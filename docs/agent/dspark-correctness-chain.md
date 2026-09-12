@@ -83,3 +83,17 @@
 - `serve.rs:1069-1076` 已记载同构现象：**该 checkpoint 没有 generation_config.json（已验证：文件不存在）且 eos_token_id 为 null**——模型答完后输出 EOS（token 1），但 stop 未生效 ⇒ 越过结束点继续生成退化尾段（"opa**" + 重启《出师表》第一句——"重启"是退化尾段的教科书形态）。
 - 数字任务的 "anao"、崩坏态的 "nofollow" 同族（拉丁碎片出现在回答边界）——系统性模式。
 - **修复方向**：① stop/EOS 的解析（tokenizer_config.json 存在——查 resolve_eos 为什么没取到 eos）；② 或硬编码 stop token 1（tokenizer stops: [1] 已经在 serve 日志里出现——查为什么没拦住）；③ 实验对照：官方 ref_inference 跑同 prompt 确认模型固有 vs ferrite 侧 stop 缺陷。
+
+## opa 根因闭环：stop 机制其实在工作——opa 是"截断前的最后一段"不是"越过 EOS"
+
+**关键事实链**：
+1. `resolve_eos` 的三级 fallback：generation_config.json（**不存在**，已验证）→ config.json 的 eos_token_id（**null**）→ tokenizer_config.json 存在 ⇒ **`Some(1)`**——**eos 解析正常**。
+2. serve 日志 `[http] tokenizer stops: [1]` ✓——stop 集是 `[1]`。
+3. serve 的 stop 检查（:690 `stop_set.contains(&tok)`）**在 emitted 循环内逐 token 检查** ✓；HTTP 层（api.rs:240-244）也过滤 `is_stop`。
+4. **⇒ stop 机制完整**。opa（id=41291，合法词表 token）是**模型在 max_tokens 耗尽前、EOS 之前**的**真实输出**——它出现在 `引喻失义` 之后是因为**模型的下一个 token 就不是 EOS**（模型在"义"后选了"opa"而不是停）。
+5. **这不是 ferrite 的 stop 缺陷，而是模型在该位置的 logits 真的偏向 opa**——数值层面：要么（a）模型固有行为（语料污染/该 checkpoint 的特性——需官方 ref_inference 对照判定），要么（b）ferrite 的某处数值微扰把近 tie 的 argmax 翻到了 opa（EAGER 也有 ⇒ 若 (b) 则是 backbone 共性偏差）。
+6. **注意出师表输出在 "opa" 之后紧跟 `**先帝创业未半而中道崩殂...`**——即输出=【完整背诵】+【opa**】+【重启出师表】——这是"模型答完正题后没找到 EOS、继续退化"的形态。**如果模型此时该出 EOS 但出了 opa ⇒ EOS 的 argmax 被翻 ⇒ 数值偏差**（候选：fp4 解包/量化路径的微扰）。
+
+**修复路径**：
+- **判定**（最便宜）：用官方 `ref_inference/generate.py` 跑同一 prompt——若官方也在同位置出 opa ⇒ 模型固有（无需修）；若官方干净 ⇒ ferrite 的 backbone 数值有共性偏差（继续二分：fp4 解包/量化）。
+- **缓解**（无论如何可做）：模型可能本来就需要"背诵完出师表后收尾"的 chat template 引导——检查 Dsv41Frame 的模板是否让模型有明确的"答完即停"信号。
