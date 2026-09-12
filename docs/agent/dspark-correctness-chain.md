@@ -929,3 +929,18 @@ Layer 20 的 norm 偏差 +14.46% 是最大异常点。config: `compress_ratios[2
 **结论**：ferrite 的 tap 值 = f32 精确计算后截断一次；官方的 = bf16 逐步截断的累积。两者**不是位等价**——ferrite 更精确（中间无损失），但最终 dtype 对齐。~2.4% 的 norm 偏差会保留（来自中间层的精度差）。
 
 **对 accept 的影响**：draft 的输入 dtype 对齐（bf16）可能改善 MTP head 的预测（head 在 bf16 输入上训练），但中间值的精度差仍在。**效果只能实测**——如果 accept 提升显著，说明 MTP head 对输入 dtype 敏感；如果不变，说明 head 对中间精度差不敏感。
+
+## Draft 内部对齐完整性检查——MoE 已共享 e4m3 路径 ✓
+
+Draft 的 MoE 用 `expert_gate_up_fp4_batched` / `expert_down_reduce_fp4_batched`（dspark_dev.rs:1963/2006）——**与 backbone 相同的 kernel**，所以 `DSV41_EXPERT_ACT_E4M3=1` 同时作用于 draft 和 backbone 的 MoE。
+
+**Draft 对齐状态汇总**：
+| 组件 | 对齐 | gate |
+|---|---|---|
+| 输入（tap→main_h）| ✅ bf16 round-trip | DSV41_TAP_BF16 |
+| hc_pre/hc_front | ✅ bf16 截断 | DSV41_BF16_TRUNCATE |
+| MoE 激活 | ✅ e4m3（同 kernel）| DSV41_EXPERT_ACT_E4M3 |
+| attention 内部 | ❌ f32（未截断）| 需要进一步工作 |
+| 其他（rope/quant）| ❌ f32 | 影响待评估 |
+
+**三个主导项已对齐**（输入+hc+MoE）——如果 accept 仍不提升，剩余的 attention 内部对齐是下一步。
