@@ -3272,3 +3272,33 @@ DSV41_SWALLOW_STEP=1 DSV41_VERIFY_GRAPH=1  # Plan B（unanimity-or-direct）的 
 | **Plan B（臂投票）** | **10,099** | **❌ 更严重** |
 
 **结论**：SWALLOW 的 ar5-hang 不是臂分歧问题。高 accept 场景下的 epoch 对齐有更深的结构性 bug。
+
+## 400 的诚实战略评估（全部分析的综合判定）
+
+### 三条路径的现状
+| 路径 | 现状 | 数学上限 | 400 可达 |
+|---|---|---|---|
+| lazy（已平台）| 83 tok/s | 145 tok/s（EAGER 完美对齐）| ❌ |
+| batched（SWALLOW）| ar5-hang（6 修复失败）| ~200-250 tok/s（kernel 限制）| ❌ 需 L4+L5 |
+| batched + L4/L5 kernel 重写 | 未开始 | 480 tok/s（理论）| ✅ 25-35 人日 |
+
+### 根本性发现（不可绕过）
+1. **kernel 是 instruction-bound 不是 bandwidth-bound**（0.7-4.9% 峰值带宽）——省字节≈0
+2. **mrows 的 M-折叠只减权重解码指令（0.6-0.68×）不减激活+FMA**——拿不到 1/M
+3. **warp-per-row 决定 M 只加每 warp 工作量**——batched 的 6 行被"串行化"
+4. **SH_PAIR 是唯一"M 进 grid"的折法**（phase-1 M×9=54 blocks）——真共享
+5. **lazy 的 k_emit × c_row 乘积是硬下限**——launch 常数优化（R2b/A4）贡献≈0
+
+### 400 的唯一路径（如果有）
+1. **修 SH_PAIR M=6 parity**（进行中）→ batched 的最大单项 -4.9~7.9ms
+2. **修 SWALLOW ar5-hang**（Plan B 失败——需要找真正的根因）
+3. **把所有 verify kernel 改成"M 进 grid"模式**（SH_PAIR 化）——L4/L5 的核心
+4. **tcgen05**（tensor cores 根治 MoE 的 instruction-bound）
+
+### 诚实的时间估计
+- SH_PAIR M=6 parity：1-2 天（subagent 正在做）
+- SWALLOW ar5-hang 根因：未知（6 次尝试失败——可能是深层架构问题）
+- 全部 kernel "M 进 grid" 化：15-25 天
+- tcgen05：5-8 天（对齐守卫已修，需要正确重测）
+
+**结论**：400 在当前 session 的时间窗口内不可达。现实的近期目标：lazy 100-120 tok/s（R2b+A4+L4-6 验证后）或 batched 修复后的 150-200 tok/s。
