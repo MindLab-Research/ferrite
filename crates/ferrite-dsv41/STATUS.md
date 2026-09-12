@@ -7875,3 +7875,21 @@ ss replay 两边都是**严格线性 fma 链**（旧 unroll 5×、新单步，�
 **对 200 tok/s 的含义**：任何"减字节"路线（swapAB 删 LUT 计算）都会把它从 compute-bound 推入 latency-bound，然后被冷读 HBM 延迟吃掉收益。**要真正兑现必须同时提高 MLP/掩藏延迟**（TMA 深队列、批化填 N 维）——与 tcgen05 + TMA 的下会话计划一致；仅换算法的路径已由 v17-v21 关闭。
 
 **⚠️ 口径修正**：nsys one.csv 的 gemm_fp8_gemv med 实际是 **10.94µs**（此前我误读 5.34µs 为 serve med——那是 many.csv 多 rank 聚合的 artifact）。
+
+### gemv-mlp-analysis 定案：v19/v21 中性的共同根因 = 只动一个因子（2026-09-12 24:00）
+
+**共同根因**：可用 in-flight ≈ (warps/SM) × (每 warp 的 smem 环深度)。需求 4.6MB。
+
+| 路径 | 改变的因子 | 不变的因子 | 结果 |
+|---|---|---|---|
+| v21 TMA | issue 机制加深（硬件队列） | 每 warp 环 18KB 不变 + warps 104（0.7/SM）不变 | **深队列没有足够 warp 灌水** → 中性 |
+| v19 ks=8 | warps ×8 | 每 warp 环 **填不满**（kc=640→nk=5 < NSTAGE=8）| 8x 并行 ÷ (8x 每 warp 延迟 + 8x epilogue) = **1** |
+
+**关键耦合：环不满不是必然——是 KStep=128 太粗**。KStep=64 时 kc=640→nk=10 ≥ NSTAGE-1，环满，8x warps 才真正变成 8x in-flight。
+
+**正确 MLP 路径（按序）**：
+1. 沿 N 加 warps（mx2 已做；batch 填 N 不适用单请求）
+2. K-split 时必须 KStep=64 / NSTAGE=16 保证 nk ≥ NSTAGE
+3. TMA 放最后——warps 先上去，队列深度才转成带宽
+
+**修复预期**：KStep=64/NSTAGE=16/ks=8 → 环满 + 8x warps → 冷读延迟隐藏 → swapAB 接近 L2 热的 5.96µs → gemv 246×6µs=1.47ms（vs SIMT 2.70ms）→ 步 4.94ms ≈ **203 tok/s**！
