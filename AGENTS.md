@@ -85,15 +85,20 @@ LD_LIBRARY_PATH=$HOME/ferrite/kernels/cuda ./target/release/ferrite-serve --back
 
 ## 当前状态与下一步（2026-09-12，详见 docs/agent/）
 
-**正确性（用户红线：不能重复不能乱码）**：根因链全部归档——最后一项是 **verify 的多行 forward 的值 vs EAGER**：
-- diff probe 实测：**anchor 每轮与 eager 一致**；mismatch 只在 verify 的行 1/2（输入对、输出错）。
-- `verify-value-hunt` 判词的 **B1（确定性）**：`attention_rows` 的 `clen_owner` 在行循环外计算（块末值）⇒ CompressConsumer 层的行 r 读到 `clen_pre+m`（EAGER 是 `clen_pre+1`）⇒ indexer 选到未来组 → 因果破坏。修复 = 行本地 `clen_rows_r` 快照（~15 行）。**B2-B6**（compressor fused/route fuse/hc tail/head slice 等单行 vs 多行的 kernel 路径差）用 `DSV41_*_FUSE=0` 逐个 A/B。
-- s.ids 回写已 gate OFF（`DSV41_SIDS_WRITEBACK`）；**verify 值修好后重新开**。
+**正确性（用户红线：不能重复不能乱码）**：
+- 8 个根因全部修复并验证（详见 `docs/agent/dspark-correctness-chain.md`）
+- 最后一个根因：**routed expert 激活量化 e2m1 vs 官方 e4m3**（4×噪声差、44 层累积=opa 的来源）——e2m1×2 双趟修复（`DSV41_EXPERT_ACT_E4M3=1`）消除 opa ✓；布局契约 bug（fuse 绑 pitch）已修；ILV+E4M3 冲突有 Rust 守卫。
+- spec 步跨步不变量断言层（`DSV41_INV_CHECK=1`，8 条优先项）。
+- diff probe（`DSV41_DIFF_EAGER=1`）：mismatch 从首轮即错→18→1（o-rope 对齐后）。
 
-**性能（400 tok/s 口径：accept 3 ⇒ 步时 ≤7.5ms）**：当前 47.7ms/步（主链 6.15 + draft 4.9 + verify ~37 + commit 0.2）@ accept 0.82。
-- verify 37ms：多行化的真实收益 = 权重读一次（~3ms），launch 削减已到头——**瓶颈在带宽/计算**（MoE act/down、投影流、attention KV）。图化（`DSV41_VERIFY_GRAPH`）可砍 launch submit 半，A/B 脚本已就绪。
-- 400 的路径：verify ≤5.5ms（图化 + 计算侧）+ draft ≤1ms + 吞主链步（−6.15）+ accept 3（draft 质量修好 s.ids/clen 后应跃升）。
+**性能（400 tok/s 口径：accept 3 ⇒ 步时 ≤7.5ms）**：
+- 基线 48ms/步（verify 37.31 + draft 4.37 + 主链 6.15 + commit 0.33）@ accept 0.83
+- **accept 是真正的乘数**（0.83→3 = 3.6× 缺口 vs 性能 1.6× 缺口）
+- 已实现的 gate（全部默认 OFF，等 A/B）：SH_EXP_MROWS(−8.3ms)、VERIFY_GRAPH(−15ms submit)、DRAFT_P3A(−37 launch)、MARKOV_SLICED(−1ms draft)、VERIFY_ROPE_MROWS(−0.6ms)、SWALLOW_STEP(−6.15ms 主链)、tcgen05 mxf4(−6.8ms routed experts)
+- **最终判定**（`docs/agent/final-400-config.md`）：全部落地后步时 ~12ms，accept 3 → 250 tok/s；**7.5ms 触架构地板**（weight-stationary 下限 7.4-9.2ms）——400 需要 accept ≥4 或 verify ≤5.5ms（需 tcgen05 + 融合全部兑现）
+- verify 的 ms 分解（`docs/agent/verify-ms-breakdown.md`）：50% launch submit + 49% in-kernel 残差 + 5% 带宽——先 A（合并/mrows）后 B（图化）
+- routed experts 残差分析（`docs/agent/routed-expert-residual.md`）：377GB/s 的成因 = 每 fp4 值 2.5 条 L1TEX 解码指令 → tcgen05 是唯一根治路径（−6.8ms）
 
-**其它 Wave 的状态**：Wave 3（KV/radix：parked-seq 零拷贝 adopt 已交付，GPU 验证待跑）；Wave 4（1M：P0-A/B/C/D/E/F 全部结论归档，1M 必须 DCP 式 KV 分片）；Wave 5（batched MTP：MtpState per-seq + 设计骨架 + 行→seq 映射全交付，五件事的接线待做）；深度统一（SpecStep trait 已在 ferrite-types，cuda.rs→devrt 待做）。
+**测试纪律**：单一 GPU 测试驱动 = 主 agent（subagent 禁止 e2e）；禁止轮询远端状态（等通知）；禁止跑已知结果的测试。
 
 **性能与知识文档**：`docs/agent/dspark-perf-400-plan.md`（400 的账本与融合清单）、`docs/agent/unified-engine-battle-plan.md`（战役计划）、`docs/agent/wave4-prefill-plan.md`（1M）、`docs/agent/wave5-multiseq-plan.md`（多并发）、`docs/agent/mtp-unification-analysis.md`（MTP 统一）、`docs/agent/dspark-swallow-step-diff.md`（吞主链步）。会话级的详细记录归 `/tmp/AGENTS_session_archive.md`（本地）与 git 历史。
