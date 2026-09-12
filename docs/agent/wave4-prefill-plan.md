@@ -484,3 +484,24 @@ latent:  fb(hd)
 ### GLM @ 1M（读码待补——MAX_CTX=8100 是 DSA cache 的 per-family max_tokens 界）
 
 GLM 的 DSA cache 分配在 `ferrite-kernel`（gpu_engine.rs:33 的注释："DSA cache allocation bound (ferrite-kernel's max_tokens per family)"）。**P0-A 的前置**：把该界抬到 1M 时，cache 的 per-family max_tokens 与显存的换算（`src/cuda.rs` 的 pool 布局）——本表的 GLM 列待补（P0-C 的口径统一后一起做）。
+
+---
+
+## 4. P0-E — GDN chunk 对齐（代码级结论，2026-09-12）
+
+**`prefill_chunk` 的结构**（`ferrite-exec/src/tp.rs:826`）:
+```rust
+pub fn prefill_chunk(&mut self, seq: u64, chunk_tokens: &[u32]) -> Result<()> {
+    self.ensure_seq_all(seq, chunk_tokens);
+    let h0 = self.shards[0].embed(chunk_tokens);          // ← 每 chunk 独立 embed
+    let mut h = if mhc { hc_expand(&h0, hc_mult) } else { h0 };
+    for plan in &plans { h = self.layer_forward_tp(seq, plan.layer_idx, h, chunk.len())?; }
+    Ok(())
+}
+```
+**关键观察**：
+1. **`h` 不跨 chunk 携带**（每 chunk 的 hidden 从本 chunk 的 token 起）——**正确**：causal 的上下文全在 seq 的 KV state 里（DSA ring/compressor）与 GDN 的 recurrent state（conv + S）里，hidden 只是"当前 chunk 这一批 token 的激活"。
+2. **GDN 的状态随 seq 累积**（`layer_forward_tp(seq, …)` 取 seq 的 state）——**chunk 边界天然连续**（state 是 seq 的属性）。
+3. **conv1d（k=4）的边界**：chunk 首个 token 需要的 3 个前驱在 seq 的 conv state 里——**同样跨 chunk 连续**。
+
+**⇒ 设计上 chunked prefill 的 GDN 语义正确**（无需 kernel 改动）。**P0-E 的剩余工作 = 数值验证**：同一 prompt 整段 prefill vs `FERRITE_PREFILL_BUDGET=512` 分块——**逐 token 的输出必须逐位一致**（若有差 → 定位 chunk 边界的 state 提交时序）。
