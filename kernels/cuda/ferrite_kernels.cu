@@ -9260,6 +9260,134 @@ extern "C" cudaError_t ferrite_p2p_ar_v5_hcpost_add(
     return cudaGetLastError();
 }
 
+// ---------------------------------------------------------------------------
+// AR v5 pubred with the segment-C `hc_post_inplace` folded into its epilogue,
+// MULTI-ROW form (the AR twin of `dsv41_hc_post_inplace_rows`).
+//
+// The single-row entry above requires `n == hc_h` and a residual laid out
+// `[hc_n][hc_h]`: it indexes row 0 of the coefficient buffers, which is exactly
+// what decode's one-token block has. The verify forward (`layer_rows`) runs the
+// SAME post over a whole m-row block, where the AR payload is `hc_rows * hc_h`
+// floats (`wo_out_r` / `moe_out_r`, row stride `hc_h`) and the coefficients
+// live at per-row strides: `post + r*hc_n`, `comb + r*hc_n*hc_n`, residual
+// `res + r*hc_n*hc_h` — the layout the m-row `hc_mixes` writes and
+// `dsv41_hc_post_inplace_rows_kernel` reads.
+//
+// The address mapping is the only difference: a float4 of the payload at
+// element offset `i4 << 2` belongs to row `(i4 << 2) / hc_h` and column
+// `(i4 << 2) % hc_h`. `hc_h % 4 == 0` (the shape gate below) makes that split
+// exact — no float4 ever straddles two rows — so the epilogue hands
+// `ar5_hc_post_col4` the row's base pointers and the within-row column, i.e.
+// the standalone rows kernel's addressing verbatim. `hc_rows == 1` reduces to
+// the single-row entry address for address (row 0, column j), and the epilogue
+// helper is the same one, so the arithmetic — and therefore the bits — is the
+// same ascending-k `__fmaf_rn` chain either way.
+//
+// Aliasing is unchanged: one thread owns four columns OF ONE ROW and walks all
+// hc_n residual rows of that row itself, so its read set and write set are the
+// same columns it alone touches. `res` may be the caller's residual stream
+// while `out` stays the distinct AR buffer.
+__global__ void p2p_ar_pubred_v5_hcpost_rows_kernel(
+    unsigned* const* __restrict__ ready_tbl,
+    unsigned* __restrict__ epoch,
+    const float* __restrict__ staging_local,
+    const unsigned* __restrict__ ready_local,
+    float* __restrict__ out,
+    int world, int my_rank, int n, int stride,
+    float* __restrict__ hc_res, const float* __restrict__ hc_post,
+    const float* __restrict__ hc_comb, int hc_n, int hc_h) {
+    const unsigned e = *epoch;
+    // Parallel stamp — identical protocol to `p2p_ar_pubred_v5_hcpost_kernel`.
+    if (blockIdx.x == 0 && threadIdx.x < (unsigned)world) {
+        atomicExch_system((unsigned int*)&ready_tbl[threadIdx.x][my_rank], e + 1u);
+        __threadfence_system();
+    }
+    __syncthreads();
+    if (blockIdx.x == 0 && threadIdx.x == 0)
+        *epoch = e + 1u;
+    if (threadIdx.x < (unsigned)world) {
+        const int tr = (int)threadIdx.x;
+        unsigned cur = *(volatile unsigned*)&ready_local[tr];
+        long spins = 0;
+        unsigned ns = 32;   // first probe 32ns, then the proven 100ns cadence
+        while ((int)(cur - (e + 1u)) < 0) {
+            __nanosleep(ns);
+            ns = 100;
+            cur = *(volatile unsigned*)&ready_local[tr];
+            if (++spins > 5000000) {
+                printf("[ar5-hang] rank=%d peer=%d need=%u cur=%u\n",
+                       my_rank, tr, e + 1u, cur);
+                break;
+            }
+        }
+    }
+    __syncthreads();
+    const int step = gridDim.x * blockDim.x;
+    const int n4 = n >> 2;
+    for (int i4 = blockIdx.x * blockDim.x + threadIdx.x; i4 < n4; i4 += step) {
+        float4 acc = make_float4(0.f, 0.f, 0.f, 0.f);
+        for (int r = 0; r < world; r++) {
+            const float4 v = *reinterpret_cast<const float4*>(
+                staging_local + (size_t)((e & 1u) * world + r) * stride + (size_t)i4 * 4);
+            acc.x += v.x; acc.y += v.y; acc.z += v.z; acc.w += v.w;
+        }
+        *reinterpret_cast<float4*>(out + (size_t)i4 * 4) = acc;
+        // `hc_h % 4 == 0` makes this split exact (no float4 straddles a row).
+        const int col = i4 << 2;
+        const int row = col / hc_h;
+        const int j = col - row * hc_h;
+        ar5_hc_post_col4(hc_res + (size_t)row * hc_n * hc_h,
+                         hc_post + (size_t)row * hc_n,
+                         hc_comb + (size_t)row * hc_n * hc_n,
+                         hc_n, hc_h, j, acc);
+    }
+    // Scalar tail — dead for every gated shape (`n == hc_rows * hc_h` and
+    // `hc_h % 4 == 0` make `n % 4 == 0`); kept for shape symmetry with the
+    // single-row kernel above.
+    for (int ii = n4 * 4 + blockIdx.x * blockDim.x + threadIdx.x; ii < n; ii += step) {
+        float acc = 0.f;
+        for (int r = 0; r < world; r++)
+            acc += staging_local[(size_t)((e & 1u) * world + r) * stride + ii];
+        out[ii] = acc;
+        const int row = ii / hc_h;
+        const int j = ii - row * hc_h;
+        ar5_hc_post_col1(hc_res + (size_t)row * hc_n * hc_h,
+                         hc_post + (size_t)row * hc_n,
+                         hc_comb + (size_t)row * hc_n * hc_n,
+                         hc_n, hc_h, j, acc);
+    }
+}
+
+// MULTI-ROW contract of `ferrite_p2p_ar_v5_hcpost` (see the kernel note): the
+// payload is `hc_rows * hc_h` floats with row stride `hc_h`, and `hc_res` /
+// `hc_post` / `hc_comb` carry one slice per row. Gated on shape
+// (`n == hc_rows * hc_h`, `1 <= hc_n <= 8`, `hc_h % 4 == 0`, `hc_rows >= 1`) so
+// a malformed call returns `cudaErrorInvalidValue` (1) instead of corrupting the
+// residual stream; the caller then runs the plain `all_reduce_inplace` +
+// `hc_post_inplace_rows` pair, which is what it used before the fold existed.
+extern "C" cudaError_t ferrite_p2p_ar_v5_hcpost_rows(
+    const float* partial, float* const* staging_tbl,
+    unsigned* const* ready_tbl, unsigned* epoch,
+    const float* staging_local, const unsigned* ready_local,
+    float* out, int n, int world, int my_rank, int stride,
+    float* hc_res, const float* hc_post, const float* hc_comb,
+    int hc_n, int hc_h, int hc_rows, cudaStream_t s) {
+    if (hc_res == nullptr || hc_post == nullptr || hc_comb == nullptr ||
+        hc_n <= 0 || hc_n > 8 || hc_h <= 0 || (hc_h & 3) != 0 ||
+        hc_rows <= 0 || n != hc_rows * hc_h)
+        return cudaErrorInvalidValue;
+    const int threads = ferrite_ar_v5_block_threads(world);
+    int blocks = ferrite_ar_v5_grid_blocks(n, threads);
+    p2p_ar_store_v5_kernel<<<dim3(blocks, world, 1), threads, 0, s>>>(
+        partial, staging_tbl, epoch, world, my_rank, n, stride, nullptr);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) return err;
+    p2p_ar_pubred_v5_hcpost_rows_kernel<<<blocks, threads, 0, s>>>(
+        ready_tbl, epoch, staging_local, ready_local, out, world, my_rank, n, stride,
+        hc_res, hc_post, hc_comb, hc_n, hc_h);
+    return cudaGetLastError();
+}
+
 
 // ============================================================
 // Knife 1b: qkv GEMV + conv FIR/silu/window-slide epilogue (decode n==1).

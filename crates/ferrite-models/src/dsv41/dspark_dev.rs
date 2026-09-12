@@ -263,6 +263,23 @@ fn draft_attn_bf16() -> bool {
     })
 }
 
+/// DRAFT BF16 ACTIVATION DOMAIN gate (`DSV41_DRAFT_BF16_DOMAIN`, DEFAULT OFF):
+/// rounds the draft's two f32 activations whose official counterparts are bf16
+/// tensors — the head's `normed` input (draft-numerical-audit C#8) and the MoE
+/// block's `xn` input (C#9: the gate's `F.linear`, and the act_quant that feeds
+/// the routed experts, both read the SAME bf16 ffn input). ONE flag covers the
+/// pair on purpose: the two sites are the same defect (an f32 activation handed
+/// to weights calibrated for a bf16 one) and a half-on state would just add
+/// noise to the A/B. Read once and cached (the house rule — never per-call).
+fn draft_bf16_domain() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("DSV41_DRAFT_BF16_DOMAIN")
+            .map(|v| v != "0")
+            .unwrap_or(false)
+    })
+}
+
 fn draft_p3a() -> DraftP3a {
     static F: std::sync::OnceLock<DraftP3a> = std::sync::OnceLock::new();
     *F.get_or_init(|| {
@@ -1986,6 +2003,22 @@ impl<'a> DsparkDev<'a> {
         let stp = crate::dsv41::weights::shared_expert_tp();
         let shared_rank = if stp { true } else { rank == 0 };
 
+        // MOE BF16 DOMAIN (draft-numerical-audit C#9; `DSV41_DRAFT_BF16_DOMAIN`,
+        // default OFF): the official block's ffn input `x` is a bf16 tensor —
+        // the gate is `F.linear(x.float(), weight.float())` (model.py:811) and
+        // the routed experts' `act_quant` reads that SAME bf16 `x`. ferrite's
+        // `xn` is the f32 ffn-norm output, so the gate's 384-way near-tie
+        // selection AND the experts' fp4/fp8 activation scale sit in a different
+        // domain. ONE in-place round-trip here covers every `xn` reader below —
+        // gate gemv, route, quant_fp4/quant_fp8, and the shared expert's
+        // quant1: they all want the bf16 value and none needs the f32 one.
+        // (Already a no-op under `DSV41_BF16_TRUNCATE`, whose `hc_collapse_norm`
+        // wrote `xn` bf16 — idempotent, so the two gates compose.)
+        if draft_bf16_domain() {
+            let n = (bs * dim) as i64;
+            self.dev.bf16_roundtrip(self.xn.ptr as *mut f32, n)?;
+        }
+
         // ---- gate + route ----
         // The gate is bf16 and the per-row GEMV is M=1, so the historical shape is
         // `bs` launches — the same call the backbone's MoE makes.
@@ -2774,6 +2807,19 @@ impl<'a> DsparkDev<'a> {
             dim as i32,
             cfg.norm_eps,
         )?;
+        // HEAD BF16 DOMAIN (draft-numerical-audit C#8; `DSV41_DRAFT_BF16_DOMAIN`,
+        // default OFF): the official `forward_head` hands the head a `normed`
+        // tensor that carries the MODEL dtype (bf16) and only then casts it to
+        // f32 for `F.linear(x.float(), weight_fp32)` (model.py:1008-1017).
+        // ferrite's rmsnorm output is f32, so `gemv_bf16`/`head_gemv_bf16_mrows`
+        // here consume a ~1e-3-different activation right before a 129280-way
+        // near-tie argmax. The in-place RN round-trip is exact (narrow+wide) and
+        // runs BEFORE the dump so a captured `normed` unit shows the value the
+        // head actually consumes. `normed` has no other reader (this fn only).
+        if draft_bf16_domain() {
+            let n = (bs * dim) as i64;
+            self.dev.bf16_roundtrip(self.normed.ptr as *mut f32, n)?;
+        }
         self.dump_unit("normed", self.normed.ptr as *const f32, &[bs, dim]);
 
         // logits = head @ normed — all `bs` rows in ONE multi-row launch.

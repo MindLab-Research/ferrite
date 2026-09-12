@@ -8183,6 +8183,48 @@ impl<'a> DevChain<'a> {
         let hc = cfg.hc_mult;
         let ld = &self.w.layers[layer];
 
+        // ---------------- DSpark tap (layer INPUT) ----------------
+        // The m-row twin of the hook at the top of `layer()`, and the SAME
+        // capture point as the reference: before the block, i.e. reading the
+        // layer's ATTENTION INPUT (`h_r` as the previous layer's `hc_post_rows`
+        // left it, with this layer's engram write-back already applied by
+        // `engram_apply_rows` in `step_rows`). `DSV41_TAP_INPUT=1` only; the
+        // end-of-block twin below carries the same gate.
+        //
+        // The row bookkeeping is the end-of-block block's, unchanged — the tap is
+        // relocated in the stream, never re-shaped: the gating (`spec_capture` /
+        // `spec_tap_deferred`), the `m <= VERIFY_ROWS` contract, and the deferred
+        // single-row staging buffer all stay exactly as they were, so
+        // `note_ctx_rows`'s indexing contract is untouched.
+        if (self.spec_capture || self.spec_tap_deferred) && Self::tap_input() {
+            if let Some(slot) = cfg.dspark_target_slot(layer) {
+                debug_assert!(
+                    m <= VERIFY_ROWS,
+                    "dspark tap_r: {m}-row block overruns the {VERIFY_ROWS}-row tap slot"
+                );
+                let (dst, rows) = if self.spec_tap_deferred {
+                    (
+                        (self.s.dspark_tap.ptr as *mut f32).wrapping_add(slot * dim),
+                        1,
+                    )
+                } else {
+                    (
+                        (self.s.dspark_tap_r.ptr as *mut f32)
+                            .wrapping_add(slot * VERIFY_ROWS * dim),
+                        m,
+                    )
+                };
+                self.dev.hc_collapse(
+                    self.s.h_r.ptr as *const f32,
+                    self.s.dspark_pre_mean.as_f32(),
+                    dst,
+                    rows as i32,
+                    hc as i32,
+                    dim as i32,
+                )?;
+            }
+        }
+
         // ---------------- attention block ----------------
         // hc_mixes has a native `rows` dimension (`rows = m`, `hc_dim = hc*dim`),
         // with pre/post/comb row-major per row — the same shape the single-row call
@@ -8321,10 +8363,14 @@ impl<'a> DevChain<'a> {
         // The real-commit path (`dspark_spec_step`) hands the ACCEPTED PREFIX of
         // this block's target hiddens to the draft (`DsparkDev::note_ctx_rows`),
         // and unlike the single-row step it needs every row, not just the one the
-        // step consumed. Same capture point as `layer()` (the layer's COMPLETED
-        // output, after this layer's whole forward — attention AND ffn — hence
-        // here, after the FFN's `hc_post` has landed back in `h_r`), same `1/hc`
-        // mean (`hc_collapse` IS the weighted sum over the hc copies).
+        // step consumed. Same capture point as `layer()`'s DEFAULT arm (the
+        // layer's COMPLETED output, after this layer's whole forward — attention
+        // AND ffn — hence here, after the FFN's `hc_post` has landed back in
+        // `h_r`), same `1/hc` mean (`hc_collapse` IS the weighted sum over the hc
+        // copies). `DSV41_TAP_INPUT=1` SKIPS this block in favour of the
+        // layer-INPUT hook at the top of this function — the reference's capture
+        // point (`model.py:1261-1267`). Running both would let this one overwrite
+        // the input tap with the output one, silently restoring the skew.
         //
         // This used to be m single-row calls. `hc_collapse` is row-INDEPENDENT —
         // `dsv41_glue.cu:301-317`: `out[t] = Σ_i pre[r*hc + i] * x[(r*hc + i)*dim
@@ -8346,7 +8392,7 @@ impl<'a> DevChain<'a> {
         // the arm copies it to row `i` outside the forward — which keeps this
         // launch's destination POINTER identical from row to row, so the one
         // captured `m = 1` graph serves them all (see `spec_tap_deferred`).
-        if self.spec_capture || self.spec_tap_deferred {
+        if !Self::tap_input() && (self.spec_capture || self.spec_tap_deferred) {
             if let Some(slot) = cfg.dspark_target_slot(layer) {
                 // (#7) The tap's row stride. The compile-time `assert!` at
                 // `VERIFY_ROWS` pins `VERIFY_ROWS == DSPARK_DRAFTS + 1`; this is
@@ -11217,11 +11263,66 @@ fn hc_tail_split() -> bool {
     *F.get_or_init(|| std::env::var("DSV41_HC_TAIL_SPLIT").map(|v| v != "0").unwrap_or(true))
 }
 
+/// DSpark tap ALIGNMENT gate (`DSV41_TAP_INPUT=1`, default OFF).
+///
+/// Moves the target-hidden tap from the END of `layer()` / `layer_rows()` to
+/// their START, where `h` is the layer's ATTENTION INPUT (the previous layer's
+/// output, as the engram write-back left it) instead of the layer's COMPLETED
+/// output.
+///
+/// The capture point is fixed by the reference, and it is the START:
+/// `ref_inference/model.py:1261-1267` runs, per layer `i`, the engram injection
+/// (1262-1263), then `main_hiddens.append(h.mean(dim=2))` (1265-1266), then
+/// `h, pre_mix = layer(h, ...)` (1267) — and the comment directly above the tap
+/// says so out loud: "the MTP head reads the attention input of its target
+/// layers, not their output". `chain.rs`'s CPU reference (the path `dspark_parity`
+/// compares against) is wired identically: engram at 568-609, tap at 610-621,
+/// `layer_forward` at 623.
+///
+/// The device chain instead tapped at the END of the block, i.e. it recorded
+/// layer `i`'s completed output — which is the official tap of layer `i+1`. With
+/// targets 37/38/39 that is `(38/39/40)`: the draft's `main_x` and every token
+/// projected from it were systematically one full layer ahead of what the head
+/// was trained on.
+///
+/// Both arms issue the SAME one-block `hc_collapse` against the SAME `[1/hc]`
+/// weights (`dspark_pre_mean`) over the SAME stream `h`; only the point in the
+/// stream differs, and the two sites are mutually exclusive (the end-of-layer
+/// hook is skipped when this gate is armed). `0`/unset therefore reproduces the
+/// historical numbers bit for bit and the gate is a pure A/B switch on one
+/// binary.
+fn tap_input() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_TAP_INPUT").map(|v| v != "0").unwrap_or(false))
+}
+
     fn layer(&mut self, layer: usize, pos: usize, pa: usize) -> Result<usize> {
         let cfg = self.cfg;
         let dim = cfg.dim;
         let hc = cfg.hc_mult;
         let ld = &self.w.layers[layer];
+
+        // ---------------- DSpark tap (layer INPUT) ----------------
+        // `DSV41_TAP_INPUT=1`: the reference's capture point — the block has not
+        // run yet, so `h` still holds the previous layer's output with this
+        // layer's engram write-back already folded in (`engram_apply` runs in
+        // `step_body` BEFORE this call, the reference's 1262-1263 order). The
+        // tap layers (37/38/39) are not engram layers, but keeping the write-back
+        // ahead of the tap is what makes the ordering match the reference
+        // statement for statement. The end-of-layer hook below is skipped while
+        // this one is armed.
+        if cfg.dspark_armed() && Self::tap_input() {
+            if let Some(slot) = cfg.dspark_target_slot(layer) {
+                self.dev.hc_collapse(
+                    self.s.h.ptr as *const f32,
+                    self.s.dspark_pre_mean.as_f32(),
+                    (self.s.dspark_tap.ptr as *mut f32).wrapping_add(slot * dim),
+                    1,
+                    hc as i32,
+                    dim as i32,
+                )?;
+            }
+        }
 
         // ---------------- attention block ----------------
         // The fused front end, when it runs, also collapses and normalises; the
@@ -11474,15 +11575,17 @@ fn hc_tail_split() -> bool {
         if phase_dbg() {
             eprintln!("[phs] L{layer} ffn_total={:?}", _t_moe.elapsed());
         }
-        if cfg.dspark_armed() {
+        // The historical capture point: the layer's COMPLETED output (after
+        // attention AND ffn). Kept as the default arm; `DSV41_TAP_INPUT=1` selects
+        // the reference's layer-INPUT point instead (see `tap_input`), in which
+        // case this hook must NOT also run — it would overwrite the input tap with
+        // the output one and silently restore the one-layer skew.
+        //
+        // NOTE the two are not interchangeable: this site samples layer `i`'s
+        // output, which IS the reference's tap for layer `i+1`, so with targets
+        // 37/38/39 this arm is the official (38/39/40).
+        if !Self::tap_input() && cfg.dspark_armed() {
             if let Some(slot) = cfg.dspark_target_slot(layer) {
-                // sglang's capture point (deepseek_v4.py:3132-3141): the mean
-                // over the hc copies of the layer's COMPLETED output
-                // (`completed.mean(dim=1)` — after this layer's whole forward,
-                // attention AND ffn). The historical tap ran at the layer's
-                // START, capturing the PREVIOUS layer's output — one full
-                // layer off, enough to systematically skew main_x and every
-                // draft token after it.
                 self.dev.hc_collapse(
                     self.s.h.ptr as *const f32,
                     self.s.dspark_pre_mean.as_f32(),
