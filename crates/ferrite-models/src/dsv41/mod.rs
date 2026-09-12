@@ -20,6 +20,9 @@ pub mod chain;
 pub mod chain_dev;
 pub mod config;
 pub mod device;
+/// Golden-comparison dump of the DSpark path (`DSV41_DSPARK_DUMP=1`): one JSON
+/// line per speculative step with the target tap / drafts / verify argmax.
+pub mod dump_dev;
 pub mod dspark;
 pub mod dspark_dev;
 pub mod dspark_parity;

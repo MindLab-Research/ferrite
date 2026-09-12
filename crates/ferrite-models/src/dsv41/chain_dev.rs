@@ -36,6 +36,7 @@ use std::sync::Arc;
 use crate::dsv41::config::{Dsv41Config, KvMode};
 use crate::dsv41::tp::Collective;
 use crate::dsv41::device::{CuStream, DevBuf, Device};
+use crate::dsv41::dump_dev;
 use crate::dsv41::dspark_dev::{DsparkDev, DSPARK_DRAFTS, DSPARK_TAP_SLOTS};
 use crate::dsv41::load::{Dsv41DevWeights, LayerDev};
 
@@ -1430,6 +1431,51 @@ impl<'a> DevChain<'a> {
     /// construction, while the parity check has to feed the TRUE continuation.
     pub(crate) fn dspark_tap_ptr(&self) -> *const f32 {
         self.s.dspark_tap.ptr as *const f32
+    }
+
+    /// Golden-comparison dump of one speculative step (`DSV41_DSPARK_DUMP=1`,
+    /// see [`crate::dsv41::dump_dev`] for the format): one JSON line with the
+    /// tap, the draft block, the verify block's argmax and the accepted prefix,
+    /// so the official reference's per-step golden latent can be diffed against
+    /// ours element by element.
+    ///
+    /// RANK 0 ONLY: every TP rank is a separate PROCESS appended to the same
+    /// path, so an unguarded dump would interleave `world` copies of every step.
+    ///
+    /// A failure is LOGGED, never propagated — a debug dump must not answer an
+    /// error for a step whose block is already committed.
+    fn dspark_dump_step(
+        &self,
+        mode: &str,
+        pos: usize,
+        token: u32,
+        next: u32,
+        k_acc: usize,
+        drafts: &[u32],
+        verify_out: &[u32],
+    ) {
+        if !dump_dev::enabled() || self.rank() != 0 {
+            return;
+        }
+        let rec = dump_dev::Step {
+            mode,
+            pos,
+            token,
+            next,
+            k_acc,
+            drafts,
+            verify_out,
+            // The tap as the step LEFT it: `import_tap` only READS it and the
+            // verify's per-row hook writes `dspark_tap_r`, so this is still the
+            // `[3, dim]` block the draft consumed — the golden's `main_x`
+            // source, read before anything downstream could rewrite it.
+            tap: self.s.dspark_tap.ptr as *const f32,
+            tap_slots: DSPARK_TAP_SLOTS,
+            dim: self.cfg.dim,
+        };
+        if let Err(e) = dump_dev::write_step(self.dev, &rec) {
+            eprintln!("[dsv41] dspark dump (pos {pos}) failed: {e}");
+        }
     }
 
     pub fn reset(&mut self) -> Result<()> {
@@ -3181,6 +3227,14 @@ impl<'a> DevChain<'a> {
             }
         }
 
+        // 9. the golden-comparison dump (no-op unless `DSV41_DSPARK_DUMP=1`).
+        //    Last, and after the rollback: the chain is already back where the
+        //    single-row path left it, so nothing the dump does can leak into the
+        //    real decode. `k_acc` is the MATCHING draft prefix (`acc`), not the
+        //    report's `accepted` (which adds the always-present anchor) — the
+        //    spec path's `k_acc` is the same quantity, so the two diff cleanly.
+        self.dspark_dump_step("shadow", pos, token, next, acc, &drafts, &verify_out);
+
         Ok(DsparkShadowReport {
             next,
             drafts,
@@ -3349,6 +3403,14 @@ impl<'a> DevChain<'a> {
         let mut emitted = Vec::with_capacity(k_acc + 1);
         emitted.push(next);
         emitted.extend_from_slice(&verify_out[..k_acc]);
+
+        // ---- 8. the golden-comparison dump (no-op unless `DSV41_DSPARK_DUMP=1`).
+        //    Last: the commit has already moved the engine, so a dump failure is
+        //    logged inside and cannot turn a committed step into an error reply.
+        //    The tap is the single-row one `step_dev` just wrote (the block's
+        //    per-row twin lives in `dspark_tap_r` and is not dumped) — the same
+        //    quantity the shadow path records, at the same step position.
+        self.dspark_dump_step("spec", pos, token, next, k_acc, &drafts, &verify_out);
 
         Ok(DsparkSpecReport {
             next,
