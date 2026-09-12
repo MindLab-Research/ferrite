@@ -143,6 +143,33 @@ pub struct DsparkSpecReport {
     pub commit_ms: f32,
 }
 
+/// What one `DSV41_DIFF_EAGER` probe found: the tokens a
+/// [`DevChain::dspark_spec_step`] emitted against the SAME positions decoded one
+/// row at a time by the plain engine.
+///
+/// The two vectors are index-aligned on the same position: `spec_emitted[i]` and
+/// `eager[i]` are both the token at `pos + 1 + i`, the first taken from the m-row
+/// verify's argmax (what the spec path emits) and the second from a single-row
+/// `step_dev` replay of that position. Greedy speculative decoding makes them
+/// equal by construction, so [`Self::first_mismatch`] is the first place the two
+/// paths disagree — the first position at which a spec-only defect becomes
+/// visible in the token stream.
+#[derive(Debug, Clone)]
+pub struct DiffEagerReport {
+    /// The tokens the spec step emitted, the ones at
+    /// `pos + 1 ..= pos + spec_emitted.len()`.
+    pub spec_emitted: Vec<u32>,
+    /// The single-row greedy decode of the same positions. `eager[0]` is echoed
+    /// from `spec_emitted[0]` rather than re-run: the anchor IS a single-row
+    /// `step_dev` argmax (every spec arm feeds the step's own argmax), so a
+    /// re-run would measure reproducibility, not the two paths against each
+    /// other.
+    pub eager: Vec<u32>,
+    /// The smallest `i` with `eager[i] != spec_emitted[i]`, else `None`. Its
+    /// position in the sequence is `pos + 1 + i`.
+    pub first_mismatch: Option<usize>,
+}
+
 struct Scratch {
     h: DevBuf,     // [hc*dim]
     h2: DevBuf,    // [hc*dim] (hc_post lands here, then copies back)
@@ -912,6 +939,25 @@ fn verify_head_fold() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *F.get_or_init(|| {
         std::env::var("DSV41_VERIFY_HEAD_FOLD")
+            .map(|v| v != "0")
+            .unwrap_or(false)
+    })
+}
+
+/// `DSV41_SIDS_WRITEBACK=1` re-enables the s.ids write-back (emitted.last()
+/// written back after the spec commit). **Default OFF** because the bisection
+/// (5f774c7 vs 65d6b5a on the SAME GPU/binary pair) showed the write-back
+/// makes the 出师表 collapse to LEN 12 ("出师nofollow") while its parent
+/// (repetition-only) runs LEN 54 — the write-back feeds a MORE-correct token
+/// (emitted.last() = verify's argmax), which AMPLIFIES verify_out's own value
+/// errors into an earlier collapse. The write-back is mathematically right
+/// (two independent verdicts verified it); the blocker is verify's values.
+/// Re-enable once the verify-value fault is fixed (spec-eager-diff-tool is
+/// building the locator). Read once and cached (the house rule).
+fn sids_writeback() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("DSV41_SIDS_WRITEBACK")
             .map(|v| v != "0")
             .unwrap_or(false)
     })
@@ -2116,6 +2162,177 @@ impl<'a> DevChain<'a> {
             world: self.world(),
         };
         vrow0_write(&rec)
+    }
+
+    /// `DSV41_DIFF_EAGER=1`: re-decode the positions a
+    /// [`Self::dspark_spec_step`] just emitted ONE ROW AT A TIME and report the
+    /// first position where the two paths disagree.
+    ///
+    /// # What it answers (and what the bisection cannot)
+    ///
+    /// The spec path emits `emitted[i]` = `verify_out`'s argmax — the MAIN
+    /// chain's own value, read off the m-row batched verify instead of a
+    /// single-row step. That substitution is correct exactly when the two agree
+    /// (`step_rows`' documented contract: "the rows' per-row outputs must be
+    /// BIT-IDENTICAL to the plain engine at the same positions — that parity is
+    /// the spec path's correctness contract"). A bisection answers *which
+    /// commit* introduced a regression; this answers *which position*, i.e.
+    /// which of the emitted tokens is the first one the two paths compute
+    /// differently — the first place a spec-only defect is OBSERVABLE in the
+    /// token stream.
+    ///
+    /// # Why an in-process probe and not two serve runs
+    ///
+    /// Two runs (SPEC vs eager, logs pulled and diffed) cannot answer it: their
+    /// KV, their capture history and their prefix state are not the same
+    /// objects, so the two sequences are only comparable "from scratch" and the
+    /// first divergence is smeared by whatever the prompt/prefill differed in.
+    /// The probe re-decodes from the state the spec step JUST left, so both
+    /// sides share the prefix bit for bit and the only thing that differs is the
+    /// forward that produced the numbers.
+    ///
+    /// # What it compares, exactly
+    ///
+    /// `emitted[i]` is the token at `pos + 1 + i`. For `i >= 1` the probe runs
+    /// `step_dev(emitted[i - 1], pos + i)` — the plain single-row step fed the
+    /// same token at the same position — and compares its argmax against
+    /// `emitted[i]`. The prefix the replay reads is the kept one the commit just
+    /// left PLUS the rows this probe itself wrote for iterations `< i`, whose
+    /// tokens are `emitted[0..i - 1]`; the verify's row `i - 1` read the same
+    /// prefix (`drafts[j] == emitted[j]` for every accepted `j`, which is what
+    /// acceptance MEANS), so the two forwards see the same context and the only
+    /// difference is the batched-per-row vs single-row scheduling. That is the
+    /// documented parity contract, tested at the token level rather than at the
+    /// logits level.
+    ///
+    /// `i == 0` is deliberately NOT re-run: `emitted[0]` is the anchor, already
+    /// a single-row `step_dev` argmax in every arm, so re-running it would test
+    /// reproducibility instead of the two paths against each other.
+    ///
+    /// # The layout it assumes (holds in all three spec arms)
+    ///
+    /// `dspark_spec_step` emits `emitted[i]` as the token at `pos + 1 + i` and
+    /// leaves the counter at `pos + emitted.len()`. The legacy 5-row block, the
+    /// seed-aligned 6-row one and the swallowed one differ in where their ROW 0
+    /// sits and in what `pos_base` the commit is called with, not in that
+    /// contract. The counter is therefore both the invariant the probe checks
+    /// and the state it has to rewind, and a mismatch is reported as an error
+    /// rather than compared against the wrong positions.
+    ///
+    /// # Cost, and why it is a probe and not a feature
+    ///
+    /// `emitted.len() - 1` extra single-row forwards (~7 ms each) per spec step,
+    /// plus one snapshot/rollback pair. Gated OFF by default and never enabled
+    /// by any code path: it changes no engine state (see the restore list below)
+    /// but it does change the timing, so it must not run under a perf A/B.
+    ///
+    /// # What it writes, and what is undone (the contract: leave the chain
+    /// exactly where `dspark_spec_step` left it)
+    ///
+    /// * the m-row block's ring rows + compressor carry/counters — saved by
+    ///   [`Self::dspark_snapshot`] and put back by [`Self::dspark_rollback`],
+    ///   the same pair the verify uses. The slots are exactly the positions the
+    ///   replay writes (`pos + 1 ..= pos + emitted.len() - 1`), and `keep == 0`
+    ///   is the shadow path's full rollback;
+    /// * `pos_ctr` — each replay argmax advances it, so it is re-set to
+    ///   `pos + emitted.len()`;
+    /// * `s.ids` — the next real step's embedding reads it (that is what makes
+    ///   the step self-feeding), and the replay's argmaxes overwrote it.
+    ///   Restoring it is not optional: without it the next step emits the wrong
+    ///   token, which is a behaviour change, not a measurement;
+    /// * `dspark_tap` — the replay re-runs the tap hook, and the SWALLOWED arm
+    ///   carries this buffer into the NEXT round's draft (it has no `step_dev`
+    ///   of its own to rewrite it). Saved/restored whole, 3 x `dim` f32;
+    /// * `decode_steps` / `step_count` — host counters the extra forwards would
+    ///   otherwise inflate (`DSV41_TOKTRACE`'s `ds=` field, the graph's
+    ///   `decode_steps >= 1` gate).
+    ///
+    /// Deliberately NOT restored, for the reasons the verify's own rollback gives:
+    /// `index_k` (unreachable past the restored `clen`, and re-published by the
+    /// next real commit), the ring's compressed rows (same), the engram table
+    /// (the replay writes the SAME tokens at the SAME kept positions the verify
+    /// wrote, so it is idempotent there and never touches the rejected rows'
+    /// slots), and the per-layer `kvp`/`scp` projections (pure functions of
+    /// `s.xn`, recomputed every step).
+    ///
+    /// The embed/argmax path is a HEAD_SLICE collective when that gate is on, so
+    /// this MUST be called on EVERY rank, exactly like [`Self::vrow0_step`]; only
+    /// the printing is rank 0's.
+    pub fn diff_eager_probe(&mut self, pos: usize, emitted: &[u32]) -> Result<DiffEagerReport> {
+        let cfg = self.cfg;
+        let n = emitted.len();
+        let rows = n.saturating_sub(1);
+        // Nothing to compare: the anchor is the single-row argmax by
+        // construction (see the doc comment).
+        if rows == 0 {
+            return Ok(DiffEagerReport {
+                spec_emitted: emitted.to_vec(),
+                eager: emitted.to_vec(),
+                first_mismatch: None,
+            });
+        }
+        // The one invariant the probe stands on: the chain is one past the last
+        // emitted token, so the block's row 0 sits at `pos + 1`.
+        let pos_ctr = self.dev.download_u32(self.s.pos_ctr.ptr as *const c_void)? as usize;
+        if pos_ctr != pos + n {
+            return Err(FerriteError::Config(format!(
+                "diff_eager_probe: the chain's position counter is {pos_ctr}, expected {} \
+                 (pos {pos} + {n} emitted) — the probe must be called immediately after \
+                 dspark_spec_step and on the state it left",
+                pos + n
+            )));
+        }
+
+        // ---- take: the block's write set, the embedding input, the tap, the
+        //      host step counters ----
+        let host = self.dspark_snapshot(pos + 1, rows)?;
+        let ids_saved = self.dev.download_u32(self.s.ids.ptr as *const c_void)?;
+        let steps_saved = (self.decode_steps, self.step_count);
+        let tap_len = DSPARK_TAP_SLOTS * cfg.dim;
+        let mut tap_saved = vec![0f32; tap_len];
+        {
+            let b = Device::view(self.s.dspark_tap.ptr, tap_len * std::mem::size_of::<f32>());
+            self.dev.download_f32(&b, &mut tap_saved)?;
+        }
+
+        // ---- the replay: one plain single-row step per emitted position after
+        //      the anchor ----
+        self.set_pos_ctr(pos + 1)?;
+        let mut eager: Vec<u32> = Vec::with_capacity(n);
+        eager.push(emitted[0]);
+        let mut replay_err: Option<FerriteError> = None;
+        for i in 1..n {
+            if let Err(e) = self.ul_i32(self.s.ids.ptr, &[emitted[i - 1] as i32]) {
+                replay_err = Some(e);
+                break;
+            }
+            match self.step_dev(emitted[i - 1], pos + i) {
+                Ok(tok) => eager.push(tok),
+                Err(e) => {
+                    replay_err = Some(e);
+                    break;
+                }
+            }
+        }
+
+        // ---- put it back, unconditionally: a probe may not leave the chain
+        //      dirty even when its own replay failed ----
+        self.dspark_rollback(pos + 1, rows, &host)?;
+        self.set_pos_ctr(pos + n)?;
+        self.decode_steps = steps_saved.0;
+        self.step_count = steps_saved.1;
+        self.dev.upload_f32_at(self.s.dspark_tap.ptr, 0, &tap_saved)?;
+        self.ul_i32(self.s.ids.ptr, &[ids_saved as i32])?;
+        if let Some(e) = replay_err {
+            return Err(e);
+        }
+
+        let first_mismatch = (0..n).find(|&i| eager[i] != emitted[i]);
+        Ok(DiffEagerReport {
+            spec_emitted: emitted.to_vec(),
+            eager,
+            first_mismatch,
+        })
     }
 
     pub fn reset(&mut self) -> Result<()> {
@@ -5120,8 +5337,10 @@ impl<'a> DevChain<'a> {
         // first polluted round makes the model treat repetition as the pattern
         // to continue — which is why the first ~10 chars were right and then it
         // collapsed, while emitted itself stayed item-by-item correct).
-        if let Some(&last) = emitted.last() {
-            self.ul_i32(self.s.ids.ptr, &[last as i32])?;
+        if sids_writeback() {
+            if let Some(&last) = emitted.last() {
+                self.ul_i32(self.s.ids.ptr, &[last as i32])?;
+            }
         }
 
         self.dspark_dump_step("spec", pos, token, next, k_acc, &drafts, &verify_out);
@@ -5325,8 +5544,10 @@ impl<'a> DevChain<'a> {
         // step_body embeds `s.ids`, and without this the next round would embed
         // a token k_acc positions stale (the digit task's self-locking
         // repetition). 4 bytes per round.
-        if let Some(&last) = emitted.last() {
-            self.ul_i32(self.s.ids.ptr, &[last as i32])?;
+        if sids_writeback() {
+            if let Some(&last) = emitted.last() {
+                self.ul_i32(self.s.ids.ptr, &[last as i32])?;
+            }
         }
 
         self.dspark_dump_step("spec", pos, token, next, k_acc, &drafts, &verify_out);
