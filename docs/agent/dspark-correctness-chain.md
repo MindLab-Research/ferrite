@@ -454,3 +454,17 @@ if cfg.indexer_owns_k(layer) && (publish_key || self.verify_recording) { self.pu
 **LEN 142、双字 0、拉丁碎片 [acs, ibu]**——文本在 `以塞忠谏之路也` 后出现 "acs"，再后面 `陟（ibu）`——**"陟"后面应该是"罚臧否"**——模型在上下文累积后退化。
 **EAGER+e4m3 也有 acs（同位置）** → **backbone 残留**（不是 spec 路径回归）。
 **下一步**：官方 ref_inference 判别（acs-model-inherent subagent 在跑）——如果官方干净则继续排查 ferrite 的 backbone 数值。
+
+## lazy verify 代码审计（lazy-verify-gpu-prep）——7 项全过 + 1 个 CRITICAL 发现
+
+| # | 项 | 判定 |
+|---|---|---|
+| R1 双提交 | dspark_commit_lazy 只 set_pos_ctr + inv_compress_len，无 rollback/replay | ✓ |
+| R2 deferred tap | spec_tap_deferred 时 layer_rows 写 staging → lazy_tap_commit D2D 到 tap_r[(slot*VERIFY_ROWS+i)*dim] | ✓ |
+| R3 pos_ctr | lazy_run_row 首 set_pos_ctr(pos+i)、错误路径还原 set_pos_ctr(pos) | ✓ |
+| AR 足迹 | k_emit rank-uniform（argmax_sliced 归约）⇒ 每轮所有 rank 同臂同行数 | ✓ |
+| 图化共存 | m=1 与 m=5 各占一槽、DRY 无额外前向 | ✓ |
+| spec_capture=false | compressor 逐行提交在 m=1 下天然满足 | ✓ |
+| off-by-one | for i in 1..=DRAFTS + judge i<DRAFTS，rows_run==k_emit 恒成立 | ✓ |
+
+**⚠️ CRITICAL 新发现**：`dspark_spec_lazy` 的错误路径调 `dspark_rollback(pos, m, &host_mirrors)`（:6910），其中 `host_mirrors` 来自 `dspark_snapshot(pos, m)`（:6861）——**但 lazy 没有 rollback_keep**（成功时零回滚 ✓），错误时回滚整块也是对的（keep=0）。**但 `dspark_rollback` 的 `pos` 参数**在 swallowed 语义下应为块行 0 的位置（= `pos`）——与 snapshot 的 `pos` 一致 ✓。**审计判定：无 bug**。
