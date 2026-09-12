@@ -1860,6 +1860,26 @@ pub struct DevChain<'a> {
     /// layer walk. Armed only around the spec step's `step_rows` call, so the
     /// shadow path pays nothing.
     spec_capture: bool,
+    /// Set ONLY while [`Self::capture_verify`] is RECORDING the verify's CUDA
+    /// graph (`DSV41_VERIFY_GRAPH=1`), and cleared before the capture ends.
+    ///
+    /// It exists for exactly one reason: the graph is a recorded LAUNCH SEQUENCE,
+    /// so nothing inside the recording may branch on a HOST value that changes
+    /// from verify to verify. `committed` (the compressor's host mirror of the
+    /// completion rule, `(pos_base + r + 1) % ratio == 0`) IS such a value — it
+    /// flips with `pos_base mod ratio`, i.e. every single verify — and it used to
+    /// decide whether `indexer_rows_one` emitted the `publish_index_key` launch
+    /// at all. The capture, taken at ONE parity, therefore baked a launch
+    /// sequence that was missing the publish for every row of the OPPOSITE
+    /// parity, and a replay at that parity selected against `index_k` slots no
+    /// launch had written.
+    ///
+    /// The direct path (and the DRY/fallback runs, which are the same direct
+    /// launches) never sets this flag, so its behaviour is bit-for-bit what it
+    /// was; only the recording is made parity-independent. See
+    /// [`Self::indexer_rows_one`] for why an unconditional launch is the correct
+    /// recording even though the direct path may skip it.
+    verify_recording: bool,
     /// `DSV41_SWALLOW_STEP` only: the spec step's bootstrap flag. The FIRST
     /// round of a request runs the legacy path (the standalone `step_dev`
     /// supplies the anchor's forward AND the tap); every later round SWALLOWS
@@ -2264,6 +2284,7 @@ impl<'a> DevChain<'a> {
             eng_map,
             moe_add_in: vec![None; cfg.n_layers],
             spec_capture: false,
+            verify_recording: false,
             spec_primed: false,
             verify_graphs: [None; VERIFY_GRAPH_SLOTS],
             verify_shapes: [0; VERIFY_GRAPH_SLOTS],
@@ -4304,7 +4325,16 @@ impl<'a> DevChain<'a> {
             // Nothing was recorded, so there is no capture to end.
             return (std::ptr::null_mut(), Some(e));
         }
+        // The recording is a LAUNCH SEQUENCE, so no host branch inside it may
+        // depend on a per-verify value: `committed` does, and it decides whether
+        // the per-row index-key publish is emitted (see
+        // [`Self::verify_recording`] and [`Self::indexer_rows_one`]). Armed for
+        // exactly the recorded call and cleared before `capture_end`, so the
+        // fallback launch below — which re-runs `step_rows_inner` on the direct
+        // path — is unaffected and eager stays bit-identical.
+        self.verify_recording = true;
         let inner = self.step_rows_inner(toks, m, pos_base);
+        self.verify_recording = false;
         let end = self.dev.capture_end();
         match (inner, end) {
             (Ok(()), Ok(g)) => (g, None),
@@ -7681,7 +7711,21 @@ impl<'a> DevChain<'a> {
         // once per block, which could only ever name the block's LAST group) is what
         // makes EVERY group of the block addressable, and it now happens BEFORE this
         // row's own selection reads `index_k[.. *clen]`.
-        if publish_key && cfg.indexer_owns_k(layer) {
+        //
+        // `verify_recording` (the GRAPH capture, `DSV41_VERIFY_GRAPH=1`) FORCES the
+        // launch. `committed` is a HOST value that flips with `pos_base mod ratio`,
+        // and a capture bakes the launch SEQUENCE it observes: recording at an even
+        // `pos_base` left every odd row's publish out of the graph, so a replay at
+        // an odd `pos_base` selected against `index_k` slots no launch had written
+        // (and the mirror case). Recording the publish for EVERY row makes the
+        // sequence parity-independent, and the replay stays correct because the
+        // extra launches are byte-idempotent: a row that did not complete a group
+        // leaves `latent` and the device `*clen` untouched, so the publish writes
+        // the group it already wrote (`*clen - 1`, same bytes) — precisely what the
+        // single-row reference does on every non-completing step. `committed` still
+        // gates the DIRECT path, whose launch sequence — and therefore whose
+        // device effects — are unchanged.
+        if cfg.indexer_owns_k(layer) && (publish_key || self.verify_recording) {
             self.publish_index_key(layer)?;
         }
         // ---- this row's query, per-head weights and selection ----

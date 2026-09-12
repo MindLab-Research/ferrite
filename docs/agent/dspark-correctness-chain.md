@@ -336,3 +336,21 @@ out_slot_stride ✓ / add_inplace 长度（m*topk*act_slot）✓ / ex_act_r_lo �
 **关键前提修正**：`ran_tc` **不在捕获区**——`moe()`（含 tcgen05）只有 eager 路径的调用点，verify 走 `moe_rows`（无 ran_tc 项）。
 
 **⚠️ 真正发现的一处 capture 冻结分支**（不在三个 gate 内）：`publish_key = committed`（值是 `pos_base mod ratio` 的函数，决定 `publish_index_key` 的 3 个 launch 是否被录制）——**layer 2/8/14（ratio=2 的 index-owning 层）随 pos_base 奇偶翻转** → 图捕获时如果 pos_base 是偶数，`publish` 被 skip，replay 到奇数位置时缺 launch（反之亦然）。**修法**：capture 前强制跑一次奇数位置（或 publish 无条件化后用 clen 门控）。
+
+**✅ 已修（2026-09-12，Rust-only，不动 kernel ABI）**：`DevChain` 新增 `verify_recording: bool`，只在 `capture_verify` 里包住被录制的 `step_rows_inner`（`capture_end` 之前清掉）；`indexer_rows_one` 的发射条件由
+
+```rust
+if publish_key && cfg.indexer_owns_k(layer) { self.publish_index_key(layer)?; }
+```
+
+改为
+
+```rust
+if cfg.indexer_owns_k(layer) && (publish_key || self.verify_recording) { self.publish_index_key(layer)?; }
+```
+
+即**录制期无条件发射 publish launch，序列与奇偶无关**；`committed` 仍门控 direct 路径（eager 逐位不变）。
+
+**为什么 replay 不需要 kernel 从 device 侧读 `committed`**：多余的那次 publish 是**逐字节幂等**的——kernel 的目的槽是设备 `*clen - 1`，而「未完成一个 group」的行既不推进 `*clen`（`compress_commit_kernel` 的 `if (*out_rows <= 0) return;`），也不改写 `latent`（`compressor_pool_kernel` 的 `if (mode == 2 && out_rows_val == 0) return;`），于是它重写的正是上一次已经写过的同一 group、同一字节。这正是**单行参考路径**每步都在做的事（`indexer()` 只要 `owns_k` 就无条件 publish），所以「无条件发射」不是新语义，而是 verify 向 reference 对齐。代价：图内每次 verify 多 3 层 × 未完成行数 个极小 launch（幂等写），图外 0 成本。
+
+**不要走 kernel 加 `do_publish` 参数的路线**：那会改 `dsv41_index_k_publish` 的 ABI，而按仓库的双产物纪律（`crates/ferrite-kernel/build.rs` 的 .so/.cu 同源门禁），部署侧已有的 .so 必须重建，否则 eager 路径直接崩（参数错位：旧符号会把 `do_publish` 当 `idx_hd`、`idx_hd` 当 stream）。
