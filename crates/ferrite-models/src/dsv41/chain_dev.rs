@@ -720,6 +720,34 @@ fn rope_fuse() -> bool {
     *F.get_or_init(|| std::env::var("DSV41_ROPE_FUSE").map(|v| v != "0").unwrap_or(true))
 }
 
+/// ROW-FOLD (DSV41_ROW_FOLD_ROPE=1, DEFAULT OFF): the verify block's q rope and
+/// inverse o rope are `m` launches each per layer because every row owns a
+/// position. The rows are INDEPENDENT (each rotates only its own `nlh` head rows
+/// at `pos_rows[r]`), so the kernel can loop r ascending in ONE launch —
+/// `dsv41_apply_rope_mrows`, whose body is `apply_rope_kernel`'s verbatim with
+/// `t = pos_rows[r]`. The per-row loop stays as the fallback (bit-identical) for
+/// an .so without the symbol. A/B arm: `DSV41_ROW_FOLD_ROPE=1`.
+fn row_fold_rope() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_ROW_FOLD_ROPE").map(|v| v != "0").unwrap_or(false))
+}
+
+/// ROW-FOLD (DSV41_ROW_FOLD_GATE=1, DEFAULT OFF): `moe_rows` runs the bf16 gate
+/// `gemv_bf16` once per activation row. `gemv_bf16` dispatches to
+/// `ferrite_gemv_bf16_v2(..., nrows = 1)` for the gate's shape (n = the routed
+/// expert count < `GEMV_V2_MAX_N`), and `ferrite_gemv_bf16_nt(..., nrows = m)`
+/// is that program's m-token form — same WPR heuristic, same K-slice walk, same
+/// uint4/8-element FMA groups, same smem fold order, one independent accumulator
+/// per token (`gemv_bf16_nt_kernel`; the `tests_dsv41_head_mrows` suite asserts
+/// this bit-identity). DEFAULT OFF so the fold is an explicit A/B arm; the fold
+/// itself only engages when the per-row path would take v2
+/// (`gemv_bf16_v2_wanted` + the symbol present), which is what makes the parity
+/// claim transfer. See `Device::gemv_bf16_mrows`.
+fn row_fold_gate() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_ROW_FOLD_GATE").map(|v| v != "0").unwrap_or(false))
+}
+
 /// DSV41_SH_EXP_MX2=0 reverts the shared expert's gate/up to two launches.
 fn sh_exp_mx2() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1150,6 +1178,52 @@ fn vrow0_probe() -> bool {
 fn swallow_step() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *F.get_or_init(|| std::env::var("DSV41_SWALLOW_STEP").map(|v| v != "0").unwrap_or(false))
+}
+
+/// `DSV41_SEED_ALIGN=1` arms the SEED↔TAP alignment (route A of the draft-quality
+/// arbitration): [`DevChain::dspark_spec_step`] moves the draft block onto the
+/// anchor the tap actually belongs to, and the verify block becomes the 6-row
+/// `[next, d1..d5]` GLM layout.
+///
+/// # The defect it fixes
+///
+/// `step_dev(token, pos)` forwards `token` at position `pos` and the tap hook
+/// records that forward's target-layer hidden — so the tap's position IS `pos`
+/// (`layer()`'s hook runs inside the step, `dspark_dev.rs`'s `import_tap` only
+/// copies it afterwards). The draft then seeded its window ring at
+/// `seed_window(s, pos - 1)` while feeding the block `[embed(token), noise×4]`:
+/// the ring row `{content: h(token@pos), RoPE: pos - 1}` is a one-token
+/// mismatch, and the slot `pos % win` (the position the tap actually describes)
+/// was written by NOBODY — every step's `p_i` was missing from the set of
+/// written positions `{p_i - 1} ∪ [p_i + 1, p_i + k_acc]`. The window's contents
+/// therefore sat one token BEHIND their RoPE phases: the tight predecessor
+/// (distance 1, the only draft candidate that matters) appeared as distance 2,
+/// while "distance 1" was the anchor itself — a duplicate of the block's row 0.
+///
+/// # The fix (this gate ON)
+///
+/// The draft is called as `draft_forward(next, pos + 1)`, where `next` is the
+/// step's own argmax (the token at `pos + 1`). The seed slot is then
+/// `(pos + 1) - 1 = pos` — the tap's real position, and `seed_window`'s `pos - 1`
+/// argument needs no change at all (it is correct for an anchor at `pos + 1`).
+/// The verify becomes the 6-row `[next, d1..d5] @ pos + 1 ..= pos + 6`, whose row
+/// 0 IS the anchor's forward, so the accept chain is INDEX-ALIGNED and the shared
+/// [`ferrite_types::spec_accept`] runs with `anchor_is_in_block = true` — the
+/// layout GLM's MTP already uses (see [`Self::dspark_spec_swallowed`]).
+///
+/// The gate also fixes the ring WRAP-AROUND (`DsparkDev::win_rows`): once
+/// `pos >= win` the window must rotate (the ring's slot `pos % win` is the
+/// anchor's and must not be a candidate) and shrinks to `win - 1` live rows;
+/// without it an anchor double-KV enters the candidate set, which the official
+/// mask forbids.
+///
+/// Default OFF, so the two paths can be A/B'd in one session (the switch is read
+/// once per process, like every gate here). This gate does NOT touch the tap
+/// COLLECTION point (`layer()`'s end vs `ref_inference/model.py:1264-1266`'s
+/// input) — that arbitration is a separate experiment.
+pub(crate) fn seed_align() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_SEED_ALIGN").map(|v| v != "0").unwrap_or(false))
 }
 
 /// How many logits each row reports: `DSV41_VROW0_TOPK`, default 5.
@@ -4870,6 +4944,14 @@ impl<'a> DevChain<'a> {
         if swallow_step() && self.spec_primed {
             return self.dspark_spec_swallowed(dspark, token, pos);
         }
+        // The seed↔tap alignment (`DSV41_SEED_ALIGN`) moves this arm's draft
+        // block onto `pos + 1` and widens the verify to 6 rows — a different
+        // block layout, so it is its own arm (see `dspark_spec_aligned`), NOT a
+        // branch inside the legacy one: the A/B must keep the legacy arm
+        // bit-identical.
+        if seed_align() {
+            return self.dspark_spec_aligned(dspark, token, pos);
+        }
 
         // ---- 1. the real step: the whole-step graph (tap hook included), the
         // argmax, and the position counter + 1.
@@ -4991,6 +5073,204 @@ impl<'a> DevChain<'a> {
         // The chain is now bootstrapped: with the gate on, the next round's
         // 6-row block carries the anchor's forward. Set LAST, so a round that
         // failed above leaves this flag alone and the next round re-runs the
+        // legacy path (whose `step_dev` re-supplies a valid tap).
+        if swallow_step() {
+            self.spec_primed = true;
+        }
+
+        Ok(DsparkSpecReport {
+            next,
+            drafts,
+            verify_out,
+            k_acc,
+            emitted,
+            draft_ms,
+            verify_ms,
+            commit_ms,
+        })
+    }
+
+    /// The SEED-ALIGNED arm of [`Self::dspark_spec_step`] (`DSV41_SEED_ALIGN=1`).
+    ///
+    /// The same four phases as the legacy arm, with the draft block moved onto
+    /// the position the imported tap actually belongs to. See [`seed_align`] for
+    /// the defect and for why `seed_window(s, pos - 1)` needs no change at all.
+    ///
+    /// # Timeline
+    ///
+    /// ```text
+    ///   1. next       = step_dev(token, pos)      the anchor's forward — the tap
+    ///                                            is the hidden of THIS forward,
+    ///                                            i.e. of the token at `pos`
+    ///   2. snapshot    dspark_snapshot(pos + 1, 6)  the block's write set
+    ///   3. draft        dspark.draft_forward(next, pos + 1) -> d1..d5
+    ///                   the seed row lands at (pos + 1) - 1 = pos — the tap's
+    ///                   position; the block's rows sit at pos + 1 .. pos + 5
+    ///   4. verify_out = step_rows([next, d1..d5])   six rows at pos+1 .. pos+6
+    ///   5. accept       k_emit = spec_accept(drafts, verify_out, true)
+    ///   6. commit       dspark_commit(pos + 1, 6, k_acc): rows 0..k_acc survive,
+    ///                   the counter lands on pos + k_acc + 1
+    ///   7. emit         [next] ++ verify_out[0..k_acc]   (k_acc + 1 tokens)
+    /// ```
+    ///
+    /// # The accept arithmetic — the SAME chain GLM's MTP runs
+    ///
+    /// Block row `i` is fed `[next, d1..d5][i]` at position `pos + 1 + i`, so its
+    /// argmax predicts `pos + 2 + i`; the draft's `drafts[i]` is its proposal for
+    /// `pos + 2 + i` too (the draft block sits at the anchor's OWN position,
+    /// `pos + 1`). The two are therefore INDEX-ALIGNED, which is GLM's
+    /// `[t_last, d1..d_nd]` layout (`TpCluster::mtp_step`:
+    /// `while drafts[k-1] == out[k-1]`), so the shared
+    /// [`ferrite_types::spec_accept`] runs with `anchor_is_in_block = true` and
+    /// returns the number of tokens the step EMITS (`1..=6`) — the always-emitted
+    /// anchor plus the surviving drafts. The legacy arm's 5-row block has no
+    /// anchor row, which is why ITS chain (and `SpecStep::ANCHOR_IS_IN_BLOCK`)
+    /// stays the shifted one: the two layouts are one chain apart by the anchor.
+    /// This is the same accept binding [`Self::dspark_spec_swallowed`] uses, and
+    /// the two blocks differ only by their ROW-0 POSITION.
+    ///
+    /// The report keeps the legacy shapes: `next` is `step_dev`'s argmax (the
+    /// token at `pos + 1`, the first emitted), `verify_out` the five argmaxes
+    /// AFTER the anchor row (row `i`, fed `drafts[i]` at `pos + 1 + i`) and
+    /// `k_acc` the accepted DRAFT count (`k_emit - 1` = `0..=5`). So the A/B
+    /// metric under this gate is `drafts[0] == verify_out[0]` — read directly off
+    /// `k_acc >= 1` — NOT `drafts[0] == next` (which under this layout compares
+    /// two different positions).
+    ///
+    /// # `emitted`, the commit and the counter
+    ///
+    /// The emitted tokens are the tokens at `pos + 1 ..= pos + k_acc + 1`, so the
+    /// last one's position is `pos + k_acc + 1` — the value [`Self::dspark_commit`]
+    /// writes for `keep = k_acc` at `pos_base = pos + 1`. `keep = k_acc` (not
+    /// `k_emit`) is therefore BOTH the right counter and the right ring/compressor
+    /// coverage: rows `0..k_acc` keep the KV of every emitted token EXCEPT the
+    /// last, whose row (row `k_acc`, covered by the block's last accepted row or
+    /// by the reversed bonus row) is rolled back and re-appended by the next
+    /// step's `step_dev` — exactly the legacy arm's invariant. Keeping `k_emit`
+    /// rows would leave the counter one past the last emitted token, desyncing the
+    /// driver's `p += emitted.len()` from the chain's `pos_ctr`.
+    ///
+    /// # Failure
+    ///
+    /// Same contract as the legacy arm: the block is rolled back at its OWN row
+    /// base (`pos + 1`, which is `pos_ctr + 1` after the step) before any error is
+    /// returned, and `spec_primed` is left alone.
+    fn dspark_spec_aligned(
+        &mut self,
+        dspark: &mut DsparkDev,
+        token: u32,
+        pos: usize,
+    ) -> Result<DsparkSpecReport> {
+        let cfg = self.cfg;
+        // The block is [next, d1..d5] — 6 rows, ONE batched forward (the weights
+        // are read ONCE for the whole block).
+        let m = VERIFY_ROWS;
+        debug_assert_eq!(
+            m,
+            DSPARK_DRAFTS + 1,
+            "the aligned block is the anchor row plus the drafts"
+        );
+
+        let pos_ctr = self.dev.download_u32(self.s.pos_ctr.ptr as *const c_void)? as usize;
+        debug_assert_eq!(
+            pos_ctr, pos,
+            "dspark_spec_step: `pos` must be the device position counter's current value"
+        );
+
+        // ---- 1. the real step: the whole-step graph (tap hook included), the
+        // argmax (the token at `pos + 1` = the block's row 0), the counter + 1.
+        let next = self.step_dev(token, pos)?;
+
+        // ---- 2. the snapshot, AFTER the step and BEFORE the verify: row `j` of
+        // the block sits at `pos_ctr + 1 + j`.
+        let host_mirrors = self.dspark_snapshot(pos_ctr + 1, m)?;
+
+        // ---- 3. the draft, from the tap of the step that just ran. The block's
+        // anchor is `next` at `pos + 1`, so `draft_forward`'s seed lands on
+        // `(pos + 1) - 1 = pos` — the position whose hidden the tap holds.
+        let t = std::time::Instant::now();
+        dspark.import_tap(self.s.dspark_tap.ptr as *const f32)?;
+        dspark.draft_forward(next, pos + 1)?;
+        let drafts = dspark.drafts()?;
+        let draft_ms = t.elapsed().as_secs_f32() * 1e3;
+
+        // ---- 4. the verify: [next, d1..d5] at pos+1..pos+6, ONE batched
+        // forward, per-row argmax. Row 0 IS the anchor's forward, so the rows'
+        // bit-parity with the plain engine at the same positions is the whole
+        // correctness contract of this path.
+        let t = std::time::Instant::now();
+        let mut rows_in: Vec<u32> = Vec::with_capacity(m);
+        rows_in.push(next);
+        rows_in.extend_from_slice(&drafts);
+        self.spec_capture = true;
+        let rows_res = self.step_rows(&rows_in);
+        self.spec_capture = false;
+        let rows = match rows_res {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = self.dspark_rollback(pos_ctr + 1, m, &host_mirrors);
+                return Err(e);
+            }
+        };
+        let verify_ms = t.elapsed().as_secs_f32() * 1e3;
+        if rows.len() != m {
+            self.dspark_rollback(pos_ctr + 1, m, &host_mirrors)?;
+            return Err(FerriteError::Config(format!(
+                "dspark_spec_step (aligned): step_rows returned {} rows for a {m}-row verify block",
+                rows.len()
+            )));
+        }
+
+        // ---- 5. the accept: index-aligned on the anchor-carrying block (see the
+        // doc comment), through the SHARED chain. `k_emit` counts the tokens the
+        // step emits (the anchor plus the accepted drafts), 1..=m.
+        let k_emit = spec_accept::<u32, u32>(&drafts, &rows, true);
+        let k_acc = k_emit - 1;
+        // The legacy report shape: the five argmaxes AFTER the anchor row. They
+        // are the judges of `drafts[0..5]` (`verify_out[j]` = the token at
+        // `pos + 2 + j`), and the block's LAST row's argmax — the bonus token at
+        // `pos + 7` — is what this step does NOT emit.
+        let mut verify_out = [0u32; DSPARK_DRAFTS];
+        verify_out.copy_from_slice(&rows[..DSPARK_DRAFTS]);
+
+        // ---- 6. the commit: roll back everything past the accepted prefix,
+        // replay the kept rows through the compressors, advance the counter to
+        // `pos + k_acc + 1` — the position of the LAST emitted token (whose KV the
+        // rollback dropped, and which the next step's `step_dev` re-appends).
+        let t = std::time::Instant::now();
+        self.dspark_commit(pos_ctr + 1, m, k_acc, &host_mirrors)?;
+        // The draft's window rings get the ACCEPTED rows back-filled at their own
+        // positions (`pos + 1 ..= pos + k_acc`), which is the range the next
+        // round's seed does not write either (`m` must be the block's row count:
+        // the tap buffer's row stride is `VERIFY_ROWS`).
+        dspark.note_ctx_rows(self.s.dspark_tap_r.ptr as *const f32, m, k_acc, pos + 1)?;
+        // ---- 6b. and hand the NEXT round's draft its tap (`DSV41_SWALLOW_STEP`
+        // only): the swallow drops `step_dev`, so this round's tap in
+        // `dspark_tap` is the last one a single-row forward will write. Row
+        // `k_acc - 1` sits at `pos + k_acc`, i.e. one before the swallow round's
+        // own counter — the position its seed needs.
+        if swallow_step() {
+            Self::carry_kept_tap(
+                self.dev,
+                self.s.dspark_tap.ptr,
+                self.s.dspark_tap_r.ptr as *const c_void,
+                cfg.dim,
+                k_acc,
+            )?;
+        }
+        let commit_ms = t.elapsed().as_secs_f32() * 1e3;
+
+        // ---- 7. what this step emits: `next` (the anchor's argmax) plus the
+        // verify's argmax for every position the draft got right.
+        let mut emitted = Vec::with_capacity(k_acc + 1);
+        emitted.push(next);
+        emitted.extend_from_slice(&verify_out[..k_acc]);
+
+        self.dspark_dump_step("spec", pos, token, next, k_acc, &drafts, &verify_out);
+
+        // The chain is now bootstrapped: with the swallow gate on, the next
+        // round's 6-row block carries the anchor's forward. Set LAST, so a round
+        // that failed above leaves this flag alone and the next round re-runs the
         // legacy path (whose `step_dev` re-supplies a valid tap).
         if swallow_step() {
             self.spec_primed = true;
@@ -5690,21 +5970,43 @@ impl<'a> DevChain<'a> {
         // rope rides the position in `off` with `step = 0` (exactly how the
         // single-row call keeps its heads at one position); the KV rope has one row
         // per position, so the block form works directly with `step = 1`.
-        for r in 0..m {
-            self.dev.apply_rope(
-                (self.s.q_r.ptr as *mut f32).wrapping_add(r * nh * hd),
+        //
+        // ROW-FOLD (DSV41_ROW_FOLD_ROPE=1): the m launches collapse into one
+        // (`apply_rope_mrows`, an in-kernel ascending r loop over `pos_rows[r]` —
+        // the same positions the host passed through `off = r`, read from the
+        // device array this row loop already uses). Rows are independent, so the
+        // result is bit-identical; `Ok(false)` keeps the loop below.
+        let q_roped = row_fold_rope()
+            && self.dev.apply_rope_mrows(
+                self.s.q_r.ptr as *mut f32,
                 self.cos.as_f32(),
                 self.sin.as_f32(),
+                m as i32,
                 nlh as i32,
+                (nh * hd) as i32,
                 hd as i32,
                 rd as i32,
                 half,
-                pos_ctr,
-                1,
-                r as i32,
-                0,
+                self.s.pos_rows.ptr as *const std::os::raw::c_int,
                 false,
             )?;
+        if !q_roped {
+            for r in 0..m {
+                self.dev.apply_rope(
+                    (self.s.q_r.ptr as *mut f32).wrapping_add(r * nh * hd),
+                    self.cos.as_f32(),
+                    self.sin.as_f32(),
+                    nlh as i32,
+                    hd as i32,
+                    rd as i32,
+                    half,
+                    pos_ctr,
+                    1,
+                    r as i32,
+                    0,
+                    false,
+                )?;
+            }
         }
         self.dev.rmsnorm(
             self.s.kv_r.ptr as *const f32,
@@ -5880,21 +6182,40 @@ impl<'a> DevChain<'a> {
         // ---- the inverse o-rope, one row per call (the attention loop above
         //      interleaves this row's selection with the block's commits, so the
         //      rope stays outside it) ----
-        for r in 0..m {
-            self.dev.apply_rope(
-                (self.s.o_r.ptr as *mut f32).wrapping_add(r * nh * hd),
+        // ROW-FOLD (DSV41_ROW_FOLD_ROPE=1): same launch fold as the q rope above,
+        // with `inverse = true`. Identical shape (`x = s.o_r`,
+        // `row_stride = nh*hd`, `rows = nlh`) and the same per-row position array.
+        let o_roped = row_fold_rope()
+            && self.dev.apply_rope_mrows(
+                self.s.o_r.ptr as *mut f32,
                 self.cos.as_f32(),
                 self.sin.as_f32(),
+                m as i32,
                 nlh as i32,
+                (nh * hd) as i32,
                 hd as i32,
                 rd as i32,
                 half,
-                pos_ctr,
-                1,
-                r as i32,
-                0,
+                self.s.pos_rows.ptr as *const std::os::raw::c_int,
                 true,
             )?;
+        if !o_roped {
+            for r in 0..m {
+                self.dev.apply_rope(
+                    (self.s.o_r.ptr as *mut f32).wrapping_add(r * nh * hd),
+                    self.cos.as_f32(),
+                    self.sin.as_f32(),
+                    nlh as i32,
+                    hd as i32,
+                    rd as i32,
+                    half,
+                    pos_ctr,
+                    1,
+                    r as i32,
+                    0,
+                    true,
+                )?;
+            }
         }
 
         // ---- grouped output projection + wo_b: ONE launch per phase ----
@@ -6505,14 +6826,34 @@ impl<'a> DevChain<'a> {
             .as_ref()
             .map(|b| b.as_f32())
             .unwrap_or(std::ptr::null());
-        for r in 0..m {
-            self.dev.gemv_bf16(
+        // ROW-FOLD (DSV41_ROW_FOLD_GATE=1, DEFAULT OFF): ONE multi-row GEMV
+        // (`ferrite_gemv_bf16_nt`, nrows = m) where the loop below issues `m`
+        // single-row `gemv_bf16` launches. The nt kernel is the v2 program with a
+        // token dimension — same WPR heuristic, same K-slice walk, same
+        // uint4/8-element FMA groups, same smem partial fold, one independent
+        // accumulator per token — so row r is bit-identical to the per-row call
+        // it replaces, PROVIDED the per-row path would take v2; the wrapper
+        // enforces that (`gemv_bf16_v2_wanted(n_routed)` + the symbol) and
+        // returns Ok(false) otherwise, keeping the loop.
+        let gate_folded = row_fold_gate()
+            && self.dev.gemv_bf16_mrows(
                 ld.gate_w.as_ref().unwrap().ptr() as *const c_void,
-                (self.s.xn_r.ptr as *const f32).wrapping_add(r * dim),
-                (self.s.scores_r.ptr as *mut f32).wrapping_add(r * n_routed),
+                self.s.xn_r.ptr as *const f32,
+                self.s.scores_r.ptr as *mut f32,
+                m as i32,
                 n_routed as i32,
                 dim as i32,
             )?;
+        if !gate_folded {
+            for r in 0..m {
+                self.dev.gemv_bf16(
+                    ld.gate_w.as_ref().unwrap().ptr() as *const c_void,
+                    (self.s.xn_r.ptr as *const f32).wrapping_add(r * dim),
+                    (self.s.scores_r.ptr as *mut f32).wrapping_add(r * n_routed),
+                    n_routed as i32,
+                    dim as i32,
+                )?;
+            }
         }
         self.dev.route_topk(
             self.s.scores_r.as_f32(),

@@ -1115,24 +1115,51 @@ impl<'a> DsparkDev<'a> {
         // n_win+bs from the parameters — every kv read past row n_win landed
         // `win - n_win` rows off once pos < win-1, which is exactly the
         // "draft outputs unrelated garbage" signature.
-        let n_win = win.min(pos);
+        //
+        // `win_rows` also fixes the RING WRAP (`DSV41_SEED_ALIGN`): once the
+        // ring has turned over, the window has to be copied in POSITION order
+        // (`(pos - n_win + j) % win`), because the slot `pos % win` belongs to
+        // the block's anchor row and must not appear as a window candidate —
+        // the official mask allows exactly one KV per position, and the
+        // slot-index-order copy handed the anchor a SECOND one while evicting
+        // the oldest live row.
+        let (n_win, s0) = self.win_rows(pos);
         let wbytes = (n_win * hd * 4) as usize;
-        self.dev
-            .memcpy_d2d(self.all_kv.ptr, self.window[s].ptr, wbytes)?;
+        if s0 == 0 {
+            self.dev
+                .memcpy_d2d(self.all_kv.ptr, self.window[s].ptr, wbytes)?;
+        } else {
+            // The ring is circular: at most ONE wrap, so two copies cover the
+            // window in position order.
+            let first = (win - s0).min(n_win) * hd * 4;
+            self.dev.memcpy_d2d(
+                self.all_kv.ptr,
+                (self.window[s].ptr as *const f32)
+                    .wrapping_add(s0 * hd) as *const c_void,
+                first,
+            )?;
+            if first < wbytes {
+                self.dev.memcpy_d2d(
+                    (self.all_kv.ptr as *mut u8).wrapping_add(first) as *mut c_void,
+                    self.window[s].ptr as *const c_void,
+                    wbytes - first,
+                )?;
+            }
+        }
         self.dev.memcpy_d2d(
             (self.all_kv.ptr as *mut u8).wrapping_add(wbytes) as *mut c_void,
             self.kv.ptr,
             (bs * hd * 4) as usize,
         )?;
-        // The anchor-KV seat: the window EXCLUDES the pos slot (n_win =
-        // min(win, pos) — the ring's pos%win copy of this position stays
-        // written for the NEXT round), so the anchor (t0) at pos has exactly
-        // ONE kv in the candidates: the block's row 0, its EMBED-derived
-        // projection — exactly the official block structure (DeepSpec's draft
-        // blocks project their own inputs; the seat arbitration in the earlier
-        // fix went one step further and swapped row 0's bytes for the
-        // target-hidden projection mk, which is NOT what the official blocks
-        // do — reverted).
+        // The anchor-KV seat: the window EXCLUDES the block's own row-0 slot
+        // (n_win = min(win - 1, pos) — the ring's copy of that position either
+        // does not exist yet or stays written for the NEXT round), so the
+        // anchor (t0) at pos has exactly ONE kv in the candidates: the block's
+        // row 0, its EMBED-derived projection — exactly the official block
+        // structure (DeepSpec's draft blocks project their own inputs; the seat
+        // arbitration in the earlier fix went one step further and swapped row
+        // 0's bytes for the target-hidden projection mk, which is NOT what the
+        // official blocks do — reverted).
 
         self.dev.sparse_attn(
             self.q.as_f32(),
@@ -1942,6 +1969,36 @@ impl<'a> DsparkDev<'a> {
         )
     }
 
+    /// The draft block's window geometry for a block whose row 0 sits at `pos`:
+    /// how many ring rows are LIVE, and the ring slot the OLDEST of them lives
+    /// in. The rows are the positions `[pos - n, pos - 1]`, slot `q % win`.
+    ///
+    /// Off (`DSV41_SEED_ALIGN` unset) this is the historical `min(win, pos)` rows
+    /// from slot 0, which is the same set as long as the ring has not turned
+    /// over — see the wrap discussion below.
+    ///
+    /// # Why the count is `min(win - 1, pos)` and never `win`
+    ///
+    /// The ring has `win` slots and the block's own row 0 owns the slot
+    /// `pos % win`. Once `pos >= win` every slot is live, so a window that
+    /// EXCLUDES that slot can hold at most `win - 1` rows; the historical
+    /// `min(win, pos)` copied `win` rows in SLOT order, which (a) handed the
+    /// anchor's position a SECOND candidate KV — the block's row 0 already
+    /// provides one, and the official mask allows exactly one KV per position —
+    /// and (b) silently evicted the oldest live position (`pos - win + 1`, whose
+    /// slot is `(pos % win) + 1`) in exchange for the stale `pos - win` row in
+    /// the anchor's slot. Copying in POSITION order (the `s0` return) is what
+    /// makes the set exact; the count alone is not enough.
+    fn win_rows(&self, pos: usize) -> (usize, usize) {
+        let win = self.win;
+        if crate::dsv41::chain_dev::seed_align() {
+            let n = pos.min(win.max(1) - 1);
+            (n, (pos - n) % win.max(1))
+        } else {
+            (win.min(pos), 0)
+        }
+    }
+
     /// Rebuild `idxs` when the valid window length changes.
     ///
     /// `dspark_topk_idxs` (dspark.rs) is `[0, n_win) ++ [win, win + bs)` repeated
@@ -1950,8 +2007,11 @@ impl<'a> DsparkDev<'a> {
     /// until `n_win` moves (it settles at `win` after the first `win` positions,
     /// so the steady-state decode path is H2D-free).
     fn ensure_idxs(&mut self, pos: usize) -> Result<()> {
-        let (win, bs) = (self.win, self.bs);
-        let n_win = win.min(pos);
+        let bs = self.bs;
+        // The SAME window geometry `draft_attention` copies with (see
+        // `win_rows`): the candidate rows are [0, n_win) plus the block at
+        // [n_win, n_win + bs), in exactly the order `all_kv` holds them.
+        let (n_win, _s0) = self.win_rows(pos);
         if self.n_win_cached == n_win {
             return Ok(());
         }

@@ -278,6 +278,14 @@ struct Kernels {
         *mut f32, *const f32, *const f32, c_int, c_int, c_int, c_int, *const c_int, c_int, c_int,
         c_int, c_int, CuStream,
     ) -> c_int,
+    // ROW-FOLD (DSV41_ROW_FOLD_ROPE): the m-verify-row form of `apply_rope`
+    // above — one launch, the kernel loops r ascending, row r roped at
+    // `pos_rows[r]`. Optional: an .so without the symbol keeps the per-row
+    // launches (the fallback is bit-identical by construction).
+    apply_rope_mrows: Option<unsafe extern "C" fn(
+        *mut f32, *const f32, *const f32, c_int, c_int, c_int, c_int, c_int, c_int, *const c_int,
+        c_int, CuStream,
+    ) -> c_int>,
     // rmsnorm + rope on one row in a single launch (the kv chain's adjacent
     // pair). Optional: an older .so without it falls back to the two launches.
     rmsnorm_rope: Option<unsafe extern "C" fn(
@@ -335,6 +343,15 @@ struct Kernels {
     // an older .so without the symbol keeps the v1 kernel above. Note the ABI
     // differs from `dsv41_gemv_bf16`: (x, w, bias, out, in_f=k, out_f=n, nrows, s).
     gemv_bf16_v2: Option<
+        unsafe extern "C" fn(
+            *const f32, *const c_void, *const f32, *mut f32, c_int, c_int, c_int, CuStream,
+        ) -> c_int,
+    >,
+    // ROW-FOLD (`DSV41_ROW_FOLD_GATE`): the m-activation-row form of the v2 GEMV
+    // above (`ferrite_gemv_bf16_nt`, `gemv_bf16_nt_kernel<NT, WPR>`) — same WPR
+    // heuristic, same K-slice walk and smem fold, one accumulator per token.
+    // Optional: an .so without it keeps the per-row `gemv_bf16` loop.
+    gemv_bf16_nt: Option<
         unsafe extern "C" fn(
             *const f32, *const c_void, *const f32, *mut f32, c_int, c_int, c_int, CuStream,
         ) -> c_int,
@@ -924,6 +941,7 @@ impl Device {
             compressor: km!(rt, "dsv41_compressor"),
             rope_precompute: km!(rt, "dsv41_rope_precompute"),
             apply_rope: km!(rt, "dsv41_apply_rope"),
+            apply_rope_mrows: ko!(rt, "dsv41_apply_rope_mrows"),
             rmsnorm_rope: ko!(rt, "dsv41_rmsnorm_rope"),
             rmsnorm_q: ko!(rt, "dsv41_rmsnorm_q"),
             gemm_bf16_fp8x2: ko!(rt, "dsv41_gemm_bf16_fp8x2"),
@@ -939,6 +957,7 @@ impl Device {
             ar_mark: ko!(rt, "dsv41_ar_mark"),
             gemv_bf16: ko!(rt, "dsv41_gemv_bf16"),
             gemv_bf16_v2: ko!(rt, "ferrite_gemv_bf16_v2"),
+            gemv_bf16_nt: ko!(rt, "ferrite_gemv_bf16_nt"),
             gemv_bf16_v2_route: ko!(rt, "ferrite_gemv_bf16_v2_route"),
             gemv_f32: ko!(rt, "dsv41_gemv_f32"),
             gemv_f32_v2: ko!(rt, "dsv41_gemv_f32_v2"),
@@ -2376,6 +2395,60 @@ impl Device {
         self.kerr(rc, "dsv41_apply_rope")
     }
 
+    /// ROW-FOLD (`DSV41_ROW_FOLD_ROPE`): [`Self::apply_rope`] for all `m` verify
+    /// rows of `x` in ONE launch (`x` = the row-0 base, rows live `row_stride`
+    /// apart, each `rows` head rows of `row_len`), row r roped at `pos_rows[r]`.
+    ///
+    /// Bit-identical to the `m` per-row launches it replaces: the kernel body is
+    /// `apply_rope_kernel`'s, the per-row position is the same integer (the
+    /// device array `attention_rows` already uploads — `pos_rows[r] == pos_base +
+    /// r`, exactly what the `off = r, step = 0` form computed off the counter),
+    /// and the rows touch disjoint memory with no cross-row reduction. See the
+    /// kernel header in `dsv41_kernels.cu` for the instruction-level argument.
+    ///
+    /// `Ok(false)` = NOT performed, keep the per-row loop: the loaded .so
+    /// predates the symbol, or the shape is degenerate.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_rope_mrows(
+        &self,
+        x: *mut f32,
+        cos: *const f32,
+        sin: *const f32,
+        m: i32,
+        rows: i32,
+        row_stride: i32,
+        row_len: i32,
+        dim: i32,
+        half: i32,
+        pos_rows: *const c_int,
+        inverse: bool,
+    ) -> Result<bool> {
+        let Some(f) = self.kernels.apply_rope_mrows else {
+            return Ok(false);
+        };
+        if m <= 0 || rows <= 0 || row_len <= 0 || half <= 0 {
+            return Ok(false);
+        }
+        let rc = unsafe {
+            f(
+                x,
+                cos,
+                sin,
+                m,
+                rows,
+                row_stride,
+                row_len,
+                dim,
+                half,
+                pos_rows,
+                inverse as i32,
+                self.stream,
+            )
+        };
+        self.kerr(rc, "dsv41_apply_rope_mrows")?;
+        Ok(true)
+    }
+
     /// rmsnorm + rope on one row in a single launch; `Ok(false)` when the
     /// loaded .so predates the kernel, so the caller runs the two launches.
     #[allow(clippy::too_many_arguments)]
@@ -2939,6 +3012,65 @@ impl Device {
         self.kerr(rc, "dsv41_gemv_bf16")
     }
 
+    /// ROW-FOLD (`DSV41_ROW_FOLD_GATE`): the MoE gate's `m` activation rows in
+    /// ONE multi-row GEMV — `x` = the `[rows, k]` block, `out` = `[rows, n]`,
+    /// `w` = the same bf16 `[n, k]` gate weight.
+    ///
+    /// THE PROGRAM THIS MATCHES is [`Self::gemv_bf16`]'s for the gate's shape:
+    /// `n = n_routed < GEMV_V2_MAX_N`, so the per-row call takes
+    /// `ferrite_gemv_bf16_v2` (`gemv_bf16_v2_kernel<WPR>`, WPR = `gv2_wpr(n)`),
+    /// and `ferrite_gemv_bf16_nt(..., nrows = m)` is that program's m-token form
+    /// (`gemv_bf16_nt_kernel<NT, WPR>`): the SAME `gv2_wpr` heuristic, the same
+    /// `kper`/`k0`/`k1` K-slice per warp, the same uint4 weight load + four
+    /// `__bfloat1622float2` decodes + two 4-term FMA groups, the same
+    /// `__shfl_down_sync` tree, the same smem partial fold
+    /// (`sum += part[t][(warp/WPR)*WPR + j]`, j ascending) — with one independent
+    /// accumulator per token and no cross-token recombination. Row `r` is
+    /// therefore bit-identical to the single-row `gemv_bf16` of row `r` it
+    /// replaces (the `tests_dsv41_head_mrows` suite asserts exactly this
+    /// nt-vs-m×v2 identity; `tests_gate_mrows.cu` re-asserts it at the gate's own
+    /// WPR > 1 shape, which is where the smem fold — not the head's WPR == 1
+    /// path — is what has to match).
+    ///
+    /// ⚠️ NOT `head_gemv_bf16_mrows`: that kernel is the WPR == 1 program only
+    /// (`out_f >= 16384`), which is the head's shape, not the gate's. Reusing it
+    /// here would silently change the K-split and with it the summation order.
+    ///
+    /// `Ok(false)` = NOT performed, keep the per-row loop: the loaded .so
+    /// predates the symbol, the per-row path would NOT take v2 (so there is no
+    /// parity to claim), or the shape is outside `ferrite_gemv_bf16_nt`'s
+    /// dispatch (`k % 8 != 0`, `rows` not in 2..=8/12/16).
+    pub fn gemv_bf16_mrows(
+        &self,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        rows: i32,
+        n: i32,
+        k: i32,
+    ) -> Result<bool> {
+        // Only fold when `gemv_bf16` would take v2: v1 is a different
+        // accumulation order and the nt kernel does not reproduce it.
+        if !gemv_bf16_v2_wanted(n) || self.kernels.gemv_bf16_v2.is_none() {
+            return Ok(false);
+        }
+        let Some(f) = self.kernels.gemv_bf16_nt else {
+            return Ok(false);
+        };
+        if !(2..=8).contains(&rows) || (k & 7) != 0 {
+            return Ok(false);
+        }
+        // `FERRITE_GEMV_SKIP` is a timing-only ablation INSIDE the nt entry: it
+        // would make this launch a no-op while the per-row path computed the
+        // scores. Treat it as "do not fold".
+        if gemv_bf16_nt_skip() {
+            return Ok(false);
+        }
+        let rc = unsafe { f(x, w, std::ptr::null(), out, k, n, rows, self.stream) };
+        self.kerr(rc, "ferrite_gemv_bf16_nt")?;
+        Ok(true)
+    }
+
     /// Multi-row twin of `gemv_bf16` for the DSpark verify's head: ONE launch
     /// streams the `[n, k]` bf16 weight ONCE and folds all `rows` activation
     /// rows against it (`x` = `[rows, k]` f32, `out` = `[rows, n]` f32), where
@@ -2947,26 +3079,26 @@ impl Device {
     /// streamed it six times — 6 x 298us = 1.79ms, the verify's largest single
     /// term after the projection family (dspark-verify-perf-plan.md §1.2).
     ///
-    /// Row r of the multi-row launch is BIT-IDENTICAL to the single-row
-    /// `gemv_bf16` launch of row r: same ascending K chain per lane, per-row
-    /// independent accumulators, same shuffle reduction tree — the kernel's
-    /// header carries the C1-C5 argument, and its accumulate is pinned to
-    /// `__fmaf_rn` so `--use_fast_math` cannot reassociate an m-way chain.
+    /// Row r of the multi-row launch is BIT-IDENTICAL to the production
+    /// single-row head GEMV of row r: `gemv_bf16_nt_kernel`'s per-token body at
+    /// WPR == 1 (`ferrite_kernels.cu`), which is the same body
+    /// `gemv_bf16_v2_kernel` runs and the program the head's shape
+    /// (`out_f >= 16384`) gets from `gv2_wpr`. The kernel's header carries the
+    /// argument (same lane->k mapping, same transcribed 8-element FMA groups,
+    /// same `__shfl_down_sync` tree, per-row independent accumulators, no
+    /// cross-row recombination, no K-split).
     ///
-    /// ⚠️ DOMAIN OF THAT PARITY (perf-review finding 4): the kernel it is
-    /// bit-identical to is v1's `gemv_bf16_kernel`, and [`Self::gemv_bf16`] only
-    /// dispatches to v1 for `n >= GEMV_V2_MAX_N` — BELOW that it takes
-    /// `gemv_bf16_v2`, whose K-split changes the f32 summation order (~1e-6, see
-    /// its note). This launcher has no such split, so it matches the single-row
-    /// path only inside the v1 domain; for a small `n` the two differ in the
-    /// last bits and the parity claim does NOT transfer. The verify's head
-    /// (`n = 129280`) is deep inside the v1 domain, which is why the claim holds
-    /// where it is used — do not reuse this kernel for a small matrix and expect
-    /// a bit-exact A/B against the `gemv_bf16` it would then be replacing.
+    /// ⚠️ DOMAIN OF THAT PARITY: (a) `out_f >= 16384`, i.e. WPR == 1 — below it
+    /// the production GEMV K-splits a row across WPR warps and folds the partials
+    /// in smem, a different program; (b) `k % 8 == 0`, which this launcher
+    /// enforces below by declining. The verify's head (`n = 129280`) satisfies
+    /// both. Do not reuse this kernel outside that domain and expect a bit-exact
+    /// A/B against the `gemv_bf16` it would then be replacing.
     ///
     /// `Ok(false)` means NOT performed — keep the per-row loop: either the
     /// loaded .so predates the symbol, or `rows` is outside the kernel's 1..=8
-    /// dispatch set (the same bound the C entry enforces).
+    /// dispatch set, or `k` is not a multiple of 8 (the same bound the C entry
+    /// enforces).
     pub fn head_gemv_bf16_mrows(
         &self,
         w: *const c_void,
@@ -2979,7 +3111,7 @@ impl Device {
         let Some(f) = self.kernels.head_gemv_bf16_mrows else {
             return Ok(false);
         };
-        if !(1..=8).contains(&rows) {
+        if !(1..=8).contains(&rows) || (k & 7) != 0 {
             return Ok(false);
         }
         let rc = unsafe { f(w, x, out, rows, n, k, self.stream) };
@@ -4651,6 +4783,16 @@ impl Device {
 /// bit-exact path. The small-n users are the MoE gate (384), the indexer's
 /// wk (index_head_dim) and wp (index_n_heads) projections.
 const GEMV_V2_MAX_N: i32 = 2048;
+
+/// `FERRITE_GEMV_SKIP=1` is a timing-only ablation INSIDE `ferrite_gemv_bf16_nt`
+/// (its entry returns `cudaSuccess` without launching). The row fold routes the
+/// MoE gate through that entry, so it must not engage while the ablation is on
+/// (the per-row `gemv_bf16` path has no such skip). Read once, like the other
+/// hot-path gates.
+fn gemv_bf16_nt_skip() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("FERRITE_GEMV_SKIP").is_ok())
+}
 
 /// `DSV41_GEMV_V2=0` pins every M=1 bf16 GEMV to v1 (A/B / bisect escape
 /// hatch). Default ON: the .so exposes `ferrite_gemv_bf16_v2`.
