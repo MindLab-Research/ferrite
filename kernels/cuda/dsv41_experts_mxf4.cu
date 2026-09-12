@@ -2481,15 +2481,23 @@ inline cudaError_t launch_mxf4(const uint8_t* a, const float* a_scale, const flo
 // `bytes` is the size of EACH side (gate == up == the local [inter, dim/2] byte
 // count); it must be a multiple of 8. `dst` must not overlap `g`/`u`.
 namespace {
-__global__ void interleave_gateup_fp4_kernel(const uint2* __restrict__ g,
-                                             const uint2* __restrict__ u,
-                                             uint2* __restrict__ dst, long n8) {
+__global__ void interleave_gateup_fp4_kernel(const uint8_t* __restrict__ g,
+                                             const uint8_t* __restrict__ u,
+                                             uint8_t* __restrict__ dst, long n8) {
     const long stride = (long)blockDim.x * (long)gridDim.x;
     // read-only sources, one write pair per iteration: the loop lets any grid
     // size cover the tensor, and every thread writes DISJOINT 16-byte slots.
+    //
+    // The SOURCES are the checkpoint's W1/W3 planes addressed through a
+    // TP-sharded `DevBuf::view` (`g` is the W3 one the grouped arm calls
+    // `bh_base`): a shard boundary can leave one rank's view a few bytes off
+    // while every other rank is fine, and a `uint2` read of such a base is err
+    // 716. Both reads therefore go through the alignment-safe helper; the bytes
+    // are IDENTICAL on both paths. `dst` is our own freshly allocated pool, so
+    // its store keeps the plain (8-byte-aligned) form.
     for (long i = (long)blockIdx.x * blockDim.x + threadIdx.x; i < n8; i += stride) {
-        dst[2 * i] = g[i];
-        dst[2 * i + 1] = u[i];
+        *reinterpret_cast<uint2*>(dst + (size_t)(2 * i) * 8) = ld_uint2_a8(g + (size_t)i * 8);
+        *reinterpret_cast<uint2*>(dst + (size_t)(2 * i + 1) * 8) = ld_uint2_a8(u + (size_t)i * 8);
     }
 }
 }  // namespace
@@ -2503,9 +2511,7 @@ extern "C" int dsv41_interleave_gateup_fp4(const uint8_t* g, const uint8_t* u, u
     const int threads = 256;
     long nb = (n8 + threads - 1) / threads;
     if (nb > 4096) nb = 4096;                                  // grid-stride covers the rest
-    interleave_gateup_fp4_kernel<<<(unsigned)nb, threads, 0, stream>>>(
-        reinterpret_cast<const uint2*>(g), reinterpret_cast<const uint2*>(u),
-        reinterpret_cast<uint2*>(dst), n8);
+    interleave_gateup_fp4_kernel<<<(unsigned)nb, threads, 0, stream>>>(g, u, dst, n8);
     return (int)cudaGetLastError();
 }
 
@@ -3600,9 +3606,15 @@ __global__ void __launch_bounds__(kThreads) expert_tcgen05_gateup_kernel(
     // =========================================================================
     for (int j = 0; j < 4; ++j) {
         const uint8_t* src = wsp + (size_t)(m0 + 32 * j) * nsf;
-        // coalesced: 32*nsf bytes = 2*nsf uint4 (nsf % 4 == 0 by contract)
+        // coalesced: 32*nsf bytes = 2*nsf uint4 (nsf % 4 == 0 by contract).
+        // The SOURCE row base is a TP-sharded `DevBuf::view` of the checkpoint
+        // (`wsp = w_scale + e*w_scale_stride`), and a shard boundary can leave one
+        // rank's scale view a few bytes off while every other rank is fine — the
+        // same premise ld_uint2_a8 documents. A `uint4` read needs 16-byte
+        // alignment, so it goes through the alignment-safe helper; the bytes are
+        // IDENTICAL on both paths (see ld_uint4_a16).
         for (int i = tid; i < 2 * nsf; i += kThreads)
-            reinterpret_cast<uint4*>(s.sf_stage)[i] = reinterpret_cast<const uint4*>(src)[i];
+            reinterpret_cast<uint4*>(s.sf_stage)[i] = ld_uint4_a16(src + (size_t)i * 16);
         __syncthreads();  // the chunk is read by every warp below
         // PACKED word for row (32j + lane), quad q, column (sfa_col + 4q + j).
         // Every warp writes its OWN 32-lane partition with identical content:
@@ -4264,8 +4276,13 @@ __global__ void __launch_bounds__(kThreads) expert_tcgen05_gateup_mxf4_kernel(
         const bool hi = (r0 >= split);
         const int rr = hi ? (r0 - split) : r0;
         const uint8_t* src = (hi ? w3sp : w1sp) + (size_t)rr * nsf;
+        // `w3sp`/`w1sp` are the TP-sharded W3/W1 SCALE views (`w3s_base +
+        // e*w3s_stride`), i.e. the same plane the grouped arm calls `bhs_base` —
+        // a shard boundary can leave one rank's view off by a few bytes. The
+        // uint4 source read therefore goes through the alignment-safe helper
+        // (byte-identical on both paths; see ld_uint4_a16).
         for (int i = tid; i < 2 * nsf; i += kThreads)  // nsf % 4 == 0 by contract
-            reinterpret_cast<uint4*>(s.sf_stage)[i] = reinterpret_cast<const uint4*>(src)[i];
+            reinterpret_cast<uint4*>(s.sf_stage)[i] = ld_uint4_a16(src + (size_t)i * 16);
         __syncthreads();  // the chunk is read by every warp below
         // Word for row (32j + lane), word index w (4 blocks 4w..4w+3), column
         // (sfa_col + 4w + j). Every warp writes its OWN 32-lane partition with
@@ -5005,8 +5022,14 @@ __global__ void __launch_bounds__(kThreads) expert_tcgen05_gateup_e4_kernel(
         const bool hi = (r0 >= split);
         const int rr = hi ? (r0 - split) : r0;
         const uint8_t* src = (hi ? w3sp : w1sp) + (size_t)rr * nsf;
+        // `w3sp`/`w1sp` are the TP-sharded W3/W1 SCALE views (`w3s_base +
+        // e*w3s_stride`) — the grouped arm's `bhs_base` under another name. A
+        // shard boundary can leave one rank's view a few bytes off while every
+        // other rank is fine, and a uint4 read of an odd base is err 716. So the
+        // source read goes through the alignment-safe helper; the bytes are
+        // IDENTICAL either way (see ld_uint4_a16).
         for (int i = tid; i < 2 * nsf; i += kThreads)  // nsf % 4 == 0 by contract
-            reinterpret_cast<uint4*>(s.sf_stage)[i] = reinterpret_cast<const uint4*>(src)[i];
+            reinterpret_cast<uint4*>(s.sf_stage)[i] = ld_uint4_a16(src + (size_t)i * 16);
         __syncthreads();  // the chunk is read by every warp below
         // Word for row (32j + lane), word index w (4 blocks 4w..4w+3), column
         // (sfa_col + 4w + j). Every warp writes its OWN 32-lane partition with
