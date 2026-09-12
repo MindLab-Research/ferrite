@@ -409,6 +409,89 @@ __global__ void gemv_f32_kernel(const float* __restrict__ w, const float* __rest
     }
 }
 
+// ===========================================================================
+// Multi-row head GEMV (`dsv41_head_gemv_bf16_mrows` below): m activation rows
+// against ONE pass over the weight.
+// ===========================================================================
+// The DSpark verify block (`step_rows`, chain_dev.rs) called `dsv41_gemv_bf16`
+// once per row. Its head is the step's single largest weight — `head.weight` is
+// Shard::Replicated [129280, 5120] bf16 = 1262 MB on every rank (weights.rs:90),
+// which is 298us of streamed bytes — so six rows paid it six times: 1.79ms, the
+// verify's largest single term after the projection family (docs/agent/
+// dspark-verify-perf-plan.md §1.2/§2.4). Here one block decodes its row tile
+// ONCE and folds every row against it.
+//
+// NUMERICS — for ANY m, row r of the m-row launch is BIT-IDENTICAL to the
+// single-row `gemv_bf16_kernel` launch of row r's activation. v1 computes, per
+// output row,
+//     y(row)   = T( SUM_{c = lane, lane+32, ... < k} (float)w[row][c] * x[c]   )
+// with T the fixed shfl_xor tree (off = 16,8,4,2,1) and the lane-local sum a
+// strictly ascending chain of multiply-accumulates. This kernel computes
+//     y(row,r) = T( SUM_{c = lane, lane+32, ... < k} (float)w[row][c] * x[r][c] )
+// so for every (row, r): the SAME expression in the SAME position (C2), over
+// the SAME ascending c sequence with the SAME lane->c mapping (C1), through the
+// SAME reduction tree (C3), with NO cross-row recombination — acc[r] is an
+// independent chain, nothing is ever added across r (C4) — and no K-split or
+// smem fold exists to reorder (C5). `wv` is hoisted out of the r loop because
+// it is a per-c value: the identical decode on the identical value, reused, so
+// C2 still holds (and it is what removes the m-fold traffic).
+// The c step stays `c = lane, lane+32, ...` — one element per lane per step,
+// NOT vectorized to 8 bf16/lane: batching c per lane would reorder the chain
+// and break C1. Vectorizing K is therefore off the table for this kernel by
+// construction; the win is the weight re-read, not the load width.
+//
+// Two deliberate codegen pins (C6 — build.sh keeps --use_fast_math ON, whose
+// header note records a 4-way unrolled gemv body written with plain operators
+// drifting ~1 ULP/layer):
+//   * the accumulate is `__fmaf_rn`, not a plain `acc[r] += wv * x[...]`. An
+//     m-way independent accumulator set is exactly the extra expression freedom
+//     that invites a fast-math reassociation. __fmaf_rn is the rounding v1
+//     already has — v1's `acc += (float)wr[c] * x[c]` contracts to one FFMA
+//     under fmad=on (the same argument gemv_f32_v2's header carries below) —
+//     and it is opaque to reassociation, so each chain stays ascending.
+//   * the shfl tree keeps v1's source form verbatim: C3 rests on T being
+//     REPRODUCED, and identical source under the same flags is the strongest
+//     guarantee of that. Pinning it would only be able to diverge.
+//
+// `x` is [m, k] f32 (the verify's `xn_r`), `out` is [m, n] f32 (`logits_r`).
+// M is a template parameter so each row owns a register chain; the launcher
+// dispatches m = 1..8 and the caller keeps its per-row loop above 8. Grid and
+// block mirror dsv41_gemv_bf16's (ceil(n/8) blocks capped at 4096, 8 warps),
+// so the two launches differ in the row fold and nothing else.
+// ===========================================================================
+template <int M>
+__global__ void head_gemv_bf16_mrows_kernel(const __nv_bfloat16* __restrict__ w,
+                                            const float* __restrict__ x,
+                                            float* __restrict__ out, int n, int k) {
+    const int lane = threadIdx.x & 31;
+    const int wid = threadIdx.x >> 5;
+    const int nwarp = (blockDim.x + 31) >> 5;
+    for (int row = blockIdx.x * nwarp + wid; row < n; row += gridDim.x * nwarp) {
+        const __nv_bfloat16* wr = w + (size_t)row * (size_t)k;
+        float acc[M];
+        #pragma unroll
+        for (int r = 0; r < M; ++r) acc[r] = 0.f;
+        // NO #pragma unroll: gemv_bf16_kernel's measured choice, and the m-way
+        // accumulator set is already the register-pressure risk here (the plan
+        // §9 flags the 64-register `__launch_bounds__(256,4)` wall).
+        for (int c = lane; c < k; c += 32) {
+            const float wv = __bfloat162float(wr[c]);   // ONE decode for all M rows
+            #pragma unroll
+            for (int r = 0; r < M; ++r) {
+                acc[r] = __fmaf_rn(wv, x[(size_t)r * (size_t)k + c], acc[r]);
+            }
+        }
+        #pragma unroll
+        for (int r = 0; r < M; ++r) {
+            float a = acc[r];
+            for (int off = 16; off > 0; off >>= 1) {
+                a += __shfl_xor_sync(0xFFFFFFFFu, a, off);
+            }
+            if (lane == 0) out[(size_t)r * (size_t)n + row] = a;
+        }
+    }
+}
+
 // Publish this rank's payload into EVERY rank's staging slot (including our own)
 // directly from the device. The old path issued `world` host-side peer copies per
 // collective — ~8 API calls per all-reduce, ~16 per layer — with the host in the
@@ -1012,6 +1095,39 @@ extern "C" int dsv41_gemv_f32(const float* w, const float* x, float* out, int n,
     unsigned blocks = (unsigned)((n + 7) / 8);
     if (blocks > 4096) blocks = 4096;
     gemv_f32_kernel<<<blocks, 256, 0, s>>>(w, x, out, n, k);
+    return (int)cudaGetLastError();
+}
+
+// Multi-row head GEMV: the verify block's head, one pass over the weight for all
+// `m` rows (kernel + the C1-C5 bit-identity argument above). `m` selects a
+// compile-time M so every row's accumulator is a register; m > 8 is refused —
+// the caller then keeps its per-row `dsv41_gemv_bf16` loop, so an out-of-range
+// call degrades to the old path instead of reading garbage. The verify block's
+// VERIFY_ROWS is 6, so 8 leaves headroom without a general-m fallback kernel.
+// Launch shape copies dsv41_gemv_bf16's exactly (ceil(n/8) blocks capped at
+// 4096, 256 threads = 8 warps) EXCEPT the dynamic smem: v1's launcher still
+// reserves k*4 bytes for the activation staging that its 2026-09-11 revert
+// removed, and this kernel declares no `extern __shared__` at all, so
+// reserving it would only cap occupancy.
+// Returns 0 (cudaSuccess) on a launch; the numeric payload is `out`.
+extern "C" int dsv41_head_gemv_bf16_mrows(const void* w, const float* x, float* out, int m, int n,
+                                          int k, cudaStream_t s) {
+    if (m <= 0 || n <= 0 || k <= 0) return (int)cudaSuccess;
+    if (m > 8) return (int)cudaErrorInvalidValue;
+    unsigned blocks = (unsigned)((n + 7) / 8);
+    if (blocks > 4096) blocks = 4096;
+    const __nv_bfloat16* wb = (const __nv_bfloat16*)w;
+    switch (m) {
+        case 1: head_gemv_bf16_mrows_kernel<1><<<blocks, 256, 0, s>>>(wb, x, out, n, k); break;
+        case 2: head_gemv_bf16_mrows_kernel<2><<<blocks, 256, 0, s>>>(wb, x, out, n, k); break;
+        case 3: head_gemv_bf16_mrows_kernel<3><<<blocks, 256, 0, s>>>(wb, x, out, n, k); break;
+        case 4: head_gemv_bf16_mrows_kernel<4><<<blocks, 256, 0, s>>>(wb, x, out, n, k); break;
+        case 5: head_gemv_bf16_mrows_kernel<5><<<blocks, 256, 0, s>>>(wb, x, out, n, k); break;
+        case 6: head_gemv_bf16_mrows_kernel<6><<<blocks, 256, 0, s>>>(wb, x, out, n, k); break;
+        case 7: head_gemv_bf16_mrows_kernel<7><<<blocks, 256, 0, s>>>(wb, x, out, n, k); break;
+        case 8: head_gemv_bf16_mrows_kernel<8><<<blocks, 256, 0, s>>>(wb, x, out, n, k); break;
+        default: return (int)cudaErrorInvalidValue;
+    }
     return (int)cudaGetLastError();
 }
 

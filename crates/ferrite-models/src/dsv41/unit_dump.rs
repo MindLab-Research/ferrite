@@ -99,6 +99,87 @@ pub fn arm_once() -> bool {
     !TAKEN.swap(true, Ordering::Relaxed)
 }
 
+/// `DSV41_DSPARK_UNIT_INJECT` points at a JSON file that REPLACES the inputs of
+/// the captured `draft_forward`.
+///
+/// A per-UNIT diff is only meaningful when both sides are fed the SAME input,
+/// and the ferrite side's real input is whatever the live serve happened to be
+/// decoding. The official harness ([`unit_golden.py`]) writes the exact input it
+/// used into its `.pt` (`inputs.*`); `ferrite_json2pt.py --extract-inject` turns
+/// that back into this file, so the device forward replays the reference's input
+/// instead of the serve's.
+///
+/// Only the three inputs every other unit derives from are injected — `main_h`
+/// (which `main_x` and the ring KV project from), `token` (`ids[0]`) and `pos`
+/// (every RoPE position). The window RING is deliberately NOT injected: it is
+/// seeded by earlier forwards, exactly as the reference's seed pass seeds it.
+///
+/// ```json
+///   {"main_hidden": [0.1, -0.2, …], "token": 12, "pos": 129}
+/// ```
+pub struct Inject {
+    /// the `[n_target * dim]` block `main_h` is overwritten with
+    pub main_hidden: Vec<f32>,
+    /// replaces `t0` (the backbone token) at `ids[0]`
+    pub token: i32,
+    /// replaces the `pos` this forward is anchored at
+    pub pos: Option<usize>,
+}
+
+/// The parsed injection, or `None` when the gate is off. A malformed file is
+/// LOGGED and ignored — a debug knob must never abort a serve whose numbers are
+/// otherwise fine.
+pub fn inject() -> Option<&'static Inject> {
+    static I: OnceLock<Option<Inject>> = OnceLock::new();
+    I.get_or_init(|| {
+        let path = std::env::var("DSV41_DSPARK_UNIT_INJECT").ok()?;
+        if path.is_empty() || path == "0" {
+            return None;
+        }
+        match parse_inject(&path) {
+            Ok(i) => {
+                eprintln!(
+                    "[dspark] unit inject: {} main_hidden values, token {}, pos {:?} from {path}",
+                    i.main_hidden.len(),
+                    i.token,
+                    i.pos
+                );
+                Some(i)
+            }
+            Err(e) => {
+                eprintln!("[dspark] unit inject {path}: {e}");
+                None
+            }
+        }
+    })
+    .as_ref()
+}
+
+/// Parse the injection file. Hand-rolled over [`serde_json::Value`] rather than a
+/// derive: this crate takes `serde_json` without the `serde` derive feature.
+fn parse_inject(path: &str) -> std::result::Result<Inject, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    let arr = v
+        .get("main_hidden")
+        .and_then(|a| a.as_array())
+        .ok_or("\"main_hidden\" is missing or not an array")?;
+    let mut main_hidden = Vec::with_capacity(arr.len());
+    for x in arr {
+        main_hidden.push(x.as_f64().ok_or("\"main_hidden\" has a non-number")? as f32);
+    }
+    let token = v.get("token").and_then(|t| t.as_i64()).unwrap_or(0) as i32;
+    let pos = v
+        .get("pos")
+        .and_then(|p| p.as_i64())
+        .map(|p| p.max(0) as usize);
+    Ok(Inject {
+        main_hidden,
+        token,
+        pos,
+    })
+}
+
 /// The collected units, in dump order. Built on the first eligible
 /// `draft_forward` and serialised at its end.
 pub struct UnitDump {

@@ -2770,17 +2770,51 @@ impl<'a> DevChain<'a> {
 
         // ---- head + per-row argmax ----
         // Same call `step_body` makes for its single token (f32 activation, bf16
-        // weight read in-kernel), once per row into that row's logits slot.
+        // weight read in-kernel), but with the m rows FOLDED INTO ONE LAUNCH.
+        // `step_rows` used to call it once per row, and the head is the block's
+        // single largest weight: `head.weight` is Shard::Replicated
+        // [129280, 5120] bf16 = 1262 MB on every rank (weights.rs:90), i.e. the
+        // full vocabulary — NOT the per-rank slice `step_dev` takes under
+        // DSV41_HEAD_SLICE (slicing the verify's head needs the multi-row
+        // cross-rank argmax, still TODO#3; this change is the GEMV half only).
+        // Six rows therefore streamed those 1262 MB six times (6 x 298us =
+        // 1.79ms). `head_gemv_bf16_mrows` decodes one weight crop and folds all
+        // m rows against it; row r is bit-identical to the single-row launch it
+        // replaces (the kernel header carries the C1-C5 argument: same ascending
+        // K chain, per-row accumulators, same shuffle tree, __fmaf_rn-pinned so
+        // --use_fast_math cannot reassociate). A stale .so without the symbol —
+        // or m outside the kernel's 1..=8 set — falls back to the per-row loop.
         let head = self.w.head.as_ref().unwrap();
-        for r in 0..m {
-            let xnr = (self.s.xn_r.ptr as *const f32).wrapping_add(r * dim);
-            let lg = (self.s.logits_r.ptr as *mut f32).wrapping_add(r * cfg.vocab_size);
-            if head.dtype == "BF16" {
-                self.dev
-                    .gemv_bf16(head.ptr(), xnr, lg, cfg.vocab_size as i32, dim as i32)?;
-            } else {
-                self.lin_f32(xnr, dim as i32, head, cfg.vocab_size as i32, lg)?;
+        let folded = if head.dtype == "BF16" {
+            self.dev.head_gemv_bf16_mrows(
+                head.ptr(),
+                self.s.xn_r.ptr as *const f32,
+                self.s.logits_r.ptr as *mut f32,
+                m as i32,
+                cfg.vocab_size as i32,
+                dim as i32,
+            )?
+        } else {
+            false
+        };
+        if !folded {
+            for r in 0..m {
+                let xnr = (self.s.xn_r.ptr as *const f32).wrapping_add(r * dim);
+                let lg = (self.s.logits_r.ptr as *mut f32).wrapping_add(r * cfg.vocab_size);
+                if head.dtype == "BF16" {
+                    self.dev
+                        .gemv_bf16(head.ptr(), xnr, lg, cfg.vocab_size as i32, dim as i32)?;
+                } else {
+                    self.lin_f32(xnr, dim as i32, head, cfg.vocab_size as i32, lg)?;
+                }
             }
+        }
+        // The argmax stays PER ROW (one tiny kernel each, ~5us): its multi-row
+        // twin is only worth writing together with the cross-rank vocabulary
+        // slice, which is where the slice-local reduce and the tie rule have to
+        // be reconsidered. Nothing here depends on the row order.
+        for r in 0..m {
+            let lg = (self.s.logits_r.ptr as *mut f32).wrapping_add(r * cfg.vocab_size);
             // NULL pos_ctr: this argmax must NOT advance the counter (the kernel
             // null-checks it) — the accept logic advances it once, for the accepted
             // prefix.

@@ -399,4 +399,49 @@ verify 落点从 4.5–6.5ms 退化到 7–9ms，400 tok/s 变成 333 tok/s。
 
 ---
 
+## 10. 实施记录
+
+### 2026-09-12 · P1 的 GEMV 一半落地（verify 的 head 多行）
+
+**已实施**：`dsv41_head_gemv_bf16_mrows`（`kernels/cuda/dsv41_glue.cu`，紧跟
+`gemv_bf16_kernel` 之后）+ `Device::head_gemv_bf16_mrows`（device.rs）+ `step_rows`
+head 段改单发（chain_dev.rs）。**未实施**（本增量故意不做）：词表切分与多行
+argmax —— 二者同属「跨 rank argmax 协议」，argmax 仍是逐行 6 发（~30µs，可接受）。
+
+**纠正本文档 §1.3 与任务书的一处口径**：verify 的 head **确实未切分**——`head.weight`
+是 `Shard::Replicated [129280, 5120]` bf16（weights.rs:90），`step_rows` 用
+`cfg.vocab_size` + `head.ptr()` 寻址，即**每次 1324 MB**、6 行 6 次。任务书里的
+「16160 行 / 165MB」是 `DSV41_HEAD_SLICE` 的**切分后**单 rank 尺寸，那条路径只在
+`step_dev` 里生效（`step_rows` 没有 sliced 分支）。所以多行前的单点成本是
+6 × 298µs = 1.79ms（与 §1.2 表一致），不是 990MB 的字节账。
+
+**为什么不复用 `gemv_bf16_v2`（nrows>1）**：读了它的签名与 kernel 体
+（ferrite_kernels.cu:2880）。v2 的 nrows 是**并行维度**不是**复用维度**——
+`rowg = blockIdx.x*rpb + warp/WPR; token = rowg/out_f; row = rowg - token*out_f`，
+权重 `w + row*in_f` 仍被每个 token 重读一遍。它省 launch 数（tp.rs 的 `small_n_rows`
+用的就是这个），**不省字节**。头要的是 weight-stationary，所以新写了一个 kernel，
+并把 c 步长**逐字保持 v1 的 `c = lane, lane+32, ...`**（向量化 K 会重排 lane 内
+累加序 → 直接破坏 C1，故本 kernel 的收益只能来自权重复用，不能来自 load 宽度）。
+
+**数值域**：kernel 头注释给出 C1-C5 的逐条论证；C6 用两处 codegen 钉死——
+累加用 `__fmaf_rn`（v1 的 `acc += (float)wr[c]*x[c]` 在 fmad=on 下就是一条 FFMA，
+同 `gemv_f32_v2` 头注释的论证），shuffle 归约树保持与 v1 逐字相同的源码形式。
+`--use_fast_math` 默认 ON，其 build.sh 注释记录过「plain operator + 多路展开
+≈1 ULP/层漂移」，m 路独立累加器正是最容易被重结合的形状，故不留给编译器。
+`m` 是模板参数（分发 1..=8），m>8 或缺符号都回退到逐行循环（stale .so 安全）。
+
+**待办（门禁 / 验收）**：
+1. **R2 的逐位回归还没写**：建议在 `kernels/cuda/tests_dsv41_glue.cu` 加一个
+   `head_gemv_mrows vs m 次 dsv41_gemv_bf16` 的 bit_diff case（本机无 nvcc，
+   写不了也编不了，留给有 CUDA 工具链的节点）。在它绿之前，这次改动只能靠
+   下面这条端到端回归兜底。
+2. **端到端**：`dspark_parity`（「verify parity — the iron rule」，
+   `cargo test -p ferrite-models --lib dspark_parity -- --ignored --nocapture`）。
+   多行 kernel 若破坏数值域，`step_rows(truth)[r]` 会偏离但位置 argmax。
+3. **实测（§9 待验证 #3）**：m=6 的寄存器占用是否触到 64-寄存器墙，以及单发
+   一行是否真到 ~0.30ms（若因 6 份 x 载入而变成 load-bound，收益会低于 5/6，
+   但不会低于 2 倍）。draft 侧（P3）未动，`draft_head` 仍是逐行。
+
+---
+
 *户部 · 基于 2026-09-12 仓库状态（HEAD 含 gpqa/v13 系列分支）*

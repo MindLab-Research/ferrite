@@ -607,6 +607,39 @@ impl<'a> DsparkDev<'a> {
             self.unit = Some(UnitDump::new());
         }
 
+        // ---- golden input injection (`DSV41_DSPARK_UNIT_INJECT`) --------------
+        // `import_tap` has already filled `main_h` with the LIVE serve's target
+        // hiddens, so an armed injection OVERWRITES it with the reference
+        // harness's own input, together with `ids[0]` and `pos`. It is gated on a
+        // live capture so only the ONE dumped forward is touched — the rest of the
+        // serve is untouched. `main_h` stays a device buffer: the override is one
+        // H2D, not a host round trip.
+        // The window RING is deliberately NOT injected: it is seeded by earlier
+        // forwards, exactly like the reference's seed pass.
+        let mut pos = pos;
+        let mut t0 = t0;
+        let mut injected = false;
+        if self.unit.is_some() {
+            if let Some(inj) = unit_dump::inject() {
+                if inj.main_hidden.len() == self.n_target * dim {
+                    self.dev.upload_f32_at(self.main_h.ptr, 0, &inj.main_hidden)?;
+                    t0 = inj.token as u32;
+                    if let Some(p) = inj.pos {
+                        pos = p;
+                    }
+                    injected = true;
+                } else {
+                    eprintln!(
+                        "[dspark] unit inject: main_hidden has {} values, expected {} \
+                         (n_target {} x dim {dim}) — ignored",
+                        inj.main_hidden.len(),
+                        self.n_target * dim,
+                        self.n_target
+                    );
+                }
+            }
+        }
+
         // ---- ids: the backbone's token first, the noise token for the rest ----
         // (dspark.rs::forward_embed; the noise row IS embed[noise_token_id])
         let noise = cfg.dspark_noise_token_id as i32;
@@ -768,7 +801,7 @@ impl<'a> DsparkDev<'a> {
             let meta = format!(
                 "{{\"pos\":{pos},\"t0\":{t0},\"bs\":{bs},\"hc\":{hc},\"dim\":{dim},\"nh\":{},\
                  \"hd\":{},\"vocab\":{},\"mr\":{},\"n_target\":{},\"n_mtp\":{},\"world\":{},\
-                 \"rank\":{},\"pid\":{}}}",
+                 \"rank\":{},\"pid\":{},\"inject\":{injected}}}",
                 self.nh,
                 self.hd,
                 self.vocab,

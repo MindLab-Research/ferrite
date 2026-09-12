@@ -352,6 +352,17 @@ struct Kernels {
         ) -> c_int,
     >,
     gemv_f32: Option<unsafe extern "C" fn(*const f32, *const f32, *mut f32, c_int, c_int, CuStream) -> c_int>,
+    // Multi-row head GEMV, from dsv41_glue.cu (`dsv41_head_gemv_bf16_mrows`).
+    // ONE pass over the [n, k] bf16 weight for all `m` activation rows instead
+    // of one pass per row: the verify block's head. `x` is [m, k] f32, `out` is
+    // [m, n] f32. Optional: a stale .so without the symbol keeps the per-row
+    // loop, and m outside 1..=8 is refused (cudaErrorInvalidValue) for the same
+    // reason. Row r is bit-identical to the single-row `gemv_bf16` launch of
+    // row r (the kernel header carries the C1-C5 argument).
+    // ABI: (w, x, out, m=rows, n, k, s).
+    head_gemv_bf16_mrows: Option<
+        unsafe extern "C" fn(*const c_void, *const f32, *mut f32, c_int, c_int, c_int, CuStream) -> c_int,
+    >,
     // v2 (vectorized float4 + K-split) f32 M=1 GEMV, from dsv41_glue.cu.
     // Optional: an older .so without the symbol keeps the v1 kernel above.
     // Same ABI as v1: (w, x, out, n=out_f, k=in_f, s).
@@ -886,6 +897,7 @@ impl Device {
             gemv_bf16_v2_route: ko!(rt, "ferrite_gemv_bf16_v2_route"),
             gemv_f32: ko!(rt, "dsv41_gemv_f32"),
             gemv_f32_v2: ko!(rt, "dsv41_gemv_f32_v2"),
+            head_gemv_bf16_mrows: ko!(rt, "dsv41_head_gemv_bf16_mrows"),
             argmax: ko!(rt, "dsv41_argmax"),
             engram_hash_step: ko!(rt, "dsv41_engram_hash_step"),
             window_idxs: ko!(rt, "dsv41_window_idxs"),
@@ -2871,6 +2883,43 @@ impl Device {
         let f = self.need(self.kernels.gemv_bf16, "dsv41_gemv_bf16")?;
         let rc = unsafe { f(w, x, out, n, k, self.stream) };
         self.kerr(rc, "dsv41_gemv_bf16")
+    }
+
+    /// Multi-row twin of `gemv_bf16` for the DSpark verify's head: ONE launch
+    /// streams the `[n, k]` bf16 weight ONCE and folds all `rows` activation
+    /// rows against it (`x` = `[rows, k]` f32, `out` = `[rows, n]` f32), where
+    /// the per-row loop paid one full pass per row. `head.weight` is
+    /// `[129280, 5120]` bf16 = 1262 MB REPLICATED on every rank, so six rows
+    /// streamed it six times — 6 x 298us = 1.79ms, the verify's largest single
+    /// term after the projection family (dspark-verify-perf-plan.md §1.2).
+    ///
+    /// Row r of the multi-row launch is BIT-IDENTICAL to the single-row
+    /// `gemv_bf16` launch of row r: same ascending K chain per lane, per-row
+    /// independent accumulators, same shuffle reduction tree — the kernel's
+    /// header carries the C1-C5 argument, and its accumulate is pinned to
+    /// `__fmaf_rn` so `--use_fast_math` cannot reassociate an m-way chain.
+    ///
+    /// `Ok(false)` means NOT performed — keep the per-row loop: either the
+    /// loaded .so predates the symbol, or `rows` is outside the kernel's 1..=8
+    /// dispatch set (the same bound the C entry enforces).
+    pub fn head_gemv_bf16_mrows(
+        &self,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        rows: i32,
+        n: i32,
+        k: i32,
+    ) -> Result<bool> {
+        let Some(f) = self.kernels.head_gemv_bf16_mrows else {
+            return Ok(false);
+        };
+        if !(1..=8).contains(&rows) {
+            return Ok(false);
+        }
+        let rc = unsafe { f(w, x, out, rows, n, k, self.stream) };
+        self.kerr(rc, "dsv41_head_gemv_bf16_mrows")?;
+        Ok(true)
     }
 
     /// Fused M=1 gate GEMV + MoE route: ONE launch where `gemv_bf16_command` +
