@@ -6368,3 +6368,19 @@ FORBIDDEN="DSV41_LAZY_VERIFY DSV41_HC_VERIFY_FUSE DSV41_HC_FRONT_ROWS"
 | **+ mrows Phase A b2** | **60.4** | **+3.6%** | **✓** |
 | + hc/B6 S3（待测） | ? | ? | ? |
 | + tcgen05 S4（待测） | ? | ? | ? |
+
+## SWALLOW 优化的实时进展表（400 sprint）
+
+| # | 优化 | 吞吐 | 增量 | 数值中性 | 红线 |
+|---|---|---|---|---|---|
+| S0 | 全 gate 基线 | 58.3 tok/s | — | ✓ | ✓ |
+| **S1** | **+ mrows Phase A b2 (ATTN_MROWS_ROPE_NORM=1)** | **60.4 tok/s** | **+3.6%** | **✓** | **🔄 出师表测试中** |
+| S2 | + mrows b3 (待测) | ? | ? | ? | ? |
+| S3 | + hc/B6 (script 更新完成) | ? | ? | ? | ? |
+| S4 | + tcgen05 (TMA 修复中) | ? | ? | ? | ? |
+| S5 | + AR 修复 (A1a 修复设计中) | ? | ? | ? | ? |
+| S6 | + L4/L5 | ? | ? | ? | ? |
+
+**当前最佳：60.4 tok/s（SWALLOW + mrows b2）**
+**当前 lazy：91.1 tok/s（仍快 1.5×）**
+**400 目标：步时 ≤15ms → 需要 tcgen05 + AR 修复 + L4/L5**
