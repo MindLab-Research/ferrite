@@ -7769,3 +7769,28 @@ wo-pair-diagnosis subagent 分析中。临时处置：**WO_PAIR 保持默认 OFF
 | v20u（DOTS_T=512） | 6.19ms | 161.6 | 中性 |
 
 **结论**：DOTS_T 的默认值已是优——256/512 都不改善。dl-kernel-optim 的 #1 机会（零成本先跑）验证为无效。DL 的剩余优化 = K-chunk（dl-kchunk-impl 实施中，14.9→8-9µs 理论）。
+
+### v21 定案：TMA 也不改变 swapAB 的 serve 中性——swapAB 路径正式关闭（2026-09-12 20:00）
+
+| 臂 | p50 | tok/s | 配置 |
+|---|---|---|---|
+| v19a（基线） | 6.17ms | 162.1 | SIMT |
+| v21t（SWAPAB + TMA bulk staging） | 6.18ms | 161.8 | **中性**（Δ=0.01ms） |
+
+**swapAB 路径的完整验证矩阵（全部中性）**：
+| 变体 | 结果 |
+|---|---|
+| v17s（全量覆盖） | 6.63ms（小 n 回归） |
+| v18s（形状分发 n≥1664） | 6.20ms（中性） |
+| v19s（+ memset 消除） | 6.18ms（中性） |
+| **v21t（+ TMA bulk staging）** | **6.18ms（中性）** |
+
+**结论**：swapAB 的 serve 中性是**深层系统性的**——不是 staging 方式（cp.async vs TMA）、不是 memset、不是形状覆盖。隔离的 1.76-1.94x 在 serve 的 SM 争抢 + L2 竞争下完全消失。**swapAB 路径（"唯一 2x 路径"）正式关闭。**
+
+**200 tok/s 的最终判定**：
+- 当前验证最优：6.17ms = 162.1 tok/s（+115.4%）
+- 剩余 1.17ms gap 的路径：
+  1. DL K-chunk（dl-kchunk-impl 实施中，理论 14.9→8-9µs——同样的翻译风险）
+  2. expert tcgen05 fp4 swapAB（tcgen05-probe 探针中，4-5 人日，300 tok/s 路径）
+  3. 无其它已识别路径
+- **200 tok/s 需要下一会话的 expert tcgen05 路径或新的结构性发现**
