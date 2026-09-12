@@ -2215,6 +2215,36 @@ fn swallow_step() -> bool {
     *F.get_or_init(|| std::env::var("DSV41_SWALLOW_STEP").map(|v| v != "0").unwrap_or(false))
 }
 
+/// How many verify BLOCKS a `DSV41_SWALLOW_STEP` request runs on the DIRECT
+/// launches before the verify graph (`DSV41_VERIFY_GRAPH`) is allowed to engage
+/// (ar5-hang's method C).
+///
+/// # Why the transition window has to be kept off the graph
+///
+/// With `SWALLOW` on, one request emits a `m = 5` verify on round 1 (the legacy
+/// bootstrap) and `m = 6` on every later one, so the shape pool's engagement
+/// order is forced: DRY the `m = 6` slot → CAPTURE it → REPLAY from then on. That
+/// is the exact window in which the four arms of [`DevChain::step_rows_sync`]
+/// coexist ACROSS RANKS — the round a rank first sees the new shape is the round
+/// another rank may be recording it — and the arms' `host_barrier` counts differ
+/// by construction (see `step_rows_sync`'s arm table). `SpinBarrier` counts
+/// ARRIVALS per generation, so a rank that takes an arm with one rendezvous
+/// fewer silently closes an epoch that a peer never entered and every later
+/// barrier misphases by one — the hang `ar5-hang` traced, whose signature is a
+/// stall that appears only in the first rounds of a request.
+///
+/// The window is also where the gate's per-RANK inputs (the `compress_len`
+/// mirror behind [`DevChain::compress_branch_steady`], the shape pool, the
+/// failure latch) are least likely to agree: they settle only once the swallowed
+/// block has committed a few groups. Holding the graph back for the first
+/// [`SWALLOW_GRAPH_WARMUP_BLOCKS`] blocks lets both the kernel warm-up and that
+/// settling happen on the direct launches, where NO arm exists to diverge into.
+///
+/// `3` = the three blocks of the window: round 1's `m = 5` bootstrap and the two
+/// `m = 6` blocks that follow (the deliberate DRY and CAPTURE of the new shape,
+/// which are real executions anyway — the direct path pays exactly that cost).
+const SWALLOW_GRAPH_WARMUP_BLOCKS: usize = 3;
+
 /// `DSV41_LAZY_VERIFY=1` arms the ROW-BY-ROW lazy verify and the lazy ⇄ batched
 /// route ([`DevChain::dspark_spec_lazy`], [`DevChain::lazy_route_decide`]).
 /// Default OFF, so every existing path stays bit-identical.
@@ -2826,6 +2856,22 @@ pub struct DevChain<'a> {
     /// capture — the second shape DRYs while the first shape's graph already
     /// exists.
     verify_dry_done: [bool; VERIFY_GRAPH_SLOTS],
+    /// How many verify BLOCKS this request has run, counted at the single entry
+    /// [`Self::step_rows_sync`] gives every verify.
+    ///
+    /// Per-request (cleared by [`Self::reset`], like the shape pool it guards)
+    /// and read by ONE consumer: the `DSV41_SWALLOW_STEP` warm-up window of
+    /// [`Self::verify_graph_gate`], which holds the verify graph off the first
+    /// [`SWALLOW_GRAPH_WARMUP_BLOCKS`] blocks so that the DRY → CAPTURE → REPLAY
+    /// transition cannot overlap the request's first rounds — see the constant's
+    /// note for why that window is where the arms' rendezvous counts disagree
+    /// across ranks.
+    ///
+    /// It counts BLOCKS rather than spec rounds on purpose: the lazy arm runs one
+    /// block per row, so a block count can only ever be conservative (the gate
+    /// simply waits a little longer), while a round count would let the first
+    /// three lazy rows of round 1 alone consume the window.
+    verify_blocks: usize,
     /// Diagnostics: captures and replays since the last `reset`.
     verify_captures: u32,
     verify_replays: u32,
@@ -3251,6 +3297,7 @@ impl<'a> DevChain<'a> {
             verify_shapes: [0; VERIFY_GRAPH_SLOTS],
             verify_graph_failed: [false; VERIFY_GRAPH_SLOTS],
             verify_dry_done: [false; VERIFY_GRAPH_SLOTS],
+            verify_blocks: 0,
             verify_captures: 0,
             verify_replays: 0,
             verify_geom: std::cell::Cell::new(None),
@@ -3722,6 +3769,11 @@ impl<'a> DevChain<'a> {
         self.verify_shapes = [0; VERIFY_GRAPH_SLOTS];
         self.verify_graph_failed = [false; VERIFY_GRAPH_SLOTS];
         self.verify_dry_done = [false; VERIFY_GRAPH_SLOTS];
+        // The warm-up window is per-request too: a new request re-bootstraps the
+        // swallow arm (round 1 = legacy), so it re-enters the very transition the
+        // window exists for. Carrying the count over would let the second
+        // request's graph engage on its FIRST block, i.e. exactly in the window.
+        self.verify_blocks = 0;
         // The next request's first spec step bootstraps again (its standalone
         // `step_dev` is what supplies the very first tap).
         self.spec_primed = false;
@@ -5148,17 +5200,23 @@ impl<'a> DevChain<'a> {
     /// [`Self::step_rows`] with the per-replay rendezvous switchable and the
     /// `pos_ctr` read-back skippable.
     ///
-    /// `skip_barrier` suppresses ONLY the single `host_barrier` that sits in front
-    /// of a stored-graph REPLAY (the `verify_graphs[idx].is_some()` arm). It never
-    /// touches the two barriers that bracket a CAPTURE (`capture_begin` .. `capture_end`),
-    /// because those are exactly the rendezvous that keep a recording rank from
-    /// being lapped by an executing peer. The replay barrier
-    /// itself is redundant once no rank can be recording: under `ar_v5()` (which the
-    /// graph gate requires whenever there are peers) the device-side protocol is
-    /// self-synchronising — `p2p_ar_pubred_v5_kernel` publishes this rank's round
-    /// stamp to every peer and then POLLS all peers' stamps for the same round
-    /// before it reduces (ferrite_kernels.cu:8898-8928), and `end_round` already
-    /// relies on exactly that ("v5 needs no host barrier", tp.rs:665-670).
+    /// `skip_barrier` suppresses the ENTRY `host_barrier` of every arm that has
+    /// one: the stored-graph REPLAY arm, the DRY arm and the DIRECT arm. It never
+    /// touches the two barriers that bracket a CAPTURE (`capture_begin` ..
+    /// `capture_end`), because those are exactly the rendezvous that keep a
+    /// recording rank from being lapped by an executing peer.
+    ///
+    /// The suppressed rendezvous is redundant once no rank can be recording:
+    /// under `ar_v5()` (which the graph gate requires whenever there are peers)
+    /// the device-side protocol is self-synchronising — `p2p_ar_pubred_v5_kernel`
+    /// publishes this rank's round stamp to every peer and then POLLS all peers'
+    /// stamps for the same round before it reduces (ferrite_kernels.cu:8898-8928),
+    /// and `end_round` already relies on exactly that ("v5 needs no host barrier",
+    /// tp.rs:665-670). Only the lazy row loop passes `true`: it has already
+    /// rendezvoused once before its loop, and every rank then runs the SAME replay
+    /// sequence back-to-back on one stream — so the suppressed barrier is uniform
+    /// across the ranks there, which is the one property the arms' counts have to
+    /// keep (see the DRY arm for what happens when they do not).
     ///
     /// `pos_base_hint` is the blocking D2H of `pos_ctr` this call would otherwise
     /// make, for a caller that has JUST written it and therefore already knows the
@@ -5219,7 +5277,12 @@ impl<'a> DevChain<'a> {
         // the kernels read as `pos_base + r` is confirmed at its head. ONE D2H 4 B.
         self.inv_pos_rows_first(pos_base)?;
 
-        if let Some(idx) = self.verify_graph_gate(m, pos_base) {
+        // The gate reads `verify_blocks`, so the counter is advanced AFTER it:
+        // a request's first verify block is block `0` for the `SWALLOW` warm-up
+        // window (see [`Self::verify_graph_gate`]).
+        let graph_slot = self.verify_graph_gate(m, pos_base);
+        self.verify_blocks += 1;
+        if let Some(idx) = graph_slot {
             if !self.verify_dry_done[idx] {
                 // DRY: a REAL execution, so every lazy first-use cost happens
                 // outside the capture. Its device effects are the caller's to
@@ -5228,18 +5291,39 @@ impl<'a> DevChain<'a> {
                 // graph already sits in its slot (harmless — `step_rows_inner`
                 // never touches the pool).
                 //
-                // NO rendezvous here, deliberately. The DRY is a real execution
-                // and under `ar_v5()` its device-side protocol is
-                // self-synchronising: `p2p_ar_pubred_v5_kernel` publishes this
-                // rank's round stamp and then POLLS the peers' stamps for the same
-                // round before it reduces (`end_round` already relies on exactly
-                // that — "v5 needs no host barrier", tp.rs). A `host_barrier`
-                // here is not merely redundant, it INVERTS the lock order: a rank
-                // spinning device-side on a peer's stamp would be held while that
-                // peer waits at the host barrier for this rank to arrive — a
-                // deadlock. The barrier BELOW, after a capture, is a different
-                // thing: there the rank RECORDED nodes without executing them, so
-                // it must not start publishing while a peer is still recording.
+                // ★ RENDEZVOUS, at the arm's ENTRY (ar5-hang's method A). The
+                // four arms of this function must each arrive at the barrier the
+                // SAME number of times per epoch, because `SpinBarrier` is a
+                // generation counter over ARRIVALS: one arm taking a wait fewer
+                // than a peer's closes the epoch without that peer and every
+                // later barrier in the request is one generation out — the
+                // silent misphase `ar5-hang` traced (its four arms measured
+                // DRY = 0, replay = 1, capture = 2, direct = 0 rendezvous each,
+                // and the gate's inputs are per-RANK, so which arm a rank takes
+                // is not guaranteed to agree across the 8 ranks of a TP8 step:
+                // a capture refusal, a `compress_branch_steady` mirror that has
+                // not settled, a shape slot taken on one rank and free on
+                // another). Making every arm's ENTRY a rendezvous means two
+                // ranks that disagree on the ARM still agree on the epoch — the
+                // hazard narrows to the capture arm's second barrier (below),
+                // which is the one method B — a rank-synchronised arm decision —
+                // is needed for.
+                //
+                // The earlier note here argued against this barrier on lock-order
+                // grounds ("a rank spinning device-side on a peer's stamp while
+                // its peer waits for it at the host barrier"). That position is
+                // the CAPTURE arm's entry barrier, which is already there and
+                // already verified (`DSV41_VERIFY_GRAPH=1` runs bit-identical
+                // under `ar_v5()`): a rank at a host barrier has, by construction,
+                // already published the stamp its own device work owed, and the
+                // v5 AR publishes BEFORE it polls (`p2p_ar_pubred_v5_kernel`), so
+                // a peer's poll cannot be waiting on a rank that is merely parked
+                // here. The asymmetry, not the barrier, was the bug.
+                if !skip_barrier {
+                    if let Some(c) = self.comm.as_ref() {
+                        c.host_barrier();
+                    }
+                }
                 self.step_rows_inner(toks, m, pos_base)?;
                 self.verify_dry_done[idx] = true;
                 self.verify_shapes[idx] = m;
@@ -5327,6 +5411,22 @@ impl<'a> DevChain<'a> {
                 }
             }
         } else {
+            // ★ THE DIRECT ARM's entry rendezvous (ar5-hang's method A). This arm
+            // is taken both when the graph is OFF for the whole process and when
+            // it is ON but this RANK declined (a shape with no free slot, a
+            // latched capture failure, an unsettled `compress_branch_steady`, a
+            // driver that cannot record). Only the second case can coexist with a
+            // peer in another arm, so the barrier is conditioned on the graph
+            // being configured on: with `DSV41_VERIFY_GRAPH` off every rank takes
+            // this arm and the count (0) already agrees, which is what keeps the
+            // default path bit-for-bit what it was. With it on, this arm now
+            // matches the DRY and replay arms at one rendezvous each — see the
+            // DRY arm for why the counts have to agree.
+            if !skip_barrier && verify_graph_want() {
+                if let Some(c) = self.comm.as_ref() {
+                    c.host_barrier();
+                }
+            }
             self.step_rows_inner(toks, m, pos_base)?;
             // (lazy verify's bare-chain path was missing this: `advance_compress_lens`
             // is called after the graph_launch but NOT after the bare chain, so the
@@ -5425,6 +5525,30 @@ impl<'a> DevChain<'a> {
 
     fn verify_graph_gate(&self, m: usize, pos_base: i32) -> Option<usize> {
         if !verify_graph_want() || pos_base < 1 {
+            return None;
+        }
+        // (ar5-hang method C) `DSV41_SWALLOW_STEP`'s warm-up window. The swallow
+        // arm's first rounds are the ONLY place a request runs TWO verify shapes
+        // in sequence (`m = 5` bootstrapping verify, then `m = 6` forever), so
+        // they are the only place the shape pool is driven through its full
+        // DRY → CAPTURE → REPLAY transition — and the only place two ranks can
+        // sit in DIFFERENT arms of `step_rows_sync`, whose rendezvous counts
+        // differ (the capture arm brackets its recording with two barriers, every
+        // other arm takes one). `SpinBarrier` is a generation counter, so a rank
+        // that arrives a different number of times per epoch closes an epoch its
+        // peers never entered and every later barrier is off by one — the stall
+        // `ar5-hang` traced, appearing only in a request's first rounds.
+        //
+        // Holding the graph off for the first `SWALLOW_GRAPH_WARMUP_BLOCKS`
+        // blocks removes that window: while it is open every rank takes the same
+        // (direct) arm, and by the time it closes both the kernels and the
+        // per-RANK gate inputs (`compress_branch_steady`'s host mirror, the shape
+        // pool) have settled, so the arm decision below is made from a state the
+        // ranks agree on. See the constant's note.
+        //
+        // Outside `SWALLOW` nothing changes: the gate is `swallow_step()`-only,
+        // and with the switch off every verify already runs one shape.
+        if swallow_step() && self.verify_blocks < SWALLOW_GRAPH_WARMUP_BLOCKS {
             return None;
         }
         // The shape pool first: without a slot there is nothing to check.
