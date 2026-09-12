@@ -1949,6 +1949,54 @@ __global__ void apply_rope_kernel(float* __restrict__ x, const float* __restrict
 }
 
 // ---------------------------------------------------------------------------
+// ROW-FOLD (DSV41_ROW_FOLD_ROPE=1): the verify block's q rope and inverse o
+// rope, `m` launches each, as ONE launch with an in-kernel ascending r loop.
+//
+// WHY THIS IS A PURE LAUNCH FUSION. `attention_rows` calls `apply_rope`
+// once per verify row r because every row owns a DIFFERENT position:
+//     apply_rope(q_r + r*nh*hd, cos, sin, nlh, hd, rd, half,
+//                pos_ctr, 1, r /*off*/, 0 /*step*/, false)
+// → launch r computes `t = (*base)*mul + off + rowh*step = pos + r` for each of
+// its `nlh` head rows (`rowh = blockIdx.x`), and rotates the trailing `rd`
+// columns of `x + r*nh*hd + rowh*hd`. The positions are already materialised on
+// the device (`s.pos_rows[r] = pos_base + r`, uploaded per step and read by
+// `ring_append`/`window_idxs`/the compressor in the SAME row loop), so
+// `pos_rows[r]` here is the identical integer `t` the off=r form produces.
+//
+// Row r's work is INDEPENDENT of every other row: it touches only
+// `[r*row_stride + rowh*row_len, +row_len)` and indexes the tables at
+// `pos_rows[r]`. Folding the m launches therefore only moves the r loop from
+// the host into the kernel; per (r, h, i) the expression below is character for
+// character `apply_rope_kernel`'s, with the same `t*half + i` table index, the
+// same `x0/x1` pair and the same rotation. Every element is still written by
+// exactly one thread, so the result is bit-identical to the m launches.
+//
+// `x` is the row-0 base of the buffer (`s.q_r` / `s.o_r`); `row_stride` is the
+// pitch between verify rows (`nh*hd` — NOT `nlh*hd`: this rank only writes the
+// leading `nlh*hd` of each `nh*hd`-wide row, which is why it is a parameter).
+// `inverse` selects the o rope's negated sine, `apply_rope_kernel`'s own flag.
+// ---------------------------------------------------------------------------
+__global__ void apply_rope_mrows_kernel(float* __restrict__ x, const float* __restrict__ cos,
+                                        const float* __restrict__ sin, int m, int rows,
+                                        int row_stride, int row_len, int dim, int half,
+                                        const int* __restrict__ pos_rows, int inverse) {
+    const int h = blockIdx.x;   // head row inside this rank's slice
+    if (h >= rows) return;
+    for (int r = 0; r < m; ++r) {
+        const int t = pos_rows[r];
+        float* row = x + (size_t)r * (size_t)row_stride + (size_t)h * (size_t)row_len +
+                     (row_len - dim);
+        for (int i = threadIdx.x; i < half; i += blockDim.x) {
+            const float c = cos[(size_t)t * half + i];
+            const float s = sin[(size_t)t * half + i] * (inverse ? -1.f : 1.f);
+            const float x0 = row[2 * i], x1 = row[2 * i + 1];
+            row[2 * i] = x0 * c - x1 * s;
+            row[2 * i + 1] = x0 * s + x1 * c;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // P1 (DSV41_SPARSE_OROPE, DEFAULT ON): sparse attention + the inverse o-rope +
 // the fp8 emission of the roped attention output, in ONE launch.
 //
@@ -7247,6 +7295,26 @@ extern "C" int dsv41_apply_rope(float* x, const float* cos, const float* sin, in
                                 cudaStream_t s) {
     apply_rope_kernel<<<rows, 128, 0, s>>>(x, cos, sin, rows, row_len, dim, half, base, mul, off, step,
                                            inverse, nullptr, nullptr);
+    return (int)cudaGetLastError();
+}
+
+// ROW-FOLD (DSV41_ROW_FOLD_ROPE=1): the m-row form of the call above, used by
+// `attention_rows`' q rope and inverse o rope. `m` verify rows live at
+// `x + r*row_stride`, each with `rows` head rows of `row_len`, and row r is
+// roped at the position `pos_rows[r]` (the device array `attention_rows`
+// already fills for `ring_append`/`window_idxs`). One launch, r ascending.
+//
+// The launcher is the m-launch pattern with `step = 1, off = 0` folded into the
+// kernel's r loop, so `t = pos_rows[r]` is the same integer the per-row call
+// produced through `off = r, step = 0` with the same base counter (see the
+// kernel header). No shape is declined: any (m, rows) the caller passes is
+// exactly m calls of the single-row form, so there is nothing to fall back to.
+extern "C" int dsv41_apply_rope_mrows(float* x, const float* cos, const float* sin, int m,
+                                      int rows, int row_stride, int row_len, int dim, int half,
+                                      const int* pos_rows, int inverse, cudaStream_t s) {
+    if (m <= 0 || rows <= 0) return (int)cudaSuccess;  // nothing to do
+    apply_rope_mrows_kernel<<<rows, 128, 0, s>>>(x, cos, sin, m, rows, row_stride, row_len, dim,
+                                                 half, pos_rows, inverse);
     return (int)cudaGetLastError();
 }
 

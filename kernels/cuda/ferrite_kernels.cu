@@ -6605,6 +6605,111 @@ __global__ void dsa_append_batched_kernel(
     }
 }
 
+// ROW-MAPPED append (Wave 5 step 3), the same fp8 quantize + per-(token, head)
+// scale write as dsa_append_batched_kernel, but the row's (seq, tok) comes from
+// an explicit mapping instead of the implicit "one token per seq" assumption:
+//   row_map != NULL -> (seq, tok) = (row_map[2r], row_map[2r+1])   [ragged]
+//   else            -> seq = r / ntok, tok = r % ntok              [padded]
+// and the row reads its OWN kvb/ki/gate row (`kvb + row*rowsz`) rather than
+// `kvb + (seq*ntok + tok)*rowsz` — the same address by construction, but the
+// row form is what makes the mapping explicit for ntok > 1.
+//
+// BIT-IDENTICAL to dsa_append_batched_kernel at rows == B, ntok == 1,
+// row_map == NULL: seq == row, tok == 0, the tail reads
+// `ki[seq*idm + c] == ki[row*idm + c]`, and the advance fires on
+// tok == ntok-1 == 0 (the old kernel's condition). That equivalence is what
+// lets the decode-batched path migrate to this entry unchanged.
+//
+// Two things the old single-token kernel could not express, both required by
+// the MTP verify block [B][n_v] (n_v = FERRITE_MTP_N):
+//   * the idx/gate tail is PER ROW — the old one copied one seq's ki/gate into
+//     every slot of that seq, so ntok > 1 would have written the anchor row's
+//     idx n_v times;
+//   * the device advance is the seq's WHOLE BLOCK (`block_len[seq]`, i.e. ntok
+//     when no table) — `t0 + 1` leaves the cache ntok-1 slots short per step,
+//     which then reads as garbage KV on the next step.
+__global__ void dsa_append_batched_mapped_kernel(
+    const float* __restrict__ kvb,       // [rows, h*(dk+dv)]
+    const float* __restrict__ ki,        // [rows, idm]  (per ROW, not per seq)
+    const float* __restrict__ gate,      // [rows, idm]
+    unsigned char* const* __restrict__ kq_tbl,    // [B] e4m3 [T, h, dk]
+    unsigned char* const* __restrict__ vq_tbl,    // [B] e4m3 [T, h, dv]
+    float* const* __restrict__ ksc_tbl,           // [B] f32 [T, h]
+    float* const* __restrict__ vsc_tbl,           // [B] f32 [T, h]
+    float* const* __restrict__ kidx_tbl,          // [B]
+    float* const* __restrict__ kgate_tbl,         // [B]
+    const int* const* __restrict__ t0_tbl,        // [B] pinned
+    const int* const* __restrict__ total_tbl,     // [B] pinned
+    const int* __restrict__ row_map,              // [rows][2] (seq, tok), or NULL
+    const int* __restrict__ block_len,            // [B] rows per seq, or NULL (= ntok)
+    int rows, int B, int ntok, int h, int dk, int dv, int idm, int max_t, int dev_adv) {
+    const int row = blockIdx.x;
+    const int hd = blockIdx.y;
+    if (row >= rows) return;
+    int seq, tok;
+    if (row_map != NULL) {
+        seq = row_map[2 * row];
+        tok = row_map[2 * row + 1];
+    } else {
+        seq = row / ntok;              // ntok > 0 — the host wrapper rejects 0
+        tok = row - seq * ntok;
+    }
+    // HARDENING (same spirit as the pinned-read check below): the table comes
+    // from the host — a bad (seq, tok) must drop the row, not scribble a
+    // neighbour's cache.
+    if (seq < 0 || seq >= B || tok < 0) return;
+    const int t0 = *t0_tbl[seq];
+    if (t0 < 0 || t0 + tok >= max_t) return;   // PINNED-READ HARDENING
+    const int tid = threadIdx.x;
+    const int rowsz = h * (dk + dv);
+    const float* src = kvb + (size_t)row * rowsz + (size_t)hd * (dk + dv);
+    const size_t slot = ((size_t)(t0 + tok) * h + hd);
+    __shared__ float sredK[16], sredV[16];
+    __shared__ float s_ks, s_vs;
+    float ka = 0.f, va = 0.f;
+    for (int c = tid; c < dk; c += blockDim.x) ka = fmaxf(ka, fabsf(src[c]));
+    for (int c = tid; c < dv; c += blockDim.x) va = fmaxf(va, fabsf(src[dk + c]));
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        ka = fmaxf(ka, __shfl_down_sync(0xffffffff, ka, off));
+        va = fmaxf(va, __shfl_down_sync(0xffffffff, va, off));
+    }
+    if ((tid & 31) == 0) { sredK[tid >> 5] = ka; sredV[tid >> 5] = va; }
+    __syncthreads();
+    if (tid == 0) {
+        float mk = 1e-9f, mv = 1e-9f;
+        for (int w = 0; w < 16; w++) { mk = fmaxf(mk, sredK[w]); mv = fmaxf(mv, sredV[w]); }
+        s_ks = mk / 448.0f;  s_vs = mv / 448.0f;
+        ksc_tbl[seq][slot] = s_ks;
+        vsc_tbl[seq][slot] = s_vs;
+    }
+    __syncthreads();
+    for (int c = tid; c < dk; c += blockDim.x) {
+        const float qv = fminf(fmaxf(src[c] / s_ks, -448.0f), 448.0f);
+        kq_tbl[seq][slot * dk + c] = (unsigned char)__nv_cvt_float_to_fp8(qv, __NV_SATFINITE, __NV_E4M3);
+    }
+    for (int c = tid; c < dv; c += blockDim.x) {
+        const float qv = fminf(fmaxf(src[dk + c] / s_vs, -448.0f), 448.0f);
+        vq_tbl[seq][slot * dv + c] = (unsigned char)__nv_cvt_float_to_fp8(qv, __NV_SATFINITE, __NV_E4M3);
+    }
+    // idx/gate on the hd == 0 blocks — THIS ROW's ki/gate (per row).
+    if (hd == 0) {
+        for (int c = tid; c < idm; c += blockDim.x) {
+            kidx_tbl[seq][(size_t)(t0 + tok) * idm + c] = ki[(size_t)row * idm + c];
+            kgate_tbl[seq][(size_t)(t0 + tok) * idm + c] = gate[(size_t)row * idm + c];
+        }
+    }
+    // DEVICE-SIDE ADVANCE: ONE writer per seq — the seq's LAST row
+    // (tok == blen-1) moves t0/total by the whole block, so the rows written by
+    // the other blocks of the same seq are all visible downstream (in-stream
+    // ordering).
+    const int blen = (block_len != NULL) ? block_len[seq] : ntok;
+    if (dev_adv && blen > 0 && tok == blen - 1 && hd == 0 && threadIdx.x == 0) {
+        *(int*)t0_tbl[seq] = t0 + blen;
+        *(int*)total_tbl[seq] = t0 + blen;
+    }
+}
+
 // 2. kpool compression: per-seq (k_idx, k_gate) → pool_keys [B, max_npools,
 // idm]. npools derived live per seq from its pinned total.
 __global__ void kpool_compress_batched_kernel(
@@ -7216,6 +7321,34 @@ extern "C" cudaError_t ferrite_dsa_append_batched(
         (unsigned char* const*)kq_tbl, (unsigned char* const*)vq_tbl,
         ksc_tbl, vsc_tbl, kidx_tbl, kgate_tbl, t0_tbl, total_tbl,
         B, ntok, h, dk, dv, idm, max_t, dev_adv);
+    return cudaGetLastError();
+}
+
+// Row-mapped variant (Wave 5 step 3): see dsa_append_batched_mapped_kernel.
+// `row_map` (ragged) XOR `block_len` (always required when ntok == 0) may be
+// NULL; with both NULL the call is bit-identical to ferrite_dsa_append_batched
+// at ntok == 1 (the decode-batched launch).
+extern "C" cudaError_t ferrite_dsa_append_batched_mapped(
+    const float* kvb, const float* ki, const float* gate,
+    void* const* kq_tbl, void* const* vq_tbl,
+    float* const* ksc_tbl, float* const* vsc_tbl,
+    float* const* kidx_tbl, float* const* kgate_tbl,
+    const int* const* t0_tbl, const int* const* total_tbl,
+    const int* row_map, const int* block_len,
+    int rows, int B, int ntok, int h, int dk, int dv, int idm, int max_t, int dev_adv,
+    cudaStream_t s) {
+    if (rows <= 0 || B <= 0 || h <= 0) return cudaSuccess;
+    // (seq, tok) must be derivable — the divisor OR the table
+    if (row_map == NULL && ntok <= 0) return cudaErrorInvalidValue;
+    // the per-seq advance step must be known — the table OR the divisor
+    if (block_len == NULL && ntok <= 0) return cudaErrorInvalidValue;
+    dim3 grid((unsigned)rows, (unsigned)h, 1);
+    dsa_append_batched_mapped_kernel<<<grid, 256, 0, s>>>(
+        kvb, ki, gate,
+        (unsigned char* const*)kq_tbl, (unsigned char* const*)vq_tbl,
+        ksc_tbl, vsc_tbl, kidx_tbl, kgate_tbl, t0_tbl, total_tbl,
+        row_map, block_len,
+        rows, B, ntok, h, dk, dv, idm, max_t, dev_adv);
     return cudaGetLastError();
 }
 

@@ -22,6 +22,11 @@ use ferrite_types::{DType, FerriteError, Result, Shape, Tensor};
 pub mod graph;
 pub mod mhc;
 pub mod distributed;
+/// GLM batched MTP (Wave 5 Step B) — the verify size class, the graph keys,
+/// and the row→(seq, tok) / commit-layout arithmetic. Pure host-side
+/// groundwork: no call sites yet, the `FERRITE_MTP && max_seqs > 1` gate in
+/// `gpu_engine` stays closed until every piece lands.
+pub mod mtp_batch;
 
 #[cfg(all(test, feature = "cuda"))]
 mod gdn_equiv_test;

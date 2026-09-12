@@ -697,7 +697,13 @@ pub(crate) fn ar_v5() -> bool {
         // AR is DEFAULT ON in its own right: it is verified correct with the graph
         // both off and on (a full 32-step generation is bit-identical to the host
         // barrier path) and it removes ~21 of the ~29 us each all-reduce costs.
-        // DSV41_AR_V5=0 restores the host barrier for A/B.
+        // DSV41_AR_V5=0 restores the host barrier for A/B — but ONLY together with
+        // DSV41_GRAPH_STEP=0: the graph leg above is an `||`, so with the (default
+        // ON) whole-step graph this function is true no matter what DSV41_AR_V5
+        // says. That short-circuit is deliberate (a captured graph cannot record a
+        // host barrier), and it is also the reason a reader must not treat
+        // `ar_v5()` as opt-in when auditing a capture gate (chain_dev.rs
+        // verify_graph_gate).
         let graph = std::env::var("DSV41_GRAPH_STEP").map(|v| v != "0").unwrap_or(true);
         graph || std::env::var("DSV41_AR_V5").map(|v| v != "0").unwrap_or(true)
     })

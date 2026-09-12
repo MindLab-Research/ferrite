@@ -7,6 +7,11 @@
 #                                               BIT-IDENTICAL to m single-row calls
 #   kernels/cuda/tests_dsv41_experts_mrows.cu   multi-row batched expert chain
 #                                               (gate/up -> swiglu -> down+reduce)
+#   kernels/cuda/tests_dsv41_head_mrows.cu      the verify head's multi-row GEMV:
+#                                               an m-row call is BIT-IDENTICAL to
+#                                               m single-row ferrite_gemv_bf16_v2
+#                                               (nrows=1) launches and to one
+#                                               ferrite_gemv_bf16_nt (nrows=m)
 #
 # WHY THE SOURCES ARE SHIPPED TO A REMOTE NODE
 #   Compiling these suites needs nvcc; running them needs ONE free GPU. This
@@ -28,7 +33,7 @@
 # USAGE
 #   bash scripts/verify_mrows.sh                  # both suites, full, remote
 #   bash scripts/verify_mrows.sh --quick          # fused arms only (forwarded)
-#   bash scripts/verify_mrows.sh --test experts   # one suite only (gemm|experts)
+#   bash scripts/verify_mrows.sh --test head     # one suite only (gemm|experts|head)
 #   MROWS_GPU=5 bash scripts/verify_mrows.sh      # pin the GPU (default: the
 #                                                 #   most idle one, auto-picked)
 #   MROWS_ENV="DSV41_GATEUP_FUSE=0" bash scripts/verify_mrows.sh
@@ -66,7 +71,7 @@ SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=15)
 # so a suite that includes its TU keeps working as-is and one that links it is
 # covered too. A candidate that duplicates extern "C" symbols simply fails to
 # compile and the next one is tried.
-TESTS=(gemm experts)
+TESTS=(gemm experts head rope gate)
 extra_sources() {
     case "$1" in
         gemm)
@@ -76,12 +81,33 @@ extra_sources() {
         experts)
             printf '%s\n' 'dsv41_glue.cu dsv41_kernels.cu'
             ;;
+        head)
+            # The suite #includes dsv41_glue.cu (the kernel under test) and links
+            # ferrite_kernels.cu as the SECOND TU — the reference program
+            # (ferrite_gemv_bf16_v2 / _nt) lives there, and this is exactly the
+            # two-TU split the production .so is linked with.
+            printf '%s\n' 'ferrite_kernels.cu'
+            ;;
+        rope)
+            # The row-fold rope suite #includes dsv41_kernels.cu (the kernel under
+            # test, exactly how tests_dsv41_attn.cu builds) -> no extra TU.
+            printf '%s\n' ''
+            ;;
+        gate)
+            # The MoE-gate row fold links ferrite_kernels.cu as the second TU for
+            # the reference program (ferrite_gemv_bf16_v2 / _nt) — the same split
+            # the head suite uses, and the same split the .so is linked with.
+            printf '%s\n' 'ferrite_kernels.cu'
+            ;;
     esac
 }
 test_file() {
     case "$1" in
         gemm)    echo "tests_dsv41_gemm_mrows.cu" ;;
         experts) echo "tests_dsv41_experts_mrows.cu" ;;
+        head)    echo "tests_dsv41_head_mrows.cu" ;;
+        rope)    echo "tests_rope_fold.cu" ;;
+        gate)    echo "tests_gate_mrows.cu" ;;
     esac
 }
 

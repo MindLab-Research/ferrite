@@ -1863,6 +1863,7 @@ impl<'a> DevChain<'a> {
             ex_act_r: dev.alloc(fb(VERIFY_ROWS * topk * 2 * inter.max(dim)))?,
             ex_down_r: dev.alloc(fb(VERIFY_ROWS * topk * dim))?,
             sh_act_r: dev.alloc(fb(VERIFY_ROWS * 2 * inter.max(dim)))?,
+            sh_out_r: dev.alloc(fb(VERIFY_ROWS * dim))?,
             eng_ids_r: dev.alloc(fb(eng_cols * n_eng_layers * VERIFY_ROWS).max(8) * 2)?, // i64
             eng_rows_r: dev.alloc(fb(VERIFY_ROWS * eng_cols * ehd).max(8))?,
             eng_kv_r: dev.alloc(fb(VERIFY_ROWS * (hc + 1) * dim))?,
@@ -7435,7 +7436,19 @@ impl<'a> DevChain<'a> {
                 ld.shared_w2.as_ref(),
                 ld.shared_w2_scale.as_ref(),
             ) {
+                // MULTI-ROW (DSV41_SH_EXP_MROWS, DEFAULT OFF): one pass over the
+                // whole block instead of the per-row loop below. `true` means
+                // every row's shared contribution is already in `moe_out_r`, so
+                // the loop has nothing left to do — see `shared_expert_mrows`
+                // for the bit-identity argument and the fallback contract.
+                let sh_mrows_done =
+                    self.shared_expert_mrows(w1, w1s, w3, w3s, w2, w2s, m, sh_il, dim)?;
                 for r in 0..m {
+                    // The multi-row pass already added this layer's shared
+                    // expert; running the loop would add it a second time.
+                    if sh_mrows_done {
+                        break;
+                    }
                     // The T1/T2 fast paths are single-row gates around this very
                     // pair, so the rows path runs the (quant1, gemm) pair.
                     self.quant1((self.s.xn_r.ptr as *const f32).wrapping_add(r * dim), dim as i32)?;
@@ -7533,6 +7546,144 @@ impl<'a> DevChain<'a> {
             c.end_round();
         }
         Ok(())
+    }
+
+    /// The shared expert as ONE multi-row pass (`DSV41_SH_EXP_MROWS`, DEFAULT
+    /// OFF): the m-row twin of the per-row loop in [`Self::moe_rows`].
+    ///
+    /// # What it removes
+    ///
+    /// The shared expert is a SINGLE expert applied to every row, so its weights
+    /// are identical across the block — yet `moe_rows` reads them once per row.
+    /// At the production shape (m = 5, `sh_il` = 288, dim = 5120) the per-row
+    /// loop streams 4.42 MB and issues 4-5 launches per row, i.e. 26.5 MB and
+    /// ~25 launches per layer = ~0.89 GB/step and ~960 launches/step of pure
+    /// repeat traffic. The routed experts' bytes are irreducible (their rows
+    /// select DIFFERENT experts); this one's divide by m.
+    ///
+    /// # The four steps, each ONE launch
+    ///
+    /// 1. `quant_rows(xn_r, m, dim)` — the block's fp8 activation into
+    ///    `xq_r`/`xsc_r`. `quant_kernel` is one thread-group per (row, block) and
+    ///    each row's amax is its own 32-element shuffle reduction, so this emits
+    ///    byte-for-byte what m per-row `quant1` launches emit.
+    /// 2. two `gemm_fp8_mrows` into `sh_act_r` at the `[row][2*sh_il]` layout
+    ///    (w1 at `+0`, w3 at `+sh_il`, `out_stride = 2*sh_il`) — the same
+    ///    weight-stationary kernel the projections use, whose per-row output is
+    ///    bit-identical to the `m == 1` GEMV, i.e. to `gemm_fp8_mx` and hence
+    ///    (transitively, by `gemm_fp8_mx2`'s own documented contract) to the two
+    ///    families of the single launch the per-row path issues.
+    /// 3. `swiglu_limit_q(rows = m)` — one launch for the whole block. The kernel
+    ///    indexes `gate_up + r*2*inter`, which IS the layout step 2 wrote, and
+    ///    its per-(row, block) arithmetic is A4's, which the `swiglu_q` case in
+    ///    `tests_dsv41_glue.cu` asserts bit-exact against (`swiglu_limit` +
+    ///    `quant1`). `inter % 32 == 0` — which `sh_il % 32 == 0` implies for the
+    ///    TP-sharded case and which is checked here — is what makes every scale
+    ///    block land inside one 32-row tile.
+    /// 4. `gemm_fp8_mrows(w2)` into the `sh_out_r` scratch, then ONE
+    ///    `add_inplace_raw` of `m*dim` elements. The per-row path's default
+    ///    (A5 off) is exactly this pair per row — a write plus an element-wise
+    ///    add — and the add's ranges are disjoint per row, so one launch over
+    ///    `m*dim` is bit-identical to m launches over `dim`.
+    ///
+    /// # Fallback (the reference this was verified against)
+    ///
+    /// Returns `Ok(false)` — leaving the per-row loop to run — when the gate is
+    /// off, the shape cannot take a step (`sh_il % 32`, `dim % 32`,
+    /// `m > VERIFY_ROWS`), the `.so` predates `dsv41_gemm_fp8_mrows`, or any
+    /// launcher declines. A PARTIAL attempt is harmless by construction:
+    /// `moe_out_r` is touched only by the final add, and everything else written
+    /// (`xq_r`/`xsc_r`/`sh_act_r`/`sh_out_r`) is scratch the fallback rewrites.
+    #[allow(clippy::too_many_arguments)]
+    fn shared_expert_mrows(
+        &self,
+        w1: &crate::dsv41::load::DevTensor,
+        w1s: &crate::dsv41::load::DevTensor,
+        w3: &crate::dsv41::load::DevTensor,
+        w3s: &crate::dsv41::load::DevTensor,
+        w2: &crate::dsv41::load::DevTensor,
+        w2s: &crate::dsv41::load::DevTensor,
+        m: usize,
+        sh_il: usize,
+        dim: usize,
+    ) -> Result<bool> {
+        let cfg = self.cfg;
+        if !sh_exp_mrows()
+            || m == 0
+            || m > VERIFY_ROWS
+            || (sh_il % 32) != 0
+            || (dim % 32) != 0
+            || !self.dev.supports_gemm_fp8_mrows()
+        {
+            return Ok(false);
+        }
+        // 1) ONE fp8 quantisation for the whole block.
+        self.quant_rows(self.s.xn_r.ptr as *const f32, m, dim as i32)?;
+        // 2) w1 | w3: one weight-stationary GEMV each, over the same activation.
+        let stride = (2 * sh_il) as i32;
+        let ok1 = self.dev.gemm_fp8_mrows(
+            self.s.xq_r.ptr as *const u8,
+            self.s.xsc_r.ptr as *const f32,
+            w1.as_u8(),
+            w1s.as_u8(),
+            std::ptr::null(),
+            self.s.sh_act_r.ptr as *mut f32,
+            m as i32,
+            sh_il as i32,
+            dim as i32,
+            stride,
+        )?;
+        let ok3 = self.dev.gemm_fp8_mrows(
+            self.s.xq_r.ptr as *const u8,
+            self.s.xsc_r.ptr as *const f32,
+            w3.as_u8(),
+            w3s.as_u8(),
+            std::ptr::null(),
+            (self.s.sh_act_r.ptr as *mut f32).wrapping_add(sh_il),
+            m as i32,
+            sh_il as i32,
+            dim as i32,
+            stride,
+        )?;
+        if !(ok1 && ok3) {
+            return Ok(false);
+        }
+        // 3) swiglu + the fp8 pair the w2 GEMV reads, all m rows in one launch.
+        let swiglu_ok = swiglu_q()
+            && self.dev.supports_swiglu_q()
+            && self.dev.swiglu_limit_q(
+                self.s.sh_act_r.ptr as *mut f32,
+                m as i32,
+                sh_il as i32,
+                cfg.swiglu_limit,
+                self.s.xq_r.ptr as *mut u8,
+                self.s.xsc_r.ptr as *mut f32,
+            )?;
+        if !swiglu_ok {
+            return Ok(false);
+        }
+        // 4) w2 for all rows, then ONE element-wise add into the accumulator.
+        let ok2 = self.dev.gemm_fp8_mrows(
+            self.s.xq_r.ptr as *const u8,
+            self.s.xsc_r.ptr as *const f32,
+            w2.as_u8(),
+            w2s.as_u8(),
+            std::ptr::null(),
+            self.s.sh_out_r.ptr as *mut f32,
+            m as i32,
+            dim as i32,
+            sh_il as i32,
+            dim as i32,
+        )?;
+        if !ok2 {
+            return Ok(false);
+        }
+        self.dev.add_inplace_raw(
+            self.s.moe_out_r.ptr as *mut std::ffi::c_void,
+            self.s.sh_out_r.ptr as *const c_void,
+            (m * dim) as i64,
+        )?;
+        Ok(true)
     }
 
     /// Tensor-parallel degree / this rank's index (1 / 0 without a collective).

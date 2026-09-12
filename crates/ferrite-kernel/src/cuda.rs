@@ -195,6 +195,19 @@ extern "C" {
                                    b: i32, ntok: i32, h: i32, dk: i32, dv: i32, idm: i32,
                                    max_t: i32, dev_adv: i32,
                                    s: CuStream) -> i32;
+    /// Row-mapped variant (Wave 5 step 3): `row_map` is an optional `[rows][2]`
+    /// interleaved `(seq, tok)` table, `block_len` an optional `[B]` rows-per-seq
+    /// table. `ntok > 0` (both NULL) = the divisor form; `ntok == 0` requires
+    /// both tables. See `CudaBackend::dsa_append_batched_mapped`.
+    fn ferrite_dsa_append_batched_mapped(kvb: *const f32, ki: *const f32, gate: *const f32,
+                                   kq_tbl: *const *mut std::ffi::c_void, vq_tbl: *const *mut std::ffi::c_void,
+                                   ksc_tbl: *const *mut f32, vsc_tbl: *const *mut f32,
+                                   kidx_tbl: *const *mut f32, kgate_tbl: *const *mut f32,
+                                   t0_tbl: *const *const i32, total_tbl: *const *const i32,
+                                   row_map: *const i32, block_len: *const i32,
+                                   rows: i32, b: i32, ntok: i32, h: i32, dk: i32, dv: i32, idm: i32,
+                                   max_t: i32, dev_adv: i32,
+                                   s: CuStream) -> i32;
     fn ferrite_kpool_compress_batched(kidx_tbl: *const *mut f32, kgate_tbl: *const *mut f32,
                                        ape: *const f32, pool_keys: *mut f32,
                                        total_tbl: *const *const i32,
@@ -674,6 +687,23 @@ impl DevBuf {
         ck(unsafe {
             cudaMemcpyAsync(self.ptr, self.stage, host.len() * 4, CUDA_MEMCPY_H2D, self.stream)
         }, "memcpy H2D")
+    }
+    /// H2D of an integer table through the same pinned stage as
+    /// [`Self::upload`] (the row→(seq, tok) map / per-seq block lengths of the
+    /// batched MTP verify): same graph-friendly property — both addresses are
+    /// fixed, only the CONTENT is refreshed between replays.
+    pub fn upload_i32(&self, host: &[i32]) -> Result<()> {
+        assert!(host.len() <= self.len);
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                host.as_ptr() as *const u8,
+                self.stage as *mut u8,
+                host.len() * 4,
+            );
+        }
+        ck(unsafe {
+            cudaMemcpyAsync(self.ptr, self.stage, host.len() * 4, CUDA_MEMCPY_H2D, self.stream)
+        }, "memcpy H2D (i32)")
     }
     /// D2H via the pinned stage; synchronises the stream (the op tail) —
     /// EXCEPT during capture, when sync is illegal and the graph's
@@ -4639,6 +4669,120 @@ impl CudaBackend {
         )?;
         let partial = self.matmul_dev(&normed, w.o_proj, ni, proj as i32, hidden as i32)?;
         Ok(partial)
+    }
+
+    /// ROW-MAPPED batched DSA cache append — the Wave-5 step-3 entry point
+    /// (`ferrite_dsa_append_batched_mapped`). A superset of
+    /// [`Self::dsa_append_batched`], which it must reproduce BIT-IDENTICALLY
+    /// when no mapping is passed:
+    ///
+    /// - **no mapping** (`row_map = None, block_len = None, ntok = 1`) — today's
+    ///   decode-batched launch: `seq = row`, `tok = 0`, the idx/gate tail reads
+    ///   `ki[seq*idm + c]`, and the device advance fires on `tok == 0`.
+    /// - **padded** (`ntok = n_v`, both tables `None`) — the MTP verify block
+    ///   `[B][n_v]` (`mtp_batch::verify_rows`): `seq = row / n_v`,
+    ///   `tok = row % n_v`, each seq's pinned `t0` advancing by `n_v`. The
+    ///   divisor form is what keeps this INSIDE a graph (two extra table
+    ///   pointers would have to be re-uploaded per replay).
+    /// - **ragged** (`ntok = 0` + both tables — `mtp_batch::AppendPlan`) —
+    ///   `row_map` is `[rows][2]` interleaved `(seq, tok)`, `block_len` is
+    ///   `[B]` rows-per-seq. Variable row count ⇒ NON-captured paths only.
+    ///
+    /// `kvb` is `[rows, h*(dk+dv)]` and `ki`/`gate` are `[rows, idm]` (per ROW,
+    /// not per seq); `tbl` is the per-seq pointer-table set for the `seqs`-wide
+    /// composition. With `ntok > 1` the old kernel was unusable here — it read
+    /// `ki[seq*idm + c]` (one seq's idx for every row) and hard-coded
+    /// `t0 + 1` (leaving the cache short by `ntok - 1` slots per step).
+    #[allow(clippy::too_many_arguments)]
+    pub fn dsa_append_batched_mapped(
+        &self,
+        kvb: &DevBuf,
+        ki: &DevBuf,
+        gate: &DevBuf,
+        tbl: &DsaBatchTables,
+        row_map: Option<&[i32]>,
+        block_len: Option<&[i32]>,
+        rows: usize,
+        seqs: usize,
+        ntok: usize,
+        h: usize,
+        dk: usize,
+        dv: usize,
+        idm: usize,
+        max_t: usize,
+        dev_adv: bool,
+    ) -> Result<()> {
+        if let Some(m) = row_map {
+            if m.len() != rows * 2 {
+                return Err(FerriteError::InvalidArg(format!(
+                    "dsa_append_batched_mapped: row_map has {} i32, expected 2*rows = {}",
+                    m.len(),
+                    rows * 2
+                )));
+            }
+        }
+        if let Some(b) = block_len {
+            if b.len() != seqs {
+                return Err(FerriteError::InvalidArg(format!(
+                    "dsa_append_batched_mapped: block_len has {} entries, expected seqs = {seqs}",
+                    b.len()
+                )));
+            }
+        }
+        if row_map.is_none() && ntok == 0 {
+            return Err(FerriteError::InvalidArg(
+                "dsa_append_batched_mapped: ntok == 0 needs a row_map (nothing to derive (seq, tok) from)"
+                    .into(),
+            ));
+        }
+        self.enter();
+        // per-call H2D through the pinned stage (two i32 tables, 2*rows + seqs
+        // entries — the ragged layout is non-captured, and the padded one
+        // passes no tables at all). Same-stream pool reuse after this function
+        // returns is ordered behind the launch, so dropping them here is safe.
+        let map_buf = match row_map {
+            Some(m) => {
+                let b = DevBuf::alloc(self.dev, self.stream, m.len())?;
+                b.upload_i32(m)?;
+                Some(b)
+            }
+            None => None,
+        };
+        let blen_buf = match block_len {
+            Some(b) => {
+                let d = DevBuf::alloc(self.dev, self.stream, b.len())?;
+                d.upload_i32(b)?;
+                Some(d)
+            }
+            None => None,
+        };
+        let map_ptr = map_buf
+            .as_ref()
+            .map(|b| b.as_const_f32() as *const i32)
+            .unwrap_or(std::ptr::null());
+        let blen_ptr = blen_buf
+            .as_ref()
+            .map(|b| b.as_const_f32() as *const i32)
+            .unwrap_or(std::ptr::null());
+        ck(
+            unsafe {
+                ferrite_dsa_append_batched_mapped(
+                    kvb.as_const_f32(), ki.as_const_f32(), gate.as_const_f32(),
+                    tbl.kn as *const *mut std::ffi::c_void, tbl.v as *const *mut std::ffi::c_void,
+                    tbl.kns as *const *mut f32, tbl.vs as *const *mut f32,
+                    tbl.kidx as *const *mut f32, tbl.kgate as *const *mut f32,
+                    tbl.t0p as *const *const i32,
+                    tbl.totp as *const *const i32,
+                    map_ptr, blen_ptr,
+                    rows as i32, seqs as i32, ntok as i32,
+                    h as i32, dk as i32, dv as i32, idm as i32,
+                    max_t as i32, i32::from(dev_adv),
+                    self.stream,
+                )
+            },
+            "dsa_append_batched_mapped",
+        )?;
+        Ok(())
     }
 
     /// Batched DSA layer: x [B, hidden] → partial [B, hidden]. Projections
