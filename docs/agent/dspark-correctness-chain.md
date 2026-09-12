@@ -2013,3 +2013,27 @@ DSV41_DRAFT_P3A=1 DSV41_LAZY_VERIFY=1 DSV41_VERIFY_GRAPH=1
 - `verify_graph_failed[idx]` 是 per-rank 的捕获失败锁存——**可能只在一部分 rank 上触发**
 - 一旦有 rank 锁存失败，它永久留在 direct arm，而 peers 走 replay
 - 修复前 direct(81) vs replay(81) = 不漂移——但**时序**上 direct 慢一步可能错过 rendezvous
+
+## Session 最终状态快照（上下文耗尽前的最后记录）
+
+### 3 个运行中的 subagent
+1. **ar5-revert-fix**：回退 argmax capturing 守卫 + DRY barrier（恢复 81=81 的 epoch 对齐）
+2. **s4-paired-alignment-design**：S4 paired ring alignment 设计（accept 的下一个大杠杆）
+3. **accept-ceiling-analysis**：accept 1.214 天花板的理论分析
+
+### ATTN_PROJ_ALIGN 重测（70728dd9 跑中）
+- 第一次测试无效（build 失败用了旧 binary）
+- 重测用了正确的双产物重建（build.sh + touch build.rs + cargo build）
+- 结果即将出来——这是 attention 投影结构性对齐的验证
+
+### 400 路径的关键阻塞
+1. **SWALLOW_STEP**：ar5-hang（回退修复实施中——恢复原始的对齐行为）
+2. **accept 1.214 天花板**：简单杠杆全部测完——需要 S4/S5 或其他深层对齐
+3. **tcgen05**：对齐修复已提交但需要重测（misaligned→ld_uint4_a16）
+4. **步时 ~33ms**：lazy verify + 全部截断——需要 SWALLOW + 融合 + tcgen05
+
+### 下一步（按优先级）
+1. ATTN_PROJ_ALIGN 重测结果（如果有效——accept 可能突破 1.214）
+2. ar5-hang 回退 → SWALLOW_STEP 重测（步时 -4.55ms）
+3. tcgen05 重测（对齐修复后——如果成功 verify -1~2.8ms）
+4. S4 paired alignment 实施（accept 的深层杠杆）
