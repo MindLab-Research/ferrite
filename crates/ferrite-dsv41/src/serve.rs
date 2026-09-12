@@ -420,7 +420,19 @@ fn pool_rank_body(
                     let next = if let Some(d) = dspark.as_mut() {
                         // shadow mode: the single-row step stays the engine's
                         // real output; draft+verify run beside it and roll back
-                        let rep = chain.dspark_shadow_step(d, t, pos + i)?;
+                        let rep = match chain.dspark_shadow_step(d, t, pos + i) {
+                            Ok(rep) => rep,
+                            Err(e) => {
+                                // NEVER `?` here: a swallowed error makes this
+                                // rank exit without answering, its siblings spin
+                                // in the next barrier forever, and the operator
+                                // sees "a rank did not answer" with NO cause —
+                                // the exact blind spot the wedge bisect hit.
+                                eprintln!("[dsv41] rank {rank} shadow step err at pos {}: {e}", pos + i);
+                                let _ = res_tx.send((rank, Err(e)));
+                                return Ok(());
+                            }
+                        };
                         dspark_acc_sum += rep.accepted as u64;
                         dspark_steps += 1;
                         dspark_draft_ms += rep.draft_ms as f64;
@@ -436,7 +448,14 @@ fn pool_rank_body(
                         }
                         rep.next
                     } else {
-                        chain.step_dev(t, pos + i)?
+                        match chain.step_dev(t, pos + i) {
+                            Ok(n) => n,
+                            Err(e) => {
+                                eprintln!("[dsv41] rank {rank} step err at pos {}: {e}", pos + i);
+                                let _ = res_tx.send((rank, Err(e)));
+                                return Ok(());
+                            }
+                        }
                     };
                     step_time(pos + i, st.elapsed());
                     out.push(next);

@@ -2965,16 +2965,21 @@ impl<'a> DevChain<'a> {
             }
         });
 
-        // 1. the snapshot, BEFORE the step that moves the counter
+        // 1. the snapshot, AFTER the real step and BEFORE the verify: the
+        //    rollback must restore the state the REAL step left (the compressor
+        //    commit it just made, the clen it just advanced), not the state from
+        //    before it — restoring the pre-step state rolls the real step's
+        //    commit back too, leaving clen one behind the truth every shadow
+        //    step and corrupting the chain from step 2 on (the exact
+        //    "step 1 fine, step 2 dead" bisect signature).
+        // 2. the real step: the whole-step graph (tap hook included), the argmax,
+        //    and the position counter + 1
+        let next = self.step_dev(token, pos)?;
         let host_mirrors = if bisect == 1 || bisect == 3 {
             Vec::new()
         } else {
             self.dspark_snapshot(pos_ctr, m)?
         };
-
-        // 2. the real step: the whole-step graph (tap hook included), the argmax,
-        //    and the position counter + 1
-        let next = self.step_dev(token, pos)?;
 
         // 3./4./5. the draft, from the tap of the step that just ran. `pos` is
         // the backbone token's position, the same convention `step_dev` uses and
