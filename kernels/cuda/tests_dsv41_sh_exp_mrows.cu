@@ -50,6 +50,24 @@
 // Build (needs nvcc, NO GPU — dsv41_kernels.cu is the only TU):
 //   nvcc -gencode arch=compute_103a,code=sm_103a -O3 --use_fast_math \
 //        -std=c++17 -o /tmp/t_sh_exp_mrows kernels/cuda/tests_dsv41_sh_exp_mrows.cu
+//
+// ⚠️ THAT COMMAND ALONE FAILS ON A HOST WHOSE `nvcc` IS NOT A COMPLETE TOOLKIT,
+// and it fails in a way that hides itself: this TU `#include`s <cuda_runtime.h>
+// and <cuda_fp8.h> (needs -I) and the driver links -lcudadevrt / -lcudart_static
+// (needs -L). With the include path missing the compile dies at once
+// ("cuda_runtime.h: No such file or directory"); with only -I it dies in the
+// LINKER ("cannot find -lcudadevrt", "cannot find -lcudart_static"), so
+// `/tmp/t_sh_exp_mrows` is never created. Either way the COMPILE WARNINGS print
+// BEFORE the error, so a `2>&1 | head -3` shows a warning and buries the cause —
+// pass BOTH paths (verified 2026-09-12):
+//   CUDA_INC=/home/smith/.local/lib/python3.10/site-packages/nvidia/cu13/include
+//   CUDA_LIB=/home/smith/.local/lib/python3.10/site-packages/nvidia/cu13/lib
+//   nvcc -gencode arch=compute_103a,code=sm_103a -O3 --use_fast_math -std=c++17 \
+//        -I"$CUDA_INC" -L"$CUDA_LIB" \
+//        -o /tmp/t_sh_exp_mrows kernels/cuda/tests_dsv41_sh_exp_mrows.cu
+// (nvcc itself: /tmp/nvccx/nvidia/cu13/bin/nvcc. Never pipe the output through
+//  `head` — a clean build is the gate, and warnings are part of its output.)
+//
 // Run (needs ONE free GPU; peak allocation is a few dozen MB):
 //   CUDA_VISIBLE_DEVICES=<free> /tmp/t_sh_exp_mrows            # full suite
 //   CUDA_VISIBLE_DEVICES=<free> /tmp/t_sh_exp_mrows --quick    # small shapes only

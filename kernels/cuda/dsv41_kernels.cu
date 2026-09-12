@@ -971,7 +971,8 @@ __global__ void sparse_attn_kernel(const float* __restrict__ q, const float* __r
         // order - so the partials are identical and the output stays bit-identical.
         // The old `float acc[512]` indexed by `c` was dynamically indexed and spilled
         // to local memory, which is the largest recoverable cost in this kernel.
-        const int per = (d + (int)blockDim.x - 1) / (int)blockDim.x;
+        // The per-thread count `ceil(d / blockDim.x)` itself is NOT a live value:
+        // the loops below walk the fixed `kMaxPer` slots with a `c < d` guard.
         float acc[kMaxPer];
 #pragma unroll
         for (int i = 0; i < kMaxPer; ++i) acc[i] = 0.f;
@@ -6955,7 +6956,12 @@ gemm_fp8_sh_exp_pair_kernel(const uint8_t* __restrict__ a, const float* __restri
     float*   s_rows = reinterpret_cast<float*>(s_pool + sm.rows_off);
     uint8_t* s_w    = s_pool + sm.w_off;
     uint8_t* s_ws   = s_pool + sm.ws_off;
-    uint8_t* s_aq   = s_pool + sm.aq_off;
+    // NOTE: `sm.aq_off` deliberately gets NO local. Phase 1 writes `aq`/`aqsc`
+    // STRAIGHT to global memory, and phase 2 re-reads them from global (`aq +
+    // q*aq_stride`) after the grid barrier -- the phases run in DIFFERENT blocks,
+    // so a smem copy could not be shared anyway. The reserved `aq_off` span stays
+    // in the layout (it is part of the design's byte table and of the launcher's
+    // `gsmem`), it is simply unused; launching with it present/absent is bit-neutral.
     float*   s_aqs  = reinterpret_cast<float*>(s_pool + sm.aqs_off);
     float*   s_af2  = reinterpret_cast<float*>(s_pool + sm.af2_off);
 
