@@ -68,6 +68,7 @@ LD_LIBRARY_PATH=$HOME/ferrite/kernels/cuda ./target/release/ferrite-serve --back
 | `DSV41_DSPARK_DEBUG=1` | 逐轮 `[dspark-dbg]` trace | OFF |
 | `DSV41_DIFF_EAGER=1` | spec vs eager 逐位对照 probe | OFF |
 | `DSV41_VERIFY_HEAD_FOLD=0` | verify 的 head 走 per-row v1（folded 有 K 序差） | **OFF（=per-row）** |
+| `DSV41_VERIFY_HEAD_SLICED=0` | verify 的 head 关词表切分（回到每行读全量 1262MB） | **ON（切分 + 1 个 v5 round）** |
 | `DSV41_SIDS_WRITEBACK=1` | spec commit 后回写 emitted.last() 到 s.ids | OFF（verify 值修好后开） |
 | `DSV41_SWALLOW_STEP=1` | 吞主链步（6 行块） | OFF |
 | `DSV41_SEED_ALIGN=1` | 判词路线 A（seed↔tap 对齐） | OFF |

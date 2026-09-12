@@ -6882,6 +6882,18 @@ __global__ void argmax_xchg_v5_rows_kernel(
             __nanosleep(200);
             if (++spins > 25000000) break;      // ~5 s watchdog; give up
         }
+        // PRINT, DO NOT SILENTLY DEGRADE (the same rule `p2p_ar_pubred_v5_kernel`
+        // and the single-row twin follow). A watchdog expiry means a peer never
+        // reached this round: the reduce below then reads a STALE parity half and
+        // writes a plausible-looking but WRONG global token, which is
+        // indistinguishable from a numerical near-tie from the outside - exactly
+        // the "verify emits a wrong token and nothing says why" shape. `rows` is
+        // in the line because THIS kernel's whole contract is "one round per
+        // block": a hang that only ever happens at rows > 1 is the v5 round-count
+        // desync the batching exists to avoid, and that is worth being visible.
+        if (spins > 25000000)
+            printf("[ar5-hang] argmax_rows rank=%d peer=%d need=%u cur=%u rows=%d\n", my_rank,
+                   r, e + 1u, (unsigned)*p, rows);
     }
     __threadfence_system();                     // observe peers' staged keys
     const char* sl = reinterpret_cast<const char*>(staging_local);

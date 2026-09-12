@@ -131,6 +131,16 @@
 **待验证**（bf3de09d）：全部修复叠加后的正确性 + 性能（verify 应从 37.31ms 降 ~1.5ms+）。
 **待跑**：GEMV_A32=0 的 A/B（上轮被并发测试 kill）。
 
+## 读侧判词：verify 切片 head 的跨 rank argmax（epoch 足迹）
+
+**契约**：`DSV41_VERIFY_HEAD_SLICED` 默认 ON 时，verify 的 head 读侧 = **每行一次切片内 `argmax_kernel`**（packed key 带*全局* index，`idx_off = rank*seg`）**+ 整个块一次 `argmax_xchg_v5_rows_kernel`**。`step_rows_inner` 的 `verify_head_geom()` 是唯一决定几何的地方（head / argmax / probe 三处同源），`logits_r` 的行距随臂变化（切片时 = `seg`）。
+
+**为什么不能在行上循环 `argmax_sliced`**：每次调用**无条件**推一次 v5 epoch（publish → stamp → `*epoch=e+1` → poll），只有 `pos_ctr` 可置空；m 行就是 m 轮，而 EAGER 的 `step_dev` 每步只 1 轮 ⇒ 足迹差 m−1 = SEED_ALIGN 那类死锁（领先方永久自旋、落后方静默读错半区）。**批量化把 m 行压成 1 轮**，于是 verify 的 head 足迹与 EAGER 的**逐位相等（1/1）**；`pos_ctr` 传 NULL（计数器由 accept 逻辑推一次）。
+
+**门必须 rank-uniform**（否则不同 rank 分支不同 = 新一轮足迹差）：`verify_head_geom` 的每一项都是 (.so 符号、world、vocab 可整除、head dtype、v5 live、`VERIFY_ROWS*8 <= bytes`)——全是 rank 无关量，唯一的 rank 依赖是切片基址。`rows*8 > stride_bytes` 时 C 入口返回 1（decline 哨兵，且**不碰 epoch**），Rust 侧把它当几何不一致直接 Err（不静默回退：此时 head 已按切片行距写了 `logits_r`，回退会读错）。
+
+**验收**：`kernels/cuda/tests_dsv41_argmax_rows.cu`（`bash scripts/verify_mrows.sh --test argmax`）——(1) 每行 == 生产全词表 `dsv41_argmax_sliced`（含跨 rank 平局→全局最小 index）；(2) `rows = 1/3/6` 的 epoch 增量**恒为 1**（批量化契约的回归闸）；(3) decline 臂不改 epoch/`out`。失败即回归，不必等 serve 挂住才发现。**诊断**：`argmax_xchg_v5_rows_kernel` 的 5s watchdog 现打印 `[ar5-hang] argmax_rows rank=… peer=… need=… cur=… rows=…`（此前静默 break，会写一个"看起来合理"的错 token）。
+
 ## opa 判定的用户纠正 + 官方对照（ref-inference-compare）
 
 **用户（权威）**："不说官方，我们自己 eager 也是没有乱码的，只有 mtp 有"——**重新核实**：

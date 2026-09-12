@@ -12,6 +12,13 @@
 #                                               m single-row ferrite_gemv_bf16_v2
 #                                               (nrows=1) launches and to one
 #                                               ferrite_gemv_bf16_nt (nrows=m)
+#   kernels/cuda/tests_dsv41_argmax_rows.cu     the verify head's SLICED
+#                                               cross-rank argmax: per row it
+#                                               equals the production
+#                                               full-vocabulary dsv41_argmax_sliced
+#                                               (global index + lowest-index tie
+#                                               rule), and ONE block costs EXACTLY
+#                                               ONE v5 epoch round for rows = 1..6
 #
 # WHY THE SOURCES ARE SHIPPED TO A REMOTE NODE
 #   Compiling these suites needs nvcc; running them needs ONE free GPU. This
@@ -71,7 +78,7 @@ SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=15)
 # so a suite that includes its TU keeps working as-is and one that links it is
 # covered too. A candidate that duplicates extern "C" symbols simply fails to
 # compile and the next one is tried.
-TESTS=(gemm experts head rope gate)
+TESTS=(gemm experts head rope gate argmax)
 extra_sources() {
     case "$1" in
         gemm)
@@ -80,6 +87,13 @@ extra_sources() {
             ;;
         experts)
             printf '%s\n' 'dsv41_glue.cu dsv41_kernels.cu'
+            ;;
+        argmax)
+            # The verify head's cross-rank argmax: the suite calls the extern "C"
+            # entries (dsv41_argmax_sliced / _rows) and #includes nothing, so
+            # dsv41_kernels.cu — where they live — is the second TU. The exchange
+            # kernel is the only CUDA code it touches.
+            printf '%s\n' 'dsv41_kernels.cu'
             ;;
         head)
             # The suite #includes dsv41_glue.cu (the kernel under test) and links
@@ -108,6 +122,7 @@ test_file() {
         head)    echo "tests_dsv41_head_mrows.cu" ;;
         rope)    echo "tests_rope_fold.cu" ;;
         gate)    echo "tests_gate_mrows.cu" ;;
+        argmax)  echo "tests_dsv41_argmax_rows.cu" ;;
     esac
 }
 
