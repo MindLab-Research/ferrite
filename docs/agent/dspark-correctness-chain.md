@@ -2998,3 +2998,25 @@ DSV41_EXPERT_ACT_E4M3=1           # e4m3
 **代价**：每步一次 dsv41_argmax_key_pub（v5 轮）= 3 blocks × 5 = 15 额外 v5 轮/draft_forward。但这是对称的（每 rank 同样发 15 轮）——无死锁风险。
 
 **预期**：draft 4.28ms → ~3.5ms（-0.7~0.8ms）
+
+## ⚠️ L3+L5 组合测试结果（65326f93）——MARKOV_SLICED 严重退化 accept！
+
+**结果**：
+- 零拉丁 ✓（LEN=207，拉丁=[]）
+- **k_acc 从 ~5.0 降到 ~1.44**！序列：3 1 3 3 3 3 1 1 1 1 1 1 1 1 1 3 3 1 1 1
+- **吞吐 73.3 tok/s**（vs 无 MARKOV 的 78.1——下降）
+- draft=3.69ms（-0.59ms ✓），verify=25.35ms，commit=0.21ms
+- 0 ar5-hang ✓
+
+**判定**：
+1. **MARKOV_SLICED 改变了 draft 的 token 选择**——切分计算 + key_pub 交换的数值差异导致 argmax 不同
+2. **accept 从 5.0 崩到 1.44**——draft 的预测质量严重退化
+3. **吞吐净负**（draft 省 0.59ms 但 accept 损失 3.56 tok/step = -14ms/步等价）
+4. **MARKOV_SLICED 应保持 OFF**
+
+**修正后的优化栈**：
+- L3 SH_PAIR_M=1: ✓ 验证成功（accept 不变）
+- L5 MARKOV_SLICED: ✗ 退化 accept（禁用！）
+- L2 LAZY_SDR: 待测试
+
+**下一步**：L3+L2（SH_PAIR + LAZY_SDR，不含 MARKOV_SLICED）
