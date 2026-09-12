@@ -407,10 +407,10 @@ __global__ void gemm_fp8_kernel(const uint8_t* __restrict__ a, const float* __re
 //                 atomicAdd (the launcher zeroes `out` first), applied by the
 //                 tg==0 lanes exactly like the plain epilogue.
 #ifndef DSV41_SWAPAB_KSTEP
-#define DSV41_SWAPAB_KSTEP 256
+#define DSV41_SWAPAB_KSTEP 128
 #endif
 #ifndef DSV41_SWAPAB_NSTAGE
-#define DSV41_SWAPAB_NSTAGE 4
+#define DSV41_SWAPAB_NSTAGE 8
 #endif
 #ifndef DSV41_SWAPAB_WARPS
 #define DSV41_SWAPAB_WARPS 1

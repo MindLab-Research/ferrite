@@ -55,7 +55,7 @@ Table 4 "Throughput of Native Arithmetic Instructions"，12.9 版；非实测。
 （tensor-core W8A8，见 SGLang 的 M<32 swapAB 路径）或把解码改成 row-stationary 复用寄存器。
 **结论：不实施 cvt 路线。**
 
-## swapAB（M=1 落 MMA 的 N 维）可行性分析 — 2026-09-12（纯分析，未落地）
+## swapAB（M=1 落 MMA 的 N 维）— 2026-09-12 已实施（DSV41_SWAPAB，默认 OFF）
 
 提案（lut-floor-research 定案）：M=1 decode 改走 FlashInfer/DeepGEMM 的 swapAB——
 权重做 A（M 维 = 输出行），激活做 B（N 维 = token），MMA 直接吃 fp8×fp8，零解码。
@@ -87,6 +87,62 @@ Table 4 "Throughput of Native Arithmetic Instructions"，12.9 版；非实测。
 
 估计工作量：新 kernel（改 `gemm_fp8_kernel` 的 A/B 角色 + N 补零）~150 行 + launcher +
 Rust dispatch + parity test，约 1-2 天；fuse 族迁移另计。
+
+### 2026-09-12 实施记录（本会话）
+
+**落地物**：`gemm_fp8_swapab_kernel` + `dsv41_gemm_fp8_swapab`（`kernels/cuda/dsv41_kernels.cu`，
+anonymous namespace 内，紧跟 `gemm_fp8_kernel` 之后）；Rust FFI `device.rs::gemm_fp8_swapab`
+（`Option`, stream LAST）+ `chain_dev.rs::gemm_fp8_mx_or_swap`；
+env gate **`DSV41_SWAPAB`（默认 OFF，=1 开）**，launcher 内 `DSV41_NO_SWAPAB` 可强制 decline。
+落点 4 处主路径：`lin()`、wo_a、wo_b、engram gather。fuse 族（mx2 / rope / norm / AR-v5 / B1）
+**未迁移**。
+
+**实测（隔离口径，n=1664 k=5120，300 call、CUDA events、权重 L2 常驻）**：
+
+| 版本 | µs/call | GB/s | vs SIMT |
+|---|---|---|---|
+| SIMT `gemm_fp8_gemv_kernel`（mode 4 + a32） | 11.55 | 737 | 1.00x |
+| ks=1（初版，一 warp 走满 K） | 28.4 | 300 | **0.41x（更慢）** |
+| + 激活/scale stage 进 smem | 28.4 | 300 | 0.41x |
+| + k_split=4 | 9.40 | 906 | 1.23x |
+| + `stage()` 去整数除法（移位/掩码） | 7.15 | 1192 | 1.62x |
+| + k_split=8 | 6.39 | 1334 | 1.81x |
+| **ksplit=16 / KStep=128 / NStage=8（当前默认）** | **5.96-6.57** | ~1300-1400 | **1.76-1.94x** |
+
+其它形状（默认配置）：n=7168 k=2048 → 8.2-8.5µs（2.0x）；n=1664 k=7168 → 6.59µs（2.23x）；
+**n=256 k=5120 → 7.2µs（0.97x，打平）**；n=576 k=1024 → 6.17µs（**0.73x，更慢**）；
+n=1664 k=1280 → 6.05µs（0.99x 打平）。
+
+**根因链（全部实测，按发现顺序）**：
+1. **不是 MMA、不是 LDS 冲突、不是寄存器压力**。逐项消融：去掉 MMA −14%；去掉
+   `cp.async` wait+syncwarp **完全不变**；ptxas 报 0 spill / 56 regs；`#pragma unroll 4`
+   零效果。内层 k-block 循环**整体**只值 ~2µs（`nobody` 变体 7.44µs vs 全量 9.4µs）。
+2. **真正瓶颈 = 每个 warp 的 cp.async 环流吞吐**。ks=1 时 grid 只有 n/16 = 104 warps
+   （148 SM 上 0.7/SM），每 warp 串行搬 80KB；`nobody` 变体说明 7.4µs 全花在 staging 上
+   （≈1.15 TB/s，离 HBM 地板 6x）。
+3. **唯一可加的自由并行维是 K**（MMA 的 M=16 钉死，N 只有 1 列有效）。k_split 把 warp 数
+   提到 n/16 × ks，原子归约合并（launcher 先 `cudaMemsetAsync(out,0)`，分区 0 附带 bias，
+   保证 bias 只加一次）。k=5120 的合法 ks：{2,4,5,8,10,16}（5120=2^10·5，需 k%(32·ks)==0，
+   launcher 从宏值按 2 折半降到可整除为止）。
+4. **`stage()` 里每个 16B chunk 一次 `c / nchunk` 整数除法**在白耗（该 kernel 的环流已完全
+   主导）：改成 full-stage 用移位+掩码（chunk/row 是编译期 2 的幂），尾部残 stage 保留除法。
+   单此一项 9.4 → 6.4。
+
+**仍未达 200 tok/s**：serve 口径（CUDA graph，memset 节点 ~0.5µs）预期
+kernel 3.35µs + memset 0.5µs ≈ 3.85µs/call → gemv 246×3.85µs = 0.95ms（SIMT 2.70ms）
+→ 步 ~4.5ms ≈ **222 tok/s**。但**隔离口径含 3.0µs 的 `cudaMemsetAsync` 独立 launch 开销**
+（已实测），小形状（n≤576）因固定开销反而慢于 SIMT，故默认仍 OFF，须上机做 serve A/B。
+**下一步的确定性杠杆**（按性价比）：
+- **消掉 memset 节点**：改「最后块归约」——各块写独立 partial slot，`atomicAdd` 计数，
+  最后到达的块（old == gridDim-1）读全部 slot 求和写出（先例：sparse-merge 选举、hc_dots_late）。
+  省一个 graph 节点（−0.5µs/call ≈ −0.12ms/步）。**需要 caller 提供 scratch**（ABI 改动）。
+- **TMA / `cp.async.bulk` 替 cp.async**：per-SM 的 outstanding 深度是当前 1.3 TB/s 的硬墙，
+  TMA 队列深得多，是逼近内存地板的唯一路径。代价：tensormap 的 host 侧 plumbing。
+- **N 维填真 token**（batched decode / MTP）：现在 7/8 的 N 是浪费，填满即再省 ~1 倍。
+
+**验收**：`kernels/cuda/tests_dsv41_gemm_fp8.cu` 新增 `run_swapab_case`（4 形状，含
+n%32==16 的部分 scale 块、k=544 的部分 ring stage）——4/4 通过；ks=1 与参考**逐位一致**，
+ks>1 因 atomicAdd 次序 rel ~5e-8（容差内）。
 
 ### swapAB parity 判据（落点：单测 + serve A/B）— 2026-09-12
 
