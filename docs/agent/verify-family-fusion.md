@@ -496,3 +496,15 @@ submit，而是 GPU 侧那一段（~3.3µs）。**融合的收益主要来自把
 *中书省 · 只读分析 + 本文档（唯一产出），未执行任何 GPU 命令、未改动任何源码。*
 *所有 ms/launch 数均标了来源（实测/推算）；未实测项集中在 §4.3 与 §6-R6。*
 *代码引用基于 HEAD `49c6fc3`；文档撰写期间该文件仍在被并行修改，行号以函数名为准。*
+
+## W2 补充：attention 族 clen_rows[m] 的具体设计（主 agent 代码分析）
+
+**当前限制**（kernels/cuda/dsv41_kernels.cu:7244/:7338）：attention kernel 体读单个 `const int* clen`——verify 的每行 clen 可能不同（行 r 的 compressor 状态在行 r-1 commit 后才确定）。
+
+**b·m grid 已就绪**：`kAttnMaxBM=8`（:1449），`g_attn_part[kAttnMaxBM][...]`（:1452）的 part buffer 已有 b·m 维，`split_c` 路径（:7274/:7364）已检查 `b*m <= kAttnMaxBM`。
+
+**改动清单**（约 3 人日）：
+1. `sparse_attn_kernel` 等 5 个 kernel 体加 `const int* clen_rows` 参数——`clen = clen_rows ? clen_rows[blockIdx.y / b] : *clen`（或统一为 clen_rows[m] 指针，eager 传同一值的数组）
+2. Rust 侧 `attention_rows` 构造 `clen_rows: [i32; VERIFY_ROWS]`（每行的 compressor len 快照）
+3. **r 绝不进 grid.y**（因果序——audit defect #2 的教训）：grid = (b, m×h)，行维度在 blockIdx.y 的低段
+4. ring/window 合核：`ring_append` 与 `window_idxs` 的 m 行批版
