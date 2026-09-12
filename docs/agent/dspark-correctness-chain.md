@@ -4182,3 +4182,25 @@ self.dev.gemm_fp8_mx_rope_norm(
 - 滞回带 [4.766, 5.266]（τ≈5.016, hyst=0.25）——**数数任务 k_acc≈5 恰好在带心！**
 - mean-k 在早期轮跳动 → **必然在某轮跨过边界** → 第 10-11 轮 = 61 token = **损坏点！**
 - 换臂改变 tap 去向/compressor 快照/commit 语义——batched 对 lazy 留下的无快照状态做 rollback → 垃圾
+
+## VERIFY_GRAPH 回放位置审查的判决（verify-graph-replay-position）
+
+**总判定：m=1 lazy 回放路径不存在"位置烧入"**——位置通过设备指针在 replay 时读取（活值）。T0 嫌疑"位置烧入"证伪。
+
+**[确认 S1] DIRECT 臂的 compress_len 双重计数**——四臂账目不对称：
+| 臂 | 镜像自增来源 | 净计数 |
+|---|---|---|
+| DRY | 仅 compress_row | +1 ✓ |
+| REPLAY | 仅 advance_compress_lens | +1 ✓ |
+| CAPTURE | advance（restore 回退后） | +1 ✓ |
+| **DIRECT** | **compress_row + advance** | **+2 ❌** |
+
+**[新发现] indexer_topk 的烧入 n_pos 守卫**（dsv41_kernels.cu:8816）：
+- 内核侧已修（*lens > 0 时设备活值覆盖烧入值）
+- **但启动器仍用宿主 n_pos 做守卫**：replay 时设备 *lens == 0（rollback 恢复后），烧入的 n_pos（捕获时 > 0）成为权威扫描界
+- **indexer_topk 扫描未写入/更早 group 的槽 → "读到更早位置的 KV" = "重置到 12"！**
+
+**S1 + indexer_topk 的联合机制**：
+1. S1 的双重计数 → mirror 超前 → compress_branch_steady 提前触发 → 图提前 engage
+2. indexer_topk 的烧入 n_pos → *lens == 0 时扫陈旧槽 → attention 读旧上下文
+3. **两个机制联合 = "重置到早期位置"的完整解释！**
