@@ -49,15 +49,19 @@
 #     performance): DSV41_TIMING=1 (the `[dsv41] step pos=` and `[dspark] steps=`
 #     lines do not exist without it) and DSV41_DSPARK_DEBUG=1 (the per-step trace).
 #
-#   DELIBERATELY NOT SET (each one would silently pick a different path):
-#     DSV41_LAZY_VERIFY    — this is the BATCHED path; lazy routes to m=1 rows.
-#     DSV41_HC_VERIFY_FUSE — pending the mrows investigation; it also carries
-#                            BF16_TRUNCATE into the verify chain (the 050c7fd
-#                            baseline-break), so it stays out of this matrix.
-#     DSV41_HC_FRONT_ROWS  — the A2 arm has the same open bf16_truncate hole
-#                            (chain_dev.rs:11404) and is not cleared to run.
-#   The script FAILS if any of those three is present in the launched serve's
-#   environment (a shell export would otherwise change the measured path).
+#   DELIBERATELY NOT SET (it would silently pick a different path):
+#     DSV41_LAZY_VERIFY    — this is the BATCHED path; lazy routes to m=1 rows,
+#                            and its v5 footprint is k_emit-dependent so the
+#                            SWALLOW pad cannot equalise it (see FORBIDDEN below).
+#   The hc pair (`DSV41_HC_VERIFY_FUSE` / `DSV41_HC_FRONT_ROWS`) USED to be on the
+#   list too. That was OUTDATED: it was written before SWALLOW was unlocked, and it
+#   described a `bf16_truncate` hole that the 2026-09-12 `truncate = false` fix in
+#   `collapse_norm_rows` closed. Manual SWALLOW runs with the hc gates ON measured
+#   58.3 tok/s with correct output (commit e7f213c), so the gates are cleared to
+#   run — but they are still OPT-IN (the `B400_HC` arm below), never in the matrix,
+#   because turning them on selects the A1+A2 verify chain rather than the shipped
+#   default. The script no longer FAILS on them; it fails only on DSV41_LAZY_VERIFY,
+#   which must never be armed alongside DSV41_SWALLOW_STEP.
 #
 # WHAT IT PRINTS (requirement 3)
 #   * the FULL 1000-token 出师表 answer;
@@ -125,7 +129,7 @@ while [ $# -gt 0 ]; do
         --no-build) BUILD=0 ;;
         --no-sync)  SYNC=0 ;;
         --dry-run)  DRY=1 ;;
-        -h|--help)  sed -n '2,90p' "$0"; exit 0 ;;
+        -h|--help)  sed -n '2,94p' "$0"; exit 0 ;;
         *) echo "error: unknown argument '$1' (try --help)"; exit 2 ;;
     esac
     shift
@@ -170,12 +174,21 @@ if [ "${B400_V5_LEDGER:-1}" = "0" ]; then
 fi
 # folded to one line for `env`-style use
 GATES_ONELINE="$(echo "$GATES" | tr '\n' ' ' | tr -s ' ')"
-# These would each silently select a DIFFERENT path than this matrix intends.
-# `DSV41_LAZY_VERIFY` is first for a second reason too: the lazy arm's v5
-# footprint is `3 + 81 * k_emit`, which is `k_emit`-dependent, so the constant
-# pad above CANNOT equalise it — lazy and SWALLOW_STEP must never be armed
-# together (design §3.3).
-FORBIDDEN="DSV41_LAZY_VERIFY DSV41_HC_VERIFY_FUSE DSV41_HC_FRONT_ROWS"
+# `DSV41_LAZY_VERIFY` is the only entry left, and it earns its place twice over:
+# this matrix IS the batched path (lazy routes to m=1 rows), and the lazy arm's v5
+# footprint is `3 + 81 * k_emit`, which is `k_emit`-dependent, so the constant pad
+# above CANNOT equalise it — lazy and SWALLOW_STEP must never be armed together
+# (design §3.3).
+#
+# HISTORICALLY the list also held `DSV41_HC_VERIFY_FUSE` / `DSV41_HC_FRONT_ROWS`.
+# Those were removed on 2026-09-12: the prohibition predated the SWALLOW unlock and
+# rested on a `bf16_truncate` leak into the verify chain that `collapse_norm_rows`'
+# `truncate = false` fix (commit 1ddff9c-era, re-verified at HEAD) closed. Manual
+# SWALLOW runs with both gates ON measured 58.3 tok/s with correct output
+# (commit e7f213c). They are NOT added to the matrix — arming them selects the
+# A1+A2 verify chain, which is a legitimate experiment but not the shipped default —
+# they ride the `B400_HC` opt-in arm below instead, exactly like the tcgen05 arm.
+FORBIDDEN="DSV41_LAZY_VERIFY"
 
 # ---------------------------------------------------------------------------
 # OPT-IN ARM: the tcgen05 e4m3 GROUPED routed gate/up (default OFF).
@@ -264,6 +277,48 @@ case "$MROWS_A" in
     b1|B1) GATES_ONELINE="$GATES_ONELINE DSV41_VERIFY_ROPE_MROWS=1" ;;
     *) echo "FATAL: B400_MROWS_A='$MROWS_A' is not a Phase A arm (b1|b2|b3); refusing to guess."; exit 2 ;;
 esac
+
+# ---------------------------------------------------------------------------
+# OPT-IN ARM: the verify-path hc chain — A1 (`DSV41_HC_VERIFY_FUSE`) + A2
+# (`DSV41_HC_FRONT_ROWS`), default OFF.
+#
+# WHY AN OPT-IN ARM AND NOT IN THE MATRIX. Same reason as the two arms above: the
+# documented batched-400 matrix is the SHIPPED configuration and it runs the raw
+# ten-launch hc chain in `layer_rows`. Arming A1/A2 selects the fused chain instead
+# — a legitimate experiment (design: 2.96 -> 1.2~1.4ms, 400 -> 160 launches/step,
+# bit-exact by construction) but NOT the shipped path, so it must be requested
+# explicitly rather than folded into `GATES`.
+#
+# WHY IT IS SAFE NOW. The two gates sat on `FORBIDDEN` because
+# `hc_verify_fuse()` routes the verify chain through `hc_collapse_norm`, which
+# reaches `DSV41_BF16_TRUNCATE` — the 050c7fd baseline-break. `collapse_norm_rows`
+# now passes `truncate = false` (`chain_dev.rs` `hc_verify_fuse()` doc), so the leak
+# is closed, and manual SWALLOW runs with both gates ON measured 58.3 tok/s with
+# correct output (commit e7f213c). The `FORBIDDEN` list no longer names them.
+#
+# ⚠️ STILL A RED-LINE ARM: `HC_VERIFY_FUSE` has a Latin-regression history
+# (`1ddff9c`). Every run of this arm MUST be judged by the script's own red lines
+# (zero Latin, 0 double-char, 先帝创业未半 present) and, for A1-b, by
+# `tests/hc_post_rows_parity` — not by the step time alone.
+#
+# THE GATE CHAIN (one serve, one arm; the two inner fusions default ON but are
+# named explicitly so a node-level `=0` export cannot silently change the arm):
+#   DSV41_HC_VERIFY_FUSE=1  (A1 total gate: collapse+norm and in-place post rows)
+#   DSV41_FUSE_B1=1         (A1 collapse half — default ON anyway)
+#   DSV41_FUSE_C=1          (A1 post half     — default ON anyway)
+#   DSV41_HC_FRONT_ROWS=1   (A2: the fused spread front end at rows = m)
+#
+# USAGE:  B400_HC=1 bash scripts/batched_400_v2.sh
+# ⚠️ The `.so` must carry `dsv41_hc_collapse_norm` / `dsv41_hc_post_inplace_rows`
+# (and `dsv41_hc_front_split` for A2). A build missing them makes the arm silently
+# fall back to the raw chain (`Ok(false)`), i.e. A/B "shows no effect" — the trap
+# the tcgen05 arm's comment warns about. A1-b additionally probes the symbol at run
+# time (`Device::supports_hc_post_inplace_rows`).
+HC_ARM="${B400_HC:-0}"
+if [ "$HC_ARM" = 1 ]; then
+    HC_GATES="DSV41_HC_VERIFY_FUSE=1 DSV41_FUSE_B1=1 DSV41_FUSE_C=1 DSV41_HC_FRONT_ROWS=1"
+    GATES_ONELINE="$GATES_ONELINE $HC_GATES"
+fi
 
 echo "== BATCHED-400 v2 (rebuilt) comprehensive run =="
 echo "-- node $NODE   arch $ARCH   port $PORT   tp $TP"
