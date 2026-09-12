@@ -481,14 +481,15 @@ fn run_cuda(
 /// --serve mode: the OpenAI-compatible HTTP/SSE API over the CUDA cluster.
 /// Same bring-up as run_cuda (cluster + fp8 bypass + concurrent resident
 /// preload), then the GpuEngine (per-seq prefill + round-robin mega-graph
-/// decode behind the ferrite-http driver) + the axum router:
+/// decode) is handed to the SHARED launcher (`ferrite_http::serve::launch`,
+/// the same driver/router/exit DSV41 serves through) with the GLM frame:
 /// POST /v1/chat/completions (stream=true → SSE chat.completion.chunk +
 /// [DONE]; false → one JSON), /v1/models, /health, /v1/stats. Concurrency:
 /// --max-seqs live requests interleaved (each ~1/N of the single-stream
 /// rate; true batched decode is the next phase — the scheduler's
 /// ExecBackend seam). Runs until ctrl-c, then process::exit(0) (no
 /// exit-time cluster drop — same reason as the one-shot path: the 1.17TB
-/// teardown segfaults).
+/// teardown segfaults; the launch options carry the CUPTI profiler stop).
 #[cfg(feature = "cuda")]
 fn run_serve(
     cfg: Glm53FlashConfig,
@@ -503,11 +504,9 @@ fn run_serve(
     direct: Option<std::sync::Arc<ferrite_model::direct::DirectView>>,
 ) -> ! {
     use ferrite_exec::tp::TpCluster;
-    use ferrite_http::api::{router, AppState};
-    use ferrite_http::driver::EngineDriver;
-    use ferrite_http::tokenizer::ChatTokenizer;
+    use ferrite_http::serve::{launch, ServeOptions};
+    use ferrite_http::tokenizer::{ChatTokenizer, GlmFrame};
     use ferrite_kernel::CudaBackend;
-    use std::sync::atomic::AtomicU64;
     use std::sync::Arc;
 
     let world = tp.max(1);
@@ -587,51 +586,26 @@ fn run_serve(
         .unwrap_or_else(|e| panic!("load tokenizer: {e}"));
     let stops = tok.stop_ids().to_vec();
 
-    // The GPU engine + the driver (one engine thread owning the cluster;
-    // HTTP on tokio — submit/cancel over mpsc, events back per request).
-    // tick_interval ZERO: the decode step is GPU-bound (~20ms/seq/step
-    // round-robin) — no pacing needed.
+    // The GPU engine (one engine thread owning the cluster) behind the SHARED
+    // launcher: ferrite-http's `serve::launch` owns the driver spawn, the
+    // router, tokio, axum and the exit — the identical wiring DSV41 serves
+    // through, so this file keeps only the engine + the frame. tick_interval
+    // ZERO: the decode step is GPU-bound (~20ms/seq/step round-robin) — no
+    // pacing needed.
     let engine = crate::gpu_engine::GpuEngine::new(cluster, stops, max_seqs);
-    let handle = EngineDriver::spawn_with(engine, std::time::Duration::ZERO);
-
-    let state = AppState {
-        handle,
-        tok: Arc::new(tok),
-        model_name: model_name.clone(),
-        req_counter: Arc::new(AtomicU64::new(1)),
-    };
-    let app = router(state);
     let addr: std::net::SocketAddr = format!("0.0.0.0:{port}")
         .parse()
         .unwrap_or_else(|_| std::net::SocketAddr::from(([0, 0, 0, 0], port)));
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime");
-    rt.block_on(async move {
-        let listener = tokio::net::TcpListener::bind(addr)
-            .await
-            .unwrap_or_else(|e| panic!("bind {addr}: {e}"));
-        println!(
-            "[serve] serving {model_name} on http://{addr}/v1/chat/completions (SSE + concurrent, max_seqs={max_seqs})"
-        );
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async {
-                let _ = tokio::signal::ctrl_c().await;
-                eprintln!("[serve] ctrl-c: shutting down");
-            })
-            .await
-            .expect("serve");
-    });
-    // NO exit-time teardown: dropping the cluster (1.17TB weights + CUDA
-    // contexts) segfaults (EXIT 139 — the one-shot path's known issue);
-    // the driver thread + its engine leak with the process instead.
-    // FERRITE_NCU: CLOSE the capture window before exit — nsys
-    // --capture-range=cudaProfilerApi waits for cudaProfilerStop and never
-    // flushes the report without it.
-    #[cfg(feature = "cuda")]
-    ferrite_kernel::cuda::profiler_stop();
-    std::process::exit(0);
+    eprintln!("[serve] max_seqs={max_seqs}");
+    // NO exit-time teardown (the launcher owns the exit): dropping the cluster
+    // (1.17TB weights + CUDA contexts) segfaults (EXIT 139 — the one-shot
+    // path's known issue); the driver thread + its engine leak with the
+    // process instead. FERRITE_NCU: the shutdown hook CLOSES the capture
+    // window before exit — nsys --capture-range=cudaProfilerApi waits for
+    // cudaProfilerStop and never flushes the report without it.
+    let opts = ServeOptions::new(addr, model_name)
+        .on_shutdown(|| ferrite_kernel::cuda::profiler_stop());
+    launch(engine, tok, Arc::new(GlmFrame), opts)
 }
 
 fn rss_gb() -> f64 {

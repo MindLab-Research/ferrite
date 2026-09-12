@@ -30,15 +30,33 @@ pub struct ServeOptions {
     /// pacing — a decode step is tens of ms), a positive value for mock/CPU
     /// engines whose tick is microseconds.
     pub tick_interval: Duration,
+    /// Optional teardown hook, run ONCE by [`launch`] immediately before
+    /// `process::exit` — for engine-side state the OS exit would otherwise
+    /// skip. GLM passes nsys/CUPTI's `cudaProfilerStop` here: nsys
+    /// `--capture-range=cudaProfilerApi` waits for it and never flushes the
+    /// report without it (the launcher owns the exit, so the hook must ride
+    /// the options — a caller cannot do it "after launch").
+    pub on_shutdown: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl ServeOptions {
     pub fn new(addr: SocketAddr, model_name: impl Into<String>) -> Self {
-        ServeOptions { addr, model_name: model_name.into(), tick_interval: Duration::ZERO }
+        ServeOptions {
+            addr,
+            model_name: model_name.into(),
+            tick_interval: Duration::ZERO,
+            on_shutdown: None,
+        }
     }
 
     pub fn paced(mut self, tick_interval: Duration) -> Self {
         self.tick_interval = tick_interval;
+        self
+    }
+
+    /// Register a teardown hook (see the field doc). Replaces any previous one.
+    pub fn on_shutdown(mut self, f: impl FnOnce() + Send + 'static) -> Self {
+        self.on_shutdown = Some(Box::new(f));
         self
     }
 }
@@ -49,8 +67,10 @@ pub fn launch<E: ServeEngine + 'static>(
     engine: E,
     tok: ChatTokenizer,
     frame: Arc<dyn ChatFrame>,
-    opts: ServeOptions,
+    mut opts: ServeOptions,
 ) -> ! {
+    // Take the teardown hook before `opts` moves into the async block below.
+    let on_shutdown = opts.on_shutdown.take();
     let handle = EngineDriver::spawn_with(engine, opts.tick_interval);
     let state = AppState {
         handle,
@@ -81,6 +101,10 @@ pub fn launch<E: ServeEngine + 'static>(
     });
     // No teardown: dropping the engine exits through the CUDA/weight destructors
     // (the documented segfault). The driver thread and the engine leak with the
-    // process by design.
+    // process by design. An engine-supplied hook runs first (e.g. CUPTI's
+    // cudaProfilerStop, which nsys waits on to flush its report).
+    if let Some(f) = on_shutdown {
+        f();
+    }
     std::process::exit(0);
 }
