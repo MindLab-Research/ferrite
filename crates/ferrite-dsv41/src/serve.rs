@@ -449,6 +449,21 @@ fn pool_rank_body(
                         dspark_steps += 1;
                         dspark_draft_ms += rep.draft_ms as f64;
                         dspark_verify_ms += rep.verify_ms as f64;
+                        // per-step token-level trace (DSV41_DSPARK_DEBUG): the
+                        // draft block vs the real next token and the verify's
+                        // argmax row — the fastest way to see whether a low
+                        // accept is a structural break (unrelated tokens) or
+                        // precision noise (neighbouring tokens).
+                        if std::env::var_os("DSV41_DSPARK_DEBUG").is_some() && rank == 0 {
+                            eprintln!(
+                                "[dspark-dbg] pos={} next={} drafts={:?} verify={:?} acc={}",
+                                pos + i,
+                                rep.next,
+                                rep.drafts,
+                                rep.verify_out,
+                                rep.accepted
+                            );
+                        }
                         if timing && rank == 0 && dspark_steps % 50 == 0 {
                             eprintln!(
                                 "[dspark] steps={} mean-accept={:.3} draft={:.2}ms verify={:.2}ms (per step)",
