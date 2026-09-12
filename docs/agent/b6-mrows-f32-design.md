@@ -479,3 +479,75 @@ draft −3 发/步（一致性为主）。判词的 −0.6~1.0ms 落在保守口
 | B 类清单 / Wave 4 gate 名 / 节省账 | `verify-eager-fusion-migration.md:186-196,208-246,308-317` |
 | draft-verify 程序不匹配（第 2 号） | `dspark-correctness-chain.md:1939-1944` |
 | 行距类根因（源行距 vs cols） | `chain_dev.rs:9802-9816`、`spec-invariants.md:72` |
+
+---
+
+## 9. 工部实施记录（2026-09-12 · Phase B 第一核 B6）
+
+**结论：B6 六件已全部落树，`cargo check --workspace` EXIT=0。** 本机无 `nvcc` / 无 `.so`
+（§0-8 口径复核：`ls kernels/cuda/*.so` = No such file，`ldconfig -p | grep cudart` = 0），
+故 CUDA 侧只到源码级；产物级验收（`nm -D`、nsys 计数、红线）一律留给远端 `build.sh 103a`
+之后的那一次 GPU 会话。
+
+| # | 交付物 | 落点 | 状态 |
+|---|---|---|---|
+| 1 | `gemm_fp8_mrows_f32_kernel<M>` + launcher `dsv41_gemm_fp8_mrows_f32` | `kernels/cuda/dsv41_kernels.cu`（紧随 `dsv41_gemm_fp8_mrows` 之后，共享 LUT/ue8m0 helper、`dsv41_mrows_warps_for`、`dsv41_smem_ceiling` 与 `>48KB` 属性阶梯） | 落树 |
+| 2 | FFI 字段 + `ko!` + `supports_gemm_fp8_mrows_f32()` + `gemm_fp8_mrows_f32(...)` | `crates/ferrite-models/src/dsv41/device.rs` | 落树 |
+| 3 | gate `wob_mrows_f32()`（`DSV41_VERIFY_WOB_MROWS_F32`，默认 OFF）+ verify 接线 | `chain_dev.rs`（`attention_rows` 的 wo_b 调用点，优先级在 `mrows` 之上，decline 时精确回落） | 落树 |
+| 4 | draft 接线（**同一 gate**，§5.1）+ 模块级 gate 副本 | `dspark_dev.rs`（`draft_attn_out`，插在 `quant1(wo)` 之前） | 落树 |
+| 5 | parity suite（§6 的六臂） | **新建** `kernels/cuda/tests_dsv41_gemm_mrows_f32.cu` | 落树（本机未编译验证） |
+| 6 | A/B arm（**接线件，不是可选项**） | `scripts/batched_400_v2.sh`：`B400_B6=1` ⇒ `DSV41_VERIFY_WOB_MROWS_F32=1`；默认 unset ⇒ `GATES_ONELINE` 逐字不变 | 落树，`bash -n` 通过 |
+
+### 9.1 实施中与设计的三处确认（读码，不凭文档转述）
+
+1. **陈旧读者已核**（B6-R4）。`attention_rows` 内 `xq_r`/`xsc_r` 的最后一次使用就是 wo_b 的那次
+   `quant_fp8` 写（`chain_dev.rs:11646-11656`），本函数到结尾（`:11714`）无读者；下一个读者
+   `indexer_front_rows`（`:11850`）**自己先 `quant_rows`** ⇒ B6 臂不写 `xq_r` 是安全的。
+   该 grep 判据已写进代码注释，便于复查。
+2. **回落链是三级不是两级**。设计的假想是 `B6 → mrows → 逐行`。写成 `if / else if` 会在
+   「gate ON 但 C 入口 decline（`Ok(false)`）」时跳过 `mrows` 直落逐行（安全但非最优）；
+   实现改为 `if !took_wob && mrows { … }`，让 decline 精确落回 `quant_fp8 + proj_mrows`。
+3. **f32 域不需要 decline `g_gemv_a32`**（§3.5 的「不 decline」条已按代码落地）：该域 a32=1 的
+   `s_af[j]` 与 a32=0 的 `a_f32[j]` 是同一个字（纯拷贝），两个 arm 都是本核的表达式。
+4. **draft 的 `a_stride = k`**：draft 的 wo_b 是 `Shard::Replicated`（紧凑 `[bs, ol_total]`），
+   与 verify 的 TP 切分（`a_stride = ol_total`、`k = ol_local`）形状不同 —— 这正是把
+   `a_stride` 做成显式参数的收益：同一个核，两种行距，调用方各说各的真话。
+
+### 9.2 验收清单（下一步 GPU 会话按此执行，缺一不算完成）
+
+```bash
+# ① 远端双产物（.cu 变了，必须先 build）
+cd kernels/cuda && bash build.sh 103a
+nm -D libferrite_kernels.so | grep -c dsv41_gemm_fp8_mrows_f32     # 必须 >= 1
+# ② parity（两次运行覆盖 arm 5 的 gate 不变性）
+nvcc -gencode arch=compute_103a,code=sm_103a -O3 --use_fast_math -std=c++17 \
+     -o /tmp/t32 tests_dsv41_gemm_mrows_f32.cu
+CUDA_VISIBLE_DEVICES=<free> /tmp/t32
+DSV41_GEMV_A32=1 CUDA_VISIBLE_DEVICES=<free> /tmp/t32
+# ③ A/B：一 gate 一 serve、一 prompt 一 serve、交错 A B A B、V5_LEDGER=0（吞吐轮）
+bash scripts/batched_400_v2.sh                      # A 臂（基线）
+B400_B6=1 bash scripts/batched_400_v2.sh            # B 臂
+# ④ 上场证据（唯一硬证）：nsys 核名 + launch 计数
+#    * nsys sum 表出现 `gemm_fp8_mrows_f32_kernel`，计数 ≈ 40 + 3/步
+#    * `dsv41_quant_fp8` 的 wo_b 调用数**归零**（gate 不变性判据）
+#    * 反向：`proj_mrows`(wo_b) 那一路 Instances/步 40 → 0
+# ⑤ 红线（B6 非位等价，走红线不走 memcmp）：
+#    * 计数 prompt 的数字顺序 + 出师表零拉丁 / 无双字 / `先帝创业未半`
+#    * `k_acc` 直方图 mode 不降；`ar5-hang=0`；0 panic
+# ⑥ env 实读防幻影门：
+tr '\0' '\n' < /proc/$(pgrep -x ferrite-serve|head -1)/environ | grep DSV41_VERIFY_WOB_MROWS_F32
+```
+
+**预期**（设计口径，未兑现前不得计入阶梯）：verify −200~−240 发/步 ⇒
+**−0.66ms（@3.3µs）~ −1.5ms（@6.2µs）**；draft 另省 3 发/步（一致性为主）。
+止损线照 §5.2：`|Δsteady_median| < 0.8ms` ⇒ 判 instruction-bound，记录并转下一项（B5）。
+
+### 9.3 未做（明确不在本次范围）
+
+* **EAGER 的 m=1 也切到本核**（§5.4 的可选项）：数值上是 no-op（同程序同 grid），但要让代码路径
+  字面一致需单独 A/B，默认不做。
+* **B5 / B4**：仍缺核（`ferrite_gemv_bf16_v2_mrows_route` / `dsv41_rmsnorm_rope_mrows`），
+  按 §4 的序排在 B6 之后；B5 的父本是既有的 `gemv_bf16_v2_mrows`，B4 必须接 `kv_stream`
+  （否则静默把 kv 半链拖回主流、抵消 FORK）。
+
+*工部 · 本段为实施记录；CUDA 侧只到源码级（无 nvcc/GPU），验收只到 `cargo check --workspace` EXIT=0 + `bash -n`。*
