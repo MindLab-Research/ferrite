@@ -4458,10 +4458,17 @@ impl<'a> DevChain<'a> {
             a_raw,
             qw,
             eps,
-            // In place: the same address `norm_rows(qr_r, q_norm, qr_r, ...)`
-            // wrote. `a_raw`'s buffer is a `DevBuf` (mutable device memory); the
-            // const/mut split is only the caller's read-side view of it.
-            a_raw as *mut f32,
+            // FIX (k1k2-prereview defect #1): the write-back MUST be null. The
+            // kernel's segment-1 prologue runs in EVERY block (each block needs
+            // its own s_a/s_as for its 32 rows), so an in-place write-back races
+            // block A's read of `a_raw` against block B's write of the SAME
+            // address (128 blocks are concurrently resident at n=4096) — a
+            // non-deterministic RAW/WAR hazard, and 128× the design's write
+            // volume (640KB/layer of redundant stores = the 9.2 tok/s cliff).
+            // The normalisation is handed back to the follow-up `norm_rows`
+            // launch instead (the caller no longer skips it), which writes each
+            // element exactly once — byte-identical to today's baseline.
+            std::ptr::null_mut(),
             w.as_u8(),
             ws.as_u8(),
             std::ptr::null(),
@@ -10083,10 +10090,14 @@ impl<'a> DevChain<'a> {
         // R2b: skipped when the fused wq_b left `qr_r` raw and the indexer
         // consumes it that way (see `qr_raw_r` above); `m == 1` on that arm, so
         // there is no second row whose normalisation anything could need.
-        // K2: also skipped — its fused launch already wrote the normalised rows
-        // back into `qr_r`, so normalising again would be a second pass over an
-        // already-normalised row (see `k2_took`).
-        if !qr_raw_r && !k2_took {
+        // FIX (k1k2-prereview defect #1, part 2): K2 no longer writes the
+        // normalised rows back (qr_norm_out = null above), so the follow-up
+        // `norm_rows` launch MUST run even when `k2_took` — it is what puts the
+        // normalised `qr_r` in place for the indexer's q half, exactly as the
+        // baseline's four-launch sequence did. This restores the "each element
+        // written exactly once, by one launch" invariant the in-place write-back
+        // broke.
+        if !qr_raw_r {
             self.norm_rows(
                 self.s.qr_r.ptr as *const f32,
                 ld.q_norm.as_ref().unwrap().as_f32(),
