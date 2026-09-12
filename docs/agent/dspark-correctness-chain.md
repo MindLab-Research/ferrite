@@ -5421,3 +5421,26 @@ pub fn epoch_dev(&self) -> *mut std::ffi::c_uint {
 **判定**：CNORM_SPLIT **中性**（不带来收益）——保持 OFF。L4-9 的 +0.5-1% 预期没有兑现。
 
 **干净栈确认**：91.1-91.4 tok/s（control 的 91.4 与之前的 91.1 一致——基线稳定！）
+
+## 🎯 第 11 次修复（动态 pad）测试结果——0 hang 但 epoch 仍冻结！
+
+**结果**（e90b54b2）：
+- **0 ar5-hang** ✓✓✓（**10 次失败后首次零 hang！**动态 pad 消除了死锁！）
+- **epoch 仍在 54**（delta=0——与第 10 次相同！）
+- v5-ledger：pos=16 所有 rank epoch=1328（同步）→ 第一次 swallowed 步后 epoch=54
+- **k_emit=4**（SWALLOW 臂在运行，4 个 draft 被接受！）
+- **但输出只有 "1 2 3 4 5 6"（6 token 后停止！）**
+- 吞吐 37.4 tok/s（慢——host 同步开销）
+
+**关键分析**：
+1. **epoch 从 1328 均匀降到 54**——所有 rank 一起降（不是分歧！）
+2. **动态 pad 无法修复均匀降级**——max=54，没有落后者可 pad
+3. **0 hang 的原因**：所有 rank 都在 54（同步）——AR 可以工作（即使 epoch 值"错"）
+4. **生成 6 token 后停止**：可能与 epoch=54 有关（AR 的内部状态混乱）或 SWALLOW 的 commit 问题
+
+**epoch=54 的谜**：
+- 不是写入（所有写入都是 e+1）
+- 均匀降级（所有 rank 一起）
+- **可能是 staging 的 rollback/恢复**——SWALLOW 的 snapshot 恢复了早期状态？
+
+**判定**：动态 pad 解决了 hang（0 ar5-hang！）但没解决 epoch 降级。下一步：找 epoch 54 的来源。
