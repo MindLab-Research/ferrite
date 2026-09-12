@@ -1426,3 +1426,27 @@ DSV41_EXPERT_ACT_E4M3=1 DSV41_EXPERT_TCGEN05_E4M3=1 DSV41_EXPERT_GROUPED=1 DSV41
 **mrows decline 日志**：只有 VERIFY_HEAD 和 ATTN_MROWS 有日志，其余 5 个 gate 静默。
 
 **tcgen05 的两个独立阻塞**：E4M3=1 排除 mxf4 arm；EXPERT_ILV 默认 ON 但需要 !ilv。
+
+## Session 状态快照（batched 400 v2 等待中，上下文即将耗尽）
+
+### 已确认的成就
+1. **零拉丁** ✓ — DSV41_BF16_TRUNCATE=1
+2. **基线修复** ✓ — HC_VERIFY_FUSE 默认 OFF + A1/A2 truncate 修复
+3. **accept +19%** ✓ — P0-3+P1-5 = 1.214（最佳组合，追加杠杆退化）
+4. **所有 P0 审计** ✓ — 5 个严重缺陷全部发现和修复/回退/gated
+5. **大量优化已提交** — 全套 mrows + tcgen05 + 图化 + hc 接线 + AR 折叠
+
+### batched 400 v2 的预期（post-batched-analysis 校准）
+- 步时 35-42ms（不是 10ms）——mrows 仅 -1.21ms、graph 仅 -1.5ms
+- 400 的差距：需要 verify 从 37ms → 9ms（4×压缩）——当前架构下极难
+- 关键阻塞：tcgen05（-6.8ms）被 E4M3/ILV/GATEUP_FUSE 三重阻塞
+
+### 下一步的决策树
+- **如果 400 不可达**（verify 地板 >15ms）：聚焦最大可达吞吐（可能 150-200 tok/s）+ 继续 accept 优化
+- **如果 tcgen05 解锁**（-6.8ms）：verify ~28ms → 步时 ~32ms → @accept 3 = 125 tok/s（仍不是 400）
+- **400 的根本路径**：verify 族级融合（6224→1300 发）+ tcgen05 + accept 3 = 可能但仍需大量工作
+
+### 用户校准
+- accept 2-3（上限 ~3）
+- 400 需要 accept 近上限 + 步时 ≤10ms
+- 当前 accept 1.214 + 步时 ~35ms = 最大的差距在步时
