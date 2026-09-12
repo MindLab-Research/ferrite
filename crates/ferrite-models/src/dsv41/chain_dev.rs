@@ -2842,19 +2842,22 @@ impl<'a> DevChain<'a> {
             // (duplicate-id) table and costs 55 KB at n_routed = 384. Sized for
             // the worst case so a malformed table truncates nothing — the
             // kernel's `j < m_cap` guard is then unreachable belt-and-braces.
-            grp_counts: dev.alloc(4 * n_exp)?,
-            grp_starts: dev.alloc(4 * (n_exp + 1))?,
-            grp_rows: dev.alloc(4 * n_exp * (VERIFY_ROWS * topk))?,
-            grp_slots: dev.alloc(4 * n_exp * (VERIFY_ROWS * topk))?,
-            grp_perm: dev.alloc(4 * VERIFY_ROWS * topk)?,
-            grp_src: dev.alloc(4 * VERIFY_ROWS * topk)?,
-            grp_active: dev.alloc(4 * n_exp)?,
+            // Every capacity comes from the `grp_*` helpers above, which the
+            // launch site reads back: the two MUST agree or a launch writes past
+            // the block.
+            grp_counts: dev.alloc(4 * grp_n_experts(cfg))?,
+            grp_starts: dev.alloc(4 * (grp_n_experts(cfg) + 1))?,
+            grp_rows: dev.alloc(4 * grp_n_experts(cfg) * grp_m_cap(cfg))?,
+            grp_slots: dev.alloc(4 * grp_n_experts(cfg) * grp_m_cap(cfg))?,
+            grp_perm: dev.alloc(4 * VERIFY_ROWS * grp_topk_max(cfg))?,
+            grp_src: dev.alloc(4 * VERIFY_ROWS * grp_topk_max(cfg))?,
+            grp_active: dev.alloc(4 * grp_n_experts(cfg))?,
             grp_nactive: dev.alloc(4)?,
             // One gathered row per ASSIGNMENT (m * topk), not per row: an
             // expert's operand block has to be contiguous, and a row's topk
             // slots normally go to topk different experts.
-            grp_xq: dev.alloc((VERIFY_ROWS * topk * dim).max(8))?, // e4m3 bytes
-            grp_xsc: dev.alloc(fb(VERIFY_ROWS * topk * dim / 32 + 8))?,
+            grp_xq: dev.alloc((VERIFY_ROWS * grp_topk_max(cfg) * dim).max(8))?, // e4m3 bytes
+            grp_xsc: dev.alloc(fb(VERIFY_ROWS * grp_topk_max(cfg) * dim / 32 + 8))?,
             // `dim` bytes per row covers both activation formats: the packed fp4
             // arm uses `dim/2`, the DSV41_EXPERT_ACT_E4M3 arm exactly `dim`.
             xq4_r: dev.alloc((VERIFY_ROWS * dim).max(8))?,
@@ -9792,6 +9795,140 @@ impl<'a> DevChain<'a> {
     ///
     /// The routing itself IS multi-row: the gate is the same M=1 bf16 GEMV `moe()`
     /// runs (once per row), and `route_topk` has a native `rows` dimension.
+    ///
+    /// # Grouped (permuted) routing — DSV41_EXPERT_GROUPED
+    ///
+    /// Build the expert-major form of `route_idx_r[m][topk]` and gather the
+    /// activation rows into it. This is the PRECONDITION of the expert-centric
+    /// dense GEMMs (`dsv41_expert_gemm_e4m3_ext` covers ONE expert per launch
+    /// over a dense row block); see `kernels/cuda/dsv41_route.cu` for the layout
+    /// contract and docs/agent/grouped-routing-design.md for the design.
+    ///
+    /// Returns `Ok(true)` when the layout is LIVE in `s.grp_*`: the gate is
+    /// armed, the `.so` carries the `dsv41_route_*` set, and the gather landed.
+    /// Every other outcome returns `Ok(false)` after a one-shot notice, so the
+    /// caller keeps the proven per-(row, slot) launches. Three rules drive that
+    /// shape:
+    ///   * the step must NEVER fail because of this arm (it is an optimisation,
+    ///     and `Ok(false)` is the fallback contract every other arm here uses);
+    ///   * an armed gate must NEVER silently measure the old path (this
+    ///     project's #1 trap), hence the notice;
+    ///   * it must NEVER produce a number the ungrouped path would not, so the
+    ///     movers are pure copies and the table they consume is the one
+    ///     `route_topk` just wrote.
+    ///
+    /// `row_bytes` is the activation's packed row pitch IN BYTES: `dim` for the
+    /// e4m3 arm (one byte per value, the format the e4x kernel eats) and `dim/2`
+    /// for the fp4 nibble packing. The scales are always one f32 per 32 values.
+    ///
+    /// ⚠️ NOT YET USED BY A GEMM. The layout and both movers are wired, but the
+    /// per-expert dense GEMM call is not issued yet: at this engine's shapes
+    /// (`m <= VERIFY_ROWS = 6`, `topk = 6`, `n_routed = 384`) the per-expert row
+    /// count is O(1), while `e4x_launch_gemm` requires `rows % 128 == 0`, so a
+    /// per-expert launch would pad 1-3 real rows out to 128 — 40x+ the tensor-core
+    /// work of the per-(row, slot) launches it replaces. Unlocking the -6.8ms
+    /// needs the GROUP-INDEXED MASKED kernel (a grid over m-tiles with a group
+    /// table, DeepGEMM's `m_grouped_gemm_nt_masked`), which is a separate
+    /// deliverable. Until then this arm is a numeric no-op BY CONSTRUCTION, and
+    /// says so.
+    fn moe_route_grouped(
+        &mut self,
+        m: usize,
+        topk: usize,
+        n_routed: usize,
+        row_bytes: usize,
+    ) -> Result<bool> {
+        if !expert_grouped() {
+            return Ok(false);
+        }
+        let so_has = self.dev.supports_route_group();
+        if !so_has {
+            expert_grouped_skipped_note(
+                "the loaded .so has no `dsv41_route_group` / `dsv41_route_gather_rows` / \
+                 `dsv41_route_scatter_rows` set (rebuild kernels/cuda: bash build.sh 103a)",
+                false,
+            );
+            return Ok(false);
+        }
+        // Capacity guard: every grouped buffer is sized from the `grp_*` helpers
+        // at allocation time, and a runtime shape past them would be an
+        // out-of-bounds WRITE inside a graph. Refuse loudly instead — the
+        // ungrouped path is always available.
+        if n_routed > grp_n_experts(self.cfg)
+            || topk > grp_topk_max(self.cfg)
+            || m > VERIFY_ROWS
+            || row_bytes == 0
+            || (row_bytes % 16) != 0
+        {
+            expert_grouped_skipped_note(
+                "the block is outside the grouped-router buffers' allocated capacity \
+                 (see grp_n_experts / grp_topk_max / grp_m_cap in chain_dev.rs), or the \
+                 activation row pitch is not a multiple of 16 bytes",
+                true,
+            );
+            return Ok(false);
+        }
+        let n_assign = m * topk;
+        let m_cap = grp_m_cap(self.cfg);
+        let sc_row_bytes = (row_bytes / 32) * 4; // one f32 scale per 32 values
+        // 1. the layout. Pure index work: counts, the prefix sum, both
+        //    directions of the permutation and the compact live-expert list.
+        let built = self.dev.route_group(
+            self.s.route_idx_r.ptr as *const i32,
+            self.s.grp_counts.ptr as *mut i32,
+            self.s.grp_starts.ptr as *mut i32,
+            self.s.grp_rows.ptr as *mut i32,
+            self.s.grp_slots.ptr as *mut i32,
+            self.s.grp_perm.ptr as *mut i32,
+            self.s.grp_src.ptr as *mut i32,
+            self.s.grp_active.ptr as *mut i32,
+            self.s.grp_nactive.ptr as *mut i32,
+            m as i32,
+            topk as i32,
+            n_routed as i32,
+            m_cap as i32,
+        )?;
+        if !built {
+            expert_grouped_skipped_note(
+                "the `.so` exposes `dsv41_route_group` only partially",
+                true,
+            );
+            return Ok(false);
+        }
+        // 2. the activation gather. Byte-verbatim: `grp_xq[g]` IS the e4m3 row
+        //    of the assignment at grouped position `g`, so an expert's operand
+        //    block is `grp_xq + starts[e] * row_bytes` and holds exactly the
+        //    bytes the per-(row, slot) path would have fed that expert.
+        let gathered = self.dev.route_gather_rows(
+            self.s.xq4_r.as_u8(),
+            self.s.xsc4_r.as_f32(),
+            self.s.grp_xq.as_u8() as *mut u8,
+            self.s.grp_xsc.ptr as *mut f32,
+            self.s.grp_src.ptr as *const i32,
+            n_assign as i32,
+            topk as i32,
+            row_bytes as i32,
+            sc_row_bytes as i32,
+        )?;
+        if !gathered {
+            expert_grouped_skipped_note(
+                "the `.so` exposes `dsv41_route_gather_rows` only partially",
+                true,
+            );
+            return Ok(false);
+        }
+        // The layout is live. The per-expert GEMM that consumes it is the next
+        // step (see the ⚠️ note above): say so once rather than let an operator
+        // believe the grouped GEMM is running.
+        expert_grouped_skipped_note(
+            "the grouped layout is built but the per-expert dense GEMM is not issued yet \
+             (rows % 128 == 0 in e4x_launch_gemm vs O(1) rows per expert at m <= 6; the \
+             group-indexed masked kernel is the missing piece)",
+            true,
+        );
+        Ok(true)
+    }
+
     fn moe_rows(&mut self, layer: usize, ld: &LayerDev, m: usize) -> Result<()> {
         let cfg = self.cfg;
         let dim = cfg.dim;
@@ -9971,6 +10108,17 @@ impl<'a> DevChain<'a> {
                     true,
                 )?;
             }
+            // ---- GROUPED (permuted) routing (DSV41_EXPERT_GROUPED) --------------
+            // The e4m3 activation bytes are now in `xq4_r` for all m rows, so this
+            // is the one point where the grouped layout can be built AND filled.
+            // `moe_route_grouped` is a pure PREPROCESSING step: it indexes and
+            // copies, never computes, and it declines (`Ok(false)`) into a no-op
+            // when the gate is OFF or the `.so` lacks the `dsv41_route_*` set —
+            // the `if` below therefore reads like every other optional arm here.
+            // It does NOT replace the launches below: the per-expert dense GEMM is
+            // the next step (see `moe_route_grouped`'s ⚠️ note).
+            let row_bytes = if e4m3 { dim } else { dim / 2 };
+            let _grouped = self.moe_route_grouped(m, topk, n_routed, row_bytes)?;
             // ---- tcgen05 e4m3 DENSE-TILE gate/up (tc5::e4x) ----------------------
             // `dsv41_expert_gemm_e4m3_ext` is the e4m3 twin of the masked M=128
             // tile GEMM (`mxf4_gemm_kernel`): the M = ACTIVATION ROWS form, i.e.

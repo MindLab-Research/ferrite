@@ -218,5 +218,62 @@ hc 链真正搬的字节            388.3 MB/步
 
 ---
 
+## 7. 接线落地（A1 + A2 已实现，2026-09-12）
+
+本波是**实现**（工部 §5 的 A1/A2），落点与 §3 的方案一致，但 launch 账要按 verify 的真实
+形态修正一条（见 7.3）。GPU 未跑，全部为源码级论证 + `cargo check`。
+
+### 7.1 落点（`chain_dev.rs`）
+
+| 项 | 位置 | 改动 |
+|---|---|---|
+| A1-a | `collapse_norm_rows()`（新，`layer_rows` 上方） | `hc_collapse` + `norm_rows` → **`hc_collapse_norm(rows = m)`**，落在 `s.xn_r`（`s.x_r` 仅剩 fallback 用途）；`hc_done` 为真时整段跳过（EARLY 已折） |
+| A1-b | `hc_post_rows()`（新） | `hc_post` + `memcpy_d2d(h_r ← h2_r)` → **`hc_post_inplace_rows(rows = m)`**（新 C 入口）；`hc_tail_join()` 移进该函数，紧跟消费点之前（与 `layer()` 同契约） |
+| A2 | `hc_mixes_auto()` 签名 + `layer_rows` 两处前置 | 形参从 `pre_slot: usize` 改为**显式 5 个 buffer 指针 + `rows: usize`**（`x` / `pre_out` / `post_out` / `comb_out`），行数从硬编码 `1` 变可传；persist 两臂加 `rows == 1` 前置（多行只走 split 或 `hc_front`）；`layer()` 两个调用点传单行 slot + `rows = 1` |
+
+新增 C 入口 `dsv41_hc_post_inplace_rows(res, x, post, comb, rows, n, h, s)`
+（`dsv41_kernels.cu`，`hc_post_inplace_rows_kernel`，`grid = (h4/256, rows)`）：单行入口
+保持独立符号与独立 codegen（decode 路径字节不变），新符号**可选加载**——`.so` 未重编时
+`supports_hc_post_inplace_rows()` 为假，自动回落到 staging 对。
+
+### 7.2 gate 清单
+
+| gate | 默认 | 作用 |
+|---|---|---|
+| `DSV41_HC_VERIFY_FUSE` | **ON** | A1 总闸；`=0` 回到接线前的原始 10 发链（同二进制 A/B 臂） |
+| `DSV41_FUSE_B1` | ON | A1-a 的内层条件（沿用 decode 的臂）；关掉它 ⇒ 退回 `hc_collapse` + `norm_rows`，**且 EARLY 一定不做 collapse**，故此时 `collapse_norm_rows` 无条件跑那对 |
+| `DSV41_FUSE_C` | ON | A1-b 的内层条件；`=0` ⇒ 退回 `hc_post` + copy |
+| `DSV41_HC_FRONT_ROWS` | **OFF** | A2 总闸（多行走 `hc_mixes_auto`）。默认 OFF：这一臂改动最大、且无 GPU 侧 A/B |
+| `DSV41_HC_FRONT` / `_TAIL_SPLIT` / `_DL_*` | ON | A2 内部沿用 decode 的既有 gate；任一拒绝 ⇒ `hc_mixes_auto` 回落 `hc_mixes(rows = m)`（= 今天的行为） |
+| `DSV41_BF16_TRUNCATE` | OFF | A1-a/A2 的 EARLY 都带 `truncate`；**接线后 verify 才第一次尊重这个 gate**（旧原始链静默忽略） |
+
+### 7.3 launch 账（修正 §5 的 160）
+
+| 形态 | 每侧 | 每步（40 层 × 2 侧） | 说明 |
+|---|---:|---:|---|
+| 接线前 | 5 | **400** | `hc_mixes` + `hc_collapse` + `norm_rows` + `hc_post` + copy |
+| A1 | 3 | **240** | −160 发（−0.48ms@3µs）＋ kernel 侧少一趟 `x_r` 往返与 0.82MB copy |
+| A1+A2 | 3 | **240** | **发数不变**：`hc_front_split` 自身是 2 发（EARLY on `side` + dots/LATE 合并 on `dl`），抵掉 `hc_mixes` + `hc_collapse_norm` 的 2 发；A2 的收益在 **main 路径**：dots（H1 的 ~7.8µs/侧/层）与 LATE 的 sinkhorn 跑到 `dl` 上，被投影段遮住 ⇒ **≈ −0.6ms/步**，另 dots 网格从 5 块变 `mix×rows = 120` 块 |
+| +AR 折叠（未做） | 2 | **160** | §3-A2 的「hc_post 折进 AR 尾」在 verify 侧还没有 rows 版入口（`ferrite_p2p_ar_v5_hcpost*` 是单行 decode 契约），要另开一波 |
+
+⇒ 本波预期 **2.96 → ~2.3ms（A1）→ ~1.7ms（A1+A2）**；§5 的 ~1.3ms 还包含 AR 折叠那一臂。
+
+### 7.4 位等价与待验
+
+- A1-a/A1-b：都是**逐语句同构**（`hc_collapse_norm` 与 collapse+norm 同 `fmaf` 链序与同一归约树；
+  新多行 inplace 核与单行核同 `__fmaf_rn` 升 k 链、同「一线程独占一个 4-float 列」的别名安全论证，
+  仅多一层 row base）。
+- A2：EARLY/dots/LATE 三段都是既有核的逐句照抄，且 `hc_front_split` **本来就带 rows**（`blockIdx.x/y = r`、
+  `pre[r*hc]`/`post`/`comb[r*hc*hc]`/`out[r*dim]`、`g_hc_part[r][*]`）——缺口确实只在 Rust 侧把行数写死成 1。
+  **唯一形态差异**：T1 的 fp8 发射在 tail 核里是单行布局（`xq[c]`，无 row base），所以多行调用传
+  `xq = xsc = null`，`attention_rows` 仍用 `quant_rows` 自己量化 `xq_r`/`xsc_r`（少一次白写的 fp8）。
+- H3 已落成可跑的测试：`crates/ferrite-dsv41/tests/hc_post_rows_parity.rs`（rows=5 in-place ↔
+  `hc_post`+copy、↔ m 次单行 `hc_post_inplace`、↔ 单行入口在 rows=1，三条都断言逐位相等；无 GPU 时自动 skip）。
+- 仍待 GPU：H1/H2/H3 实测，以及 `DSV41_VERIFY_GRAPH=1`（整步捕获）下的 side-stream 事件配对——
+  split 的 record/wait 保持相邻配对（kernel 头注释写死的要求），decode 的 `DSV41_GRAPH_STEP` 已在同一
+  结构下跑通，但 verify 图臂本身没上过 GPU，**建议 A2 与 verify 图先不同时开**。
+
+---
+
 *工部 · 只读分析，未改动任何代码；本文件为唯一产出。*
 *字节按 `configs/dsv41_flash.json` 的真实 shape 推导；时间数凡非实测者均已标注来源。*

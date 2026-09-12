@@ -1113,7 +1113,7 @@ impl<'a> DsparkDev<'a> {
         // the reference does (`dspark_attention` with start_pos == 0).
         if pos == 0 {
             for s in 0..cfg.n_mtp_layers {
-                self.seed_window(s, pos)?;
+                self.seed_window(s, pos, false)?;
             }
             return Ok(());
         }
@@ -1477,7 +1477,7 @@ impl<'a> DsparkDev<'a> {
         // directly, which under the old (anchor == t0) timing happened to be
         // the same position; under the official timing it must shift back one.
         debug_assert!(pos > 0, "draft_forward: the anchor is never at pos 0");
-        self.seed_window(s, pos - 1)?;
+        self.seed_window(s, pos - 1, false)?;
 
         // ---- q = wq_b(q_norm(wq_a(x))) with RoPE at the draft positions ----
         // D1 fix (audit-ffi-args): quantise ALL bs rows — the historical call
