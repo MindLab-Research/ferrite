@@ -5483,3 +5483,29 @@ epoch 1328 → 54（第一次 swallowed 步的均匀降级）
 - **最强假设**：SWALLOW 步使用了**不同的 epoch 计数器**（不同的 Collective 或不同的 ctr_at 偏移）——54 是那个计数器的值！
 
 **验证方法**：epoch54-source-and-stop 的调查——是否有多个 Collective 或 ctr_at 变化
+
+## 🎯 最终干净栈（91.1）的 nsys per-kernel 完整数据（32e15cc4）
+
+**配置**：23 个 gate 的最终干净栈 + AR_V5=0（nccl）+ 计数 1-100
+
+| 排名 | Time% | 总时间(ms) | 实例数 | 平均(μs) | Kernel | 对比基线 |
+|---|---|---|---|---|---|---|
+| 1 | **27.1%** | 49.8 | 933 | 53.4 | **p2p_ar_pubred_v5_hcpost** | ↑ 从 13.2%（AR 因子数增加？）|
+| 2 | 19.0% | 35.0 | 15,744 | 2.2 | **interleave_gateup_fp4** | ↑ 从 25.1%（更多实例）|
+| 3 | 18.5% | 34.1 | 2,871 | 11.9 | **gemm_fp8_gemv** | ↑ 从 24.0% |
+| 4 | 7.8% | 14.3 | 934 | 15.3 | hc_dots_late | ↓ 从 10.1%（R2 效果）|
+| 5 | 5.2% | 9.5 | 467 | 20.4 | expert_gemv_fp4_batched | ↓ 从 6.9% |
+| 6 | 4.4% | 8.2 | 467 | 17.5 | expert_gemv_fp4_down_reduce | ↓ 从 6.1% |
+| 7 | 4.2% | (截断) | | | (下一项) | |
+
+**关键发现**：
+1. **AR（#1）从 13.2% → 27.1%**——AR 成为了最大项！原因：多行 AR（hcpost_rows）+ R2 的 m=1 臂有更多 AR 轮
+2. **interleave_gateup_fp4（#2）**：15,744 实例 × 2.2μs——MoE 的 interleave 仍然显著
+3. **gemm_fp8_gemv（#3）**：R2 的 lin2/lin_rope_norm 走这个 kernel
+4. **hc_dots_late（#4）从 10.1% → 7.8%**——R2 的融合效果可见
+5. **expert_gemv_fp4（#5+#6）从 13% → 9.6%**——MARKOV 的效果
+
+**L4/L5 的优化目标**（从新分布推导）：
+1. **AR（27.1%）**——最大目标：AR 等待减少（A4 修复）或 AR 轮次减少
+2. **MoE interleave（19%）**——tcgen05（替换三件套）
+3. **gemv（18.5%）**——R2 已做大部分；剩余是其他投影
