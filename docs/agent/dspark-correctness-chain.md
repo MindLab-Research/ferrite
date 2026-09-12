@@ -1844,3 +1844,18 @@ DSV41_LAZY_VERIFY=1 DSV41_VERIFY_GRAPH=1
 **修复**（ar5-hang-fix subagent 实施中）：
 1. argmax_sliced_rows 加 capturing 守卫（与 MoE AR 同规则）
 2. DRY 分支加 host barrier（与 replay/capture 一致）
+
+## tcgen05 手动冒烟结果（f15ecd37）——不 crash 但空输出
+
+**结果**：SURVIVED ✓（serve 不崩）但 **LEN=0（空输出）**
+
+**日志**：`[single-flight] engine fault: config error: rank 6: config error: sync: misaligned address`
+
+**根因**：rank 6 的 "misaligned address"——tcgen05 kernel 的指针对齐问题（可能是 b_split 双池的间接寻址在某个 rank 上的偏移不 16B 对齐，或 gather/scatter 的行距不对齐）
+
+**判定**：
+- tcgen05 kernel 不 crash（重要里程碑——调度链 5 gate 全通过）
+- 但数值路径有对齐错误（misaligned address → CUDA sync error → 空输出）
+- 需要调查 b_split/gather 的指针对齐（tcgen05-test-analysis 预测的两个 [OPEN] 解码猜测之一可能就是根因）
+
+**下一步**：tcgen05 的对齐修复是 kernel 级工作（需要读 dsv41_experts_mxf4.cu 的 e4x 块）——不阻塞当前 400 路径（tcgen05 是性能优化，不是正确性）
