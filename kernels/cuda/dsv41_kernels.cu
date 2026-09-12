@@ -5057,13 +5057,50 @@ gemm_fp8_mrows_kernel(const uint8_t* __restrict__ a, const float* __restrict__ a
     // is what the launcher guarantees).
     const int row = blockIdx.x * nwarps + warp;
     const bool active = row < n;
+    // cp.async 16B weight staging (2026-09-12, verify-family-fusion finding #1).
+    //
+    // WHAT IT REPLACES. The row used to be staged by `for (i = lane; i < k;
+    // i += 32) row_s[i] = wr[i]` -- one BYTE per lane per iteration, i.e. 32 B
+    // moved per warp-issue where the m=1 prologue moves 512 B (32 lanes x 16 B).
+    // SIXTEEN times the instructions for identically the same bytes, and that is
+    // why folding the m-fold weight traffic into this kernel bought nothing: the
+    // staging it was supposed to amortise was the cost. The mechanism is the
+    // m=1 prologue's, verbatim (`dsv41_cp_async16` issue, commit, wait_all,
+    // __syncwarp -- see the P3 block above), so the two kernels stage a row by
+    // the same rule.
+    //
+    // NUMERICS -- staging does not touch a value. The staged slot is filled with
+    // the same bytes from the same global address as the scalar loop wrote (the
+    // loop it replaces was a pure copy: `row_s[i] = wr[i]`, no arithmetic), and
+    // the consume loop below reads only that slot. cp.async is a copy engine
+    // detail; the K walk (`kb` ascending, `j = kb*32 + lane`), the `acc[r] +=
+    // av * wv` chain and the `shfl_xor` tree are untouched, so every output bit
+    // is identical to the scalar-staged launch (and to the m=1 decode of the
+    // same row, per the kernel header's C1-C6).
+    //
+    // ALIGNMENT (cp.async.cg needs a 16B-aligned global+smem pair). The launcher
+    // rejects `k & 31`, so `k` is a multiple of 32 and every row offset
+    // `row * k` is 16B-aligned in global memory; `row_s = s_w + warp * k` is
+    // likewise 16B-aligned off the dynamic-smem base, exactly as the m=1
+    // prologue's `pf_s = s_w + warp * k` already relies on (line ~4398). No
+    // interleaved / non-aligned weight pointer reaches this kernel -- the ABI
+    // above is the plain `w[n, k]`.
     if (active) {
         const uint8_t* __restrict__ wr = w + (size_t)row * (size_t)k;
         uint8_t* __restrict__ row_s = s_w + (size_t)warp * (size_t)k;
-        for (int i = lane; i < k; i += 32) row_s[i] = wr[i];
+        const int n16 = k >> 4;
+        for (int i = lane; i < n16; i += 32) dsv41_cp_async16(row_s + (i << 4), wr + (i << 4));
+        // k % 16 tail: unreachable for every launcher (all reject `k & 31`),
+        // kept so the row is staged by exactly the rule the m=1 prologue uses.
+        for (int i = (n16 << 4) + lane; i < k; i += 32) row_s[i] = wr[i];
+        dsv41_cp_commit();
     }
+    // The transfer overlaps the tail warps' barrier wait; only the warps that
+    // issued a copy need to retire it, and `active` is uniform within a warp.
     __syncthreads();
     if (active) {
+        dsv41_cp_wait_all();
+        __syncwarp();
         const uint8_t* __restrict__ wsr = w_scale + (size_t)(row >> 5) * (size_t)nb_k;
         float acc[M];
         #pragma unroll
@@ -8082,10 +8119,19 @@ extern "C" int dsv41_hc_post_inplace(float* res, const float* x, const float* po
 // result was a one-ulp shift that flipped preambles. Everything that can be
 // pinned is pinned; anything left to the compiler must be settled by the parity
 // test, not by reading the source.
+//
+// DSV41_BF16_TRUNCATE (`truncate`, default OFF) rounds the collapsed row back to
+// bf16 before the norm consumes it, reproducing the official `hc_pre`'s
+// `y.to(x.dtype)` (`ref_inference/model.py:957-960`). The official rmsnorm reads
+// that bf16 row (exact upcast), so its variance is taken on the ROUNDED values —
+// the round trip therefore lands on `acc` BEFORE the sum of squares below as well
+// as before the phase-2 scale. OFF keeps the f32 path bit-for-bit unchanged:
+// `__float2bfloat16` is round-to-nearest and `__bfloat162float` widens losslessly.
 __global__ void dsv41_hc_collapse_norm_kernel(const float* __restrict__ x,
                                               const float* __restrict__ pre,
                                               const float* __restrict__ w,
-                                              float* __restrict__ out, int hc, int dim, float eps) {
+                                              float* __restrict__ out, int hc, int dim, float eps,
+                                              int truncate) {
     const int row = blockIdx.x;
     const float* pre_r = pre + (size_t)row * hc;
     const float* x_r = x + (size_t)row * hc * dim;
@@ -8096,6 +8142,7 @@ __global__ void dsv41_hc_collapse_norm_kernel(const float* __restrict__ x,
     for (int c = threadIdx.x; c < dim; c += blockDim.x) {
         float acc = 0.f;
         for (int i = 0; i < hc; ++i) acc = fmaf(pre_r[i], x_r[(size_t)i * dim + c], acc);
+        if (truncate) acc = __bfloat162float(__float2bfloat16(acc));
         o_r[c] = acc;
         ss += acc * acc;
     }
@@ -8118,10 +8165,11 @@ __global__ void dsv41_hc_collapse_norm_kernel(const float* __restrict__ x,
 }
 
 extern "C" int dsv41_hc_collapse_norm(float* x, const float* pre, const float* w, float* out, int rows,
-                                      int hc, int dim, float eps, cudaStream_t s) {
+                                      int hc, int dim, float eps, int truncate, cudaStream_t s) {
     if (x == nullptr || pre == nullptr || w == nullptr || out == nullptr) return (int)cudaErrorInvalidValue;
     if (rows <= 0 || hc <= 0 || dim <= 0) return (int)cudaErrorInvalidValue;
-    dsv41_hc_collapse_norm_kernel<<<(unsigned)rows, 1024, 0, s>>>(x, pre, w, out, hc, dim, eps);
+    dsv41_hc_collapse_norm_kernel<<<(unsigned)rows, 1024, 0, s>>>(x, pre, w, out, hc, dim, eps,
+                                                                  truncate);
     return (int)cudaGetLastError();
 }
 
