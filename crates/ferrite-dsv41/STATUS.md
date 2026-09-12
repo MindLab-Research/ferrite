@@ -8021,3 +8021,17 @@ TP4 路径**关闭**。AR 的理论节省（0.66→0.33ms）远小于计算翻�
 - env gate 必须进程级 OnceLock（per-call getenv 破坏 graph capture）
 - `launch_mxf4_indirect` 的 down 接 GEMV 曾导致全零输出 + illegal access——M=1 派发要严格限定 `!aq`
 - 骨架 launcher 契约：dim%128==0、rows%kMTile==0
+
+### mxf4 + mxf8f6f4 骨架编译验证：双通过（2026-09-12 30:00）
+
+| 骨架 | 编译命令 | 结果 |
+|---|---|---|
+| mxf4 variant | `-DDSV41_TCGEN05_GATEUP_MXF4_SKELETON=1` | **0 errors** ✓ |
+| mxf8f6f4 variant | `-DDSV41_TCGEN05_GATEUP_SKELETON=1` | **0 errors** ✓ |
+
+两个 tcgen05 Phase 1 骨架变体都在 sm_103a 上编译通过。下会话的完整起点：
+1. 骨架（双变体，编译验证 ✓）
+2. Phase 0 测试（mxf4 371 行 GPU-verified EXACT + mxf8f6f4 1565 行编译+数值分析 ✓）
+3. 计划（docs/agent/expert-tcgen05-plan.md，mxf4 为默认 ✓）
+4. FFI + 派发（mxf4-ffi-dispatch 实施中）
+5. 交接文档（NEXT-SESSION-HANDOVER.md ✓）
