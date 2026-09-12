@@ -241,6 +241,33 @@ if weight.dtype == torch.float4_e2m1fn_x2:
 2. **opa 是存量偏差**——8a5a952 时点就存在，且与 e2m1-vs-e4m3 的架构级分歧（head 号根因）的时间线吻合（它早于锚点，从 fp4 expert 路径的第一天就存在）。
 3. **修复路径不变**：e2m1×2 双趟（Stage 2 在实施）就是正解——它不是"回归修复"而是"存量架构级数值偏差的修复"。
 
+## Stage 2 实施（e2m1×2，2026-09-12）
+
+**gate**：`DSV41_EXPERT_ACT_E4M3`（默认 OFF，`!= "0"` 开）。名字说的是"达到 e4m3 精度"。
+
+**改动点**（`crates/ferrite-models/src/dsv41/` + `kernels/cuda/dsv41_kernels.cu`）：
+
+| 位置 | 改动 |
+|---|---|
+| `chain_dev.rs:expert_act_e4m3()` | 新 gate（OnceLock 缓存，同 `expert_tcgen05_mxf4` 的房规）+ `act_e4m3_skipped_note()` 一次性告警 |
+| `chain_dev.rs:moe()` 量化侧 | `quant_fp4(xn→xq4/xsc4)`（=q_hi，原样）+ `sub_dequant_fp4(xn, q_hi → xres)` + `quant_fp4(xres→xq4_lo/xsc4_lo)`（=q_lo） |
+| `chain_dev.rs:moe_rows()` 量化侧 | 同上，`rows = m` 一次发射（量化器原生多行） |
+| `chain_dev.rs:moe()` GEMM 侧 | batched：`for pass in 0..{1或2}`（pass 0→`ex_act_b`，pass 1→`ex_act_lo`）+ `add_inplace_raw` 求和后**一次** swiglu；顺序 6-slot 路径同构（`ex_act`/`ex_act_lo`） |
+| `chain_dev.rs:moe_rows()` GEMM 侧 | 同上（`ex_act_r`/`ex_act_r_lo`，加 `m*topk*act_slot`） |
+| `device.rs` | `sub_dequant_fp4` 包装 + `supports_sub_dequant_fp4()`（OPTIONAL 符号：老 .so 只让 gate 保持 OFF + 告警，不 fail load） |
+| `dsv41_kernels.cu` | 新 `dsv41_sub_dequant_fp4`（elementwise `out = x - dequant_fp4(q, scale)`，索引契约与 `dsv41_quant_fp4` 输出一致） |
+
+**两条形状规则（刻意，非调参）**：
+1. **armed 时强制关掉 gate_up+swiglu 融合**——融合的 epilogue 每趟各自做 swiglu，而 `swiglu(x+y) != swiglu(x)+swiglu(y)`，所以两趟必须写**未融合**的 `[2*inter]` gate|up 布局，再对**和**做一次 swiglu。
+2. **armed 时跳开 tcgen05 MXFP4 臂**（同理：它也需要自己的第二趟 + 累加）。
+
+**down 方向不做双趟**（与上表第 2 条一致）：`expert_gemv_fp4_down_reduce_kernel` 是 `acc += s_act[j] * w`（f32 激活直接乘反量化权重，**不量化激活**），加第二趟只会多出一个虚假项而不是减少误差。
+
+**代价**：每层 +1 `sub_dequant`（仅量化侧，1 次）+1 第二趟 expert gate/up（batched：1 次；顺序：topk 次）+1 `add_inplace`。
+
+**⚠️ A/B 前置**：新符号 `dsv41_sub_dequant_fp4` 必须重编 .so（`bash build.sh 103a`）；否则 gate 保持 OFF 并打印一次性告警（="ON 臂实际跑老路径"的一号测量陷阱，已显式防住）。
+
+
 ## verify 图化与最新 verify 路径的兼容性预审（代码级，等待 verify-graph-capture2 的完整判词）
 
 代码级已确认的兼容性要点：
@@ -263,3 +290,12 @@ if weight.dtype == torch.float4_e2m1fn_x2:
 ## expert down 路径的数值状态（代码级核实）
 
 `expert_down_fp4`（device.rs:2147）的激活参数 `act: *const f32`——**down 吃 f32（不量化）**。官方对 swiglu 输出也做 e4m3 量化（model.py:194-197 的 fp8 分支）——**down 方向 ferrite 反而更精确**（f32 > e4m3）。⇒ **激活量化分歧集中在 gate/up**（quant_fp4 的 e2m1），down 无需改。
+
+## markov head 的实际结构（代码级核实——draft 1ms 设计的关键事实）
+
+`dspark_dev.rs:1832` 的 `for step in 0..bs` 循环（bs=5）：**每步一次 `dspark_markov_head` launch**。
+`dsv41_glue.cu:1374` 的 kernel：
+- **markov_embed 是 [vocab, mr]**、**markov_head 也是 [vocab, mr]**——**mr = markov_rank（不是 dim！）**
+- 每步的 kernel：读 `markov_embed[tok]`（一行 mr 元素）+ 遍历 vocab 的每行 `markov_head[v]`（mr 元素点积）→ **bias 到 logits[step]**
+- **⇒ markov 的权重读 = vocab × mr（不是 vocab × dim！）**——如果 mr 小（比如 512 或 1024），markov 每步只读 vocab×mr×4B ≈ 129280×512×4 ≈ 264MB？——**比 head 的 vocab×dim×2B=1.26GB 小**——**需要从 checkpoint 确认 mr 的真实值**（`mtp.last.markov_head.head.weight` 的形状）。
+- **head 本身（collapse→norm→head）只在循环外做一次**（:1721 的 forward_head）——**draft 的 head 权重读是 1 次（1.26GB）+ markov 的 5 次（vocab×mr）**。
