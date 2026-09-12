@@ -147,6 +147,40 @@ GATES_ONELINE="$(echo "$GATES" | tr '\n' ' ' | tr -s ' ')"
 # These would each silently select a DIFFERENT path than this matrix intends.
 FORBIDDEN="DSV41_LAZY_VERIFY DSV41_HC_VERIFY_FUSE DSV41_HC_FRONT_ROWS"
 
+# ---------------------------------------------------------------------------
+# OPT-IN ARM: the tcgen05 e4m3 GROUPED routed gate/up (default OFF).
+#
+# WHY AN OPT-IN ARM AND NOT IN THE MATRIX ABOVE. The arm changes
+# `DSV41_EXPERT_ILV` (a LOAD-TIME weight-layout decision) from the production
+# default ON to OFF, so it does NOT measure the shipped layout — folding it into
+# `GATES` would silently turn the documented batched-400 matrix into a different
+# experiment (exactly the class of mistake `FORBIDDEN` guards against).
+#
+# WHAT IT RUNS. `moe_rows` (the verify path) dispatches the group-indexed masked
+# M=128 e4m3 tile (`dsv41_expert_gemm_e4m3_grouped`, `tc5::e4x`) at
+# `moe_experts_grouped_gate_up` when ALL of these hold:
+#   * `DSV41_EXPERT_ACT_E4M3=1`   — already in the matrix; the kernel eats e4m3
+#                                   activation bytes (`kind::f8f6f4`);
+#   * `DSV41_EXPERT_TCGEN05_E4M3=1` — the e4m3 tcgen05 family's runtime gate (the
+#                                   MXF4 gate is NOT involved: `kind::mxf4` is
+#                                   e2m1 x e2m1, a different kernel);
+#   * `DSV41_EXPERT_GROUPED=1`    — builds the permuted layout the kernel indexes;
+#   * `DSV41_GATEUP_FUSE=0`       — the e4x epilogue only clamps, it never fuses
+#                                   swiglu, so the fused shape declines the arm;
+#   * `DSV41_EXPERT_ILV=0`        — the plain (non-interleaved) w1/w3 planes; the
+#                                   interleaved layout is unreadable by this arm.
+# The `.so` must carry the symbol, which `build.sh 103a` compiles in BY DEFAULT
+# (`DSV41_TCGEN05_GATEUP_E4M3_SKELETON`; opt out with `DSV41_BUILD_TCGEN05_E4M3=0`).
+#
+# USAGE:  B400_TCGEN05_E4M3_GROUPED=1 bash scripts/batched_400_v2.sh
+# ONE-LINE GATE CHAIN (the arm's additions, on top of the matrix above):
+#   DSV41_EXPERT_TCGEN05_E4M3=1 DSV41_EXPERT_GROUPED=1 DSV41_GATEUP_FUSE=0 DSV41_EXPERT_ILV=0
+TCGEN05_E4M3_GROUPED="${B400_TCGEN05_E4M3_GROUPED:-0}"
+if [ "$TCGEN05_E4M3_GROUPED" = 1 ]; then
+    TC5_GATES="DSV41_EXPERT_TCGEN05_E4M3=1 DSV41_EXPERT_GROUPED=1 DSV41_GATEUP_FUSE=0 DSV41_EXPERT_ILV=0"
+    GATES_ONELINE="$GATES_ONELINE $TC5_GATES"
+fi
+
 echo "== BATCHED-400 v2 (rebuilt) comprehensive run =="
 echo "-- node $NODE   arch $ARCH   port $PORT   tp $TP"
 echo "-- prompt: 出师表 max_tokens=$MAXTOK   steady-skip=$STEADY_SKIP"
