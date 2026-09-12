@@ -34,6 +34,17 @@
 #   DSV41_VERIFY_GRAPH=1
 #   DSV41_SWALLOW_STEP=1                      # without it the step is +6.15ms and
 #                                             # the 400 target is out of reach
+#   DSV41_SWALLOW_EPOCH_PAD=1                 # the D2 pad: advance the swallowed
+#                                             # arm's v5 epoch by 2*n_layers+1
+#                                             # (81) empty rounds so every arm
+#                                             # pays the same rounds/step — see
+#                                             # docs/agent/swallow-fix9-round-ledger-design.md
+#                                             # §3.2. This IS the ninth fix; the
+#                                             # gate existed with no reader.
+#   DSV41_V5_LEDGER=1                         # the round ledger (design D1):
+#                                             # one `[v5-ledger]` line per step,
+#                                             # one 4-byte D2H. OBSERVATION, not
+#                                             # path selection.
 #   + the two DIAGNOSTIC gates requirement 3 needs (they gate OUTPUT, not
 #     performance): DSV41_TIMING=1 (the `[dsv41] step pos=` and `[dspark] steps=`
 #     lines do not exist without it) and DSV41_DSPARK_DEBUG=1 (the per-step trace).
@@ -140,11 +151,27 @@ DSV41_INDEXER_MROWS=1 DSV41_NORM_MROWS=1 \
 DSV41_COMPRESSOR_MROWS=1 \
 DSV41_DRAFT_GRAPH=1 DSV41_DRAFT_P3A=1 \
 DSV41_VERIFY_GRAPH=1 \
-DSV41_SWALLOW_STEP=1 \
+DSV41_SWALLOW_STEP=1 DSV41_SWALLOW_EPOCH_PAD=1 \
+DSV41_V5_LEDGER=1 \
 DSV41_TIMING=1 DSV41_DSPARK_DEBUG=1"
+# The v5 round LEDGER is an OBSERVATION arm, not a path selector: it adds one
+# `[v5-ledger]` line (and one 4-byte device->host read) per step, so a THROUGHPUT
+# measurement runs with it OFF (design §4.4: the throughput numbers come from the
+# `V5_LEDGER=0` run; the ledger run is read for its `[v5-ledger]` lines only).
+# B400_V5_LEDGER=0 drops just that gate and leaves everything else identical —
+# stated here rather than exported silently, the same discipline the FORBIDDEN
+# list below follows. The PAD (`DSV41_SWALLOW_EPOCH_PAD`) is NOT optional: it is
+# the fix, and unsetting it reproduces the pre-ninth-fix behaviour.
+if [ "${B400_V5_LEDGER:-1}" = "0" ]; then
+    GATES="$(printf '%s\n' "$GATES" | sed 's/DSV41_V5_LEDGER=1//')"
+fi
 # folded to one line for `env`-style use
 GATES_ONELINE="$(echo "$GATES" | tr '\n' ' ' | tr -s ' ')"
 # These would each silently select a DIFFERENT path than this matrix intends.
+# `DSV41_LAZY_VERIFY` is first for a second reason too: the lazy arm's v5
+# footprint is `3 + 81 * k_emit`, which is `k_emit`-dependent, so the constant
+# pad above CANNOT equalise it — lazy and SWALLOW_STEP must never be armed
+# together (design §3.3).
 FORBIDDEN="DSV41_LAZY_VERIFY DSV41_HC_VERIFY_FUSE DSV41_HC_FRONT_ROWS"
 
 # ---------------------------------------------------------------------------

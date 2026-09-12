@@ -1926,6 +1926,25 @@ fn swallow_missing_rounds(n_layers: usize) -> u32 {
     (2 * n_layers + 1) as u32
 }
 
+/// The D2 pad's ONE silent-skip arm, reported ONCE (`DSV41_SWALLOW_EPOCH_PAD=1`
+/// set but the loaded `.so` predates `dsv41_v5_epoch_pad`).
+///
+/// Why this exists at all: the ninth-fix history is a string of "fixes" that
+/// were believed to be running and were not (no call site, no kernel, no gate).
+/// A pad that quietly does nothing is that same failure mode, so this counts as
+/// a report rather than as a silent degradation. Printed once — the symbol
+/// either resolves for the whole process or never does.
+fn warn_epoch_pad_missing_symbol() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        eprintln!(
+            "[swallow-pad] DSV41_SWALLOW_EPOCH_PAD=1 but the loaded .so has no \
+             `dsv41_v5_epoch_pad` — the swallowed arm is NOT padded (rebuild kernels/cuda: \
+             bash build.sh 103a)"
+        );
+    });
+}
+
 /// `DSV41_INV_CHECK=1` arms the spec path's cross-step INVARIANT ASSERTIONS.
 ///
 /// Default OFF, so the steady-state hot path pays nothing: every check below is
@@ -8603,6 +8622,18 @@ impl<'a> DevChain<'a> {
         // because its `step_dev` has already advanced the counter).
         let host_mirrors = self.dspark_snapshot(pos, m)?;
 
+        // ---- 1b. the D2 EPOCH PAD (`DSV41_SWALLOW_EPOCH_PAD=1`) — pad the
+        // swallowed arm's v5 round sequence up to the legacy/aligned arm's. The
+        // snapshot above and `import_tap` below carry no collectives, so the pad
+        // sits on a clean boundary: everything this arm did before it is host
+        // work, and the 81 empty rounds it adds are what `step_dev` (which this
+        // arm never runs) would have issued. See [`swallow_epoch_pad`] and
+        // [`Self::v5_epoch_pad_swallow`] — this call is the whole fix: without it
+        // the gate is a documented env var nothing reads (the ninth "fix").
+        if swallow_epoch_pad() {
+            self.v5_epoch_pad_swallow(swallow_missing_rounds(cfg.n_layers))?;
+        }
+
         // ---- 2. the draft, from the tap the PREVIOUS round carried over. The
         // anchor's own forward (row 0 below) has not happened yet — it is what
         // makes this path cheap and what forces the carry.
@@ -9500,6 +9531,46 @@ impl<'a> DevChain<'a> {
             "[v5-ledger] pos={pos} rank={} epoch={epoch} arm={arm} k_emit={k_emit} delta={delta}",
             self.rank()
         );
+    }
+
+    /// D2 EPOCH PAD (`DSV41_SWALLOW_EPOCH_PAD=1`) — see [`swallow_epoch_pad`] for
+    /// the WHY and [`Device::v5_epoch_pad`] for the kernel's contract.
+    ///
+    /// Called from [`Self::dspark_spec_swallowed`] ONLY, once per swallowed step,
+    /// right after the ring snapshot. The pad advances this rank's v5 epoch by
+    /// `rounds` EMPTY rounds, so the swallowed arm's per-step footprint (84)
+    /// equals the legacy/aligned arm's (165) and a rank that lands on the other
+    /// arm can no longer open the epoch rift that `[ar5-hang]` reports.
+    ///
+    /// No-op with no `comm` (there is no peer to rendezvous with) or when the v5
+    /// protocol is not live (`uses_v5()` false — the epoch/stamps are then not a
+    /// rendezvous and advancing them would be meaningless, if harmless).
+    ///
+    /// An `.so` predating the kernel is reported once
+    /// ([`warn_epoch_pad_missing_symbol`]) and otherwise skipped: this is the one
+    /// silent-skip arm, and it is loud on purpose.
+    ///
+    /// NOT applied to the lazy arm: its footprint is `3 + 81 * k_emit`, which is
+    /// `k_emit`-dependent, so a constant pad cannot equalise it. `DSV41_LAZY_VERIFY`
+    /// with `DSV41_SWALLOW_STEP` stays forbidden (`scripts/batched_400_v2.sh`).
+    fn v5_epoch_pad_swallow(&self, rounds: u32) -> Result<()> {
+        let Some(c) = self.comm.as_ref() else {
+            return Ok(());
+        };
+        if !c.uses_v5() {
+            return Ok(());
+        }
+        let ok = self.dev.v5_epoch_pad(
+            c.peer_stamps_u32(),
+            c.epoch_dev(),
+            self.world() as i32,
+            self.rank() as i32,
+            rounds,
+        )?;
+        if !ok {
+            warn_epoch_pad_missing_symbol();
+        }
+        Ok(())
     }
 
     /// The common failure report: one line naming the invariant, the position and

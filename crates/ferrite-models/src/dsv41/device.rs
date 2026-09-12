@@ -385,6 +385,17 @@ struct Kernels {
         *const *mut u32, *mut c_uint, *mut u64, *const c_uint, c_int, c_int, c_int, c_long,
         CuStream,
     ) -> c_int>,
+    // D2 EPOCH PAD (`DSV41_SWALLOW_EPOCH_PAD`), `dsv41_v5_epoch_pad_kernel`:
+    // advance this rank's v5 epoch by `pad` EMPTY rounds in ONE launch, stamping
+    // this rank's slot in every peer's ready row (and the A4 broadcast word) with
+    // the final value `e + pad`, so the swallowed arm's per-step round footprint
+    // equals the legacy/aligned arm's. Optional: an .so predating the symbol
+    // keeps the swallowed arm's smaller footprint and the pad is skipped — the
+    // caller reports that once rather than padding silently. See
+    // docs/agent/swallow-fix9-round-ledger-design.md §3.2.
+    v5_epoch_pad: Option<unsafe extern "C" fn(
+        *const *mut u32, *mut c_uint, c_int, c_int, c_uint, CuStream,
+    ) -> c_int>,
     hc_mixes: unsafe extern "C" fn(
         *const f32, *const f32, *const f32, *const f32, *mut f32, *mut f32, *mut f32,
         c_int, c_int, c_int, c_int, f32, CuStream,
@@ -1322,6 +1333,7 @@ impl Device {
             gemm_bf16_fp8x2: ko!(rt, "dsv41_gemm_bf16_fp8x2"),
             argmax_sliced: ko!(rt, "dsv41_argmax_sliced"),
             argmax_sliced_rows: ko!(rt, "dsv41_argmax_sliced_rows"),
+            v5_epoch_pad: ko!(rt, "dsv41_v5_epoch_pad"),
             hc_mixes: km!(rt, "dsv41_hc_mixes"),
             moe_route: km!(rt, "dsv41_moe_route"),
             add_inplace: ko!(rt, "ferrite_add"),
@@ -3199,6 +3211,44 @@ impl Device {
             return Ok(false);
         }
         self.kerr(rc, "dsv41_argmax_sliced_rows")?;
+        Ok(true)
+    }
+
+    /// D2 EPOCH PAD (`DSV41_SWALLOW_EPOCH_PAD`) — ONE launch that advances this
+    /// rank's v5 epoch by `pad` EMPTY rounds, so the arm that DROPS `step_dev`
+    /// (the swallowed arm) still pays the same number of v5 rounds per step as
+    /// the arm that runs it (legacy/aligned): `legacy == aligned == 165`,
+    /// `swallowed == 84`, and the missing `81 = 2 * n_layers + 1` is exactly what
+    /// this call adds back. See
+    /// `docs/agent/swallow-fix9-round-ledger-design.md` §3.2 and the kernel's
+    /// own note (`dsv41_v5_epoch_pad_kernel`).
+    ///
+    /// `ready_tbl` is the `[world]` peer ready-row array (`peer_stamps_u32()`);
+    /// the kernel stamps `ready_tbl[r][rank] = e + pad` for every peer `r` and
+    /// advances the A4 broadcast word `epoch + 1` with the same value. No staging
+    /// is written, because a padded round has no payload and no reader.
+    ///
+    /// `Ok(false)` when the loaded `.so` predates the symbol. This is the ONE
+    /// silent-skip arm and the caller reports it once (`ar5-hang`'s history is a
+    /// string of fixes that were believed to run and did not) — every other
+    /// non-zero return is a REAL launch error and is answered as one. Note the
+    /// `rc == 1` "declined" convention the argmax entries use is deliberately NOT
+    /// reused here: this entry has no decline condition, and swallowing a genuine
+    /// error as "declined" would rebuild exactly the phantom-fix failure mode.
+    pub fn v5_epoch_pad(
+        &self,
+        ready_tbl: *const *mut u32,
+        epoch: *mut c_uint,
+        world: i32,
+        rank: i32,
+        pad: u32,
+    ) -> Result<bool> {
+        let f = match self.kernels.v5_epoch_pad {
+            Some(f) => f,
+            None => return Ok(false),
+        };
+        let rc = unsafe { f(ready_tbl, epoch, world, rank, pad, self.stream) };
+        self.kerr(rc, "dsv41_v5_epoch_pad")?;
         Ok(true)
     }
 
