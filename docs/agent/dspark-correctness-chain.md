@@ -6010,3 +6010,30 @@ DSV41_SWALLOW_STEP=1 DSV41_VERIFY_GRAPH=1 DSV41_SH_PAIR_M=1
 - **结论：AR 的慢不是数据量而是等待**——peer 到达漂移在 batched 模式下更严重
 
 **AR 优化的潜力**：78.3μs → 20-30μs（消除等待）→ 节省 ~-2ms/步
+
+## SWALLOW accept 5 测试结果（d9af4345）——54.1 tok/s！accept 质量问题！
+
+**结果**：
+- **54.1 tok/s**（64 tokens / 1184ms）
+- **数字正确=32/32 前20行=True** ✓（全部正确！）
+- **零拉丁** ✓ finish_reason=stop（正常停止——数完 32 停止）
+- 0 ar5-hang ✓ 0 panic ✓
+
+**关键发现——SWALLOW 的 accept 质量问题**：
+| 路径 | 计数任务 accept | 吞吐 |
+|---|---|---|
+| lazy | ~5.0（几乎全接受）| **91.1 tok/s** |
+| SWALLOW | ~1.2？（k_emit∈{1,2}）| **54.1 tok/s** |
+
+**同模型同 prompt 但 SWALLOW 的 accept 远低于 lazy！**
+
+**分析**：
+1. **64 tokens / 6 tok/step ≈ 11 steps → step time = 1184/11 ≈ 108ms**（远超预期的 31ms！）
+2. **或者 accept ~2（3 tok/step）→ 21 steps → 56ms/步**
+3. **SWALLOW 的 draft-verify 管线质量低于 lazy**——draft 预测或 verify 的 argmax 有差异
+
+**SWALLOW 比 lazy 慢 1.7× 的两个假设**：
+A. **步时更高**（batched forward 的 kernel 效率低）→ 优化 kernel
+B. **accept 更低**（draft 质量差）→ 调查 draft 的预测质量
+
+**下一步**：SWALLOW + V5_LEDGER 的 k_emit 序列分析（确认 accept 是不是真的 ~1.2）
