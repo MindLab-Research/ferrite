@@ -1,21 +1,28 @@
-# DSV4.1-Flash 会话最终报告（定稿）
+# DSV4.1-Flash 会话最终报告（定稿 v2）
 
-> **状态：已定稿**（2026-09-12 00:20，HEAD `8b32bcf`）。本文件是会话的权威汇总，
+> **状态：已定稿**（2026-09-12 01:20，HEAD `6fc6113`）。本文件是会话的权威汇总，
 > 数字全部来自本会话已验证的 serve A/B 或隔离复现器；未验证项已显式标注。
 >
-> **会话终态**：**13.28 → 6.26ms（+112.2%），75.3 → 159.7 tok/s**。
-> v16（gate 修复后）定案 **6.26ms / 159.7 tok/s**，四段文本全对、`faults=0`。
-> **通往 200+ 的唯一数量级路径已确认：swapAB**（预估 ~238 tok/s），实施中。
+> **会话终态**：**13.28 → 6.17ms（+115.4%），75.3 → 162.1 tok/s**。
+> v17a 基线复测定案 **6.17ms / 162.1 tok/s**，四段文本全对、`faults=0`。
+> **"唯一数量级路径" swapAB 在 serve 全矩阵中性，已于 v21 正式关闭**（§3.5）；
+> 通往 200+ 的剩余路径只剩 **DL K-chunk**（已实施待验证）与 **expert tcgen05**（4-5 人日）。
 
 ---
 
 ## 0. 一句话结论
 
-会话把单请求 decode 步时从 13.28ms 砍到 **6.26ms**（160 tok/s），并**彻底解开**了
-v13→v15 连续三轮的 6.6ms 谜团——根因**不是**"热点 kernel 代码存在性"（residue-hunt 的误诊），
-而是 commit `006bd0c` 的 `FileReplace` **改错了同名变量**：
+会话把单请求 decode 步时从 13.28ms 砍到 **6.17ms**（162.1 tok/s，+115.4%），
+**彻底解开**了 v13→v15 连续三轮的 6.6ms 谜团——根因**不是**"热点 kernel 代码存在性"
+（residue-hunt 的误诊），而是 commit `006bd0c` 的 `FileReplace` **改错了同名变量**：
 把 K-split（已验证 **−0.33ms** 收益）误关、把 PDEPTH pipeline（**+0.04ms** 回归）误开，
 净 **+0.37ms 隐藏回归**。这是一条**代码卫生 > 性能分析**的教训。
+
+**第二个同等重要的结论**：曾被评为"唯一数量级路径（预估 ~238 tok/s）"的 **swapAB**，
+经 v17→v21 四个变体（全量 / 形状分发 / memset 消除 / TMA bulk staging）的完整 serve 矩阵验证，
+**全部中性**。隔离口径的 1.76–1.94x 在 serve 的 SM 争抢 + L2 竞争下**完全不兑现**——
+这是本会话第 7 次、也是最昂贵的一次"隔离→生产失效"。**swapAB 路径正式关闭**（§3.5）。
+教训升级为：**没有任何隔离收益可以不经 serve A/B 就直接写进路线图**。
 
 ---
 
@@ -35,9 +42,14 @@ v13→v15 连续三轮的 6.6ms 谜团——根因**不是**"热点 kernel 代�
 | 9 | P4 act-cpasync（默认 ON） | **6.24** | **+112.8%** | `fdd70d4` | serve A/B，160.3 tok/s |
 | — | *v10–v13 回归区（见 §4）* | *6.31→6.63* | *回退* | — | — |
 | 16 | **gate 错配修复**（ksplit=2 / pipeline=1） | **6.26** | **+112.2%** | `4bed9f6` | serve A/B，159.7 tok/s ✓ |
+| 17 | **会话终态复测**（v17a 基线，同 v16 配置） | **6.17** | **+115.4%** | — | serve A/B，162.1 tok/s ✓ |
 
-> v9（P4 act-cpasync，6.23–6.24ms / 160.5 tok/s）是会话中的最优读数；v16 回到 6.26ms
-> （差 0.03ms 在噪声内），即"基线恢复"。**"最终值"取 6.23–6.26ms / 160–161 tok/s。**
+> v9（P4 act-cpasync，6.23–6.24ms / 160.5 tok/s）与 v17a（6.17ms / 162.1）是会话中的两个最优读数；
+> v16 的 6.26ms 与 v17a 的 6.17ms 是**同配置**，0.09ms 的差异是 serve 读数漂移（噪声内）。
+> **"最终值"取 6.17ms / 162.1 tok/s（+115.4%）。** 后续 v18–v21 的全部 swapAB 变体均未超过此基线。
+>
+> ⚠️ **重要**：§1 表只记录**已落地并 serve 验证**的优化。v17–v21 期间实施但默认 OFF 的
+> 三条新路径（swapAB / TMA / DL K-chunk）见 §2.2，它们**不构成收益**。
 
 ---
 
@@ -62,6 +74,17 @@ v13→v15 连续三轮的 6.6ms 谜团——根因**不是**"热点 kernel 代�
 **旁证**：`175462d` 的 fold 物理清理与 `3570524` 的 hot-kernel-restore 本身也是"落地"——
 它们不是为兑现收益，而是**修复缺陷 gate、消除 ABI 风险、恢复 np1 形态**（见 §4）。
 
+### 2.2 已实施但默认 OFF（未兑现收益，勿计入）
+
+| # | 实现 | commit | 默认 | serve 结果 |
+|---|---|---|---|---|
+| 1 | **swapAB kernel 族**（`gemm_fp8_swapab_kernel`，形状分发 + last-block reduction） | `166acc5`/`9696afa`/`b7744a1` | OFF | **中性**（4 变体全中性，§3.5） |
+| 2 | **TMA Phase 1**（1D `cp.async.bulk` staging + mbarrier，`DSV41_SWAPAB_TMA`） | `0f34001` | OFF | **中性**（v21t，§3.5） |
+| 3 | **DL K-chunk cp.async 流水**（`hc_dots_late_kchunk_kernel`，`DSV41_HC_DL_KCHUNK`） | `6fc6113` | OFF | **待 serve 验证**（理论 14.9→8-9µs） |
+
+> 三条都是**完整的、编译通过、位一致已论证**的实现，保留在树内供后续升级后重测。
+> 但**它们都不构成会话收益**——报告的数字口径以 §1 的 serve A/B 为准。
+
 ---
 
 ## 3. 失败关停清单（全部有机制级解释）
@@ -85,6 +108,36 @@ v13→v15 连续三轮的 6.6ms 谜团——根因**不是**"热点 kernel 代�
 | 15 | **cross-layer pipe** | −0.3~0.5ms | −0.05~0.15ms | 80% 被路由依赖挡死（L+1 专家取哪 6/384 由 gate(xn) 决定） | 关闭 |
 | 16 | **bf16-lut（a32 物化的 bf16 LUT）** | −0.1ms | **分析否证（未落地）** | 位序错配：`*(bf162*)(lut + b4)` 取 `LUT[c0]`/`LUT[c0+1]`，而 `o.y` 要 `LUT[c1]` ⇒ 49.8% 元素错 | 关闭（勿再提案） |
 | 17 | **cvt 解码路线** | 省 smem gather | **分析否证（未落地）** | 转换管 16 results/clk/SM < LDS 32 值/clk/SM；且丢位一致 | 关闭（见 §5） |
+| 18 | **swapAB（SIMT 形状分发）** | −2.0ms（隔离 1.76–1.94x） | **中性**（v18s 6.20 vs 6.17） | 隔离收益在 serve 的 SM 争抢 + L2 竞争中消失（第 7 次隔离→生产失效） | 默认 OFF；**路径正式关闭**（§3.5） |
+| 19 | **swapAB + memset 消除** | −0.5µs/call | **中性**（v19s 6.18） | memset 本非瓶颈（图节点已被 last-block reduction 消除） | 随 §3.5 关闭 |
+| 20 | **swapAB + TMA bulk staging** | 突破 staging 1.3TB/s 墙 | **中性**（v21t 6.18） | bulk DMA 不占 LSU ≠ 免于 SM 争抢；结论与 staging 方式无关 | 默认 OFF；**路径正式关闭** |
+| 21 | **DSV41_HC_DOTS_T = 256/512** | −1~1.5µs/launch | **中性**（6.21 / 6.19） | 默认值 128 已是优；DL 的瓶颈不在 dot block 尺寸 | 保持默认 128 |
+| 22 | **mx2 swapAB 变体**（wq_a+wkv 合并过阈值） | −0.28ms（理论） | **未上机（预判失效）** | 与 §3.5 同源；基于同失效模式，理论需大幅打折 | 不实施 |
+
+---
+
+## 3.5 swapAB 路径的完整验证矩阵（正式关闭）
+
+> swapAB 曾被 §5 评为"唯一数量级路径（预估 ~238 tok/s）"，并投入 4 个迭代。
+> 这是本会话**最昂贵的一次隔离→生产失效**，其完整证据链必须留档，防止未来重启。
+
+| 变体 | 消除的变量 | p50 | tok/s | 判定 |
+|---|---|---|---|---|
+| v17a（基线，SIMT） | — | **6.17ms** | **162.1** | 基准 |
+| v17s（全量覆盖 swapAB） | — | 6.63ms | 150.8 | **回归**——~146 个小 n 调用（0.73–0.97x）吃掉 ~100 个大 n 收益 |
+| v18s（形状分发 n≥1664） | 小 n 回归 | 6.20ms | 161.3 | **中性**（Δ=+0.03） |
+| v19s（+ memset 消除，last-block reduction） | memset 图节点 | 6.18ms | 161.8 | **中性**（Δ=+0.01） |
+| v21t（+ TMA bulk staging，1D `cp.async.bulk` + mbarrier） | staging 路径 | 6.18ms | 161.8 | **中性**（Δ=+0.01） |
+
+**逐项排除（排除法定位根因）**：
+- **不是小 n 回归**（v18 形状分发已隔离）
+- **不是 memset**（v19 已消除）
+- **不是 staging 方式**（v21 TMA vs cp.async 同结果）
+- ⇒ **是深层系统差异**：serve 的 4 条 side stream 造成 SM 争抢 + L2 竞争，
+  使隔离口径的 cp.async staging 1.3TB/s 与"混合形状下的 SIMT 实际耗时"两头失真。
+
+**结论：swapAB 路径正式关闭。** 代码保留（`DSV41_SWAPAB` 默认 OFF，`166acc5`/`9696afa`/`b7744a1`/`0f34001`），
+供未来架构变化（如去掉 side stream、增大 L2 隔离）后重测，但**不得再计入路线图收益**。
 
 ---
 
@@ -214,6 +267,13 @@ hc_mixes_tail 在 decode 只有 1 个 block——占用率不是变量。
 | **a32 的 416x（实为 640x）块级冗余** | a32 物化是**每 block 重算**：416 blocks（n=3328, warps=8）× k=5120 = 2.13M 次解码，而该 token 只有 5120 个唯一值 ⇒ **416× 冗余**。生产大 shape（n=5120, warps=8）为 **640 blocks ⇒ 640× 冗余**。这才是 1.55µs/call 的真身。 |
 | **cvt 解码被否证** | 用 `cvt.rn.f16x2.e4m3x2` 替代 smem gather：转换管吞吐 **16 results/clk/SM**（Table 4 "All other type conversions"）< shared memory 的 **32 值/clk/SM**（LDS.32）；且每元素还需 `cvt.f32.f16` 展回 f32 ⇒ ≤10.7 元素/clk/SM，**严格更慢**；位一致也无法保持（scale 重结合改舍入序）。 |
 
+> ⚠️ **本节结论已被 serve 否证（2026-09-12 20:00，见 §3.5）**：上表预测 swapAB 是
+> "唯一数量级路径（~238 tok/s）"，但 v17–v21 的四个变体 serve 全矩阵**全部中性**
+> （6.18–6.20ms vs 基线 6.17ms）。隔离口径的 1.76–1.94x 在 serve 的 SM 争抢 + L2 竞争中
+> 完全消失。**本节的"swapAB 是唯一路径"判断作废**——保留它是因为其中
+> **a32 的 416×/640× 块级冗余诊断仍然成立**（那是 1.55µs/call 的真身），
+> 只是"换成 MMA 就能兑现"这一步不成立。
+
 **bf16-LUT 同族否证**：`s_lut` 由 256×f32 改 256×bf16 的提案**物理不成立**——
 `*(bf162*)(lut + (b4&0xFF))` 取到 `LUT[c0]`/`LUT[c0+1]`，而 `o.y` 要的是 `LUT[c1]`（码是任意字节，无相邻关系）；
 随机枚举实测 **49.8% 元素错**，直接破坏位一致。且 LDS 不减半、smem 512B 不跨驻留边界。**勿再提案。**
@@ -232,35 +292,61 @@ hc_mixes_tail 在 decode 只有 1 个 block——占用率不是变量。
 | 阻碍 2 | **epilogue 契约**：kernel 的融合 epilogue（B1 fp8 行发射 / rope / AR-v5 / xq 发射）要求特定的行布局与 thread 映射；row-stationary 的重排会破坏这些契约 |
 | 判定 | **性价比低于 swapAB** —— 同为"消 a32 冗余"，swapAB 收益更高、且顺带删掉 LUT 解码；row-stationary 收益 <1µs 却要动 epilogue 契约，风险/收益比差 |
 
-**结论：不做 row-stationary；a32 冗余的正确修法是 swapAB（§5）。**
+**结论：不做 row-stationary。** 原判定理由是"a32 冗余的正确修法是 swapAB（§5）"——
+**该理由已因 swapAB 关闭而作废**（§3.5），但**结论不变且更强**：row-stationary 的
+<1µs/call 收益同样要穿越隔离→serve 的翻译损失（7 次失效的先验），且还要破坏 epilogue 契约，
+**收益低于噪声、风险高于收益，双重不该做**。a32 的 640× 冗余在当前架构下**保持不修**。
 
 ---
 
-## 7. 方法论铁律（7 条 + gate 卫生）
+## 7. 方法论铁律（8 条）
+
+### 7.1 八条铁律
 
 1. **隔离探针只用于淘汰，正向收益必须 serve A/B。**
-   隔离探针无法模拟 serve 的三个条件：**SM 争抢（侧流并行）、L2 竞争、占用率敏感**。
-   本会话最终确认 **7 次**隔离→生产失效：a32-vec4 → AR grid → PDEPTH pipeline → w2 warm →
-   quant+swiglu fold → stamp fold → swapAB。（早期清单只数到 5 次，漏了 3 条 fold 与 swapAB。）
+   隔离探针无法复现 serve 的四个条件：**SM 争抢（侧流并行）、L2 竞争、占用率敏感、graph replay 模式**。
+   本会话共确认 **7 次**"隔离→生产失效"（完整清单与三分类见 §7.2）。
+   **推论（本会话最贵的教训）**：**任何隔离收益不得直接写进路线图**——
+   swapAB 正是凭隔离 1.76–1.94x 被写进"唯一数量级路径"，最终 4 个变体全部中性。
 2. **fork_ev 是 kernel 级事件，不是 block 级。**
-   `fork_ev` 在 EARLY kernel **完成时**记录，所以给 gating kernel 加任何工作 = 加到 main 的关键路径。
+   `fork_ev` 在 EARLY kernel **完成时**记录 ⇒ 给 gating kernel 加任何工作 = 加到 main 的关键路径。
    小 kernel 合并的收益必须 **> gate 语义的代价**（省 launch 的收益 < 加到 gate kernel 的代价时是净负）。
 3. **失败实验的代码立即物理删除，不留 gated-off。**
-   gated-off 的死代码也可能影响 ABI 与代码布局；且"gate 可探测 ≠ gate 生效"。
-   **gate 必须验证"OFF 时是否真的回退"。**
+   gated-off 死代码也可能影响 ABI 与代码布局；且"gate 可探测 ≠ gate 生效"。
+   **gate 必须验证"OFF 时是否真的回退"**（§4.5 的 quant-fold gate 缺陷即反例）。
 4. **FFI 边界（.cu ↔ Rust）是原子性单位，必须同一 commit。**
-   `git add -A` 在 subagent 并行工作时是危险的——docs 提交会扫入进行中的实施。
+   `git add -A` 在 subagent 并行工作时是危险的——docs 提交会扫入进行中的实施（§4.3 的 709 崩溃）。
    docs 提交用 `git add <specific-files>`。
 5. **给热点 kernel 加运行时参数/分支 = 编译产物变重 = 回归风险（模板或独立 kernel）。**
    ⚠️ **修正**：v13/v14 的 +0.34ms 曾被归为此条，但 gate-hygiene-audit 证明真因是 **gate 错配**（§4.7）。
-   此条作为**设计偏好**保留（数量少、编译期可消除的参数更安全），但**不再作为那 0.34ms 的解释**。
+   此条作为**设计偏好**保留（参数少、编译期可消除更安全），但**不再作为那 0.34ms 的解释**。
 6. **小 kernel 合并、folding 的收益分析必须考虑 gate/fork 语义**（见 2）。三条 fold（quant/swiglu/stamp）全败。
-7. **位一致是硬约束。** 本仓库所有优化必须通过 fingerprint / 四段文本 / 逐位一致性验证。
-   bf16 LUT 的 **49.8% 元素错**不可接受（§5）。
+7. **位一致是硬约束。** 所有优化必须通过 fingerprint / 四段文本 / 逐位一致性验证。
+   bf16 LUT 的 **49.8% 元素错**不可接受（§5）；swapAB 的 ks=1 逐位一致、ks>1 rel~5e-8 是它唯一通过的门槛。
+8. **gate 卫生（最决定性）：改 gate 默认值时，`FileReplace` 必须按函数名/上下文锚定，改完读回确认。**
+   用 `int v = 2` 这类裸变量声明作锚点会静默改错同名对象——
+   这一个错误造成了 v13→v15 连续三轮、~0.37ms 的误诊与 499 行无谓清理。
 
-**（附加，最决定性）gate 卫生**：**改 gate 默认值时，`FileReplace` 必须按函数名/上下文锚定，
-改完读回确认。** 用 `int v = 2` 这类裸变量声明作锚点会静默改错同名对象——
-这一个错误造成了 v13→v15 连续三轮、~0.37ms 的误诊与 499 行无谓清理。
+### 7.2 隔离→生产失效的 7 次分类
+
+| 类型 | 次数 | 案例 | 机制 |
+|---|---|---|---|
+| **测量有偏** | 3 | a32-vec4 / AR reduce grid / quant+swiglu fold | 分母是旧构型（P4 cp.async 已吸收）/ 理论高估 / 计数漏掉 fork_ev 关键路径 |
+| **serve 条件改变** | 3 | PDEPTH pipeline / AR stamp fold / w2 L2 prewarm | 占用率在 serve 被暴露 / graph replay 机制崩 / PDL 窗口与 side stream 争 SM |
+| **系统差异** | 1 | **swapAB**（最贵） | L2 争用使 staging 慢于隔离 + 混合形状下 SIMT 实际更快，净亏 |
+
+**系统性差异权重排序**：**SM 争抢（最高）> L2 竞争 > graph replay 模式 > 构型漂移**。
+
+### 7.3 "serve-faithful" 隔离协议（6 条，新提案）
+
+若必须做隔离实验，必须满足以下 6 条，否则结果只能当**淘汰信号**，不能当收益证据：
+
+1. **生产构型**——含所有已 ON 的前置优化（否则分母有偏，如 a32-vec4）。
+2. **图模式 capture + replay**——禁止 direct-launch 计时（stamp fold 的 29.5s 灾难即图模式特有）。
+3. **侧流干扰注入**——主动复现 SM 争抢（本会话最高权重的差异源）。
+4. **L2 污染**——每轮换缓冲，禁止驻留红利（swapAB 的 staging 墙在 serve 更严）。
+5. **关键路径计费**——gate/fork kernel 按 `fork_ev` 语义计入 main 关键路径。
+6. **判据分层**——隔离只做淘汰；正向收益一律 **serve A/B + 四段文本 + `faults=0`**。
 
 ---
 
@@ -268,7 +354,7 @@ hc_mixes_tail 在 decode 只有 1 个 block——占用率不是变量。
 
 | 地板 | 值 | 依据 |
 |---|---|---|
-| **gemm a32 物化** | 1.55µs/call（640× 块级冗余的 LUT gather + consume） | consume 地板 4.45µs（LDS 延迟受限）+ launch 0.71µs ≈ 5.2µs；生产 mean ~7.5–8µs → 246 次 ≈ 1.85–2.0ms。**swapAB 可删掉此地板**（§5）。 |
+| **gemm a32 物化** | 1.55µs/call（640× 块级冗余的 LUT gather + consume） | consume 地板 4.45µs（LDS 延迟受限）+ launch 0.71µs ≈ 5.2µs；生产 mean ~7.5–8µs → 246 次 ≈ 1.85–2.0ms。~~swapAB 可删掉此地板~~ **——swapAB 已关闭（§3.5），此地板在当前架构下保持不可逾越**。 |
 | **expert gateup LUT-gather** | — | cp.async 无效已证 5 次；IPC 0.8/4，80% issue 槽停等（操作数供给受限，非 FMA 吞吐） |
 | **expert down L1TEX** | — | 8 项理论优化全部失败（k-split/uint4/加 blockDim/降 rows…） |
 | **AR NVLink 协议** | ~8µs/call（往返 ~6µs 是 stamp/poll） | 网格形状只影响 1–2µs；AR 总量 ~0.65ms |
@@ -278,23 +364,40 @@ hc_mixes_tail 在 decode 只有 1 个 block——占用率不是变量。
 
 ---
 
-## 9. 200 tok/s 判定与前行路径
+## 9. 200 tok/s 的最终判定与前行路径
 
 | 量 | 值 |
 |---|---|
-| 会话最优（v16，已验证） | **6.26ms / 159.7 tok/s**（v9 为 6.23ms / 160.5） |
+| **会话终态（v17a，serve 验证）** | **6.17ms / 162.1 tok/s（+115.4%）** |
 | 目标 | 5.00ms / 200 tok/s |
-| Gap | **~1.26ms** |
+| Gap | **~1.17ms** |
 
-**判定：在"逐 kernel 抠 SIMT 地板"的框架下不可达；但 swapAB 打开了新框架。**
+### 9.1 判定：旧框架已全部关闭
 
-- 全部**已识别的小优化路径**（节点削减 / gemv_bf16 / w2 warm / down cp.async / epilogue folding）
-  若全部兑现 → ~6.05ms ≈ 165 tok/s，**仍达不到 200**。
-- **唯一数量级路径 = swapAB**：gemv 2.33ms → ~0.3ms（删掉 LUT 解码 + 640× 冗余），
-  步时预估 **~4.2ms ≈ 238 tok/s** ✓。实施中（新 kernel + launcher + Rust dispatch + parity）。
-- 剩余研究级项：expert 侧 fp4 的 tcgen05 swapAB（需 `kind::f8f6f4` 混精，属另一条线）。
+- **"逐 kernel 抠 SIMT 地板"框架**：全部已识别的小优化路径（节点削减 / gemv_bf16 / w2 warm /
+  down cp.async / epilogue folding）若全部兑现 → ~6.05ms ≈ 165 tok/s，**达不到 200**。
+- **swapAB 换范式框架**：曾被判定为"唯一数量级路径（~238 tok/s）"，
+  但 **v17–v21 四变体 serve 全矩阵中性**（§3.5）——**该框架正式关闭**，
+  与它绑定的 ~1.8ms gemv 收益、a32 地板拆除、row-stationary 替代等**全部作废**。
 
-**结论一句话**：SIMT 抠法已到顶（~6.0ms / 166 tok/s）；**突破 200 靠 swapAB 换范式**，而非再抠现有 kernel。
+### 9.2 剩余路径（按可行性排序）
+
+| # | 路径 | 预期 | 状态 |
+|---|---|---|---|
+| 1 | **DL K-chunk cp.async**（`DSV41_HC_DL_KCHUNK`） | 14.9→8–9µs/launch，打 6 折后 **0.15–0.3ms/步** | **已实施**（`6fc6113`，默认 OFF，位一致已构造论证）**待 serve 验证** |
+| 2 | **expert tcgen05 fp4 swapAB**（`kind::f8f6f4`） | expert 2.0ms → 1.0ms，步时 ~3.0ms ≈ **333 tok/s** | 可行性已三处离线证实；**缺口是现 mxf4 无 cp.async/TMA**（16.8 GB/s LDG→STS 是 0.2% 带宽地板）；工作量 **4-5 人日** |
+| 3 | 无其它已识别路径 | — | — |
+
+> ⚠️ **路径 1 带有与 swapAB 完全相同的翻译风险**（隔离探针、7 次失效先验），必须走 serve A/B 判定。
+> 路径 2 的两条已验证事实：① `tcgen05.mma.cta_group::1.kind::f8f6f4` 在 sm_103a 可用
+> （CCCL arch guard 含 1030 / CUTLASS SM100_MMA_MXF8F6F4_SS / DeepGEMM 已实写 e4m3.e2m1 配对）；
+> ② scale 用 `kind::mxf8f6f4.block_scale.scale_vec::1X`（K=32 粒度，与 checkpoint per-32 e8m0 零转换）。
+> swapAB 布局同时解决 tcgen05 的 M=128 钉死（gateup 3840/128=30 tile、down 5120/128=40 tile）。
+
+### 9.3 结论一句话
+
+**SIMT 抠法已到顶（~6.0ms / 166 tok/s）；曾被视为突破口的 swapAB 范式被 serve 否证；
+200 tok/s 需要下一会话的 expert tcgen05 路径，或一个新的结构性发现。**
 
 ---
 
@@ -302,6 +405,13 @@ hc_mixes_tail 在 decode 只有 1 个 block——占用率不是变量。
 
 - serve A/B：`scripts/dsv41_serve_ab.sh`，同二进制背靠背，判据 = 四段文本（Paris/Tokyo/1+1=/静夜思/出师表）
   逐字 + `faults=0` + p50。
-- 相关文档：`crates/ferrite-dsv41/STATUS.md`（逐 commit 记录）、`docs/agent/dsv41-methodology.md`（方法论手册）、
+- 本报告 v2 覆盖的 commit 区间：`9cddfb8` … `6fc6113`（HEAD）。关键 commit：
+  `4bed9f6`（gate 修复）、`166acc5`/`9696afa`/`b7744a1`（swapAB 三阶段）、
+  `0f34001`（TMA Phase 1）、`6fc6113`（DL K-chunk）、`319ffc1`（v21 定案）。
+- 相关文档：`crates/ferrite-dsv41/STATUS.md`（逐 commit 记录，v17–v21 全部定案在此）、
+  `docs/agent/dsv41-methodology.md`（方法论手册）、`docs/agent/dsv41-layer-fusion.md`
+  （DL K-chunk 与 dots+LATE merge）、`docs/agent/dsv41-persistent-arch.md`（选举/持久化段核）、
   `docs/agent/perf-roadmap.md`（gemv/a32/swapAB 分析）、`docs/agent/dsv41-nsys-v14-plan.md`（nsys 分解）、
   `docs/agent/roadmap-200-tokps.md`（执行计划）。
+- 未验证项标注：§2.2 三条默认 OFF 实现（swapAB/TMA 已 serve 判中性；DL K-chunk 待 serve）；
+  §9.2 路径 1/2 的预期收益均为**理论值**。

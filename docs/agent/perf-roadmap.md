@@ -177,16 +177,23 @@ stale .so / 无 `DSV41_KERNELS` 时 skip，不 fail）；serve 阶段跑
 > 退化成同一条路径（测试会 assert 拒绝）。gate 每进程只读一次，serve A/B 必须是
 > **两次独立启动**，不能在同一进程内发两次请求。
 
-### expert 侧 tcgen05 fp4 swapAB 预研（2026-09-12，纯分析、未上机）
+### expert 侧 tcgen05 fp4 swapAB 预研（2026-09-12，纯分析 + ptxas 已验）
 
-上面第 7 条说"混精需 `kind::f8f6f4`"过粗。**离线核实的精确结论**（本机无 nvcc，
-证据来自 CUDA 13.x/CCCL 头 + CUTLASS + DeepGEMM，仍需 ptxas + 数值自测兜底）：
+上面第 7 条说"混精需 `kind::f8f6f4`"过粗。**离线核实的精确结论**（原始证据来自
+CUDA 13.x/CCCL 头 + CUTLASS + DeepGEMM；`assemble` 一项已于 2026-09-12 本地
+ptxas 实测闭环，数值自测仍待 GPU）：
 
-- **可用性 ✓**：`tcgen05.mma.cta_group::1.kind::f8f6f4` 与
+- **可用性 ✓（ptxas 已于 2026-09-12 实测）**：`tcgen05.mma.cta_group::1.kind::f8f6f4` 与
   `...kind::mxf8f6f4.block_scale.scale_vec::1X` 在 **sm_103a 都可用** ——
   `nvidia/cu13/include/cccl/.../generated/tcgen05_mma.h` 的 arch guard 显式含
   `_LIBCUDA_PTX_ARCH_SPECIFIC() == 1030`（报错串也写 `SM_100a_100f_103a_103f_110a`）。
   注意 `r3_tcgen05_f8f6f4.ptx` 那批 probe 只覆盖了 `mma.sync` 与 `kind::mxf4`，**没覆盖** tcgen05 f8f6f4。
+  **实测补强**：探针 `kernels/cuda/tests_tcgen05_mxf8f6f4_1x.cu` 用本机 CUDA 13.3
+  (`/tmp/nvccx/nvidia/cu13`) 编译，产出 `{a_desc}, {b_desc}, idesc, [sf_a], [sf_b], p`
+  形式的 PTX 并 `ptxas -arch=sm_103a` 汇编通过（30 regs / 4364 B smem）；`.scale_vec::1X`
+  与裸 `.block_scale` 两种拼写都过。**踩坑**：该 nvcc 的 `--list-gpu-arch` 没有 sm_103a 条目，
+  `-arch=sm_103a` 会被静默降成 `sm_103`（tcgen05 全线报 "not supported on .target 'sm_103'"），
+  必须写 `-gencode arch=compute_103a,code=sm_103a`。
 - **要带 scale 就必须用 `mxf8f6f4`，不是裸 `f8f6f4`**：裸 `kind::f8f6f4` 的操作数是
   `{%4,%5,%6,%7}`（disable_output_lane 掩码），**没有 block-scale 描述符**；per-32 e8m0
   scale 只能走 `kind::mxf8f6f4.block_scale.scale_vec::1X`（`mxf8f6f4` **只有 1X**，没有 2X/4X）。
