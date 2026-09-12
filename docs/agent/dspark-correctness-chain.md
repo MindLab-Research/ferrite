@@ -991,3 +991,24 @@ Draft 的 MoE 用 `expert_gate_up_fp4_batched` / `expert_down_reduce_fp4_batched
 1. bf16 截断的计算开销（round-trip 指令 × 40 层 × 2 侧）——应该很小（2 条指令）
 2. verify 图与截断的交互（图捕获可能失败，回退裸链）
 3. SH_EXP_MROWS + 截断的路径冲突
+
+## Draft attention 的 bf16 截断设计（accept 提升的下一步）
+
+**现状对齐矩阵**（lazy + 双截断 = 43% k_acc=0，比无截断的 64% 改善 21 个百分点）：
+| 组件 | backbone | draft | 对齐 |
+|---|---|---|---|
+| hc_pre | ✅ bf16 | ✅ bf16 | ✓ |
+| tap/输入 | N/A | ✅ bf16 | ✓ |
+| MoE 激活 | ✅ e4m3 | ✅ e4m3（同 kernel）| ✓ |
+| attention q/k/v | ❌ f32 | ❌ f32 | 部分（同错可抵消）|
+| attention 输出 | ❌ f32 | ❌ f32 | 部分 |
+| rope | ❌ f32 | ❌ f32 | 部分 |
+
+**关键洞察**：backbone 和 draft 的 attention 都是 f32——它们的"同错"可能部分抵消（draft 预测的偏差方向与 backbone 的 argmax 偏差一致）。但 draft 是在 official 的 bf16 attention 上训练的，其权重校准期望 bf16 噪声。
+
+**修法**（按侵入度）：
+1. **draft 的 attention 输出截断**（最简）：每个 MTP 层的 o 投影输出后加 round-trip（3 层 × 1 次 = 3 kernel/步）——把 draft 的 attention 输出拉回 bf16 精度
+2. **draft 的 q/k/v 截断**：fp8 GEMM 输出后 round-trip（更细粒度但更多截断点）
+3. **全 draft 内部截断**：每层 residual 都 round-trip（最彻底但最贵）
+
+**推荐**：先做 #1（最简，一次试验即可判定方向）。
