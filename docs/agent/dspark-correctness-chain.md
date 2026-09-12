@@ -3098,3 +3098,27 @@ DSV41_EXPERT_ACT_E4M3=1           # e4m3
 3. **v5 AR 的惊群回归**（v3 消除的 160-block 轮询被 v5 引回）
 4. **accept 天花板是 5**（数字任务满接受）不是 1.214
 5. **质量退化是模型行为**（EAGER 对照 77% 重复率）
+
+## 🎯 400 的数学必然性：accept=5 下必须走 batched（SWALLOW）
+
+**lazy 路径的数学下限**（即使 c_row 达到 EAGER 水平 6.15ms）：
+- 步时 = k_emit × c_row + draft + commit = 6 × 6.15 + 4.3 + 0.2 = **41.4ms**
+- 吞吐 = 6 / 0.0414 = **145 tok/s**（远不是 400！）
+
+**400 在 lazy 下需要的 c_row**：
+- 15ms = 6 × c_row + 4.5 → c_row ≤ **1.75ms/行**（比 EAGER 快 3.5×——物理不可能！）
+
+**batched（SWALLOW m=6）的数学**：
+- 6 行共享一次权重读（weight-stationary）→ 一次 forward ≈ EAGER + 边际 ≈ 7-8ms
+- 步时 = 7-8 + draft 4.3 + commit 0.2 = **~12.5ms**
+- 吞吐 = 6 / 0.0125 = **480 tok/s** ✓✓
+
+**结论**：400 @ accept 5 **只有 batched 能达到**。lazy 是 accept ≤ 2 的正确路径（k_emit 小时 lazy 更快）。
+
+**关键未测试项**：Plan B（unanimity-or-direct）已实施但从未 GPU 测试！如果它修复 SWALLOW + 图的 ar5-hang：
+- batched + 图 + SH_PAIR + tcgen05 → 400 可达！
+
+**SWALLOW 的已知问题**：
+1. ar5-hang（Plan A+C 失败 gap 23；无图时出师表 OK 但计数 937 hang）
+2. Plan B 是最后的希望（unanimity-or-direct 的 rank 投票）
+3. 如果 Plan B 也不行 → 需要分析为什么无图模式在计数任务也 hang（这不是臂分歧问题！）
