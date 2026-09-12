@@ -27,7 +27,7 @@
 use std::collections::HashMap;
 
 use ferrite_model::{AttnKind, Glm53FlashConfig, MlpKind, Weights, build_layer_plans, Fp8Weight, Weights8};
-use ferrite_types::{DType, FerriteError, Result, Shape, Tensor};
+use ferrite_types::{DType, FerriteError, Result, Shape, SpecStep, Tensor};
 
 use crate::Engine;
 
@@ -1362,7 +1362,7 @@ impl<B: KernelBackend> TpCluster<B> {
                 if mtp {
                     Self::mtp_setup_bufs(s, &plans, seq)?;
                 }
-                let vio = if mtp { Some(Self::mtp_vio(s, false)) } else { None };
+                let vio = if mtp { Some(Self::mtp_vio(s, seq, false)) } else { None };
                 Self::mega_chain_dev(s, seq, in_vals.as_slice(), &plans, num_dsa, false, &gname, 1, vio.as_ref())
             })
             .into_iter()
@@ -1394,7 +1394,7 @@ impl<B: KernelBackend> TpCluster<B> {
             // is deadlock-free (the nccl test proved it).
             let tc = std::time::Instant::now();
             Self::fan_out(&mut self.shards, |s| {
-                let vio = if mtp { Some(Self::mtp_vio(s, false)) } else { None };
+                let vio = if mtp { Some(Self::mtp_vio(s, seq, false)) } else { None };
                 Self::mega_chain_dev(s, seq, in_vals.as_slice(), &plans, num_dsa, true, &gname, 1, vio.as_ref())
             })
             .into_iter()
@@ -1429,7 +1429,7 @@ impl<B: KernelBackend> TpCluster<B> {
                             let emb = ferrite_kernel::cuda::DevBuf::alloc(cuda.dev(), cuda.stream_handle(), hidden)?;
                             emb.upload(h2.as_slice())?;
                             let m = cuda.mtp.lock().unwrap();
-                            let m = m.as_ref().ok_or_else(|| FerriteError::Config("mtp bufs missing".into()))?;
+                            let m = m.as_ref().and_then(|b| b.get(seq)).ok_or_else(|| FerriteError::Config("mtp bufs missing".into()))?;
                             (emb, &m.hf_dev as *const ferrite_kernel::cuda::DevBuf as usize)
                         };
                         let hout = ferrite_kernel::cuda::DevBuf::alloc(
@@ -1464,7 +1464,7 @@ impl<B: KernelBackend> TpCluster<B> {
                             .as_cuda()
                             .ok_or_else(|| FerriteError::Config("cuda".into()))?;
                         let m = cuda.mtp.lock().unwrap();
-                        let m = m.as_ref().ok_or_else(|| FerriteError::Config("mtp bufs missing".into()))?;
+                        let m = m.as_ref().and_then(|b| b.get(seq)).ok_or_else(|| FerriteError::Config("mtp bufs missing".into()))?;
                         cuda.copy_dev(&m.hf_dev, 0, m.hprev.as_f32(), hidden)?;
                     }
                     Ok::<(), FerriteError>(())
@@ -1484,13 +1484,13 @@ impl<B: KernelBackend> TpCluster<B> {
                 let h2 = self.shards[0].embed(&vec![last; n_v]);
                 let in_vals2 = crate::mhc::hc_expand(&h2, self.full_cfg.hc_mult);
                 let _ = Self::fan_out(&mut self.shards, |s| {
-                    let vio = Self::mtp_vio(s, true);
+                    let vio = Self::mtp_vio(s, seq, true);
                     Self::mega_chain_dev(s, seq, in_vals2.as_slice(), &plans, num_dsa, false, &gv, n_v, Some(&vio))
                 })
                 .into_iter()
                 .collect::<Result<Vec<Vec<f32>>>>()?;
                 Self::fan_out(&mut self.shards, |s| {
-                    let vio = Self::mtp_vio(s, true);
+                    let vio = Self::mtp_vio(s, seq, true);
                     Self::mega_chain_dev(s, seq, in_vals2.as_slice(), &plans, num_dsa, true, &gv, n_v, Some(&vio))
                 })
                 .into_iter()
@@ -1533,6 +1533,7 @@ impl<B: KernelBackend> TpCluster<B> {
                             let m = cuda.mtp.lock().unwrap();
                             let m = m
                                 .as_ref()
+                                .and_then(|b| b.get(seq))
                                 .ok_or_else(|| FerriteError::Config("mtp bufs missing".into()))?;
                             m.tokens_dev.as_f32() as *mut i32
                         };
@@ -1777,6 +1778,7 @@ impl<B: KernelBackend> TpCluster<B> {
                             let m = cuda.mtp.lock().unwrap();
                             let m = m
                                 .as_ref()
+                                .and_then(|b| b.get(seq))
                                 .ok_or_else(|| FerriteError::Config("mtp bufs missing".into()))?;
                             m.tokens_dev.as_f32() as *mut i32
                         };
@@ -1800,6 +1802,7 @@ impl<B: KernelBackend> TpCluster<B> {
                             let m = cuda.mtp.lock().unwrap();
                             let m = m
                                 .as_ref()
+                                .and_then(|b| b.get(seq))
                                 .ok_or_else(|| FerriteError::Config("mtp bufs missing".into()))?;
                             m.d_argmax_dev.as_f32()
                         };
@@ -1829,6 +1832,7 @@ impl<B: KernelBackend> TpCluster<B> {
                         let m = cuda.mtp.lock().unwrap();
                         let m = m
                             .as_ref()
+                            .and_then(|b| b.get(seq))
                             .ok_or_else(|| FerriteError::Config("mtp bufs missing".into()))?;
                         (m.tokens_dev.as_f32() as *mut i32, m.d_argmax_dev.as_f32())
                     };
@@ -1896,6 +1900,7 @@ impl<B: KernelBackend> TpCluster<B> {
                         let m = cuda.mtp.lock().unwrap();
                         let m = m
                             .as_ref()
+                            .and_then(|b| b.get(seq))
                             .ok_or_else(|| FerriteError::Config("mtp bufs missing".into()))?;
                         &m.hprev as *const DevBuf as usize
                     };
@@ -1971,7 +1976,7 @@ impl<B: KernelBackend> TpCluster<B> {
             let mut out = vec![0f32; n_v];
             let ids_dev = {
                 let m = cuda.mtp.lock().unwrap();
-                m.as_ref().map(|m| m.tokens_dev.as_f32() as *mut i32)
+                m.as_ref().and_then(|b| b.get(seq)).map(|m| m.tokens_dev.as_f32() as *mut i32)
             };
             let ran = match ids_dev {
                 Some(p) => cuda.graph_run_ids(&gvname, &toks_in, p, &mut out)?,
@@ -1992,14 +1997,12 @@ impl<B: KernelBackend> TpCluster<B> {
             // host pinned bookkeeping (ns); the B_k -> A ping-pong commit +
             // hprev <- hf_v[k-1] is ONE ferrite_mtp_commit launch.
             // k = longest matching prefix of (d1..d_nd) vs (a0..a_{nd-1}),
-            // 1..=n_v (N-UNIFIED generalization of the old d1/d2 nesting).
-            let mut k: i32 = 1;
-            while (k as usize) < n_v
-                && drafts[(k - 1) as usize] as u32 == out[(k - 1) as usize] as u32
-            {
-                k += 1;
-            }
-            let k = k as usize;
+            // 1..=n_v (N-UNIFIED generalization of the old d1/d2 nesting):
+            // THE shared accept chain. This block CONTAINS the anchor row
+            // (`[t_last, d1..d_nd]`), so the chain is index-aligned —
+            // `SpecStep::ANCHOR_IS_IN_BLOCK = true` — and k counts the emitted
+            // tokens (the always-accepted anchor plus the surviving drafts).
+            let k = Self::accept(&drafts, &out);
             if std::env::var_os("FERRITE_MTP_DEBUG").is_some() {
                 eprintln!("[mtp-acc] drafts={:?} out={:?} k={}", drafts, out, k);
             }
@@ -2011,7 +2014,7 @@ impl<B: KernelBackend> TpCluster<B> {
             // k>=2 keeps last + the accepted d1..d_{k-2}. Same arithmetic as
             // the old (2-k).max(0) at nd=2.
             cuda.dsa_host_rollback(seq, mtp_family, nd.saturating_sub(k));
-            cuda.mtp_commit(k as i32)?;
+            cuda.mtp_commit(seq, k as i32)?;
             Ok((out, k))
         })
         .into_iter()
@@ -2059,7 +2062,6 @@ impl<B: KernelBackend> TpCluster<B> {
         Ok(ret)
     }
 
-    /// ZERO-H2D device-resident MTP step (FERRITE_ZERO_H2D=1): the entire
     /// draft→verify→accept→commit chain runs on device — the token NEVER
     /// crosses to host for computation. The only D2H is 8 bytes at the end
     /// (k + next_token, for SSE/seq tracking — FERRITE_SSE=0 defers even
@@ -2121,6 +2123,7 @@ impl<B: KernelBackend> TpCluster<B> {
                     let m = cuda.mtp.lock().unwrap();
                     let m = m
                         .as_ref()
+                        .and_then(|b| b.get(seq))
                         .ok_or_else(|| FerriteError::Config("mtp bufs missing".into()))?;
                     let n_v = mtp_verify_n();
                     let nd = n_v - 1;
@@ -2175,7 +2178,7 @@ impl<B: KernelBackend> TpCluster<B> {
                         // commit validation: hprev SHOULD equal hf_v[0] (k=1 →
                         // row 0 of last step's verify h_final export). D2H both.
                         let m2 = cuda.mtp.lock().unwrap();
-                        let m2 = m2.as_ref().unwrap();
+                        let m2 = m2.as_ref().and_then(|b| b.get(seq)).unwrap();
                         let mut hfv = [0f32; 12];
                         let rh2 = ferrite_kernel::cuda::memcpy_d2h_sync(
                             m2.hf_v.as_f32() as *mut std::ffi::c_void, hfv.as_mut_ptr(), 12, cuda.stream_handle());
@@ -2487,7 +2490,7 @@ impl<B: KernelBackend> TpCluster<B> {
                         }
                     }
                     // mtp_commit with k from host (pinned — TODO: k_dev from device)
-                    cuda.mtp_commit(k_host)?;
+                    cuda.mtp_commit(seq, k_host)?;
                     let t_commit = t_c.elapsed();
 
                     if mtp_tm {
@@ -2664,7 +2667,12 @@ impl<B: KernelBackend> TpCluster<B> {
             h_d.push(DevBuf::alloc(cuda.dev(), cuda.stream_handle(), hidden)?);
         }
         let d_argmax_dev = DevBuf::alloc(cuda.dev(), cuda.stream_handle(), nd.max(1))?;
-        *cuda.mtp.lock().unwrap() = Some(MtpState {
+        // ONE MtpState per live MTP seq (MtpStateB): register this seq's set
+        // instead of overwriting a per-rank singleton. Re-binding a seq that is
+        // already registered replaces its state in place — the old one drops
+        // here, AFTER the buffers above were allocated, which is the order the
+        // pre-split singleton's overwrite had.
+        cuda.mtp_bind(seq, MtpState {
             hf_dev, hf_v, hprev, scratch, commit: Some(commit),
             tokens_dev, verify_argmax_dev, k_dev, next_token_dev, n_accepted_dev,
             emb_devs, h_d, d_argmax_dev,
@@ -2672,14 +2680,15 @@ impl<B: KernelBackend> TpCluster<B> {
         Ok(())
     }
 
-    /// VerifyIO for the given graph: verify=false → decode graph (n=1, empty
-    /// scratch, h_final → hf_dev); verify=true → verify graph (n=2, GDN
-    /// ping-pong scratch ptrs, h_final → hf_v).
+    /// VerifyIO for `seq`'s MtpState and the given graph: verify=false → decode
+    /// graph (n=1, empty scratch, h_final → hf_dev); verify=true → verify graph
+    /// (n=2, GDN ping-pong scratch ptrs, h_final → hf_v). One MtpState per seq
+    /// (see `MtpStateB`) — `mtp_setup_bufs` must have bound `seq` already.
     #[cfg(feature = "cuda")]
-    fn mtp_vio(s: &Engine<B>, verify: bool) -> VerifyIO {
+    fn mtp_vio(s: &Engine<B>, seq: u64, verify: bool) -> VerifyIO {
         let cuda = s.backend.as_cuda().unwrap();
         let m = cuda.mtp.lock().unwrap();
-        let m = m.as_ref().unwrap();
+        let m = m.as_ref().and_then(|b| b.get(seq)).unwrap();
         if verify {
             VerifyIO {
                 gdn_scratch: m
@@ -2854,7 +2863,7 @@ fn mega_chain_dev(
     // Dry-run keeps the host staging (its sampled token needs REAL input).
     let ids_dev_cap: Option<*mut i32> = {
         let m = cuda.mtp.lock().unwrap();
-        m.as_ref().map(|m| m.tokens_dev.as_f32() as *mut i32)
+        m.as_ref().and_then(|b| b.get(seq)).map(|m| m.tokens_dev.as_f32() as *mut i32)
     };
     let dev_embed = capture && ids_dev_cap.is_some();
     if dev_embed {
@@ -5468,6 +5477,7 @@ pub(crate) fn draft_step_dev<B: KernelBackend>(
         let m = cuda.mtp.lock().unwrap();
         let m = m
             .as_ref()
+            .and_then(|b| b.get(seq))
             .ok_or_else(|| FerriteError::Config("mtp bufs missing".into()))?;
         let tokens = m.tokens_dev.as_f32() as *mut i32;
         let emb = m.emb_devs[i].as_f32();
@@ -5525,3 +5535,39 @@ pub(crate) fn draft_step_dev<B: KernelBackend>(
 
 
 
+
+// ---------------------------------------------------------------------------
+// The SpecStep seam — the four-phase skeleton shared with DSV41's DSpark chain
+// ---------------------------------------------------------------------------
+
+/// The GLM MTP chain as one [`SpecStep`], the same four phases DSV41's
+/// `DevChain` exposes (`ferrite-models/src/dsv41/chain_dev.rs`):
+/// draft → verify → accept → commit.
+///
+/// `ANCHOR_IS_IN_BLOCK = true` is the layout fact the shared accept chain needs:
+/// this verify block is `[t_last, d1..d_nd]`, whose row 0 IS the anchor row, so
+/// `SpecStep::accept` lands on the index-aligned convention (see
+/// `ferrite_types::spec_accept`) — block row `i`'s argmax judges `drafts[i]`
+/// directly, and the returned `k` counts the emitted tokens (the always-accepted
+/// anchor plus the surviving drafts).
+///
+/// The phases stay fused in one call on purpose: accept + commit run INSIDE the
+/// verify's `fan_out` (see `mtp_step`), so the trait exposes the step, not its
+/// parts.
+#[cfg(feature = "cuda")]
+impl<B: ferrite_kernel::KernelBackend> SpecStep for TpCluster<B> {
+    type Step<'a, 'b>
+        = (u64, &'a [ferrite_model::LayerPlan], usize)
+    where
+        'b: 'a;
+    type Report = u32;
+    const ANCHOR_IS_IN_BLOCK: bool = true;
+
+    fn spec_step<'a, 'b>(&mut self, step: Self::Step<'a, 'b>) -> Result<Self::Report>
+    where
+        'b: 'a,
+    {
+        let (seq, plans, num_dsa) = step;
+        self.mtp_step(seq, plans, num_dsa)
+    }
+}

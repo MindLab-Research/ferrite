@@ -1654,14 +1654,334 @@ __global__ void indexer_topk_kernel(const float* __restrict__ qi,
     }
 }
 
+// ============================================================
+// indexer_topk HEAP path (Wave 4 P0-D, 2026-09-12) — the O(select_k × t) slow
+// path replaced by a single streaming pass. Opt-in: FERRITE_INDEXER_HEAP=1.
+//
+// WHY. The old slow path is
+//     for r in 0..select_k { block-wide argmax over the t scores; mark used }
+// i.e. O(select_k × t) — and worse for LATENCY, the inner scan is serial
+// inside a thread (t/blockDim steps PER r): at t = 500K pools / select_k = 512
+// one row costs ~1.9M serial-ish cycles. At 1M context (t ≈ 250K-500K pools)
+// that is the "time availability" blocker (docs/agent/wave4-prefill-plan.md §7).
+//
+// HOW. Stream the causally-valid pools in chunks of `chunk` pools, keeping a
+// running candidate buffer of at most `cap` keys:
+//   1. per chunk: score the pools and pack each score into ONE monotone u64
+//      key — (score desc, index asc), which is exactly the order the old
+//      selection implements (see idx_key);
+//   2. append every key > tau to the candidate buffer (tau = a lower bound on
+//      the select_k-th largest; 0 = "no filter" until the first prune);
+//   3. when a further chunk could overflow the buffer, PRUNE: exact MSD
+//      radix-select of the top-select_k keys, which also raises tau.
+// tau is an EXACT filter: at a prune the buffer already holds select_k keys
+// >= tau, so a later key < tau can never enter the final top-k.
+//
+// COMPLEXITY. Scoring dominates either way (O(t·h·d) MACs, parallel, unchanged
+// FP association). The SELECTION drops from O(select_k · t) serial-ish steps
+// to O(t / blockDim) for the τ-filter pass plus O(digits · cap) per prune, with
+// ~2 prunes per row in the typical case (the chunk survival rate is
+// ~select_k · chunk / t). Worst case one prune per (cap - select_k) appended
+// candidates, each ≤ 8 digit passes over a shrinking array — still bounded far
+// below k·t. 1M estimate in the report.
+//
+// The buffer sizes are derived from `topk` (the caller's frozen select_k_max),
+// so the frozen smem stays graph-safe; when the result exceeds the device
+// ceiling the launcher falls back to the original kernel.
+// ============================================================
+
+// (score desc, index asc) as a single monotone u64 key. The old selection
+// repeatedly takes the block-wide max with a STRICT `>` (both in the per-thread
+// scan and in the shuffle/cross-warp reduce), which keeps the LOWEST index on
+// ties — so the set it selects is the top-k under (score desc, index asc).
+// Packing the index into the key makes that order TOTAL (keys are unique), so
+// an exact radix select on the key reproduces the set exactly.
+//
+// key == 0 is IMPOSSIBLE for a real score (mono == 0 needs the sign bit clear
+// AND (bits | 0x80000000) == 0) and is the EMPTY marker: NaN scores map to it
+// (the old path never selected a NaN — NaN fails every `>` test) and so do the
+// pools outside the causal range, which the old path leaves at -INFINITY
+// (never selected while select_k valid candidates exist, i.e. whenever this
+// path runs: select_k < jmax).
+__device__ __forceinline__ unsigned long long idx_key(float s, int j) {
+    if (!(s == s)) return 0ull; // NaN → empty (never selected)
+    // +0.0 and -0.0 compare EQUAL under f32 `>`, so the old path ties them and
+    // prefers the lower index; the monotone key would order -0.0 one step
+    // below +0.0. Canonicalise so the tie falls to the index, as before.
+    if (s == 0.0f) s = 0.0f;
+    const unsigned int b = __float_as_uint(s);
+    const unsigned int mono = (b >> 31) ? ~b : (b | 0x80000000u);
+    return ((unsigned long long)mono << 32) | (unsigned long long)(0xFFFFFFFFu - (unsigned int)j);
+}
+
+__device__ __forceinline__ int key_idx(unsigned long long k) {
+    return (int)(0xFFFFFFFFu - (unsigned int)(k & 0xFFFFFFFFull));
+}
+
+// Exact top-nsel of src[0..live) by packed key, compacted into sel[0..nsel):
+// MSD radix select, 8 bits per pass, 256 bins. `sel` needs >= nsel slots
+// (nsel = min(live, m) <= m). Returns nsel and publishes the nsel-th largest
+// key (the prune threshold) in *tau_slot.
+// Keys are unique, so the pass that narrows the target bucket to a single key
+// has found the exact nsel-th largest (8 passes = all 64 bits is the hard
+// bound). Every key with a digit ABOVE the target bucket is collected into
+// sel[] as it is discarded — those keys are all in the top-nsel.
+__device__ int indexer_heap_prune(unsigned long long* src, unsigned long long* scratch,
+                                  unsigned long long* sel, unsigned int* hist, int* red,
+                                  unsigned long long* tau_slot, int live, int m, int tid) {
+    const int nsel = (live < m) ? live : m;
+    if (nsel <= 0) { if (tid == 0) *tau_slot = 0ull; return 0; }
+    int n = live;
+    int rem = nsel; // rank (1-based, descending) inside the current bucket
+    unsigned long long* cur = src;
+    unsigned long long* nxt = scratch;
+    unsigned long long tau = 0ull;
+    bool have = false;
+    if (tid == 0) red[5] = 0; // # keys already promoted into sel[]
+    for (int dg = 0; dg < 8 && !have; dg++) {
+        const int shift = 56 - 8 * dg;
+        for (int b = tid; b < 256; b += blockDim.x) hist[b] = 0u;
+        __syncthreads();
+        for (int i = tid; i < n; i += blockDim.x)
+            atomicAdd(&hist[(unsigned int)((cur[i] >> shift) & 0xFFu)], 1u);
+        __syncthreads();
+        if (tid == 0) {
+            int cum = 0, bin = 0;
+            for (int b = 255; b >= 0; b--) {
+                cum += (int)hist[b];
+                if (cum >= rem) { bin = b; cum -= (int)hist[b]; break; }
+            }
+            red[0] = bin;       // target bucket
+            red[1] = rem - cum; // rank inside the bucket
+            red[4] = 0;         // survivor write cursor
+        }
+        __syncthreads();
+        const unsigned int bin = (unsigned int)red[0];
+        for (int i = tid; i < n; i += blockDim.x) {
+            const unsigned int dgv = (unsigned int)((cur[i] >> shift) & 0xFFu);
+            if (dgv > bin) {
+                const int s = atomicAdd(&red[5], 1);
+                sel[s] = cur[i]; // strictly above τ: selected for sure
+            } else if (dgv == bin) {
+                const int s = atomicAdd(&red[4], 1);
+                nxt[s] = cur[i];
+            }
+        }
+        __syncthreads();
+        n = red[4];
+        rem = red[1];
+        if (n <= 1) { tau = nxt[0]; have = true; } // n >= 1 always (rem <= n)
+        else { unsigned long long* sw = cur; cur = nxt; nxt = sw; }
+    }
+    if (!have) tau = cur[0]; // unreachable (unique keys ⇒ n == 1 on the last digit)
+    if (tid == 0) {
+        if (red[5] < m) sel[red[5]] = tau; // the nsel-th largest itself
+        *tau_slot = tau;
+    }
+    return nsel;
+}
+
+// Bitonic sort, DESCENDING key order — i.e. (score desc, index asc), the order
+// the old slow path emits. n must be a power of two; the caller zero-pads.
+__device__ void indexer_heap_sort(unsigned long long* a, int n, int tid) {
+    for (int k = 2; k <= n; k <<= 1) {
+        for (int j = k >> 1; j > 0; j >>= 1) {
+            for (int i = tid; i < n; i += blockDim.x) {
+                const int ixj = i ^ j;
+                if (ixj > i) {
+                    const unsigned long long x = a[i], y = a[ixj];
+                    if (((i & k) == 0) ? (x < y) : (x > y)) { a[i] = y; a[ixj] = x; }
+                }
+            }
+            __syncthreads();
+        }
+    }
+}
+
+// smem: [cap] cand | [cap] scratch | [psel] sel | [chunk] ck | [256] hist | [32] red
+// (red[8] is aliased as the u64 τ slot; the arrays are laid out so every u64
+// base keeps 8B alignment).
+__global__ void indexer_topk_heap_kernel(const float* __restrict__ qi,
+                                         const float* __restrict__ ki,
+                                         const float* __restrict__ w,
+                                         float* __restrict__ idx,
+                                         int n, int h, int d, int topk_max,
+                                         const int* __restrict__ total_ptr, int kpool_val,
+                                         int n_fixed, int cap, int chunk, int psel) {
+    const int total = *total_ptr;
+    const int t = (total + kpool_val - 1) / kpool_val;
+    const int select_k = min(topk_max, t);
+    const int ctx0 = total - n_fixed;
+    const int ctx0_pools = ctx0 / kpool_val;
+    const int row = blockIdx.x;
+    if (row >= n) return;
+    const int tid = threadIdx.x;
+    extern __shared__ __align__(16) unsigned char smraw[];
+    unsigned long long* cand = reinterpret_cast<unsigned long long*>(smraw);
+    unsigned long long* scr = cand + cap;
+    unsigned long long* sel = scr + cap;
+    unsigned long long* ck = sel + psel;
+    unsigned int* hist = reinterpret_cast<unsigned int*>(ck + chunk);
+    int* red = reinterpret_cast<int*>(hist + 256);
+    unsigned long long* tau_slot = reinterpret_cast<unsigned long long*>(red + 8);
+
+    const int jmax = min(ctx0_pools + row + 1, t);
+    if (select_k >= jmax || select_k <= 0) {
+        // FAST PATH — bit-identical to indexer_topk_kernel's (idx = 0..jmax-1
+        // then the -1 padding must stay byte-equal for A/B).
+        for (int r = tid; r < select_k; r += blockDim.x)
+            idx[(size_t)row * topk_max + r] = (r < jmax) ? (float)r : -1.0f;
+        const int pad0 = (select_k > 0) ? select_k : 0;
+        for (int r = pad0 + tid; r < topk_max; r += blockDim.x)
+            idx[(size_t)row * topk_max + r] = -1.0f;
+        return;
+    }
+    // Scoring keeps the old H-SPLIT's FP ASSOCIATION (four head-quarter sums
+    // accumulated in rising order, dot = (a0+a1)+(a2+a3)) so both paths rank
+    // equal-valued scores identically — otherwise near-ties could split.
+    const int nq = (h >= 4 && (h & 3) == 0) ? 4 : 1;
+    const int hq = h / nq;
+    const float inv_sqrt_d = rsqrtf((float)d);
+    const float* qrow = qi + (size_t)row * (h * d);
+    if (tid == 0) { red[0] = 0; *tau_slot = 0ull; }
+    __syncthreads();
+    unsigned long long tau = 0ull;
+    int live = 0;
+    for (int c0 = 0; c0 < jmax; c0 += chunk) {
+        const int nch = min(chunk, jmax - c0);
+        for (int p = tid; p < nch; p += blockDim.x) {
+            const int j = c0 + p;
+            const float* krow = ki + (size_t)j * d;
+            float s = 0.f;
+            for (int qq = 0; qq < nq; qq++) {
+                float part = 0.f;
+                const int hi0 = qq * hq, hi1 = hi0 + hq;
+                for (int hi = hi0; hi < hi1; hi++) {
+                    const float* qp = qrow + (size_t)hi * d;
+                    float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+                    for (int l = 0; l + 3 < d; l += 4) {
+                        const float4 qv = *reinterpret_cast<const float4*>(qp + l);
+                        const float4 kv = *reinterpret_cast<const float4*>(krow + l);
+                        a0 += qv.x * kv.x; a1 += qv.y * kv.y;
+                        a2 += qv.z * kv.z; a3 += qv.w * kv.w;
+                    }
+                    const float dot = (a0 + a1) + (a2 + a3);
+                    part += w[(size_t)row * h + hi] * fmaxf(dot, 0.f);
+                }
+                s += part;
+            }
+            ck[p] = idx_key(s * inv_sqrt_d, j);
+        }
+        __syncthreads();
+        // τ filter + append. live <= cap - chunk here, so at most `chunk` new
+        // keys land in cand[0..cap) — the `s < cap` guard cannot drop one.
+        for (int p = tid; p < nch; p += blockDim.x) {
+            const unsigned long long k = ck[p];
+            if (k != 0ull && k > tau) {
+                const int s = atomicAdd(&red[0], 1);
+                if (s < cap) cand[s] = k;
+            }
+        }
+        __syncthreads();
+        live = red[0];
+        if (live > cap) { live = cap; red[0] = cap; } // unreachable by construction
+        if (live > cap - chunk) {
+            const int ns = indexer_heap_prune(cand, scr, sel, hist, red, tau_slot, live, select_k, tid);
+            __syncthreads();
+            tau = *tau_slot;
+            for (int i = tid; i < ns; i += blockDim.x) cand[i] = sel[i];
+            if (tid == 0) red[0] = ns;
+            __syncthreads();
+            live = ns;
+        }
+    }
+    // final selection: also the whole answer when no prune fired (live < cap)
+    const int ns = indexer_heap_prune(cand, scr, sel, hist, red, tau_slot, live, select_k, tid);
+    __syncthreads();
+    for (int i = ns + tid; i < psel; i += blockDim.x) sel[i] = 0ull; // sort padding
+    __syncthreads();
+    int pw = 1;
+    while (pw < ns) pw <<= 1;
+    if (pw > 1) indexer_heap_sort(sel, pw, tid);
+    for (int r = tid; r < topk_max; r += blockDim.x) {
+        const int j = (r < ns) ? key_idx(sel[r]) : -1;
+        idx[(size_t)row * topk_max + r] = (float)j;
+    }
+}
+
+// Sizes for the heap path: `chunk` pools per scoring pass, `cap`-key candidate
+// buffer, `psel`=next_pow2(topk) padded output/sort list. cap is the next power
+// of two >= topk + chunk, which is what guarantees cap - chunk >= topk (the
+// no-overflow invariant above) and psel <= cap.
+static int indexer_heap_sizes(int topk, int* cap_out, int* chunk_out, int* psel_out) {
+    const int chunk = 1024;
+    int cap = chunk;
+    while (cap < topk + chunk) cap <<= 1;
+    int psel = 1;
+    while (psel < topk) psel <<= 1;
+    *cap_out = cap;
+    *chunk_out = chunk;
+    *psel_out = psel;
+    return cap * 2 * (int)sizeof(unsigned long long) + psel * (int)sizeof(unsigned long long)
+           + chunk * (int)sizeof(unsigned long long) + 256 * (int)sizeof(unsigned int) + 32 * 4;
+}
+
+// sm_103 (B300) allows 227KB of dynamic smem per block; keep headroom so a
+// cudaFuncSetAttribute failure can never make the op unlaunchable.
+static const int kIndexerHeapMaxSmem = 200 * 1024;
+
+// Same ABI as ferrite_indexer_topk but FORCED onto the heap path (the env gate
+// is read once per process, so A/B and the host self-test need a direct entry).
+// Returns cudaErrorInvalidValue when the frozen smem does not fit — callers
+// fall back to the original kernel.
+extern "C" cudaError_t ferrite_indexer_topk_heap(const float* qi, const float* ki,
+                                                 const float* w,
+                                                 float* idx, int n, int h, int d,
+                                                 int topk, const int* total_ptr, int kpool_val,
+                                                 int n_fixed, cudaStream_t s) {
+    int cap = 0, chunk = 0, psel = 0;
+    const int smem = indexer_heap_sizes(topk, &cap, &chunk, &psel);
+    if (smem > kIndexerHeapMaxSmem) return cudaErrorInvalidValue;
+    if (smem > 48 * 1024) {
+        cudaError_t e = cudaFuncSetAttribute(indexer_topk_heap_kernel,
+                                             cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        if (e != cudaSuccess) return e;
+    }
+    dim3 block(512);
+    dim3 grid(n);
+    indexer_topk_heap_kernel<<<grid, block, (size_t)smem, s>>>(
+        qi, ki, w, idx, n, h, d, topk, total_ptr, kpool_val, n_fixed, cap, chunk, psel);
+    return cudaGetLastError();
+}
+
 extern "C" cudaError_t ferrite_indexer_topk(const float* qi, const float* ki,
                                             const float* w,
                                             float* idx, int n, int h, int d,
                                             int topk, const int* total_ptr, int kpool_val, int n_fixed,
                                             cudaStream_t s) {
+    // Heap path (P0-D) is env-gated and read ONCE — this launcher runs per
+    // DSA layer-step and a per-call getenv is the hot-path slip this file
+    // avoids. Default OFF = the original kernel below (no behavior change).
+    // "0" also means OFF, like the other atoi() gates in this file.
+    static const bool heap_ = [] {
+        const char* e = getenv("FERRITE_INDEXER_HEAP");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    if (heap_) {
+        int cap = 0, chunk = 0, psel = 0;
+        if (indexer_heap_sizes(topk, &cap, &chunk, &psel) <= kIndexerHeapMaxSmem)
+            return ferrite_indexer_topk_heap(qi, ki, w, idx, n, h, d, topk, total_ptr, kpool_val,
+                                             n_fixed, s);
+        // topk too large for the buffer layout (cap >= 24K) — keep the old
+        // kernel rather than failing the op.
+    }
     // H-SPLIT (v11): 4 threads per pool (4 heads each) — blockDim 544 = 17 warps
     // (129 pools × 4 quarters = 516 threads + 28 idle). The smem: t scores +
     // 4t partials = 5 × max_t floats.
+    // NOTE (P0-D): the smem below is frozen at max_t = 2048 pools, so this
+    // kernel only runs while t <= 2048 (t = ceil(total/kpool)); beyond that
+    // the score staging itself overflows and FERRITE_INDEXER_HEAP=1 is the
+    // only legal path at long context.
     dim3 block(544);
     dim3 grid(n);
     // smem sized for MAX possible pools (graph-safe: frozen smem with actual

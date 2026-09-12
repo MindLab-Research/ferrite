@@ -16,10 +16,12 @@
 //! (~GBs per seq — without it the serve OOMs after a handful of
 //! requests).
 //!
-//! MTP constraint: `MtpState` is a per-rank SINGLETON (the MTP verify
-//! path's ping-pong scratch) — with FERRITE_MTP=1 the engine forces
-//! max_seqs=1 (multi-seq MTP corrupts the shared scratch; lifting this
-//! needs per-seq MtpState buffers).
+//! MTP constraint: the MTP step is still the SINGLE-SEQ round-robin — the
+//! verify graph is one seq's block (`mega_v{seq}`, n = FERRITE_MTP_N rows)
+//! and the draft chain / accept / commit are per seq — so with FERRITE_MTP=1
+//! the engine forces max_seqs=1. The scratch is already per seq
+//! (`ferrite_kernel::cuda::MtpStateB`); what is still missing is the B-row
+//! verify graph (Wave 5 Step B), and the gate lifts with it.
 
 #![cfg(feature = "cuda")]
 
@@ -628,12 +630,13 @@ pub struct GpuEngine {
 
 impl GpuEngine {
     pub fn new(cluster: TpCluster<CudaBackend>, stops: Vec<u32>, mut max_seqs: usize) -> Self {
-        // MTP: MtpState (verify ping-pong scratch, hf_v/hprev) is a
-        // per-rank singleton — multi-seq corrupts it. Single-seq only
-        // until the scratch is per-seq.
+        // MTP: the step is the single-seq round-robin — the verify graph is
+        // one seq's block (mega_v{seq}) and the draft chain / commit are per
+        // seq. MtpState itself is per-seq now (MtpStateB); the gate lifts with
+        // the B-row verify graph (Wave 5 Step B).
         if std::env::var_os("FERRITE_MTP").is_some() && max_seqs > 1 {
             eprintln!(
-                "[serve] FERRITE_MTP=1 with max_seqs={max_seqs}: forcing 1 (MtpState is a per-rank singleton — multi-seq MTP is unsafe)"
+                "[serve] FERRITE_MTP=1 with max_seqs={max_seqs}: forcing 1 (the MTP step is still the single-seq round-robin; the batched verify graph is Step B)"
             );
             max_seqs = 1;
         }
@@ -933,9 +936,10 @@ impl ServeEngine for GpuEngine {
         //    as B × n=1 in-graph launches with each row's own state
         //    pointers. Composition change (admission/retirement) re-captures
         //    (~1-2s, amortized over 1000-token streams).
-        //    MTP: the per-seq round-robin (MtpState is a per-rank singleton —
-        //    the batched MTP is Step B; FERRITE_MTP already forces max_seqs=1
-        //    so this branch degenerates to a single live seq).
+        //    MTP: the per-seq round-robin (MtpState is per-seq, but the
+        //    batched MTP — a B-row verify graph — is Step B; FERRITE_MTP
+        //    already forces max_seqs=1, so this branch degenerates to a single
+        //    live seq).
         let mtp_mode = std::env::var_os("FERRITE_MTP").is_some();
         let mut retired: Vec<SeqId> = Vec::new();
         if !self.live.is_empty() {

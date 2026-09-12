@@ -4955,30 +4955,24 @@ extern "C" int dsv41_gemm_fp8_mrows(const uint8_t* a, const float* a_scale,
         // 48KB default → cudaErrorInvalidValue at m=5 (the verify block's exact
         // case, observed on serve as "dsv41_gemm_fp8_mrows: cuda error 1").
         cudaError_t e = cudaSuccess;
-        e |= cudaFuncSetAttribute(
-            gemm_fp8_mrows_kernel<1>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-            dsv41_smem_ceiling(gemm_fp8_mrows_kernel<1>));
-        e |= cudaFuncSetAttribute(
-            gemm_fp8_mrows_kernel<2>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-            dsv41_smem_ceiling(gemm_fp8_mrows_kernel<2>));
-        e |= cudaFuncSetAttribute(
-            gemm_fp8_mrows_kernel<3>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-            dsv41_smem_ceiling(gemm_fp8_mrows_kernel<3>));
-        e |= cudaFuncSetAttribute(
-            gemm_fp8_mrows_kernel<4>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-            dsv41_smem_ceiling(gemm_fp8_mrows_kernel<4>));
-        e |= cudaFuncSetAttribute(
-            gemm_fp8_mrows_kernel<5>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-            dsv41_smem_ceiling(gemm_fp8_mrows_kernel<5>));
-        e |= cudaFuncSetAttribute(
-            gemm_fp8_mrows_kernel<6>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-            dsv41_smem_ceiling(gemm_fp8_mrows_kernel<6>));
-        e |= cudaFuncSetAttribute(
-            gemm_fp8_mrows_kernel<7>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-            dsv41_smem_ceiling(gemm_fp8_mrows_kernel<7>));
-        e |= cudaFuncSetAttribute(
-            gemm_fp8_mrows_kernel<8>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-            dsv41_smem_ceiling(gemm_fp8_mrows_kernel<8>));
+        // `cudaError_t` is an enum — no `|=`. Each specialisation gets its own
+        // call; the first failure is what the caller sees.
+#define FERRITE_SET_MROWS_SMEM(k)                                                  \
+    do {                                                                           \
+        cudaError_t r = cudaFuncSetAttribute(                                      \
+            gemm_fp8_mrows_kernel<k>, cudaFuncAttributeMaxDynamicSharedMemorySize, \
+            dsv41_smem_ceiling(gemm_fp8_mrows_kernel<k>));                         \
+        if (r != cudaSuccess && e == cudaSuccess) e = r;                           \
+    } while (0)
+        FERRITE_SET_MROWS_SMEM(1);
+        FERRITE_SET_MROWS_SMEM(2);
+        FERRITE_SET_MROWS_SMEM(3);
+        FERRITE_SET_MROWS_SMEM(4);
+        FERRITE_SET_MROWS_SMEM(5);
+        FERRITE_SET_MROWS_SMEM(6);
+        FERRITE_SET_MROWS_SMEM(7);
+        FERRITE_SET_MROWS_SMEM(8);
+#undef FERRITE_SET_MROWS_SMEM
         if (e != cudaSuccess) { (void)cudaGetLastError(); return (int)e; }
     }
     const dim3 grid(blocks);

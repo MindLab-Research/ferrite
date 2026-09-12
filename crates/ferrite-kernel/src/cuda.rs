@@ -760,6 +760,10 @@ impl DevRef {
 /// h_final [2*hidden] (n=2: rows t_last/d1), hprev = draft's h input, and
 /// per-GDN-layer (conv, gdn) ping-pong B scratch (verify writes B, accept
 /// commits B→A, reject leaves A untouched).
+///
+/// ONE state per live MTP sequence — the pool is [`MtpStateB`] (the fields are
+/// per-token scratch: two seqs sharing one set would overwrite each other's
+/// verify ping-pong / draft h relays / token chain).
 pub struct MtpState {
     pub hf_dev: DevBuf,
     /// verify graph's h_final [N*hidden] (N = FERRITE_MTP_N rows; the
@@ -810,6 +814,122 @@ pub struct MtpState {
     /// contiguous [N-1] buffer (draft i's token at offset i; the accept
     /// kernel reads it as the d array).
     pub d_argmax_dev: DevBuf,     // [N-1] f32 — draft tokens (argmax outputs)
+}
+
+/// The per-seq [`MtpState`] pool: ONE state per LIVE MTP sequence, keyed by the
+/// cluster seq that owns it.
+///
+/// Every field of `MtpState` is per-token scratch — the verify ping-pong
+/// (`hf_v`/`hprev`), the draft h relays (`h_d`), the device token chain
+/// (`tokens_dev`) and the commit plan (whose A-side pointers are that seq's
+/// recurrent states). Two seqs sharing one set would silently corrupt each
+/// other, which is why the serve layer forces `max_seqs=1` under
+/// `FERRITE_MTP` (see `gpu_engine`).
+///
+/// Slots hold `Box<MtpState>` on purpose: the exec layer hands
+/// `&m.hprev as *const DevBuf as usize` to `mtp_forward` — a raw reference to
+/// the `DevBuf` struct INSIDE the state, whose address must stay valid for the
+/// seq's (and its captured graphs') lifetime. A plain `Vec<MtpState>` would
+/// move them on realloc.
+///
+/// Lifecycle: `bind` from the exec layer's `mtp_setup_bufs` (before the seq's
+/// graphs are captured), `unbind` from `CudaBackend::free_seq` (after they are
+/// destroyed). `unbind` DROPS the state — its device buffers go back to the
+/// `DevBuf` pool — so a long-lived serve process holds one state per live seq,
+/// not one per request served.
+pub struct MtpStateB {
+    /// Slot states; `None` = the slot is free (its seq retired).
+    slots: Vec<Option<Box<MtpState>>>,
+    /// The seq bound to each slot; parallel to `slots`.
+    owners: Vec<Option<u64>>,
+}
+
+impl MtpStateB {
+    pub fn new() -> Self {
+        Self { slots: Vec::new(), owners: Vec::new() }
+    }
+
+    /// Number of slots ever allocated (bound + recycled).
+    pub fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
+    /// Number of seqs currently bound (= live MTP seqs; bounded by the serve
+    /// layer's `max_seqs`, NOT by the request count).
+    pub fn live(&self) -> usize {
+        self.owners.iter().filter(|o| o.is_some()).count()
+    }
+
+    /// The slot index `seq` is bound to.
+    pub fn slot_of(&self, seq: u64) -> Option<usize> {
+        self.owners.iter().position(|o| *o == Some(seq))
+    }
+
+    /// The state bound to `seq` (`None` before its `bind` / after its
+    /// `unbind`).
+    pub fn get(&self, seq: u64) -> Option<&MtpState> {
+        let i = self.slot_of(seq)?;
+        self.slots[i].as_deref()
+    }
+
+    /// Bind `seq` to `state`, returning its slot index. A seq that is already
+    /// bound (a re-capture for the same seq) is REPLACED in place: the old
+    /// state drops here, i.e. AFTER `state`'s buffers were allocated by the
+    /// caller — the pre-split singleton's overwrite order, so the `DevBuf` pool
+    /// hands out the same addresses it did before the split.
+    pub fn bind(&mut self, seq: u64, state: MtpState) -> usize {
+        if let Some(i) = self.slot_of(seq) {
+            self.slots[i] = Some(Box::new(state));
+            return i;
+        }
+        match self.owners.iter().position(|o| o.is_none()) {
+            Some(i) => {
+                self.slots[i] = Some(Box::new(state));
+                self.owners[i] = Some(seq);
+                i
+            }
+            None => {
+                // Deterministic layout: the pool never leaves a hole in front
+                // of the bound slots, so the FIRST bind lands in slot 0 and a
+                // bind after a full unbind lands back in slot 0. That is what
+                // keeps the single-seq path (max_seqs=1, the FERRITE_MTP
+                // gate's forced value) on the same slot — and therefore the
+                // same DevBuf allocations — as the pre-split singleton.
+                let i = self.slots.len();
+                self.slots.push(Some(Box::new(state)));
+                self.owners.push(Some(seq));
+                debug_assert!(
+                    i == 0 || self.owners[..i].iter().all(|o| o.is_some()),
+                    "MtpStateB: bind left a free slot in front of a bound one"
+                );
+                i
+            }
+        }
+    }
+
+    /// Release `seq`'s slot, dropping its state (the device buffers return to
+    /// the `DevBuf` pool) and recycling the slot for the next seq. Returns
+    /// `false` when `seq` was not bound.
+    pub fn unbind(&mut self, seq: u64) -> bool {
+        match self.slot_of(seq) {
+            Some(i) => {
+                self.slots[i] = None;
+                self.owners[i] = None;
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+impl Default for MtpStateB {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Device-resident commit pointer table for ferrite_mtp_commit. `plan`
@@ -952,8 +1072,10 @@ pub struct CudaBackend {
     graph_execs: std::sync::Mutex<std::collections::HashMap<String, usize>>,
     /// Fixed IO pointers of captured segment graphs (per name).
     graph_io: std::sync::Mutex<std::collections::HashMap<String, GraphIO>>,
-    /// MTP speculative-decoding fixed buffers (see MtpState).
-    pub mtp: std::sync::Mutex<Option<MtpState>>,
+    /// MTP speculative-decoding fixed buffers, one [`MtpState`] per live MTP
+    /// seq (see [`MtpStateB`]). `None` until the exec layer's
+    /// `mtp_setup_bufs` binds the first seq.
+    pub mtp: std::sync::Mutex<Option<MtpStateB>>,
     /// Per-row GEMV for small-n matmul (n==2) — ONLY the MTP verify chain
     /// sets this: the n=2 tiled GEMM wastes a whole tile (verify 108ms vs
     /// 23ms). Prefill MUST keep the GEMM (its row-batched accumulation
@@ -4932,8 +5054,9 @@ impl CudaBackend {
     /// schedule). Order matters: graph execs are destroyed BEFORE the
     /// buffers their recorded kernel params reference (DSA caches, pinned
     /// t0). The gdn{layer}/moe{layer} per-LAYER segment graphs are
-    /// seq-independent shared assets and are NOT touched. MtpState is a
-    /// per-rank singleton (MTP serving is single-seq); not touched here.
+    /// seq-independent shared assets and are NOT touched. The seq's MtpState
+    /// (per-seq since the MTP split) IS released here — step 6, AFTER the
+    /// graphs above were destroyed.
     ///
     /// GraphIO pins (x_stage/out_dev) are REMOVED from the map but NOT
     /// freed: x_stage is the input DevBuf's pinned staging — that DevBuf
@@ -5023,6 +5146,12 @@ impl CudaBackend {
         // stable for per-size graph reuse, and their content (the per-seq
         // state pointers) is refreshed on every call, so a freed seq's stale
         // pointer is overwritten before the next replay. Nothing to purge.
+        // 6. The seq's MTP fixed buffers (one MtpState per live MTP seq).
+        //    Released here, i.e. after the seq's own graphs were destroyed
+        //    above and after the device sync at the top — the same point in
+        //    the lifecycle at which the pre-split singleton was overwritten by
+        //    the NEXT seq's mtp_setup_bufs, minus the leak.
+        self.mtp_unbind(seq);
         Ok(())
     }
 
@@ -6824,16 +6953,36 @@ impl CudaBackend {
         Ok(())
     }
 
+    /// Register `state` as the MTP fixed-buffer set of `seq` (one per live MTP
+    /// seq — see [`MtpStateB`]). The exec layer's `mtp_setup_bufs` calls this
+    /// once per seq, BEFORE that seq's graphs are captured; a re-capture for a
+    /// seq that is already bound replaces its state in place (the old one
+    /// dropping after the new buffers were allocated — the pre-split singleton
+    /// overwrite order). Returns the slot index.
+    pub fn mtp_bind(&self, seq: u64, state: MtpState) -> usize {
+        let mut m = self.mtp.lock().unwrap();
+        m.get_or_insert_with(MtpStateB::new).bind(seq, state)
+    }
+
+    /// Release `seq`'s MTP state (the device buffers return to the `DevBuf`
+    /// pool) and recycle its slot. Called by `free_seq` AFTER the seq's graphs
+    /// were destroyed. Returns `false` when `seq` held no state.
+    pub fn mtp_unbind(&self, seq: u64) -> bool {
+        let mut m = self.mtp.lock().unwrap();
+        m.as_mut().map(|b| b.unbind(seq)).unwrap_or(false)
+    }
+
     /// MTP accept commit with k from a DEVICE buffer (zero-H2D chain: the
     /// accept kernel wrote k to k_dev on device — no host round-trip).
     /// Same commit kernel as the pinned variant, but reads k from device.
     /// N-UNIFIED: cp.mtp_n = FERRITE_MTP_N — the kernel's k range 1..=n
     /// (k=n commits B; k=j<n commits snapshot j-1 at base + (j-1)*len).
-    pub fn mtp_commit_dev(&self, k_dev: *const i32) -> Result<()> {
+    pub fn mtp_commit_dev(&self, seq: u64, k_dev: *const i32) -> Result<()> {
         let m = self.mtp.lock().unwrap();
         let m = m
             .as_ref()
-            .ok_or_else(|| FerriteError::Config("mtp bufs missing".into()))?;
+            .and_then(|b| b.get(seq))
+            .ok_or_else(|| FerriteError::Config(format!("mtp bufs missing for seq {seq}")))?;
         let cp = m
             .commit
             .as_ref()
@@ -6872,11 +7021,12 @@ impl CudaBackend {
     /// 2*n_gdn cudaMemcpyAsync launches + the hprev select. Graph-unsafe
     /// (pinned k write) — always called OUTSIDE captures, right after the
     /// verify replay's D2H sync.
-    pub fn mtp_commit(&self, k: i32) -> Result<()> {
+    pub fn mtp_commit(&self, seq: u64, k: i32) -> Result<()> {
         let m = self.mtp.lock().unwrap();
         let m = m
             .as_ref()
-            .ok_or_else(|| FerriteError::Config("mtp bufs missing".into()))?;
+            .and_then(|b| b.get(seq))
+            .ok_or_else(|| FerriteError::Config(format!("mtp bufs missing for seq {seq}")))?;
         let cp = m
             .commit
             .as_ref()
