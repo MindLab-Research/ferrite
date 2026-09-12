@@ -2129,3 +2129,14 @@ Step 40-41: 3 1                     (mean 2.0)
 ## sparse_attn_orope 的 verify 路径现状（代码级确认）
 
 `DSV41_VERIFY_OROPE`（默认 **ON**）——verify 的 m 行路径**已经**走与 EAGER 相同的融合 sparse_attn_orope launch（chain_dev.rs:1966-1967 "the m-row verify path takes the SAME fused sparse-attention launch the EAGER path takes"）。✓ 已对齐——不需要额外迁移。
+
+## SWALLOW_STEP 回退重测的中间状态（24c95232）
+
+**0 ar5-hang** ✓（回退生效——没有死锁！）
+**k_acc 在生成**：前 6 步 = 4 0 0 1 0 0（与 lazy verify 的模式相似——首步 4 然后下降）
+
+**意义**：ar5-hang 回退成功——SWALLOW_STEP 的 m=6 形状不再死锁。如果测试完成：
+- 步时应该 ~28ms（比 lazy 33ms 省 4.55ms——主链被吞）
+- accept 模式应该与 lazy 相似（k_acc 序列可比）
+
+**下一步**：如果 SWALLOW_STEP 工作，立即跑第一波 mrows A/B（GATE -2.75ms + INDEXER -1.0~1.5ms + 其他 mrows）。
