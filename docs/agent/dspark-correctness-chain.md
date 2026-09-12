@@ -3580,3 +3580,31 @@ self.dev.gemm_fp8_mx_rope_norm(
 4. **cos/sin 表的索引**：lin_rope_norm 的表索引方式与 apply_rope_mrows 不同？
 
 **待 subagent 判决**（r2-rope-position-analysis + r2-corruption-rootcause 分析中）
+
+## ⚠️ SWALLOW 修复测试中间结果（18303492）——修复失败！
+
+**观察**（测试还在跑）：
+- **49,583 ar5-hang 行**（比 Plan B 的 10,099 更糟！）
+- hang 消息：`[ar5-hang] argmax_rows rank=3 peer=7 need=79 cur=54 rows=6`
+- **argmax_rows（batched 头 argmax 交换，rows=6）在 hang**！gap = 79-54 = 25
+
+**分析**：
+1. **spec_primed_unanimous 修复没有解决 hang**——臂足迹不是唯一问题（或修复有 bug）
+2. **argmax_rows rows=6**——这是 SWALLOW 特有的（aligned 的 verify 块是 5 行 + 主链步分离；SWALLOW 是 6 行锚+drafts）
+3. **gap = 25**（不是预测的 ~80）——步数/轮次的差异不是 step_dev 的 80 轮
+
+**新的根因假设**：
+- SWALLOW 的 argmax_rows（rows=6）比 aligned 的（rows=5?）多一轮 AR？
+- 或者：锚行（row 0）的 argmax 交换与 drafts 的 argmax 交换之间有额外的轮次
+- **关键对比**：aligned（0 hang）的 argmax_rows 是 rows=5 还是 rows=6？
+
+**SWALLOW 的修复历史**（7 次尝试全失败）：
+| 尝试 | 结果 |
+|---|---|
+| 修复1（argmax守卫）| gap 22 ❌ |
+| 回退 | gap 3 ❌ |
+| Plan A+C（对称化）| gap 23 ❌ |
+| 无图（出师表）| 0 ✓ |
+| 无图（计数）| 937 ❌ |
+| Plan B（臂投票）| 10,099 ❌ |
+| **Plan B + spec_primed_unanimous** | **49,583 ❌** |
