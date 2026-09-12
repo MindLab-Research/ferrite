@@ -282,7 +282,16 @@ fn run_case(dev: &Device, n: usize, k: usize, with_bias: bool, seed: u64) -> Opt
             dctr.ptr as *mut u32,
         )
         .expect("dsv41_gemm_fp8_swapab");
-    assert!(ran, "swapAB declined the shape n={n} k={k} (needs n%16==0, k%32==0)");
+    if !ran {
+        // rc 2 = the launcher's graceful decline. Since 2026-09-12 that includes
+        // EVERY n < 1664 (the shape dispatch routes those small calls — the ones
+        // dominating the step — to the SIMT gemv, where swapAB's fixed overhead
+        // loses). No swapAB result exists to compare, so SKIP the shape; the
+        // SIMT fallback is the correct path there and the .cu self-test already
+        // prints the decline. `ran` false for n%32!=0 is impossible in this file
+        // (see the scale-layout note on `quant_weight_fp8_block`).
+        return None;
+    }
     dev.sync().unwrap();
     let mut newo = vec![0f32; n];
     dev.download_f32(&dnew, &mut newo).unwrap();

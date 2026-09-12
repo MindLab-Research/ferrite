@@ -35,24 +35,32 @@ DRIVER="$HERE/dsv41_serve_ab.sh"
 
 A="swapab_off"
 B="swapab_on"
-echo "== swapAB text parity: '$A' (SIMT gemv) vs '$B' (tensor core) =="
+C="swapab_tma"
+echo "== swapAB text parity: '$A' (SIMT gemv) vs '$B' (tensor core) vs '$C' (tensor core + TMA) =="
 
-# Arm 1: the current SIMT path. The gate is read ONCE per process, so the two
-# arms MUST be two separate serves (one binary, two launches) — never two
-# requests in one process.
+# Arm 1: the current SIMT path. The gate is read ONCE per process, so the arms
+# MUST be separate serves (one binary, several launches) — never several
+# requests in one process. `DSV41_SWAPAB_TMA` is ALSO a process-level `getenv`
+# gate (static, read once in the launcher), so the TMA variant needs its own
+# process too — it cannot be toggled inside a running serve.
 DSV41_SWAPAB=0 "$DRIVER" "$A" DSV41_SWAPAB=0
 # Arm 2: the tensor-core path.
 DSV41_SWAPAB=1 "$DRIVER" "$B" DSV41_SWAPAB=1
+# Arm 3: the tensor-core path with the TMA weight-ring staging
+# (`cp.async.bulk` + mbarrier). Same numerics contract as arm 2 — it must be
+# character-for-character identical to the SIMT baseline, exactly like arm 2.
+DSV41_SWAPAB=1 DSV41_SWAPAB_TMA=1 "$DRIVER" "$C" DSV41_SWAPAB=1 DSV41_SWAPAB_TMA=1
 
 OA="/tmp/ab_${A}_out.txt"
 OB="/tmp/ab_${B}_out.txt"
-[ -s "$OA" ] && [ -s "$OB" ] || { echo "FATAL: missing output file(s) $OA / $OB"; exit 1; }
+OC="/tmp/ab_${C}_out.txt"
+[ -s "$OA" ] && [ -s "$OB" ] && [ -s "$OC" ] || { echo "FATAL: missing output file(s) $OA / $OB / $OC"; exit 1; }
 
-python3 - "$OA" "$OB" "$A" "$B" <<'PY'
+python3 - "$OA" "$OB" "$OC" "$A" "$B" "$C" <<'PY'
 import json
 import sys
 
-a_path, b_path, a_tag, b_tag = sys.argv[1:5]
+a_path, b_path, c_path, a_tag, b_tag, c_tag = sys.argv[1:7]
 PROMPTS = [
     "The capital of France is",
     "请背诵《静夜思》",
@@ -76,27 +84,34 @@ def load(path):
     return out
 
 
-A, B = load(a_path), load(b_path)
+A = load(a_path)
+
 bad = 0
-for i, p in enumerate(PROMPTS):
-    ca = A[i] if i < len(A) else None
-    cb = B[i] if i < len(B) else None
-    same = ca == cb
-    # A first-token flip shows up as identical tails after the first token.
-    body_same = (
-        ca is not None
-        and cb is not None
-        and len(ca) > 1
-        and len(cb) > 1
-        and ca[1:] == cb[1:]
-    )
-    verdict = "IDENTICAL" if same else ("BODY-OK/leading-token-diff" if body_same else "*** DIFF ***")
-    if not same and not body_same:
-        bad += 1
-    print(f"  [{verdict:28s}] {p!r}")
-    if not same:
-        print(f"      {a_tag}: {ca!r}")
-        print(f"      {b_tag}: {cb!r}")
+# Every other arm is judged against the SIMT baseline independently: the TMA
+# ring must not change a single character vs SIMT (the same bar as the
+# cp.async ring).
+for b_path, b_tag in ((b_path, b_tag), (c_path, c_tag)):
+    B = load(b_path)
+    print(f"-- {a_tag} vs {b_tag} --")
+    for i, p in enumerate(PROMPTS):
+        ca = A[i] if i < len(A) else None
+        cb = B[i] if i < len(B) else None
+        same = ca == cb
+        # A first-token flip shows up as identical tails after the first token.
+        body_same = (
+            ca is not None
+            and cb is not None
+            and len(ca) > 1
+            and len(cb) > 1
+            and ca[1:] == cb[1:]
+        )
+        verdict = "IDENTICAL" if same else ("BODY-OK/leading-token-diff" if body_same else "*** DIFF ***")
+        if not same and not body_same:
+            bad += 1
+        print(f"  [{verdict:28s}] {p!r}")
+        if not same:
+            print(f"      {a_tag}: {ca!r}")
+            print(f"      {b_tag}: {cb!r}")
 
 print()
 if bad:
@@ -108,6 +123,6 @@ PY
 rc=$?
 
 echo
-echo "p50/tok-s per arm are printed above by the driver; compare $A vs $B."
-echo "target: step p50 6.26ms -> ~4.2ms (~238 tok/s)."
+echo "p50/tok-s per arm are printed above by the driver; compare $A vs $B vs $C."
+echo "target: step p50 6.26ms -> ~4.2ms (~238 tok/s); the TMA arm must match SIMT text."
 exit $rc

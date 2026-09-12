@@ -153,8 +153,12 @@ kernel 3.35µs + memset 0.5µs ≈ 3.85µs/call → gemv 246×3.85µs = 0.95ms�
 ### swapAB parity 判据（落点：单测 + serve A/B）— 2026-09-12
 
 跑批前先跑 `crates/ferrite-dsv41/tests/swapab_parity.rs`（无需 checkpoint，随机输入按运行时语义量化；
-stale .so / 无 `DSV41_KERNELS` 时 skip，不 fail）；serve 阶段跑
-`scripts/dsv41_swapab_text_parity.sh`（`DSV41_SWAPAB=0` vs `=1` 背靠背两臂，四段文本逐字对比 + p50）。
+stale .so / 无 `DSV41_KERNELS` 时 skip，不 fail；launcher 对 **n < 1664 的 shape 回退 SIMT
+（rc=2）**，这些 shape 无 swapAB 结果可比较，单测 **skip 该 shape** 而非 fail——SIMT 才是那里的
+正确路径）；serve 阶段跑 `scripts/dsv41_swapab_text_parity.sh`（三臂：`DSV41_SWAPAB=0`（SIMT
+基线）vs `DSV41_SWAPAB=1`（tensor core）vs `DSV41_SWAPAB=1 DSV41_SWAPAB_TMA=1`（tensor core
++TMA ring），各臂独立进程——两个 gate 都是进程级 `getenv` 只读一次；后两臂分别与基线四段文本
+逐字对比 + p50）。
 
 | 判据 | 阈值 | 依据 |
 |---|---|---|

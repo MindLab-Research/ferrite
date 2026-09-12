@@ -321,6 +321,15 @@ int main() {
     // kernel -- and the ONLY case that takes the ks > 1 last-block reduction
     // (k = 5120 = 160 * 32, 160 % 8 == 0 => ks = 8), so it is the regression
     // guard for the reduction's correctness and determinism.
+    //
+    // TMA variant: `DSV41_SWAPAB_TMA=1` routes the weight ring through the 1D
+    // `cp.async.bulk` + mbarrier staging instead of the cp.async.cg grid (see
+    // dsv41_kernels.cu). The gate is a process-level `static` `getenv` read
+    // ONCE per process, so it cannot be toggled between cases here -- run this
+    // self-test twice from the shell to cover BOTH paths:
+    //   ./tests_dsv41_gemm_fp8                 # cp.async ring (default)
+    //   DSV41_SWAPAB_TMA=1 ./tests_dsv41_gemm_fp8   # TMA ring
+    // Same inputs, same tolerances: the production shape must pass in either.
     bad += run_swapab_case(32, 32, false);    // exactly one stage, one k block
     bad += run_swapab_case(96, 64, true);     // 3 full weight-scale row blocks
     bad += run_swapab_case(48, 544, false);   // n%32==16 partial block, partial ring stage (544 = 17*32)
