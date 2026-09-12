@@ -2587,9 +2587,18 @@ impl<'a> DevChain<'a> {
     /// `Ok(false)` = NOT performed — the caller keeps its per-row loop (the
     /// bit-exact reference it was verified against). It declines when the loaded
     /// .so lacks the symbol, the C entry declines the shape or the process's
-    /// `DSV41_GEMV_FP8_MODE` / `DSV41_NO_GEMV_FP8` gates refuse it, or the swapAB
-    /// opt-in is on (that arm is explicitly NOT bit-identical to the SIMT gemv
-    /// and keeps its own kernel).
+    /// `DSV41_GEMV_FP8_MODE` / `DSV41_NO_GEMV_FP8` / `DSV41_GEMV_A32` gates refuse
+    /// it, or the swapAB opt-in is on (that arm is explicitly NOT bit-identical to
+    /// the SIMT gemv and keeps its own kernel).
+    ///
+    /// `DSV41_GEMV_A32` (Direction A): the mrows kernel implements only the inline
+    /// (a32=0) activation form, so at the gate's DEFAULT (a32=1 — the materialised
+    /// `s_af` form the per-row `gemm_fp8_mx`'s M=1 GEMV runs) it declines here and
+    /// every `proj_mrows` call site falls back to the per-row loop. That makes the
+    /// multi-row projection unavailable by default until its a32 variant lands
+    /// (Direction B) — a deliberate correctness-over-speed trade: the fallback is
+    /// the very program EAGER runs. Setting `DSV41_GEMV_A32=0` makes both arms the
+    /// same inline expression again and re-enables the multi-row path.
     fn proj_mrows(
         &self,
         w: *const u8,

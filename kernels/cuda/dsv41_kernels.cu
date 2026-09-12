@@ -4980,6 +4980,21 @@ extern "C" int dsv41_gemm_fp8_mrows(const uint8_t* a, const float* a_scale,
     // vectorised/scalar arms (mode 0/1) reorder a lane's elements, so a run
     // configured for them keeps the per-row loop.
     if (g_gemv_fp8_mode < 3) return 2;
+    // Direction A (a32, DSV41_GEMV_A32): this kernel implements ONLY the inline
+    // activation form (a32=0) -- `s_lut[s_a[...]] * s_as[...]`, C2 above. It has
+    // no materialised `s_af` slot and reads no `g_gemv_a32`, so under the gate's
+    // DEFAULT (a32=1) the multi-row launch is a DIFFERENT program from the M=1
+    // GEMV its per-row fallback would have run (the gemv's `a32 ? s_af[j] : ...`
+    // consume form). Leaving that arm unserved is exactly the mismatch class the
+    // FOLD incident turned out to be -- a consumer that ignores a process-wide
+    // gate its replacement honours. Until the a32 variant lands (Direction B)
+    // this kernel is used ONLY in the run configured for the form it implements
+    // (`DSV41_GEMV_A32=0`: the per-row fallback then folds the SAME inline
+    // product, so the two arms are the same expression again); at the default it
+    // declines here and the caller's per-row loop runs the very GEMV EAGER runs,
+    // so the multi-row projection can no longer be a correctness divergence. The
+    // price is the multi-row speedup, not correctness.
+    if (g_gemv_a32) return 2;
     // Same for DSV41_NO_GEMV_FP8: with the M=1 GEMV disabled the m=1
     // gemm_fp8_mx call runs the M-tile MMA path instead, whose accumulation is a
     // different expression entirely.
