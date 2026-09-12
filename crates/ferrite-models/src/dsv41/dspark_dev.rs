@@ -748,6 +748,19 @@ impl<'a> DsparkDev<'a> {
                 self.post.ptr as *mut f32,
                 self.comb.ptr as *mut f32,
             )?;
+            // the hc_mixes coefficients (pre/post/comb) — the golden harness's
+            // `stage{s}.attn.hc_pre/hc_post/hc_comb`, never diffed before; the
+            // ffn input's 4.4% residual (which flips top-k expert picks and
+            // explodes into the 139% MoE divergence) starts somewhere in this
+            // chain.
+            self.dump_unit_idx("mixes_attn_pre", s, self.pre_attn.ptr as *const f32, &[bs, hc]);
+            self.dump_unit_idx("mixes_attn_post", s, self.post.ptr as *const f32, &[bs, hc]);
+            self.dump_unit_idx("mixes_attn_comb", s, self.comb.ptr as *const f32, &[bs, hc, hc]);
+            // the FFN-side mixes coefficients — the golden's `stage{s}.ffn.hc_pre/
+            // hc_post/hc_comb`.
+            self.dump_unit_idx("mixes_ffn_pre", s, self.pre_ffn.ptr as *const f32, &[bs, hc]);
+            self.dump_unit_idx("mixes_ffn_post", s, self.post.ptr as *const f32, &[bs, hc]);
+            self.dump_unit_idx("mixes_ffn_comb", s, self.comb.ptr as *const f32, &[bs, hc, hc]);
             // collapse with the INCOMING premix, then the attn norm
             let attn_norm = need(&ld.attn_norm, "mtp.*.attn_norm.weight")?;
         // THE decisive dump: the first 10 weights of this rank's attn_norm.
@@ -1462,6 +1475,9 @@ impl<'a> DsparkDev<'a> {
                 &self.shared_out,
                 (bs * dim) as i64,
             )?;
+            // the shared expert's output BEFORE the routed sum — the golden
+            // harness's `stage{s}.ffn.shared.out`.
+            self.dump_unit_idx("shared_out", s, self.shared_out.ptr as *const f32, &[bs, dim]);
         }
 
         // ---- the MoE all-reduce ----
