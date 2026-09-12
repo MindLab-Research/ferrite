@@ -1972,3 +1972,26 @@ nvjet splitK + splitKreduce。门控 `FERRITE_GEMM3`（默认 ON，`=0` 完全�
 | q（rope 后） | rel=1.0 ✗（token/位置语义 + 注入 off-by-one） |
 | o/attn out | rel=1.0 ✗（下游） |
 | moe/h | rel=1.6-1.8 ✗（下游） |
+
+## 2026-09-12 Wave 2 终局定位：单元对照的完整证据链（draft 匹配率 6% 的根源）
+
+**单元对照的执行链**（golden: /tmp/unit_golden.pt 官方 TP1 参考；ferrite: /tmp/unit_ferrite.json 注入同输入 dump）：
+
+| 单元 | rel diff | 判定 |
+|---|---|---|
+| embed（块输入 [5,4,5120]） | **0.0** | ✓ 注入完全一致 |
+| main_x（main_proj 投影） | 4.4e-3 | ✓ 量化噪声级 |
+| **xn post-norm（attn_norm 后）** | **1.1e+38** | **✗✗✗ rmsnorm 输出天文数字** |
+| q_pre_rope（wq_b 投影后） | 1.0 | ✗（xn 爆炸的下游） |
+| q/o/moe/h | 1.0-1.8 | ✗（下游全污染） |
+
+**最终定位**：block0 的 collapse（hc_collapse + identity premix [1,0,0,0]）输出正常量级，**紧随的 rmsnorm（attn_norm）产生 5.4e+37** —— attn_norm 权重的加载/内容是最强嫌疑（mtp 层的 attn_norm key 名/规格/加载路径）。多行 gemm 路径被排除（m=1 逐行版同样爆——它爆在输入 xn 本身）。
+
+**排除项**（对照过程中的方法论教训）：
+- rope 位置（pos 128/129 注入零影响——三次 max|d|=54 完全相同）
+- gemm 多行路径（xn 爆炸在上游）
+- 量化粒度（官方 block=128 vs 我们 32——量化噪声级不是 100%）
+- 对照语义错位陷阱：h_premix（norm 前）vs golden attn.in（norm 后）的 78% 差异是**语义错位**不是数值 bug；golden 的 stage0.attn.hc_pre 是 mixes 输出 [1,5,4] 不是 collapse
+- qr 的 dump 必须在 quant1 **前**（quant1 原地覆盖 fp8 字节→NaN 假象）
+
+**下一步**（下会话）：①attn_norm 权重的加载验证（远端读 mtp.0.attn_norm 的 checkpoint key 名+形状+前几个值 vs golden 的权重 dump）②rmsnorm kernel 的多行调用（n=bs）复查 ③修复后 accept 应跃升（xn 正常→q/o/h 全链恢复）。
