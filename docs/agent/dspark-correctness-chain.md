@@ -61,3 +61,16 @@
 **18 个 mismatch 的 index 分布：{1: 16, 3: 1, 4: 1}**——即 16/18 是 verify 行 0（verify_out[0]）与 eager 分歧、各 1 个是行 2/行 3。**不是** quant_rows 那种"行 0 恒对 r≥1 全错"的指纹——行 0 现在也错了（16 次）。
 - pos=14 的 mismatch=4（行 3）：spec 第 5 个 token 37500 vs eager 28638——**前 4 个全对**（654/1767/1146/1338 完全一致），说明 k_acc=4 的深度接受已工作，只是第 5 行（被拒的那行之后的 bonus）偶有分歧——这属于正常的近 tie 或残余路径差。
 - 16 个 index=1（行 0）：需要对照 verify-moe-ilv-audit 的 B2-B6 判定树（compressor fused / route fuse / hc tail / 融合投影族）——这是"多行 vs 单行的 kernel 路径差"的最后一层。
+
+## 剩余 16 个 row-0 mismatch 的判定树（verify-moe-ilv-audit 判词）
+
+**关键否定**：B3（route fuse）**不是嫌疑**——两臂的 route 数学逐句一致（smem 布局/激活/选择 tie 规则/归一/WPR 全同）。
+
+**按优先级的 A/B 开关**（每关一个跑一次 diff probe，mismatch 归零即命中）：
+| 优先 | 开关 | 差异 | 风险级 |
+|---|---|---|---|
+| 1 | `DSV41_GEMV_A32=0` | EAGER 的投影走物化 s_af、verify 的 mrows 走 inline——**与 FOLD 翻车完全同类**（自称逐位一致、藏在 fma 配对） | 高 |
+| 2 | `DSV41_SPARSE_OROPE=0` | EAGER 的 sparse+rope+fp8 融合 vs verify 的三连——"verbatim" 未经实测 | 中 |
+| 3 | `DSV41_NORM_FUSE=0` | EAGER 的 rmsnorm 折进 GEMV prologue vs verify 的独立 rmsnorm | 低 |
+| 4 | `DSV41_COMPRESS_FUSE=0` | compressor fused vs pool+commit——主链已逐句核对一致，stage-1 state carry 未核 | 低 |
+| 5 | `DSV41_HC_TAIL_SPLIT=0 DSV41_HC_FRONT=0` | hc 的 tail split（ss/dots 已证位级一致；collapse/norm 融合未实测）——**注意要同时关两个** | 低 |
