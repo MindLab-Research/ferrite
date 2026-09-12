@@ -7852,3 +7852,26 @@ ss replay 两边都是**严格线性 fma 链**（旧 unroll 5×、新单步，�
 - gemv 总量 = 246 × 5.34µs = 1.31ms（21%，非 44%）
 - swapAB 隔离 3.35µs vs SIMT serve 5.34µs = **只有 1.6x**——翻译损失后归零完全合理
 - 这解释了 swapAB 中性的数学：1.6x 隔离收益 − SM 争抢/L2 竞争 ≈ 0
+
+### gemv-l2-analysis 定案：swapAB 中性的数学解释（2026-09-12 23:00）
+
+**硬件事实**（nsys TARGET_INFO_GPU 直接读取）：L2 = 126.5MB，HBM = 7.672 TB/s，148 SM × 64 warp。
+
+**核心发现：假说对 swapAB 成立，但对 SIMT 是错的解释**：
+
+| 路径 | 隔离（L2 热） | serve（冷读） | 判定 |
+|---|---|---|---|
+| SIMT gemv | 11.55µs | 10.94µs | **对 L2 不敏感**——compute-bound（LUT+a32+FFMA），内存延迟被计算掩盖 |
+| swapAB | **5.96µs** | **~11µs** | **对 L2 敏感**——cp.async 环流深度是墙（1.15TB/s = HBM 地板的 6x），冷读延迟 3x → 吞吐等比下降 |
+
+**→ swapAB 的隔离 1.76x（5.96/11.55×2≈1.94x in med）完全是 L2-热条件制造的幻觉。serve 冷读后两条路径都 ~11µs → 1.0x → 中性。**
+
+**真实瓶颈是延迟/MLP，不是带宽**：
+- gemv 有效带宽 = 1.1GB/2.945ms = **373 GB/s = HBM 峰值的 4.9%**
+- DRAM 地板 0.145ms vs 实际 2.945ms = **20x 差距**
+- 要打满 7.67TB/s 需同时 in-flight 4.6MB——**超过单呼叫的权重总量（4.5MB），结构上不可能**
+- 单 warp 1 行的 MLP 不足是根因
+
+**对 200 tok/s 的含义**：任何"减字节"路线（swapAB 删 LUT 计算）都会把它从 compute-bound 推入 latency-bound，然后被冷读 HBM 延迟吃掉收益。**要真正兑现必须同时提高 MLP/掩藏延迟**（TMA 深队列、批化填 N 维）——与 tcgen05 + TMA 的下会话计划一致；仅换算法的路径已由 v17-v21 关闭。
+
+**⚠️ 口径修正**：nsys one.csv 的 gemm_fp8_gemv med 实际是 **10.94µs**（此前我误读 5.34µs 为 serve med——那是 many.csv 多 rank 聚合的 artifact）。
