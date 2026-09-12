@@ -7750,3 +7750,22 @@ wo-pair-diagnosis subagent 分析中。临时处置：**WO_PAIR 保持默认 OFF
 | 4 | 减 sinkhorn 轮数 | — | **不做**（语义变更） |
 
 **打 6 折预期：0.15-0.3ms/步**（隔离→serve 铁律）。
+
+**K-chunk 对齐约束（dl-kchunk-design，2026-09-12，已核代码）**：位一致要求 chunk 起点同时落在
+**dot 链的 96-float4 网格**（`hc_dots_late_kernel` 三累加器步长 96 f4，`kernels/cuda/dsv41_kernels.cu:8073`）
+与 **ss replay 的 192-float4 网格**（`for (c2 = lane+m*32; c2<hc_dim; c2+=mix*32)`，步长 768 floats = 192 f4，:8091）上
+⇒ **chunk 起点 ≡ 0 (mod 192 float4)**，长度取 192 f4 的倍数（末段长度任意，只要起点对齐即可）。
+**故分析里的「4×5120 floats（=1280 f4）/ 8×2560 floats（=640 f4）」不可用**（均非 192 倍数）。
+可行切分：**768 f4/chunk（12 KiB/行，双缓冲 48 KiB → 4 blk/SM）** 或 **576 f4/chunk（9 KiB/行，36 KiB → 6 blk/SM）**；
+两种都是 **6/8 个满 chunk 覆盖 4608 f4 + 末段 512 f4**（起点 4608 f4 = 96×48 = 192×24，恰好复现全局尾部），
+**a0/a1/a2 跨 chunk 不重置**即可逐操作数复现单链顺序。
+
+### v20 DOTS_T 扫描定案：中性（2026-09-12 19:00）
+
+| 臂 | p50 | tok/s | 判定 |
+|---|---|---|---|
+| 基线（v19a） | 6.17ms | 162.1 | — |
+| v20t（DOTS_T=256） | 6.21ms | 161.0 | 中性偏慢 |
+| v20u（DOTS_T=512） | 6.19ms | 161.6 | 中性 |
+
+**结论**：DOTS_T 的默认值已是优——256/512 都不改善。dl-kernel-optim 的 #1 机会（零成本先跑）验证为无效。DL 的剩余优化 = K-chunk（dl-kchunk-impl 实施中，14.9→8-9µs 理论）。
