@@ -225,6 +225,15 @@ impl Collective {
         let stamps_at = 2 * world * bytes;
         let reduced_at = stamps_at + world * 4;
         let ctr_at = reduced_at + world * 4;
+        // `ctr_at + 4` (the word right after the v5 epoch) is the A4 broadcast
+        // flag: `DSV41_AR_SINGLE_POLL` makes the pubred kernels' block 0 wait on
+        // the peers' stamps and then publish `e + 1` there, so the other blocks
+        // wait on ONE local word instead of on 8 stamps (160 pollers -> 8). It is
+        // written by nothing else in the tree — the v2 path binds it as
+        // `_ctr2_unused` (see `all_reduce_inplace_inner`) and its reader no-ops
+        // unless `do_mark` is set. Zeroing it here is what makes the monotonic
+        // `(int)(flag - (e+1)) < 0` wait in the kernel start from a clean slate
+        // (the epoch itself is never reset at runtime).
         let staging = dev.alloc(ctr_at + 64)?;
         // dev.alloc is cudaMalloc, which does NOT zero. The stamp arrays, the
         // `reduced` marks and the two last-block counters must start at 0: the
@@ -758,6 +767,9 @@ impl Collective {
             self.staging.ptr as *const u8
         };
         let stamps = (self.staging.ptr as *const u8).wrapping_add(self.stamps_at) as *const c_uint;
+        // ctr_at + 4: unused on this path (the reader below `do_mark == 0` does not
+        // touch it) and now also the A4 broadcast flag word (`DSV41_AR_SINGLE_POLL`,
+        // see `Collective::new`); v2 and the v5 pubred path never run the same round.
         let _ctr2_unused = (self.staging.ptr as *mut u8).wrapping_add(self.ctr_at + 4) as *mut c_uint;
         // In the device-side path the reduce writes STRAIGHT into the caller's
         // buffer: keeping dst inside the staging half meant the copy-back below

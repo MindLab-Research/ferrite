@@ -228,6 +228,16 @@ struct Scratch {
     /// consumes it. Written on EVERY `attention()` path, so a layer that never
     /// reaches the indexer cannot leak a stale value into the next step.
     qr_raw: std::cell::Cell<bool>,
+    /// R2b: the m-ROW twin of `qr_raw` — set by `attention_rows` when the fused
+    /// `lin_rope_norm` wq_b launch left the block's `qr_r` RAW (it normalised into
+    /// shared memory instead of in place, see [`attn_lin_fuse`]). The indexer's q
+    /// half then normalises it inside its OWN gemv prologue (`indexer_front_rows`
+    /// / `indexer_rows_one`), which is what removes the compensating `norm_rows`
+    /// R2 had to pay. Set on EVERY `attention_rows` path — the fused arm is the
+    /// only one that sets it true — and consumed by the first indexer q-half that
+    /// reads `qr_r` (a layer without an indexer leaves it set; the next layer's
+    /// `attention_rows` overwrites it, so it cannot leak across a layer).
+    qr_raw_r: std::cell::Cell<bool>,
     /// L2+L3: set by `attention()` when the wq_b + idx_wq_b pair was computed
     /// in ONE mx2 launch (`DSV41_IDX_FUSE`), so `indexer()` skips its own
     /// `lin(idx_wq_b)`. Cleared after the indexer consumes it (and whenever the
@@ -2035,15 +2045,48 @@ fn norm_fuse() -> bool {
 ///
 /// Every consumer downstream of `qr_r` sees byte-identical input: the fused
 /// wq_b launch leaves `qr_r` RAW (its prologue normalised into shared memory),
-/// so `attention_rows` materialises that normalisation in place with the very
-/// `norm_rows` call the unfused path made, and the indexer's q half — the only
-/// other `qr_r` reader — quantises the same bytes it always did. A decline
+/// and the indexer's q half — the only other `qr_r` reader — normalises it inside
+/// its OWN gemv prologue (`indexer_qr_raw`, R2b, default ON) or, with R2b off,
+/// consumes the `norm_rows`-materialised copy this path then pays for. Either way
+/// the bytes the indexer's GEMV dot consumes are the same ones. A decline
 /// (an .so without the symbol, a shape the launcher rejects, `PROJ_FUSE=0`)
 /// falls straight through to today's mrows sequence, so OFF and ON-but-declined
 /// are the same code path.
 fn attn_lin_fuse() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *F.get_or_init(|| std::env::var("DSV41_ATTN_LIN_FUSE").map(|v| v == "1").unwrap_or(false))
+}
+
+/// R2b (DSV41_INDEXER_QR_RAW, **default ON, only reachable under R2**): the
+/// indexer's q half consumes the RAW `qr_r` that R2's fused wq_b launch left
+/// behind, normalising it inside its own gemv prologue, instead of the copy R2
+/// had to materialise with a compensating `norm_rows` launch.
+///
+/// R2 (above) routed `m == 1`'s wq_b through EAGER's `lin_rope_norm`, which
+/// normalises `qr_r` into SHARED MEMORY and never writes the row back — so R2
+/// owed every later `qr_r` reader the normalisation. `attention_rows` paid it as
+/// one `norm_rows` over the block, which kept the indexer's input byte-identical
+/// (its stated zero-risk property) but left ONE launch per layer of the
+/// projection family's budget on the table. R2b removes exactly that launch by
+/// handing the indexer the fused launch EAGER's `indexer()` already uses for this
+/// very purpose (`s.qr_raw` → `lin_rope_norm(idx_wq_b)`): the prologue normalises
+/// the raw row with `rmsnorm_q_kernel`'s arithmetic term for term and quantises
+/// it into shared memory, so the GEMV's dot — and therefore `idx_q_r` — is the
+/// bytes the unfused (`norm_rows` + `quant1`) pair produced.
+///
+/// It is `m == 1`-only by construction: `lin_rope_norm` is the `m = 1` program,
+/// and [`attn_lin_fuse`] is what sets `s.qr_raw_r` in the first place. Both
+/// indexer q-half sites are covered — the block-wide front
+/// ([`Self::indexer_front_rows`], `DSV41_INDEXER_MROWS`) and the per-row select
+/// ([`Self::indexer_rows_one`]) — and each materialises the norm itself when the
+/// fused launcher declines, so the fallbacks below still read normalised values.
+///
+/// `DSV41_INDEXER_QR_RAW=0` reverts to R2's compensating `norm_rows` (the same
+/// code path R2 shipped); with `DSV41_ATTN_LIN_FUSE` off nothing here is
+/// reachable at all.
+fn indexer_qr_raw() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_INDEXER_QR_RAW").map(|v| v != "0").unwrap_or(true))
 }
 
 /// B2 (DSV41_OROPE_Q, default ON): the inverse o-rope's epilogue emits the fp8
@@ -3143,6 +3186,7 @@ impl<'a> DevChain<'a> {
             xq_of_xn_valid: std::cell::Cell::new(false),
             xq_of_qr_valid: std::cell::Cell::new(false),
             qr_raw: std::cell::Cell::new(false),
+            qr_raw_r: std::cell::Cell::new(false),
             idx_q_ready: std::cell::Cell::new(false),
             idx_q_rope: std::cell::Cell::new(false),
             pre: dev.alloc(fb(hc))?,
@@ -6388,6 +6432,10 @@ impl<'a> DevChain<'a> {
     ///   `idx_q_rope`): they are pointer-gated to the SINGLE-ROW scratch (`s.xn`,
     ///   `s.qr`), which the m-row path never passes, so the verify can neither
     ///   consume nor leak one; each is cleared by the end of a real step anyway.
+    ///   `qr_raw_r` (R2b) is that flag's m-row twin and IS read/written by the
+    ///   verify: `attention_rows` sets it (on every path) and the same layer's
+    ///   indexer q half consumes it, so it is produced and retired inside one
+    ///   layer and cannot leak either.
     /// * `pos_ctr`: never advanced by the verify — `step_rows` passes a NULL
     ///   counter to its per-row argmax.
     /// * everything in `s.*_r`: the m-row scratch is the verify's own.
@@ -9446,12 +9494,13 @@ impl<'a> DevChain<'a> {
         //
         // ⚠️ The fused launch leaves `qr_r` RAW (it normalises into shared
         // memory and never writes the row back), so it MUST run before the
-        // `norm_rows` below — that call is what materialises the normalised
-        // `qr_r` the indexer's q half quantises (`indexer_rows_one`'s `lin`;
-        // `indexer_front_rows`'s `quant_rows` + `proj_mrows`). Same call, same
-        // eps, same in-place destination as the unfused path, so every `qr_r`
-        // consumer sees the bytes it always saw. The rope is then already on
-        // `q_r` and the standalone rope below skips the row.
+        // `norm_rows` below — that call is what materialised the normalised
+        // `qr_r` R2 handed the indexer's q half (`indexer_rows_one`'s `lin`;
+        // `indexer_front_rows`'s `quant_rows` + `proj_mrows`). R2b hands that
+        // half the RAW row instead (`s.qr_raw_r`), so it normalises inside its
+        // own gemv prologue and the `norm_rows` is skipped — same bytes into the
+        // GEMV's dot either way. The rope is then already on `q_r` and the
+        // standalone rope below skips the row.
         let q_norm_fused = lin_fuse
             && self.lin_rope_norm(
                 self.s.qr_r.ptr as *const f32,
@@ -9465,16 +9514,29 @@ impl<'a> DevChain<'a> {
                 rd as i32,
                 hd as i32,
             )?;
+        // R2b (DSV41_INDEXER_QR_RAW, default ON under R2): when the fused wq_b
+        // launch above took (only ever at `m == 1`), `qr_r` is RAW and the
+        // indexer's q half is the one reader that has to be told. Handing it the
+        // flag lets it normalise inside its own gemv prologue — the `norm_rows`
+        // below then has nothing left to do for it, which is the launch R2b
+        // removes. `=0` keeps R2's compensating normalisation verbatim.
+        let qr_raw_r = q_norm_fused && indexer_qr_raw();
+        self.s.qr_raw_r.set(qr_raw_r);
         // q norm, in place: ALL m rows in ONE launch (the T2 epilogue's own
         // fallback pair — a plain rmsnorm into `qr`). Was m launches.
-        self.norm_rows(
-            self.s.qr_r.ptr as *const f32,
-            ld.q_norm.as_ref().unwrap().as_f32(),
-            self.s.qr_r.ptr as *mut f32,
-            m,
-            ql,
-            cfg.norm_eps,
-        )?;
+        // R2b: skipped when the fused wq_b left `qr_r` raw and the indexer
+        // consumes it that way (see `qr_raw_r` above); `m == 1` on that arm, so
+        // there is no second row whose normalisation anything could need.
+        if !qr_raw_r {
+            self.norm_rows(
+                self.s.qr_r.ptr as *const f32,
+                ld.q_norm.as_ref().unwrap().as_f32(),
+                self.s.qr_r.ptr as *mut f32,
+                m,
+                ql,
+                cfg.norm_eps,
+            )?;
+        }
         // wq_b: ONE launch for the whole block (see `proj_mrows`). The activation
         // is the normalised `qr_r` block; the output row is `nh*hd` wide but this
         // rank only writes its leading `nlh*hd`, which is why `out_stride` is a
