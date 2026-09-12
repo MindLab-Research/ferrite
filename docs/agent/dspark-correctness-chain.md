@@ -3647,3 +3647,23 @@ self.dev.gemm_fp8_mx_rope_norm(
 | 7 | Plan B + spec_primed_unanimous + serve 毒化 | **105,469 ❌❌** |
 
 **判决**：SWALLOW 的 ar5-hang 有多个根因（臂足迹 + argmax 轮次），修复一个暴露另一个。**SWALLOW 暂时搁置**——专注 lazy 路径的优化。
+
+## K1/K2 的验证计划（R2 的教训应用）
+
+**R2 的教训**：
+1. "逐位等价"的构造性论证不够——gemm_fp8_mx2 与 mrows 是两个不同程序（不同 warp helpers、vec modes、decline 码）
+2. **只查拉丁不够**——R2 的计数测试"干净"但数字错了（61-65 → 12-15）！必须验证数字顺序
+3. 数值差异在 ~60 token 后级联——短测试可能不暴露
+
+**K1/K2 的验证清单**（实施完成后）：
+| 检查 | 方法 | 红线 |
+|---|---|---|
+| 1. Parity 逐字节 diff | kernel-parity-byte-diff 的测试（真实形状）| 必须逐字节相同 |
+| 2. 出师表 1000 tok | 我的 e2e 测试 | 零拉丁 + 内容正确 |
+| 3. 计数 1-200 | 我的 e2e 测试 + 数字顺序验证 | 数字必须 1-200 顺序正确 |
+| 4. 吞吐 | 计数任务的端到端 | ≥ 78.8（基线）+ 预期 +5-6% |
+| 5. k_acc 序列 | 与 base 相同 | 不退化 |
+
+**测试顺序**：先 1（parity）再 2/3（正确性）再 4/5（性能）——parity 不过不上 GPU e2e。
+
+**gate**：DSV41_ATTN_MROWS2=1（K1）/ DSV41_ATTN_MROWS_ROPE_NORM=1（K2）——独立 gate 分别验证。
