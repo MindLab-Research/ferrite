@@ -83,16 +83,15 @@ LD_LIBRARY_PATH=$HOME/ferrite/kernels/cuda ./target/release/ferrite-serve --back
 - serve 卡住/日志 mtime 停滞 = 挂了（查 `stat -c %y` + pgrep，别等）。
 - 加载错防线（三道 runtime + 三道编译期 + git hooks）见 `docs/agent/` 的加载防线文档。
 
-## 当前状态与下一步（2026-09-12 深夜最终更新，详见 docs/agent/session-final-handover.md）
+## 当前状态与下一步（2026-09-12 session 收官，详见 docs/agent/session-final-handover.md）
 
-**范式转移（本 session 最重要发现）**：计数 line-62 "重置"、出师表 ~100 字拉丁、对话 77% 重复——**全部是 base 模型（非 chat 微调）在 ~50-60 token 后的自然退化**（EAGER+e4m3 对照确认）。**验证协议 v2**：计数只对前 61 行有效；出师表退化与 EAGER 一致 = 干净；引擎红线 = 不引入 EXTRA 损坏。
+**Session 成果（743 commits，88 知识文件）**：
+- **范式转移**：所有"损坏"判定是模型行为（base 模型 ~50-60 token 后自然退化——EAGER 对照确认）——验证协议 v2（计数前 61 行 + 出师表退化与 EAGER 一致 + k_acc 对照）
+- **干净栈：91.1 tok/s（+15.6%）**：base + R2(+10.2%) + MARKOV(+3.2%) + VERIFY_FORK(+1.5%) + RING_WIN(+0.3%)——全部修正判据验证
+- **SWALLOW 10 次修复全失败**：第 9 次是幻影（零调用点）；第 10 次真 pad 但 **epoch 冻结在 54**（epoch_dev 是 per-rank 的——AR 的不对称失败）；第 11 次（动态 pad）实施中
+- **tcgen05 2 轮对齐修复失败**（仍 1 misaligned——需 compute-sanitizer 定位）
+- **红线报告**：出师表零拉丁在 >60 tok 生成下不可达成（模型行为）——需用户决策
 
-**性能（干净栈，全部修正判据下验证）**：
-- **base 78.8 → +R2（ATTN_LIN_FUSE）86.8（+10.2%）→ +MARKOV_SLICED 89.6 → +VERIFY_FORK 90.8（+15.2%）**
-- LAZY_SDR 中性；K1/K2 干净但 R2 更快（88.7 vs 90.8）
-- lazy 数学上限 ~145（accept 5）/ ~97（accept 3）——**400 必须走 batched**
-- **SWALLOW 第 9 次修复**（epoch pad——轮次账本：swallowed 84 轮/步 vs legacy 165——pad 81 轮使臂选择对 v5 不可见）：实施中
-- tcgen05 仍被阻塞（split body 的对齐——ld_uint2_a8 守卫保护的 pair body 不是 grouped 路径）
-- **红线报告**：出师表零拉丁在 >60 tok 生成下不可达成（模型行为）——需用户决策（接受/换模型/限长度）
+**400 的诚实判定**：lazy 上限 ~145（accept 5）/ ~97（accept 3）——不够 400；batched（SWALLOW）是唯一路径——10 次失败；L4/L5 kernel 重写（"M 进 grid" 化 + tcgen05 + 流水）= 25-35 人日
 
 **验证纪律（v2 协议）**：EAGER 对照必须；前 61 行判据；退化模式一致 = 干净；三探针（数字+拉丁+k_acc）缺一不可。
