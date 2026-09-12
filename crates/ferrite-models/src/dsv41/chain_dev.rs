@@ -873,6 +873,31 @@ fn row_fold_rope() -> bool {
     *F.get_or_init(|| std::env::var("DSV41_ROW_FOLD_ROPE").map(|v| v != "0").unwrap_or(false))
 }
 
+/// VERIFY-ROPE-MROWS (`DSV41_VERIFY_ROPE_MROWS=1`, DEFAULT OFF): `attention_rows`'
+/// q rope as ONE `dsv41_apply_rope_mrows` launch instead of `m` `apply_rope`
+/// calls at `off = r, step = 0` — the same kernel with the same argument pattern
+/// the draft side's P3a a4 fold calls (`DsparkDev::rope_mrows`, `dspark_dev.rs`,
+/// `row_stride = nh*hd`). This is the verify-plan's own arm (§10 of
+/// `docs/agent/dspark-perf-400-plan.md`: the q-rope row is "semantically per-row
+/// but not per-launch", `pos_rows` is already a device array).
+///
+/// It is also the q-rope HALF of what `DSV41_ROW_FOLD_ROPE` already covers: that
+/// gate folds the q rope and the inverse o rope together behind one name, so it
+/// cannot A/B the q rope alone (the o-rope side is now `DSV41_VERIFY_OROPE`'s
+/// business anyway). Both gates are honoured — `row_fold_rope()` keeps its exact
+/// historical behaviour, this one is additive — and with BOTH off the per-row
+/// loop runs, which is the bit-identical target. Read ONCE and cached: this
+/// branch runs 40x/step, inside graph capture.
+fn verify_rope_mrows() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("DSV41_VERIFY_ROPE_MROWS")
+            .map(|v| v != "0")
+            .unwrap_or(false)
+            || row_fold_rope()
+    })
+}
+
 /// ROW-FOLD (DSV41_ROW_FOLD_GATE=1, DEFAULT OFF): `moe_rows` runs the bf16 gate
 /// `gemv_bf16` once per activation row. `gemv_bf16` dispatches to
 /// `ferrite_gemv_bf16_v2(..., nrows = 1)` for the gate's shape (n = the routed
@@ -7033,12 +7058,14 @@ impl<'a> DevChain<'a> {
         // single-row call keeps its heads at one position); the KV rope has one row
         // per position, so the block form works directly with `step = 1`.
         //
-        // ROW-FOLD (DSV41_ROW_FOLD_ROPE=1): the m launches collapse into one
-        // (`apply_rope_mrows`, an in-kernel ascending r loop over `pos_rows[r]` —
-        // the same positions the host passed through `off = r`, read from the
-        // device array this row loop already uses). Rows are independent, so the
-        // result is bit-identical; `Ok(false)` keeps the loop below.
-        let q_roped = row_fold_rope()
+        // ROW-FOLD (DSV41_ROW_FOLD_ROPE=1 / DSV41_VERIFY_ROPE_MROWS=1): the m
+        // launches collapse into one (`apply_rope_mrows`, an in-kernel ascending
+        // r loop over `pos_rows[r]` — the same positions the host passed through
+        // `off = r`, read from the device array this row loop already uses, and
+        // the identical kernel the draft side's P3a a4 calls). Rows are
+        // independent, so the result is bit-identical; `Ok(false)` keeps the loop
+        // below. See [`verify_rope_mrows`] for why the q rope has its own gate.
+        let q_roped = verify_rope_mrows()
             && self.dev.apply_rope_mrows(
                 self.s.q_r.ptr as *mut f32,
                 self.cos.as_f32(),
