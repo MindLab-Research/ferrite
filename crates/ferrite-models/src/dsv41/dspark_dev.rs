@@ -1337,7 +1337,7 @@ impl<'a> DsparkDev<'a> {
             // `stage{s}.attn.in` (attn_norm's output), for direct diffing.
             self.dump_unit_idx("h_norm_block", s, self.xn.ptr as *const f32, &[bs, dim]);
 
-            self.draft_attention(s, pos)?;
+            self.draft_attention(s, pos, slot_dev)?;
             // the attention block's own units: q/kv are the post-RoPE projections,
             // o is the module's output (after wo_b), all still live here.
             self.dump_unit_idx("q_block", s, self.q.ptr as *const f32, &[bs, self.nh, self.hd]);
@@ -1458,28 +1458,155 @@ impl<'a> DsparkDev<'a> {
 
         // ---- forward_head: collapse, norm, head, then the Markov sampler ----
         self.draft_head()?;
+        Ok(())
+    }
 
-        // ---- serialise the capture (one file per armed forward) ----
-        if let Some(u) = self.unit.take() {
-            let meta = format!(
-                "{{\"pos\":{pos},\"t0\":{t0},\"bs\":{bs},\"hc\":{hc},\"dim\":{dim},\"nh\":{},\
-                 \"hd\":{},\"vocab\":{},\"mr\":{},\"n_target\":{},\"n_mtp\":{},\"world\":{},\
-                 \"rank\":{},\"pid\":{},\"inject\":{injected}}}",
-                self.nh,
-                self.hd,
-                self.vocab,
-                self.mr,
-                self.n_target,
-                cfg.n_mtp_layers,
-                self.world,
-                self.rank,
-                std::process::id(),
+    /// Can THIS draft forward go through the device-level graph right now?
+    ///
+    /// Every clause is either a concrete CAPTURE HAZARD — a host value the
+    /// recorded region reads that a LATER position changes, which a capture
+    /// would freeze at its recording-time value — or a missing capability of the
+    /// loaded `.so`. A refused step takes the direct launches
+    /// (`slot_dev = false`), bit for bit, which is also what keeps
+    /// `DSV41_DRAFT_GRAPH` OFF indistinguishable from the historical path.
+    fn draft_graph_arm(&self, pos: usize) -> bool {
+        if !draft_graph_want() || self.graph_failed {
+            return false;
+        }
+        // D2: the ring append must be the DEVICE-derived one. Without
+        // `dsv41_ring_append` the recording would bake one ring slot (`window +
+        // (pos % win)*hd`) and every replay would overwrite that same row.
+        if !self.dev.supports_ring_append() {
+            return false;
+        }
+        // The MoE zeroes `moe_out` on the sequential arm; a SYNCHRONOUS memset
+        // runs on the legacy stream and would invalidate the capture.
+        if !self.dev.supports_memset_async() {
+            return false;
+        }
+        // A host barrier is not a CUDA call, so it would not be recorded and the
+        // replayed graph would lose the inter-rank synchronisation of the MoE
+        // all-reduce. `ar_v5` is the device-side protocol the recording CAN
+        // carry — the same clause `DevChain::verify_graph_gate` carries, and
+        // satisfied by default (`ar_v5` is on whenever the step graph is).
+        if self.comm.is_some() && !crate::dsv41::tp::ar_v5() {
+            return false;
+        }
+        // D3 + D4: the window geometry has to be in its STEADY state.
+        // `win_rows(pos)` returns `(win, 0)` from `pos >= win` on and only then,
+        // which is exactly what freezes the `window -> all_kv` copy's SIZE, its
+        // `s0 == 0` branch, `sparse_attn`'s window argument and the `idxs`
+        // table. Every earlier position has a different window, so a recording
+        // could not follow it.
+        //
+        // `DSV41_SEED_ALIGN` rotates the ring's start slot (`s0`) every step,
+        // turning that copy into two variable-length pieces at a host-computed
+        // split — which no capture can represent. The aligned arm therefore
+        // keeps the direct launches.
+        if self.win < 1 || pos < self.win || crate::dsv41::chain_dev::seed_align() {
+            return false;
+        }
+        // The golden per-unit capture probes the device from the HOST inside the
+        // body (`dump_unit`'s D2H) and injects its inputs with blocking H2Ds, so
+        // the whole debug arm stays on the direct launches.
+        if unit_dump::enabled() || self.unit.is_some() {
+            return false;
+        }
+        true
+    }
+
+    /// The `DSV41_DRAFT_GRAPH` CAPTURE arm: record [`Self::draft_body`] into a
+    /// fresh graph, instantiate it, and run it ONCE — a capture records without
+    /// executing, so the step still has to be launched.
+    ///
+    /// A capture is an OPTIMISATION: every failure (`capture_begin`,
+    /// `capture_end` — a driver-rejected op inside the recording — the
+    /// instantiate, the first launch) latches `graph_failed` and this step
+    /// finishes on the direct launches, so nothing can take the draft down with
+    /// it. That is the `verify_graph_failed` pattern.
+    fn draft_capture(&mut self, pos: usize) -> Result<()> {
+        // Rendezvous before the recording: a peer EXECUTING its MoE all-reduce
+        // while this rank only RECORDS it would poll for a stamp this rank is
+        // not publishing (see `Collective::host_barrier`'s note in tp.rs).
+        if let Some(c) = self.comm.as_ref() {
+            c.host_barrier();
+        }
+        let (g, mut err) = self.capture_draft(pos);
+        // ... and once more after it, so no rank starts a step against a peer
+        // still inside its recording.
+        if let Some(c) = self.comm.as_ref() {
+            c.host_barrier();
+        }
+
+        let mut exec: *mut c_void = std::ptr::null_mut();
+        if err.is_none() && !g.is_null() {
+            match self.dev.graph_instantiate(g) {
+                Ok(e) => exec = e,
+                Err(e) => err = Some(e),
+            }
+        }
+        if !g.is_null() {
+            // The captured GRAPH handle is released right after the instantiate:
+            // only the EXEC is needed from here on.
+            let _ = self.dev.graph_free(g, std::ptr::null_mut());
+        }
+        if err.is_none() {
+            // The capture did not execute, so this launch IS this step's draft.
+            if let Err(e) = self.dev.graph_launch(exec) {
+                err = Some(e);
+            }
+        }
+        if let Some(why) = err {
+            if !exec.is_null() {
+                let _ = self.dev.graph_free(std::ptr::null_mut(), exec);
+            }
+            // ★ PRINT, DO NOT SILENTLY DEGRADE. The graph is an optimisation, so
+            // a refusal is *designed* to leave the draft on the direct launches —
+            // which makes "graph on but never engaged" indistinguishable from
+            // "engaged" without this line (the trap the verify switch was born
+            // from).
+            eprintln!(
+                "[draft_graph] capture FAILED (pos={pos}): {why} — the draft stays on the \
+                 direct launches (latched)"
             );
-            if let Err(e) = u.write(&meta) {
-                eprintln!("[dspark] unit dump write failed: {e}");
+            self.graph_failed = true;
+            self.draft_body(pos, true)?;
+        } else {
+            self.graph = Some(exec);
+            self.graph_captures += 1;
+            if self.rank == 0 {
+                eprintln!(
+                    "[draft_graph] captured the draft chain at pos={pos} (bs={}, mtp={}) — every \
+                     later draft forward replays (DSV41_DRAFT_GRAPH=1)",
+                    self.bs, self.cfg.n_mtp_layers
+                );
             }
         }
         Ok(())
+    }
+
+    /// Record one [`Self::draft_body`] into a fresh graph.
+    ///
+    /// Returns `(graph, error)`: a non-null graph with `None` on success, or a
+    /// null graph with the first failure otherwise. The stream is ALWAYS taken
+    /// out of capture mode before returning — when `capture_begin` succeeded and
+    /// the body failed, `capture_end` is what ends it — so the caller's fallback
+    /// launch is legal. That is the whole point of this helper, and the same
+    /// contract `DevChain::capture_verify` keeps.
+    fn capture_draft(&mut self, pos: usize) -> (*mut c_void, Option<FerriteError>) {
+        if let Err(e) = self.dev.capture_begin() {
+            // Nothing was recorded, so there is no capture to end.
+            return (std::ptr::null_mut(), Some(e));
+        }
+        let inner = self.draft_body(pos, true);
+        let end = self.dev.capture_end();
+        match (inner, end) {
+            (Ok(()), Ok(g)) => (g, None),
+            (inner, end) => {
+                let e = end.err().or_else(|| inner.err()).expect("one arm failed");
+                (std::ptr::null_mut(), Some(e))
+            }
+        }
     }
 
     /// `hc_mixes` for one sub-block of one draft block. `ffn` selects the
@@ -1528,7 +1655,11 @@ impl<'a> DsparkDev<'a> {
     /// `DSparkAttention` (dspark.rs::dspark_attention): the draft block's own
     /// q/k/v, the window ring seeded from the main stream, and every draft query
     /// additionally attending its own block.
-    fn draft_attention(&mut self, s: usize, pos: usize) -> Result<()> {
+    ///
+    /// `slot_dev` is passed straight through to [`Self::seed_window`]: it selects
+    /// the device-derived ring destination that `DSV41_DRAFT_GRAPH` needs and is
+    /// `false` on every direct path.
+    fn draft_attention(&mut self, s: usize, pos: usize, slot_dev: bool) -> Result<()> {
         let cfg = self.cfg;
         let (dim, hd, nh, ql) = (self.dim, self.hd, self.nh, self.ql);
         let (bs, win, groups, hpg) = (self.bs, self.win, self.groups, self.hpg);
@@ -1554,7 +1685,7 @@ impl<'a> DsparkDev<'a> {
         // directly, which under the old (anchor == t0) timing happened to be
         // the same position; under the official timing it must shift back one.
         debug_assert!(pos > 0, "draft_forward: the anchor is never at pos 0");
-        self.seed_window(s, pos - 1, false)?;
+        self.seed_window(s, pos - 1, slot_dev)?;
 
         // ---- q = wq_b(q_norm(wq_a(x))) with RoPE at the draft positions ----
         // D1 fix (audit-ffi-args): quantise ALL bs rows — the historical call
