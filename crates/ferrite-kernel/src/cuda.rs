@@ -2065,7 +2065,7 @@ unsafe fn verify_kernel_build(
     // ABI 4: the bf16 truncation gate reached the fused hc front end (a trailing
     // `int truncate` on the four `dsv41_hc_front*` entries). Keep in lockstep with
     // FERRITE_KERNEL_ABI_VERSION in kernels/cuda/ferrite_kernels.cu.
-    const EXPECTED_ABI: u32 = 4;
+    const EXPECTED_ABI: u32 = 5;
     let get_id = libc_dlsym(
         handle,
         b"ferrite_kernel_build_id\0".as_ptr() as *const std::os::raw::c_char,

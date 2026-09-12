@@ -5148,3 +5148,568 @@ extern "C" int dsv41_expert_tcgen05_gate_up_e4m3(
 }  // namespace tc5
 
 #endif  // DSV41_TCGEN05_GATEUP_E4M3_SKELETON
+
+// =============================================================================
+// PHASE 1c — tcgen05 e4m3-activation MASKED M=128 TILE GEMM with the per-32-block
+// scales EXTERNALIZED to the accumulation step (kind::f8f6f4 DENSE — no
+// block-scale operands).   [SKELETON — compile-gated, GPU parity pending]
+// =============================================================================
+// WHY THIS ARM (docs/agent/verify-family-fusion.md W5 + dspark-correctness-chain.md
+// "tcgen05 f8f6f4 判词")
+// -----------------------------------------------------------------------------
+// The routed experts' activation is quantised by the OFFICIAL path as
+// `act_quant(e4m3, block=32)` — one e4m3 byte per value, with one e8m0
+// (power-of-two) scale per (row, 32 K elements). A tensor-core path that eats
+// exactly that activation therefore needs kind::f8f6f4 (FP8 x FP4), and THAT
+// kind has no block-scale operands:
+//     tcgen05.mma.cta_group::1.kind::f8f6f4.block_scale...  -> ptxas REJECTS
+//         "'.kind::f8f6f4' cannot be combined with '.block_scale'"
+// (probed; see expert-tcgen05-plan.md §8.1 and tests_tcgen05_mxf8f6f4_1x.cu).
+// The only block-scaled FP8 x FP4 kind is kind::mxf8f6f4, which is what the
+// tc5::e4 swapAB arm above uses — at the price of forcing scale_vec::1X and of
+// UNPACKING the fp4 operand in smem. This arm takes the other road: the MMA runs
+// RAW (dense, no scale operand) and the per-32-block scales are applied AFTER it,
+// in the accumulation step — the official tilelang inner loop
+//     C_local_accum += C_local * scale_a * scale_b
+// (dspark-correctness-chain.md:711, "scale 外提"). That is what makes the e4m3
+// activation reachable for THIS file's masked M=128 tile GEMM.
+//
+// -----------------------------------------------------------------------------
+// WHAT IT IS: the e4m3 twin of mxf4_gemm_kernel (A = activation)
+// -----------------------------------------------------------------------------
+// Same masked M=128 tile GEMM, same tile machinery (M=128 / N=64 / K staging in
+// 64-element atoms), same B side (the fp4 WEIGHT, with b_split + per-slot `ids`),
+// same epilogue conventions. TWO things change:
+//   * the A operand is e4m3 — 1 byte per value, the official act_quant output —
+//     instead of packed e2m1 (mxf4_gemm_kernel's kAtomBytes / 2 form);
+//   * the MMA is kind::f8f6f4 (dense), so the scales can NOT ride in the
+//     instruction and are folded by the accumulator instead.
+// The scale ROLES are unchanged from mxf4_gemm_kernel, which is exactly why they
+// can be moved out instead of needing the TMEM SF lanes the block-scaled arms
+// stage:
+//     scale_a = the ACTIVATION scale, per (row, 32-block) — f32 powers of two
+//     scale_b = the WEIGHT scale,     per (col, 32-block) — e8m0 bytes
+//
+// -----------------------------------------------------------------------------
+// THE DESIGN, AND THE ONE PLACE THIS IMPLEMENTATION DIFFERS FROM IT (honest)
+// -----------------------------------------------------------------------------
+// W5 reads:
+//     for each K-atom (64 elements = 2 x 32-blocks):
+//         MMA(A_atom[e4m3], B_atom[fp4]) -> tmem partial C_local[128x64]
+//         for each 32-K block of C_local: C_accum += C_local * sa * sb
+// A SINGLE 64-element MMA cannot be split that way: its C_local[m][n] is the sum
+// of ALL 64 K products, so a per-32 scale applied afterwards would also scale the
+// other block's contribution. This implementation therefore issues TWO K=32 MMAs
+// per atom — one per 32-block, each into its OWN C_local region (d0/d1) — then
+// ONE tcgen05.commit, ONE mbarrier wait and two scale-folds. Consequences:
+//   * the tmem ROUND TRIP count is exactly the design's: one commit+wait+read per
+//     atom = K / kAtomK = 2304 / 64 = 36. (The two loads of a round trip are
+//     separate but share the single wait: the two MMAs retire on one arrival.)
+//   * `enable_input_d = 0` on BOTH MMAs: each C_local IS the RAW partial, and the
+//     accumulator lives in registers (there is nothing left for the tensor core
+//     to accumulate, because the scale would have to be applied in between).
+//   * the scales are constant per 32-block for the whole K loop, so they are
+//     staged ONCE per stage into smem (coalesced) rather than re-read per fold.
+//
+// -----------------------------------------------------------------------------
+// NUMERIC DOMAIN (why the multiply order is safe)
+// -----------------------------------------------------------------------------
+// 1. The MMA accumulates in f32: C_local is the f32 sum of 32 products of an
+//    e4m3 activation value and an e2m1 weight value, computed by the tensor core
+//    (its internal order is the hardware's, exactly as in the block-scaled arms).
+// 2. scale_a is a fast_round_scale output and scale_b is an e8m0 byte: BOTH are
+//    powers of two (2^p, 2^q), so every multiply by them is an EXACT exponent
+//    shift — no rounding, and no reassociation risk under --use_fast_math (which
+//    this .so builds with). Only the final `acc += ...` rounds, once per
+//    (atom, 32-block) contribution. This is why `(v*sa)*sb` and `v*(sa*sb)` are
+//    the SAME f32 value here (the product sa*sb is itself exact), i.e. the
+//    design's "乘法可交换" holds numerically, not just algebraically.
+// 3. The accumulation order is FIXED and ascending in K: sub-block 0 then 1
+//    inside the atom, atoms ascending inside the stage, stages ascending over K.
+//    One f32 chain per (m, n) — no split accumulators, no shuffle tree — so the
+//    order is a property of the source, not of the scheduler.
+// 4. Range: sa*sb underflows the f32 exponent only if p + q < -126. The
+//    checkpoint's scales are chosen so each block's values land in the operand
+//    type's range, and a flushed-to-zero product is the same edge the SIMT path
+//    has. e8m0 0x00 decodes to 2^-127, which is FINITE — the weight path never
+//    writes 0xFF (NaN), which would poison the whole fold.
+//
+// -----------------------------------------------------------------------------
+// [OPEN — settle on an sm_103a GPU before this arm is trusted]
+// -----------------------------------------------------------------------------
+//  * the non-block-scaled idesc format codes. This arm takes a_format = E4M3 = 0
+//    and b_format = E2M1 = 5 from MXF8F6F4Format — the only enum this repo has
+//    decoded (tests_tcgen05_mxf8f6f4_1x.cu:836). The non-block-scaled form
+//    spends bits [4,6) on the D type instead of b_sf_id; f32 (1) is used because
+//    a f32 accumulate is the whole point of the parity with the SIMT path.
+//  * the fp4 operand of the f8f6f4 family is the UNPACKED ("unpacksmem") form:
+//    one e2m1 element per BYTE, i.e. 32 bytes per row per K=32 atom = the same
+//    geometry as the e4m3 A operand. This is the file's own documented finding
+//    for kind::mxf8f6f4 (CUTLASS float_e2m1_unpacksmem_t -> MXF8F6F4Format::E2M1
+//    while the packed float_e2m1_t -> MXF4Format::E2M1, (:3030)) and it is what
+//    keeps ONE descriptor form (LBO 128 B / SBO 256 B) valid for both operands.
+//    The alternative reading (packed fp4, 16 bytes per row = a single core
+//    chunk) would halve B's smem but invent an SBO=128 B descriptor this repo
+//    has no precedent for — it is one numeric parity run away either way.
+// =============================================================================
+
+#ifdef DSV41_TCGEN05_GATEUP_E4M3_SKELETON
+
+#include <cstdlib>  // getenv (launcher gate)
+
+namespace tc5 {
+namespace e4x {
+
+// ------------------------------------------------------------------ geometry
+constexpr int kMTile = 128;  // MMA M (1-CTA kind::f8f6f4 is fixed at 128)
+constexpr int kNTile = 64;   // output columns per CTA (N of the MMA)
+constexpr int kSubK = 32;    // dense K of ONE kind::f8f6f4 MMA: 32 elements
+                             // (== 32 e4m3 bytes == 32 unpacked fp4 bytes per row)
+constexpr int kAtomK = 64;   // K per staging atom == 2 sub-blocks == 2 scale blocks
+constexpr int kSubs = kAtomK / kSubK;  // 2 sub-blocks (2 scale blocks) per atom
+// Atoms per smem stage. This is SMALLER than mxf4_gemm_kernel's 4 on purpose:
+// the e4m3 activation is 1 byte/element AND the fp4 weight has to be expanded to
+// the unpacked form, so a sub-block costs 4096 (A) + 2048 (B) bytes against 4096
+// for a whole K=64 fp4 atom there. 2 atoms (128 K elements) is what fits the
+// same 48 KiB window with the scales staged.
+constexpr int kStageAtoms = 2;
+constexpr int kSubsPerStage = kStageAtoms * kSubs;  // 4
+constexpr int kThreads = 128;                       // 4 warps == 4 TMEM partitions
+// Descriptor strides in bytes, for the canonical K-major SWIZZLE_NONE atom
+//     unit16(row, kb) = (row % 8) + 8*kb + 16*(row / 8)        kb in {0,1}
+// Both operands carry 32 bytes per row per K=32 sub-block (e4m3 = 1 byte/element;
+// unpacked fp4 = 1 byte/element), i.e. 2 x 16-byte core chunks, so LBO (chunk
+// stride) = 128 B and SBO (8-row-group stride) = 256 B — the SAME numbers as the
+// file-scope make_desc() and mxf4_gemm_kernel's operand (only the element size
+// changed, so the descriptor did not).
+constexpr int kLboBytes = 128;
+constexpr int kSboBytes = 256;
+// Per-K=32-sub-block operand bytes.
+constexpr int kASubBytes = kMTile * kSubK;        // 128 x 32 = 4096 (e4m3 A)
+constexpr int kBSubBytes = kNTile * kSubK;        //  64 x 32 = 2048 (unpacked fp4 B)
+constexpr int kABytes = kSubsPerStage * kASubBytes;  // 16384
+constexpr int kBBytes = kSubsPerStage * kBSubBytes;  //  8192
+// TMEM. D is no longer an accumulator: it is TWO per-sub-block PARTIAL regions
+// (C_local), one per 32-block of the atom in flight. tc_alloc wants a power of
+// two, so the pair is allocated as 128 columns.
+constexpr int kDCols = kNTile;         // 64 columns per C_local region
+constexpr int kTmemCols = 2 * kDCols;  // 128
+static_assert((kTmemCols & (kTmemCols - 1)) == 0, "tc_alloc wants a power of two");
+
+struct Smem {
+    // ---- operands, canonical K-major, one block per K=32 sub-block ---------
+    alignas(1024) uint8_t a[kABytes];  // e4m3 activation, 1 byte per value
+    alignas(1024) uint8_t b[kBBytes];  // fp4 weight, UNPACKED 1 element/byte
+    // ---- scales of the stage in flight -------------------------------------
+    // [sub][row] and [sub][col], TRANSPOSED so the fold's per-lane A-scale read
+    // is stride 1 (bank-conflict free) and its per-column B-scale read is a
+    // uniform address (broadcast). f32 because that is the precision the fold
+    // multiplies in; the e8m0 bytes are decoded on the way in.
+    float sa[kSubsPerStage][kMTile];
+    float sb[kSubsPerStage][kNTile];
+    alignas(8) uint64_t mbar;  // tcgen05.commit retirement (one arrival per atom)
+    uint32_t tmem_base;
+};
+// The 48 KiB static window, same rule as every other arm in this file: a tuning
+// change that trips this fails the BUILD instead of failing at launch.
+static_assert(sizeof(Smem) <= 48 * 1024, "tc5::e4x stage does not fit static smem");
+// 16384 + 8192 + 2048 + 1024 + 12 ~= 27.7 KiB.
+
+// ------------------------------------------------------------------- helpers
+// Byte offset of the canonical 16-byte unit holding (row, kb) of a K=32 atom.
+__device__ __forceinline__ int e4x_off(int row, int kb) {
+    return 16 * ((row & 7) + 8 * kb + 16 * (row >> 3));
+}
+// SMEM operand descriptor. Kept local (not the file-scope make_desc) so this
+// arm's constants cannot drift through a macro switch; the VALUES are identical.
+__device__ __forceinline__ uint64_t e4x_make_desc(uint32_t smem_base) {
+    const uint64_t start = (uint64_t)((smem_base >> 4) & 0x3FFFu);
+    const uint64_t lbo = (uint64_t)((kLboBytes >> 4) & 0x3FFFu);  // 8
+    const uint64_t sbo = (uint64_t)((kSboBytes >> 4) & 0x3FFFu);  // 16
+    return start | (lbo << 16) | (sbo << 32) | ((uint64_t)1 << 46);  // version = 1
+}
+// Instruction descriptor, kind::f8f6f4, NON-block-scaled. Bits [4,6) carry the D
+// type here (the block-scaled form spends them on b_sf_id), bits 7-9 / 10-12 the
+// A/B formats (MXF8F6F4Format: E4M3 = 0, E2M1 = 5), bits 13-16 the negates and
+// majors (all 0 = K-major, no negation). See [OPEN] in the header.
+__device__ __forceinline__ uint32_t e4x_make_idesc() {
+    uint32_t d = 0;
+    d |= 1u << 4;   // D / accumulator type = f32
+    d |= 0u << 7;   // a_format = E4M3 (A = the activation)
+    d |= 5u << 10;  // b_format = E2M1 (B = the fp4 weight)
+    d |= (uint32_t)(kNTile >> 3) << 17;  // n_dim
+    d |= (uint32_t)(kMTile >> 4) << 24;  // m_dim
+    return d;
+}
+// The MMA. NOTE the operand list: FIVE operands, no [sf_a]/[sf_b] — that is the
+// whole point of this arm (kind::f8f6f4 cannot carry them, so the scales are
+// folded by the caller). `enable_d` is always 0 here: every MMA produces the RAW
+// partial of its own 32-block.
+__device__ __forceinline__ void e4x_mma(uint32_t d_tmem, uint64_t a_desc, uint64_t b_desc,
+                                        uint32_t idesc, uint32_t enable_d) {
+    asm volatile(
+        "{\n\t.reg .pred p;\n\t"
+        "setp.ne.b32 p, %4, 0;\n\t"
+        "tcgen05.mma.cta_group::1.kind::f8f6f4 [%0], %1, %2, %3, p;\n\t}" ::"r"(d_tmem),
+        "l"(a_desc), "l"(b_desc), "r"(idesc), "r"(enable_d)
+        : "memory");
+}
+// Packed fp4 -> UNPACKED e2m1 (one element per byte). Same nibble->byte widening
+// as tc5_expand/e4_expand above (kept local to this arm for the same reason):
+//   p = [b0 b1 b2 b3], bi = e(2i) | e(2i+1) << 4
+//   ev = p & 0x0F0F0F0F = [e0 e2 e4 e6]   od = (p >> 4) & mask = [e1 e3 e5 e7]
+//   out bytes [e0 e1 e2 e3] = __byte_perm(ev, od, 0x5140)
+//   out bytes [e4 e5 e6 e7] = __byte_perm(ev, od, 0x7362)
+// A uint4 (16 packed bytes = 32 elements = ONE K=32 sub-block) therefore becomes
+// two uint4, i.e. exactly the two core chunks (kb 0/1) of one B row.
+__device__ __forceinline__ void e4x_expand(uint32_t p, uint32_t& ev, uint32_t& od) {
+    ev = p & 0x0F0F0F0Fu;
+    od = (p >> 4) & 0x0F0F0F0Fu;
+}
+__device__ __forceinline__ uint32_t e4x_ilv_lo(uint32_t ev, uint32_t od) {
+    return __byte_perm(ev, od, 0x5140u);  // [e0 e1 e2 e3]
+}
+__device__ __forceinline__ uint32_t e4x_ilv_hi(uint32_t ev, uint32_t od) {
+    return __byte_perm(ev, od, 0x7362u);  // [e4 e5 e6 e7]
+}
+
+// -----------------------------------------------------------------------------
+// The kernel.
+//
+// Contract (checked by the launcher, not here):
+//   k % kAtomK == 0        (a stage never carries a half atom)
+//   rows % kMTile == 0, n_total % kNTile == 0   (full CTA tiles)
+//   a       [rows, k]    e4m3, ONE byte per value (the act_quant(e4m3, 32) row)
+//   a_scale [rows, k/32] f32 powers of two
+//   b/b_hi  [r, k/2]     fp4, packed 2 values/byte, + [r, k/32] e8m0 scales
+//   k % 32 == 0 (the scale-block granularity), 16-byte alignment on every base
+// -----------------------------------------------------------------------------
+// The min-blocks hint pins the register budget: this kernel holds the whole
+// [1 row x 64 column] accumulator plus a 16-register tmem load in flight, and
+// without a target ptxas spends 162 registers (3 CTAs/SM) rather than 128
+// (4 CTAs/SM). Latency, not bandwidth, is this arm's risk, so occupancy wins.
+__global__ void __launch_bounds__(kThreads, 4) e4m3_gemm_kernel(
+    const uint8_t* __restrict__ a,        // [rows, k] e4m3, one byte per value
+    const float* __restrict__ a_scale,    // [rows, k/32] f32 powers of two
+    const uint8_t* __restrict__ b,        // [b_rows, k/2] fp4, packed
+    const uint8_t* __restrict__ b_scale,  // [b_rows, k/32] e8m0
+    const uint8_t* __restrict__ b_hi,     // second half (b_split >= 0), else b
+    const uint8_t* __restrict__ b_hi_scale,
+    float* __restrict__ out,              // [rows, n_total]
+    int rows, int n_total, int k, int b_split, int epi_mode, float limit,
+    const float* __restrict__ row_weight,
+    // Indirect (graph-friendly) B addressing, same convention as
+    // mxf4_gemm_kernel: ids != nullptr derives the four B pointers per CTA from
+    // `base + ids[slot] * stride`, so the routing never reaches the host;
+    // ids == nullptr keeps the direct path (one expert, every slot identical).
+    const uint8_t* __restrict__ b_base, long b_stride,
+    const uint8_t* __restrict__ bs_base, long bs_stride,
+    const uint8_t* __restrict__ bh_base, long bh_stride,
+    const uint8_t* __restrict__ bhs_base, long bhs_stride,
+    const int* __restrict__ ids, int slot) {
+    const uint8_t* b_use = b;
+    const uint8_t* bsc_use = b_scale;
+    const uint8_t* bhi_use = b_hi;
+    const uint8_t* bhs_use = b_hi_scale;
+    if (ids != nullptr) {
+        const size_t e = (size_t)ids[slot];
+        b_use = b_base + e * (size_t)b_stride;
+        bsc_use = bs_base + e * (size_t)bs_stride;
+        bhi_use = bh_base + e * (size_t)bh_stride;
+        bhs_use = bhs_base + e * (size_t)bhs_stride;
+    }
+    const int m_base = blockIdx.y * kMTile;
+    const int n_base = blockIdx.x * kNTile;
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int kbytes = k >> 1;  // PACKED fp4 weight bytes per row
+    const int nk_blk = k >> 5;  // 32-element blocks == scale columns
+
+    __shared__ Smem s;
+
+    // ---------------------------------------------------------- tmem alloc
+    if (warp == 0) {
+        tc_alloc(&s.tmem_base, kTmemCols);
+        tc_relinquish();
+    }
+    if (tid == 0) mbar_init(&s.mbar, 1);
+    __syncthreads();
+
+    const uint32_t tmem_base = s.tmem_base;
+    const uint32_t d0_col = tmem_base;           // C_local, sub-block 0 (64 cols)
+    const uint32_t d1_col = tmem_base + kDCols;  // C_local, sub-block 1 (64 cols)
+
+    // --------------------------------------------------- register accumulator
+    // acc[c] holds row (m_base + warp*32 + lane) x column (n_base + c) for the
+    // WHOLE K loop. It has to live in registers: the scale fold is not something
+    // the tensor core can do, so the partials must come out to where a multiply
+    // can happen. One f32 chain per (m, n), ascending K (see NUMERIC DOMAIN).
+    float acc[kNTile];
+#pragma unroll
+    for (int c = 0; c < kNTile; ++c) acc[c] = 0.f;
+
+    // ------------------------------------------------------------- K loop
+    uint32_t phase = 0;
+    for (int k0 = 0; k0 < k; k0 += kStageAtoms * kAtomK) {
+        const int natoms = min(kStageAtoms, (k - k0 + kAtomK - 1) / kAtomK);
+
+        // ---- 1. stage the A operand (e4m3) --------------------------------
+        // One 16-byte chunk per (atom, row, sub, kb). The e4m3 row is already one
+        // byte per value, so this is a straight 16-byte copy onto the canonical
+        // unit — no expansion pass (that is this arm's advantage over every fp4
+        // operand in the file: 2 values per byte become 1 byte per value here).
+        for (int c = tid; c < kStageAtoms * kMTile * 2 * kSubs; c += kThreads) {
+            const int atom = c / (kMTile * 2 * kSubs);
+            if (atom >= natoms) continue;
+            const int r = c % (kMTile * 2 * kSubs);
+            const int m = r >> 2;  // row within this CTA's M tile
+            const int q = r & 3;   // chunk within the atom: 2 subs x 2 kb
+            const int sub = q >> 1, kb = q & 1;
+            const int row = m_base + m;
+            const size_t kk = (size_t)k0 + (size_t)atom * kAtomK + sub * kSubK + kb * 16;
+            uint4 val = make_uint4(0, 0, 0, 0);
+            if (row < rows && kk + 16 <= (size_t)k)
+                val = *reinterpret_cast<const uint4*>(a + (size_t)row * k + kk);
+            *reinterpret_cast<uint4*>(s.a + (atom * kSubs + sub) * kASubBytes +
+                                      e4x_off(m, kb)) = val;
+        }
+
+        // ---- 2. stage + expand the B operand (packed fp4 -> unpacked) ------
+        // The source is the checkpoint's 16 packed bytes of this row's K=32
+        // sub-block; the destination is the two 16-byte core chunks of one B row
+        // (kb 0 = elements 0..15, kb 1 = elements 16..31). See the [OPEN] note in
+        // the header: the f8f6f4 family's fp4 operand is the unpacked form, which
+        // is why this expansion exists at all.
+        for (int c = tid; c < kStageAtoms * kNTile * kSubs; c += kThreads) {
+            const int atom = c / (kNTile * kSubs);
+            if (atom >= natoms) continue;
+            const int r = c % (kNTile * kSubs);
+            const int n = r >> 1, sub = r & 1;
+            const int n_glob = n_base + n;
+            const size_t ko = (size_t)(k0 + atom * kAtomK + sub * kSubK) >> 1;
+            uint4 o0 = make_uint4(0, 0, 0, 0), o1 = make_uint4(0, 0, 0, 0);
+            if (n_glob < n_total && ko + 16 <= (size_t)kbytes) {
+                const uint8_t* src_base = b_use;
+                int row = n_glob;
+                if (b_split >= 0 && n_glob >= b_split) {
+                    src_base = bhi_use;
+                    row = n_glob - b_split;
+                }
+                if (row >= 0) {
+                    const uint4 p = *reinterpret_cast<const uint4*>(src_base +
+                                                                    (size_t)row * kbytes + ko);
+                    uint32_t ev[4], od[4];
+                    e4x_expand(p.x, ev[0], od[0]);
+                    e4x_expand(p.y, ev[1], od[1]);
+                    e4x_expand(p.z, ev[2], od[2]);
+                    e4x_expand(p.w, ev[3], od[3]);
+                    o0.x = e4x_ilv_lo(ev[0], od[0]);
+                    o0.y = e4x_ilv_hi(ev[0], od[0]);
+                    o0.z = e4x_ilv_lo(ev[1], od[1]);
+                    o0.w = e4x_ilv_hi(ev[1], od[1]);
+                    o1.x = e4x_ilv_lo(ev[2], od[2]);
+                    o1.y = e4x_ilv_hi(ev[2], od[2]);
+                    o1.z = e4x_ilv_lo(ev[3], od[3]);
+                    o1.w = e4x_ilv_hi(ev[3], od[3]);
+                }
+            }
+            uint8_t* dst = s.b + (atom * kSubs + sub) * kBSubBytes;
+            *reinterpret_cast<uint4*>(dst + e4x_off(n, 0)) = o0;
+            *reinterpret_cast<uint4*>(dst + e4x_off(n, 1)) = o1;
+        }
+
+        // ---- 3. stage this stage's scales (once, coalesced) ---------------
+        // The scales are the SAME for every MMA of the K loop given the block
+        // index, so they are decoded once per stage instead of once per fold: the
+        // fold then touches only smem. A: [sub][row] f32; B: [sub][col] f32
+        // (e8m0 -> f32 on the way in; ue8m0_to_f is the file's 2^(b-127), 0x00
+        // stays FINITE so a zeroed/unwritten block can never poison the sum).
+        for (int c = tid; c < kSubsPerStage * kMTile; c += kThreads) {
+            const int sub = c / kMTile;
+            const int m = c % kMTile;
+            const int row = m_base + m;
+            const int bb = (k0 >> 5) + sub;  // global 32-block of this sub
+            float v = 0.f;
+            if (row < rows && bb < nk_blk) v = a_scale[(size_t)row * nk_blk + bb];
+            s.sa[sub][m] = v;
+        }
+        for (int c = tid; c < kSubsPerStage * kNTile; c += kThreads) {
+            const int sub = c / kNTile;
+            const int n = c % kNTile;
+            const int n_glob = n_base + n;
+            const int bb = (k0 >> 5) + sub;
+            float v = 0.f;
+            if (n_glob < n_total && bb < nk_blk) {
+                const uint8_t* sc = bsc_use;
+                int row = n_glob;
+                if (b_split >= 0 && n_glob >= b_split) {
+                    sc = bhs_use;
+                    row = n_glob - b_split;
+                }
+                if (row >= 0) v = ue8m0_to_f(sc[(size_t)row * nk_blk + bb]);
+            }
+            s.sb[sub][n] = v;
+        }
+
+        // publish every smem write to the async proxy (the MMA reads it there)
+        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+        __syncthreads();
+
+        // ---- 4. per atom: 2 MMAs (one per 32-block) + ONE commit/wait + fold
+        // This is the design's inner loop: one tmem round trip per K-atom, with
+        // the scale applied on the way out of tmem (C_accum += C_local * sa * sb).
+        for (int atom = 0; atom < natoms; ++atom) {
+            if (tid == 0) {
+                const uint32_t id = e4x_make_idesc();
+                const uint64_t da0 =
+                    e4x_make_desc(smem_addr(s.a + (atom * kSubs + 0) * kASubBytes));
+                const uint64_t db0 =
+                    e4x_make_desc(smem_addr(s.b + (atom * kSubs + 0) * kBSubBytes));
+                const uint64_t da1 =
+                    e4x_make_desc(smem_addr(s.a + (atom * kSubs + 1) * kASubBytes));
+                const uint64_t db1 =
+                    e4x_make_desc(smem_addr(s.b + (atom * kSubs + 1) * kBSubBytes));
+                // enable_input_d = 0 on BOTH: each region holds the RAW partial of
+                // its own 32-block, and no tensor-core accumulate can happen
+                // across two blocks with different scales.
+                e4x_mma(d0_col, da0, db0, id, 0u);
+                e4x_mma(d1_col, da1, db1, id, 0u);
+                tc_commit(&s.mbar);  // ONE arrival covers BOTH MMAs of the atom
+            }
+            mbar_wait(&s.mbar, phase);
+            phase ^= 1u;
+
+            const int mrow = warp * 32 + lane;  // this thread's row in the M tile
+#pragma unroll
+            for (int sub = 0; sub < kSubs; ++sub) {
+                const int ssub = atom * kSubs + sub;  // stage-local sub index
+                const uint32_t dcol = (sub == 0) ? d0_col : d1_col;
+                const float sa = s.sa[ssub][mrow];  // [row, 32-block] activation
+#pragma unroll
+                for (int c0 = 0; c0 < kNTile; c0 += 16) {
+                    uint32_t v[16];
+                    tc_ld_x16((((uint32_t)(warp * 32)) << 16) | (dcol + c0), v);
+                    tc_wait_ld();
+#pragma unroll
+                    for (int i = 0; i < 16; ++i) {
+                        // sa and sb are powers of two, so sa*sb is EXACT: the
+                        // association below is numerically irrelevant, and the
+                        // only rounding is the accumulate (see NUMERIC DOMAIN).
+                        acc[c0 + i] += __uint_as_float(v[i]) * (sa * s.sb[ssub][c0 + i]);
+                    }
+                }
+            }
+
+            // Every warp has now consumed both C_local regions; the NEXT atom's
+            // MMAs overwrite them, so all four warps' tcgen05.ld must be retired
+            // CTA-wide before tid 0 issues them. Same idiom the SF prologue uses
+            // for a generic-proxy write feeding the async proxy.
+            tc_fence_before_thread_sync();
+            __syncthreads();
+            tc_fence_after_thread_sync();
+        }
+    }
+
+    // ------------------------------------------------------------ epilogue
+    // No final tmem wait is needed: every atom's MMAs were waited inside the loop
+    // (that IS the 36 round trips), so `acc` is complete here. Read-out mapping
+    // is mxf4_gemm_kernel's: lane (m % 32) of partition (m / 32) is row m and the
+    // column index is the N index (this arm does NOT use the swapAB mapping).
+    // The mask (row/col bounds) and every epi_mode convention are inherited
+    // verbatim, so a caller can A/B this arm against the e2m1 one unchanged.
+#pragma unroll
+    for (int c = 0; c < kNTile; ++c) {
+        const int row = m_base + warp * 32 + lane;
+        const int col = n_base + c;
+        if (row >= rows || col >= n_total) continue;
+        float x = acc[c];
+        if (epi_mode == 1) {  // gate/up clamps (training convention)
+            if (limit > 0.f) {
+                if (col < b_split) x = fminf(x, limit);           // gate
+                else x = fminf(fmaxf(x, -limit), limit);          // up
+            }
+        } else if (epi_mode == 2 || epi_mode == 3) {  // down: routing weight
+            if (row_weight != nullptr) x *= row_weight[row];
+        }
+        // epi_mode 3 accumulates straight into the caller's MoE accumulator.
+        if (epi_mode == 3) out[(size_t)row * n_total + col] += x;
+        else out[(size_t)row * n_total + col] = x;
+    }
+
+    __syncthreads();
+    if (warp == 0) tc_dealloc(tmem_base, kTmemCols);
+}
+
+// =============================================================================
+// LAUNCHER
+// =============================================================================
+// Same shape as mxf4_gemm_kernel's launcher (one CTA per (n-tile, m-tile), the
+// grid iterating n fastest) and the same capture rule: the runtime gate is read
+// ONCE per process, because a per-call getenv is a CUDA-graph capture hazard.
+// =============================================================================
+inline cudaError_t e4x_launch_gemm(const uint8_t* a, const float* a_scale, const uint8_t* b,
+                                   const uint8_t* b_scale, const uint8_t* b_hi,
+                                   const uint8_t* b_hi_scale, float* out, int rows, int n_total,
+                                   int k, int b_split, int epi_mode, float limit,
+                                   const float* row_weight, const uint8_t* b_base, long b_stride,
+                                   const uint8_t* bs_base, long bs_stride, const uint8_t* bh_base,
+                                   long bh_stride, const uint8_t* bhs_base, long bhs_stride,
+                                   const int* ids, int slot, cudaStream_t stream) {
+    if (rows <= 0 || n_total <= 0 || k <= 0) return cudaErrorInvalidValue;
+    // k % kAtomK: a stage never carries a half atom (and k % 32 == 0 is implied,
+    // the scale block being the MMA's own K). The two tile contracts keep every
+    // CTA on a full tile — the kernel masks out-of-range rows/columns anyway, but
+    // a partial tile would silently change the folding pattern, so it is refused
+    // here rather than tolerated.
+    if (k % kAtomK != 0 || rows % kMTile != 0 || n_total % kNTile != 0)
+        return cudaErrorInvalidValue;
+    // 16-byte alignment is a hard contract on the operand bases: the K=32 e4m3
+    // row is addressed in 16-byte chunks and the packed fp4 source in uint4s. A
+    // misaligned access does not fault, it silently misplaces bytes.
+    const auto al16 = [](const void* p) { return ((uintptr_t)p & 0xF) == 0; };
+    if (!al16(a) || !al16(b) || !al16(b_hi)) return cudaErrorInvalidValue;
+    const dim3 grid((unsigned)(n_total / kNTile), (unsigned)(rows / kMTile));
+    e4m3_gemm_kernel<<<grid, kThreads, 0, stream>>>(
+        a, a_scale, b, b_scale, b_hi, b_hi_scale, out, rows, n_total, k, b_split, epi_mode, limit,
+        row_weight, b_base, b_stride, bs_base, bs_stride, bh_base, bh_stride, bhs_base, bhs_stride,
+        ids, slot);
+    return cudaGetLastError();
+}
+
+// "e4m3 activation x fp4 weight, masked M=128 tile GEMM, per-32-block scales
+// externalized to the accumulation step". Returns 0 (and does nothing) while
+// disabled, so a caller can invoke it unconditionally and keep the SIMT/GEMV
+// path as the fallback — the same contract as every other arm in this file.
+//
+// Runtime gate: DSV41_EXPERT_TCGEN05_E4M3 (default OFF, strict first-char '1'
+// rule, read once). This arm is the w=row sibling of the tc5::e4 swapAB arm and
+// shares its activation FORMAT, so it shares the gate name: which of the two a
+// step runs is a launch-shape decision (a dense M=128 tile of activation rows vs
+// the single-token swapAB form), NOT a numeric-format decision. Each has its own
+// symbol, so a .so carrying only one of them still behaves (the Rust side probes
+// `dsv41_expert_tcgen05_gate_up_e4m3` today; this arm's symbol is additive and
+// carries no ABI bump).
+extern "C" int dsv41_expert_gemm_e4m3_ext(
+    const uint8_t* a, const float* a_scale, const uint8_t* b, const uint8_t* b_scale,
+    const uint8_t* b_hi, const uint8_t* b_hi_scale, float* out, int rows, int n_total, int k,
+    int b_split, int epi_mode, float limit, const float* row_weight, const uint8_t* b_base,
+    long b_stride, const uint8_t* bs_base, long bs_stride, const uint8_t* bh_base, long bh_stride,
+    const uint8_t* bhs_base, long bhs_stride, const int* ids, int slot, cudaStream_t stream) {
+    static const int enabled = [] {
+        const char* g = getenv("DSV41_EXPERT_TCGEN05_E4M3");
+        return (g != nullptr && g[0] == '1') ? 1 : 0;  // default OFF until serve A/B
+    }();
+    if (!enabled) return 0;
+    const cudaError_t rc = e4x_launch_gemm(a, a_scale, b, b_scale, b_hi, b_hi_scale, out, rows,
+                                           n_total, k, b_split, epi_mode, limit, row_weight,
+                                           b_base, b_stride, bs_base, bs_stride, bh_base,
+                                           bh_stride, bhs_base, bhs_stride, ids, slot, stream);
+    (void)cudaGetLastError();  // never fail the step: the fallback path is correctness
+    return (int)rc;
+}
+
+}  // namespace e4x
+}  // namespace tc5
+
+#endif  // DSV41_TCGEN05_GATEUP_E4M3_SKELETON

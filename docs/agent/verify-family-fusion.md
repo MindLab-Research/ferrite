@@ -509,6 +509,43 @@ submit，而是 GPU 侧那一段（~3.3µs）。**融合的收益主要来自把
 3. **r 绝不进 grid.y**（因果序——audit defect #2 的教训）：grid = (b, m×h)，行维度在 blockIdx.y 的低段
 4. ring/window 合核：`ring_append` 与 `window_idxs` 的 m 行批版
 
+### W2 实施记录（工部，2026-09-12）——三项方案补正 + 两个硬前置
+
+**已实施（ABI 5，`.so` 必须同源重建）**：5 个 attention kernel 体（`sparse_attn_kernel` /
+`_warp_` / `_pf_` / `_split_` / `_orope_`；merge 不读 clen 未动）加尾参
+`const int* clen_rows, int idx_stride`（orope 另加 `int row_step`），body 为
+`const int cl = clen_rows ? clen_rows[mm] : *clen;`（`mm = row % m`，**不是** `blockIdx.y`——
+见下方第 1 项）；launcher `dsv41_sparse_attn` / `dsv41_sparse_attn_orope` 同步加尾参
+（stream 前）；`device.rs` 方法与 5 个调用点（verify 逐行 ×2、eager ×2、draft 的 `b=1,m=bs` ×1）
+同步；`FERRITE_KERNEL_ABI_VERSION` / `EXPECTED_ABI` 4 → 5。`cargo check --workspace` EXIT=0。
+
+**补正 1 · 还缺 `idx_stride`（否则语义错）**：per-row 调用传的 `idxs` 是
+`idxs_r + r*(win+index_topk)`，即行距是 **`ist`**；而 `clen` 一旦逐行，`topk = win + min(cl, index_topk)`
+也逐行，kernel 里历史的 `(bb*m+mm)*topk` 行基址会串到下一行。批版必须传 `idx_stride = ist`
+（`idx_stride = 0` 保留历史 `topk` 行距）。
+
+**补正 2 · orope 的 rope 位置要有行项**：`tt = (*base)*mul + off + hh*step` 里**没有行号**，
+单行调用靠 `off = r` 表达；批版必须 `+ mm*row_step`（verify 传 `base=pos_ctr, mul=1, off=0,
+step=0, row_step=1` ⇒ `tt = pos_ctr + mm`，与逐行的 `off = r` 逐位同一公式）。
+
+**补正 3 · 行距在 `world > 1` 下不是 `h*d`**：kernel 用 `(row*h + hh)*d` 索引 q/out，而 verify 的行
+在完整的 `[m, nh*hd]` 缓冲里（行距 `nh*hd`），只有 `h = nlh = nh/world` ⇒ **`world == 1` 时相等**。
+批版在 TP>1 还需要一个 `row_pitch` 尾参（5 个 attention kernel + **merge**（split 是默认臂））。
+
+**硬前置 A（因果序，本波最关键）**：`clen_rows` 只解决 defect #1（块末 `*clen`）。块内后续行的
+`ring_append` 会覆盖前面行窗口读到的最旧 m-1-r 个 slot——**只有 `pos + m - 1 < window`（环未回绕）时**
+`window_idxs_kernel` 的 `idx > start_pos` 过滤才仍然把「未写过的 slot」置 -1（此时 slot == position），
+每行读到的 ring 镜像才与逐行相同。一旦 `pos + r >= window`，该过滤永不触发，行 `0..m-2` 会把块自己的
+未来行当历史读——**正是 defect #2**（`verify_ring_win` 因此被回退）。长上下文要批 `b·m`，必须先做
+§3.4(b) 的 ring/window 合核（或给 kernel 传「块前 ring 快照」把被覆盖的最旧行读回来）。
+
+**因此当前接线（`DSV41_ATTN_MROWS=1`，默认 OFF）在 `world == 1` 且 `pos + m - 1 < window` 时
+才取单发**，其余情况走逐行并**一次性打印 decline 原因**（避免「gate ON 但什么都没变」）。
+OFF / 老路径的 `nullptr, 0, 0` 参数使输出逐位不变。
+
+**要让它在生产（TP8 + 长上下文）真正生效，还差**：(1) `row_pitch` 尾参（补正 3）；
+(2) ring/window 的块内 r 升序合核或块前 ring 快照（硬前置 A）。两条都不是本波的范围内改动。
+
 ## 全景修正：37.31ms 的完整分解（verify-ms-breakdown 的账本）——"其他 7.7ms"的谜底
 
 之前我只看了族清单的 ~29.6ms，漏掉的 7.7ms 是：
