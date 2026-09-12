@@ -1488,6 +1488,10 @@ fn verify_head_fold() -> bool {
 /// `dsv41_gemv_bf16_v1_mrows`; a stale one falls back to the per-row loop (the
 /// method returns `Ok(false)`), as does `m > 8`. Read once and cached — this
 /// branch runs at the verify's head, inside graph capture.
+///
+/// **The strict `== "1"`** (where most gates in this file test `!= "0"`) is
+/// deliberate, not an oversight: this fold is an opt-in A/B arm, so a value
+/// that is exported but empty, or mistyped, must not arm it.
 fn verify_head_mrows() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *F.get_or_init(|| {
@@ -1495,6 +1499,150 @@ fn verify_head_mrows() -> bool {
             .map(|v| v == "1")
             .unwrap_or(false)
     })
+}
+
+/// The verify head's SLICE conditions, evaluated by `DevChain::verify_head_geom`
+/// and carried as ONE value so the DECISION and its one-shot decline report
+/// cannot drift: a second copy of the condition list is exactly how the report
+/// would start lying about why the layout fell back.
+///
+/// The fields mirror `verify_head_geom`'s doc verbatim — the gate, a BF16 head,
+/// `world > 1`, a vocabulary divisible by the world, the batched argmax symbol,
+/// a live v5 collective, and room for the WHOLE block's keys in its slot.
+struct VerifyHeadGeom {
+    env: bool,
+    head_bf16: bool,
+    world: usize,
+    vocab: usize,
+    symbol: bool,
+    v5: bool,
+    slot_fit: bool,
+    slot_bytes: usize,
+}
+
+impl VerifyHeadGeom {
+    /// The predicate itself, spelled ONCE. `world > 1` short-circuits the
+    /// divisibility test, so a degenerate `world == 0` cannot panic here.
+    fn sliced(&self) -> bool {
+        self.env
+            && self.head_bf16
+            && self.world > 1
+            && self.vocab % self.world == 0
+            && self.symbol
+            && self.v5
+            && self.slot_fit
+    }
+
+    /// One `&'static str` per FAILED condition, in predicate order — empty when
+    /// the geometry IS available. Only ever built from the one-shot note below,
+    /// so the steady-state hot path pays nothing for it.
+    fn declines(&self) -> Vec<&'static str> {
+        let mut v: Vec<&'static str> = Vec::new();
+        if !self.env {
+            v.push("DSV41_VERIFY_HEAD_SLICED=0 (the gate is off, i.e. the full head is the intended A/B arm)");
+        }
+        if !self.head_bf16 {
+            v.push("the head weight is not BF16 (the sliced arm is the bf16 GEMV)");
+        }
+        if self.world <= 1 {
+            v.push("world <= 1 (no cross-rank exchange to slice across)");
+        } else if self.vocab % self.world != 0 {
+            v.push("vocab_size is not divisible by the world");
+        }
+        if !self.symbol {
+            v.push(
+                "the loaded .so has no `dsv41_argmax_sliced_rows` (rebuild kernels/cuda: \
+                 bash build.sh 103a)",
+            );
+        }
+        if !self.v5 {
+            v.push("the collective is not AR v5 (`comm.uses_v5()` is false)");
+        }
+        if !self.slot_fit {
+            v.push(
+                "the v5 slot is too small for the whole verify block (VERIFY_ROWS * 8 > \
+                 comm.bytes)",
+            );
+        }
+        v
+    }
+
+    /// One-shot decline report for the verify head's SLICE geometry. Every
+    /// FAILED condition is named, so "the verify head is not sliced" stops being
+    /// a fact with no cause — the mrows-decline investigation had to re-derive
+    /// these seven conditions by hand because this line did not exist (the
+    /// fallback path had zero observability).
+    fn note_once(&self) {
+        static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        ONCE.get_or_init(|| {
+            eprintln!(
+                "note: the DSpark verify head runs the FULL-vocabulary per-row path and \
+                 `logits_r` keeps the vocab pitch: the SLICE geometry's conditions are not all \
+                 met — {}. (world={}, vocab={}, comm.bytes={})",
+                self.declines().join("; "),
+                self.world,
+                self.vocab,
+                self.slot_bytes,
+            );
+        });
+    }
+}
+
+/// One-shot notice for an ARMED `DSV41_VERIFY_HEAD_MROWS` whose fold did NOT
+/// run, or ran on an arm the operator did not expect. Before it, the gate's only
+/// failure mode was SILENT: the fold's call site sits inside `verify_head_geom`'s
+/// `Some` branch, so ANY one of that geometry's seven conditions made the gate a
+/// NO-OP that printed nothing — the STRUCTURAL DEAD GATE the mrows-decline
+/// investigation found, and the project's #1 measurement-bias trap (an "ON" arm
+/// that measures the OLD path).
+///
+/// `arm_sliced` records which arm the fold was attempted on and `performed` what
+/// the kernel actually answered, giving three distinct states:
+///
+/// * UNSLICED arm, performed — the gate is ALIVE, just off the sliced geometry:
+///   the same v1 kernel is bit-identical on the full-vocabulary head (`n = vocab`
+///   is still `>= GEMV_V2_MAX_N`, so the per-row program it replaces is v1, NOT
+///   the v2/nt fold `verify_head_fold` claims).
+/// * UNSLICED arm, not performed, no BF16 head — STRUCTURALLY DEAD for this
+///   model: the v1 kernel is bf16-only and there is no slice geometry to fall
+///   back to.
+/// * either arm, not performed with a BF16 head — the kernel declined
+///   (`Ok(false)`): a stale .so without `dsv41_gemv_bf16_v1_mrows`, or a block
+///   whose rows are outside its `1..=8` dispatch set.
+fn verify_head_mrows_note(
+    arm_sliced: bool,
+    head_bf16: bool,
+    performed: bool,
+    vocab: usize,
+    m: usize,
+) {
+    static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    ONCE.get_or_init(|| {
+        if performed {
+            eprintln!(
+                "note: DSV41_VERIFY_HEAD_MROWS is set: the v1 multi-row fold runs on the \
+                 UNSLICED head (no slice geometry — see the note above), i.e. ONE pass over the \
+                 {vocab}-row head weight serves all {m} verify rows, and row r is bit-identical \
+                 to the per-row gemv_bf16 it replaces."
+            );
+        } else if !head_bf16 {
+            eprintln!(
+                "warning: DSV41_VERIFY_HEAD_MROWS is set, but the verify head is not BF16 and no \
+                 slice geometry is available: the v1 multi-row kernel is bf16-only, so this gate \
+                 is STRUCTURALLY DEAD for this model. The per-row head runs, and any A/B run with \
+                 this gate ON measures the OLD path."
+            );
+        } else {
+            eprintln!(
+                "warning: DSV41_VERIFY_HEAD_MROWS is set, but the v1 multi-row fold did not run \
+                 on the {} head: the loaded .so has no `dsv41_gemv_bf16_v1_mrows` (rebuild \
+                 kernels/cuda: bash build.sh 103a), or the block's {m} rows are outside the \
+                 kernel's 1..=8 dispatch set. The per-row head runs, so any A/B run with this \
+                 gate ON measures the OLD path.",
+                if arm_sliced { "sliced" } else { "full-vocabulary" },
+            );
+        }
+    });
 }
 
 /// `DSV41_VERIFY_HEAD_SLICED` (DEFAULT ON) gives the DSpark verify's head the
@@ -5354,29 +5502,43 @@ impl<'a> DevChain<'a> {
     ///   arm, checked here for the worst-case row count so the geometry cannot
     ///   depend on `m` — a geometry that changed with `m` would leave the head,
     ///   the argmax and the probe disagreeing on different verifies.
+    /// Every condition that fails is reported ONCE by
+    /// [`VerifyHeadGeom::note_once`], so a `None` here is a cause and not just a
+    /// fact. Before that report existed, "the verify head is not sliced" could
+    /// only be diagnosed by re-deriving the seven conditions by hand — the
+    /// fallback path had zero observability.
+    ///
+    /// # What a `None` here does NOT disable
+    ///
+    /// `DSV41_VERIFY_HEAD_MROWS`'s fold LOOKS like it lives behind this function
+    /// (its call site sits inside the `Some` branch of the caller), but the
+    /// geometry only decides the SLICE. [`Self::step_rows_inner`] also folds the
+    /// FULL-vocabulary head with the same v1 kernel on its unsliced arm, so a
+    /// `None` no longer silently no-ops that gate — see
+    /// [`verify_head_mrows_note`], which says out loud which arm ran.
     fn verify_head_geom(&self) -> Option<(usize, usize)> {
         let cfg = self.cfg;
-        let world = self.world();
-        let seg = if world > 1 { cfg.vocab_size / world } else { 0 };
-        let head_bf16 = self
-            .w
-            .head
-            .as_ref()
-            .map(|h| h.dtype == "BF16")
-            .unwrap_or(false);
-        let sliced = verify_head_sliced()
-            && head_bf16
-            && world > 1
-            && cfg.vocab_size % world == 0
-            && self.dev.supports_argmax_sliced_rows()
-            && self
-                .comm
+        let comm = self.comm.as_ref();
+        let geom = VerifyHeadGeom {
+            env: verify_head_sliced(),
+            head_bf16: self
+                .w
+                .head
                 .as_ref()
-                .map(|c| c.uses_v5() && VERIFY_ROWS * 8 <= c.bytes)
-                .unwrap_or(false);
-        if !sliced {
+                .map(|h| h.dtype == "BF16")
+                .unwrap_or(false),
+            world: self.world(),
+            vocab: cfg.vocab_size,
+            symbol: self.dev.supports_argmax_sliced_rows(),
+            v5: comm.map(|c| c.uses_v5()).unwrap_or(false),
+            slot_fit: comm.map(|c| VERIFY_ROWS * 8 <= c.bytes).unwrap_or(false),
+            slot_bytes: comm.map(|c| c.bytes).unwrap_or(0),
+        };
+        if !geom.sliced() {
+            geom.note_once();
             return None;
         }
+        let seg = cfg.vocab_size / geom.world;
         Some((seg, self.rank() * seg))
     }
 
@@ -5550,7 +5712,8 @@ impl<'a> DevChain<'a> {
             // is a traffic + launch change and not a numerical one. Default OFF:
             // a stale .so (no symbol) or `m > 8` makes the method return
             // `Ok(false)` and the per-row loop below still runs.
-            let mrows = verify_head_mrows()
+            let armed = verify_head_mrows();
+            let mrows = armed
                 && self.dev.head_gemv_bf16_v1_mrows(
                     head_ptr as *const c_void,
                     self.s.xn_r.ptr as *const f32,
@@ -5560,6 +5723,13 @@ impl<'a> DevChain<'a> {
                     dim as i32,
                 )?;
             if !mrows {
+                // Armed-but-declined is this gate's OTHER silent no-op (a stale
+                // .so without the symbol, or `m > 8`): the per-row loop below
+                // answers, so an A/B with the gate ON would otherwise measure the
+                // OLD path with nothing said. One line, once.
+                if armed {
+                    verify_head_mrows_note(true, true, false, cfg.vocab_size, m);
+                }
                 for r in 0..m {
                     let xnr = (self.s.xn_r.ptr as *const f32).wrapping_add(r * dim);
                     let lg = (self.s.logits_r.ptr as *mut f32).wrapping_add(r * lg_stride);
@@ -5573,14 +5743,50 @@ impl<'a> DevChain<'a> {
                 }
             }
         } else if !folded {
-            for r in 0..m {
-                let xnr = (self.s.xn_r.ptr as *const f32).wrapping_add(r * dim);
-                let lg = (self.s.logits_r.ptr as *mut f32).wrapping_add(r * lg_stride);
-                if head.dtype == "BF16" {
-                    self.dev
-                        .gemv_bf16(head.ptr(), xnr, lg, cfg.vocab_size as i32, dim as i32)?;
-                } else {
-                    self.lin_f32(xnr, dim as i32, head, cfg.vocab_size as i32, lg)?;
+            // ---- the UNSLICED arm's fold (the structural dead gate's fallback) ----
+            //
+            // `DSV41_VERIFY_HEAD_MROWS`'s original call site sits inside the SLICED
+            // branch above, so with a slice-less geometry it was not even
+            // evaluated: an armed gate silently ran the per-row head on every A/B
+            // (the mrows-decline investigation's "structural dead gate"). The SAME
+            // v1 kernel folds the FULL-vocabulary head just as validly, and for the
+            // same stated reason: `n = vocab` is still `>= GEMV_V2_MAX_N`, so the
+            // per-row launch this replaces is v1's `gemv_bf16` — the very program
+            // the kernel header transcribes (one accumulator per row, `c = lane;
+            // c += 32`, v1's shuffle tree, no K-split). So this is the UNSLICED
+            // arm's traffic change (m passes over the replicated 1262 MB head →
+            // one) and not a numerical one, exactly like the sliced fold.
+            //
+            // It is NOT `verify_head_fold`: that one is the v2/`nt` program
+            // (`head_gemv_bf16_mrows`) and is a numerical change, which is why it
+            // is gated separately and tested first (`folded` above). A non-BF16
+            // head has no v1 kernel to fold, so the `lin_f32` loop keeps it.
+            let armed = verify_head_mrows();
+            let mrows = armed
+                && head.dtype == "BF16"
+                && self.dev.head_gemv_bf16_v1_mrows(
+                    head.ptr(),
+                    self.s.xn_r.ptr as *const f32,
+                    self.s.logits_r.ptr as *mut f32,
+                    m as i32,
+                    cfg.vocab_size as i32,
+                    dim as i32,
+                )?;
+            // Say which arm ran (or why none did) once — the whole point of the
+            // fix: an armed gate must never be a silent no-op.
+            if armed {
+                verify_head_mrows_note(false, head.dtype == "BF16", mrows, cfg.vocab_size, m);
+            }
+            if !mrows {
+                for r in 0..m {
+                    let xnr = (self.s.xn_r.ptr as *const f32).wrapping_add(r * dim);
+                    let lg = (self.s.logits_r.ptr as *mut f32).wrapping_add(r * lg_stride);
+                    if head.dtype == "BF16" {
+                        self.dev
+                            .gemv_bf16(head.ptr(), xnr, lg, cfg.vocab_size as i32, dim as i32)?;
+                    } else {
+                        self.lin_f32(xnr, dim as i32, head, cfg.vocab_size as i32, lg)?;
+                    }
                 }
             }
         }
