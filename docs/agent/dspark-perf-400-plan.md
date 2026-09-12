@@ -88,3 +88,35 @@
 - 每阶段单独测（同会话背靠背 A/B）: `FERRITE_*` gate 的开关对照
 - **止损门**: 阶段 1 的 verify 若 >12ms（多行化 + 图化后）→ 检查 kernel 的行独立性（C1-C5）
 - **正确性红线**: 每阶段的文本（出师表逐字）+ `dspark_parity` 的 verify 行级对照（`verify_bad == 0`）
+
+---
+
+## 六、账本更新（2026-09-12，多行化接线后的量化）
+
+**verify 的 38.5ms 的分解**（verify-perf-impl 的审计：6232 launch × (2.9µs submit + 3.3µs 最小执行)）:
+- **submit 半**：6232 × 2.9µs = **18.1ms**（launch 提交）
+- **执行半**：6232 × 3.3µs = **20.6ms**（小 kernel 的最小执行时间——固定开销主导）
+
+**已落地的削减**（本轮 subagent 的产出）:
+| 项 | 原 launch/步 | 现 | 手段 |
+|---|---|---|---|
+| 投影（wq_a/wkv/wq_b/wo_a/wo_b） | 2000 | **~400** | 多行 GEMV（mrows，权重读 1/5）|
+| MoE expert（gate_up/swiglu/down/shared） | 1800 | **~360** | rows=m 进 grid |
+| q_norm | 200 | **40** | n=m 批量化 + rmsnorm_q 的行偏移修复 |
+| 其余（rope/append/window/sparse_attn 等逐行必要项 + AR/compress/indexer/engram/head） | ~2200 | ~2200 | 保持（正确性要求）|
+| **合计** | **6232** | **~3000** | **−52%** |
+
+**预估**（两项叠加）:
+- **图化**后每 node 的 submit → 0.4µs（CUDA graph 的 node dispatch）
+- **verify ≈ 3000 × (0.4 + 3.3) ≈ 11.1ms**（从 38.5ms）——**若大 kernel 的最小执行随工作量增长，实际会更低**（投影/MoE 的 kernel 变大后，3.3µs 的固定项被工作量吸收）
+
+**400 的最终账**（叠加吞主链步）:
+| 项 | 现在 | 目标 |
+|---|---|---|
+| verify（6 行，多行化+图化） | 38.5（5 行） | **11** |
+| draft | 4.9 | **3**（P3 剩余项） |
+| 主链步 | 6.15 | **0**（吞掉，tap 从 verify 的 anchor 行取） |
+| commit | 0.2 | 0.2 |
+| **步时** | **49.8** | **~14.2** |
+
+**accept 4.5 × (1000/14.2) ≈ 317 tok/s**；再压 verify（confidence 门控 / 进一步融合）或 accept 到 5.0 → **~350-380**；**400 需要 verify ≤11ms 且 draft ≤2.5ms 且 accept ≥4.8**——**三项都在本设计的能力范围内**（吞主链步是最大的单项 −6ms）。
