@@ -2289,3 +2289,14 @@ kernel `dsa_append_batched_mapped_kernel`（`ferrite_kernels.cu`）。**没有�
 | 数字任务 | **LEN 56、双字 10**（无乱码崩） | LEN 42-137、双字 1-5 | LEN 216、完美 |
 
 ⇒ **用户判断的基线确认**：5f774c7 只有重复、没有乱码崩。**第二点（65d6b5a = 基线+s.ids 修复）在测**——若它也崩（HEAD 与 65d6b5a 之间只有 docs+无调用的 mtp_batch.rs+无行为的打印，行为应等价）⇒ **s.ids 修复与 verify 值错的组合放大**：修复前喂"落后 1"的 token（模型凑合），修复后喂 emitted.last()（若 verify_out 的值本身错，喂的错 token 位置更远 → 崩得更快）。**根治 = verify_out 的值**（prefill-sids-init / spec-eager-diff-tool 在查）。
+
+## 2026-09-12 二分定案 + 用户红线："不能重复不能乱码"
+
+**二分第二点（64c9c191）**：65d6b5a（只含 s.ids 回写）**同样崩**（出师表 LEN 12"出师nofollow"、数字 LEN 137 双字 5）——与 HEAD 一致。
+**⇒ 定案**：s.ids 回写本身数学正确（两份判词独立验算），但它喂的是 **emitted.last() = verify 的 argmax**——**verify 的值本身错**（乱码/EOS 的根源），喂"更对"的 token 反而把 verify 的值错放大成更早的崩。
+**处置**：`DSV41_SIDS_WRITEBACK` gate **默认 OFF**（回到"只重复"的已知状态：出师表 LEN 54/双字 4）。**两条正确性红线（用户）**：不能重复、不能乱码——**最后剩下的嫌疑 = `step_rows` 的多行 forward 与 EAGER 的单行 forward 在同位置的数值差**（`verify-value-hunt` 已派 vanguard 查：kernel 路径差/spec_capture 的副作用/compressor 组边界（ratio=2 在奇数位提交——第一轮 verify 的行 0 就在组边界上）/多行缓冲串扰）。
+
+**prefill-sids-init 的关键排除与发现**：
+- ✅ prefill **确实写** s.ids = first_token（最后一步 prompt 的 argmax）⇒ 第一轮 anchor 与 EAGER **bit-identical**——"prefill 不写 s.ids"被证伪。
+- ⚠️ ratio=2 的 compressor 在**奇数位置**提交组 ⇒ **第一轮 verify 的行 0（pos+1）就落在组边界**，`compress_replay(pos_base, keep)` 的语义在第一轮就被执行——若 pos_base/keep 差 1，第一轮就污染压缩 carry（被 4 个 source 层 + indexer 读）。
+- ⚠️ engram 的 token cache 不在 rollback 清单（若 lookback 只向后则无害——需读 engram.rs 的方向确认）。
