@@ -656,3 +656,30 @@ for each K-atom (64 fp4 元素 = 2 个 32-块):
 3. **接受损失**：在某些场景（短上下文）安全，长上下文关闭 gate——动态选路
 
 **结论**：attention 的 m-rows 在当前 ring 架构下**根本上受限**。1.3ms 的收益需要架构改动（scratch ring 或 KV 布局重构），ROI 低于 tcgen05（-6.8ms）和 draft P3c（-3.3ms）。**优先做 tcgen05 和 P3c**。
+
+## 400 目标的最终数学（全部优化落地后）
+
+**基线**（无截断 lazy，mrows staging 修复后）：18.82ms/步
+
+**subagent 优化清单**（跑中）：
+| 项 | 预期 | 状态 |
+|---|---|---|
+| hc verify 接线（A1+A2）| −1.3~1.7ms | hc-verify-wiring 跑中 |
+| draft P3c 图化 | −3.3ms | draft-p3c-graph 跑中 |
+| grouped routing + tcgen05 | −6.8ms | grouped-routing 跑中 |
+| **合计** | **−11.4ms** | → 步时 ~7.4ms |
+
+**accept 乘数**（关键变量）：
+| accept | tok/step | 吞吐 @ 7.4ms | 400 达标 |
+|---|---|---|---|
+| 1.02（当前）| 2.02 | 273 tok/s | ✗（差 47%）|
+| 2.0 | 3.0 | 405 tok/s | ✓（刚过）|
+| 3.0 | 4.0 | 540 tok/s | ✓✓ |
+| 5.0（sglang 级）| 6.0 | 810 tok/s | ✓✓✓ |
+
+**结论**：步时 7.4ms + accept ≥2 即可达 400。accept 的三个杠杆：
+1. **draft attention 截断**（DSV41_DRAFT_ATTN_BF16，已实现待测）
+2. **tap 截断**（DSV41_TAP_BF16，已实现）
+3. **bf16 主链截断**（DSV41_BF16_TRUNCATE，已验证零拉丁 + accept 43%k0）
+
+**截断代价**：~14% 平均吞吐（78.8 vs 91.3 tok/s）——但换来零拉丁（红线）。净效应在 accept ≥2 时为正。
