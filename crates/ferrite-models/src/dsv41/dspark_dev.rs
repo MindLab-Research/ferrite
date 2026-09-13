@@ -742,6 +742,20 @@ pub struct DsparkDev<'a> {
     ex_act_b: DevBuf,
     moe_out: DevBuf,
     shared_out: DevBuf,
+    /// `[bs, sh_il]` fp8 e4m3 bytes + `[bs, sh_il/32 + 8]` f32: the P3b b1
+    /// multi-row pass's swiglu output ([`Self::shared_expert_mrows`] step 2,
+    /// `swiglu_limit_q`), i.e. the activation its `w2` GEMV consumes. Row `r`
+    /// sits at `+r*sh_il` / `+r*(sh_il/32)`.
+    ///
+    /// ⚠️ DELIBERATELY SEPARATE from `xq`/`xsc`, which this pass only READS:
+    /// they hold `quant1(xn, bs*dim)`'s staging of the block's INPUT, and the
+    /// caller's per-row fallback reads them at `+r*dim` / `+r*dim/32` whenever
+    /// the pass declines. Writing the swiglu output back into `xq` (as this arm
+    /// first did) left that fallback reading the swiglu bytes as if they were
+    /// the block's activation — a silent wrong-answer defect, not a perf one
+    /// (draft-p3lite-segment-fusion §3.2 hole ①).
+    sh_aq: DevBuf,
+    sh_aqsc: DevBuf,
 
     /// `[hc]` of `1 / hc`, the mean the target-hidden recording collapses with
     pre_mean: DevBuf,
@@ -937,6 +951,12 @@ impl<'a> DsparkDev<'a> {
             ex_act_b: dev.alloc(fb(mo_topk * bs * 2 * inter_local))?,
             moe_out: dev.alloc(fb(bs * dim))?,
             shared_out: dev.alloc(fb(bs * dim))?,
+            // The b1 pass's OWN swiglu fp8 pair, at the `[bs, sh_il]` pitch it
+            // writes — see the field docs for why it cannot be `xq`/`xsc`. A few
+            // KB; allocated unconditionally so the allocation graph stays static
+            // (same policy as the rest of the scratch set).
+            sh_aq: dev.alloc((bs * sh_il).max(8))?,
+            sh_aqsc: dev.alloc(fb(bs * sh_il / 32 + 8))?,
             pre_mean: dev.alloc(fb(hc))?,
             premix_init: dev.alloc(fb(bs * hc))?,
             cos: None,
@@ -3114,10 +3134,18 @@ impl<'a> DsparkDev<'a> {
             self.quant1(self.xn.ptr as *const f32, bs * dim)?;
             // P3b b1 (`DSV41_DRAFT_P3B`): the whole `(w1 | w3) -> swiglu+quant ->
             // w2` chain as ONE multi-row pass. Ok(false) = gate off, a shape the
-            // kernels decline, or a stale `.so` — the per-row loop follows and
-            // rewrites every buffer this attempt touched, so a partial attempt is
-            // harmless by construction (only `moe_out` is not scratch, and it is
-            // written by the merge `add_inplace` alone).
+            // kernels decline, or a stale `.so` — the per-row loop follows.
+            //
+            // The pass leaves the block's staged activation (`xq`/`xsc`, from the
+            // `quant1` above) UNTOUCHED — its swiglu output goes to its own
+            // `sh_aq`/`sh_aqsc` — precisely so this fallback can read row `r` at
+            // `+r*dim` as the INPUT activation on every path. `ex_act` and
+            // `shared_out` are the only other buffers it writes, and the loop
+            // rewrites both in full (`ex_act` per row before every read,
+            // `shared_out` per row) — so a partial attempt is recoverable BY
+            // CONSTRUCTION, which is what the earlier "writes xq too" version got
+            // wrong (it made the fallback read `swiglu` bytes as the input:
+            // draft-p3lite-segment-fusion §3.2 hole ①).
             if !(p3b.sh_exp_mrows
                 && self.shared_expert_mrows(w1, w1s, w3, w3s, w2, w2s)?)
             {
@@ -3302,9 +3330,13 @@ impl<'a> DsparkDev<'a> {
     ///    layout step 1 wrote (`inter` here is `sh_il`), and its per-(row, block)
     ///    arithmetic is the fused epilogue `tests_dsv41_glue.cu`'s `swiglu_q` case
     ///    asserts bit-exact against (`swiglu_limit` + `quant1`). Its fp8 output
-    ///    lands in the SAME `xq`/`xsc` at pitch `sh_il` / `sh_il/32`, which is the
-    ///    activation step 3 reads. `sh_il % 32 == 0` is what lets every 32-element
-    ///    scale block stay inside one warp's tile, and it is checked here.
+    ///    lands in this pass's OWN `sh_aq`/`sh_aqsc` at pitch `sh_il` /
+    ///    `sh_il/32`, which is the activation step 3 reads. ⚠️ It must NOT land in
+    ///    `xq`/`xsc`: those hold the block's staged INPUT, which the caller's
+    ///    per-row fallback reads row-wise when this pass declines — see
+    ///    [`Self::shared_expert_mrows`]'s fallback note and the `sh_aq` field
+    ///    docs. `sh_il % 32 == 0` is what lets every 32-element scale block stay
+    ///    inside one warp's tile, and it is checked here.
     /// 3. `gemm_fp8_mrows(w2)` into `shared_out` at pitch `dim` — the same
     ///    `[bs, dim]` layout the per-row loop's `shared_out + r*dim` writes, so
     ///    the `shared_out` unit dump keeps its meaning.
@@ -3320,8 +3352,14 @@ impl<'a> DsparkDev<'a> {
     /// predates `dsv41_gemm_fp8_mrows` / `dsv41_swiglu_limit_q`, or any launcher
     /// declines. A PARTIAL attempt is harmless by construction: `moe_out` is
     /// untouched by everything above (the caller's `add_inplace` is what writes
-    /// it) and every buffer this pass writes (`ex_act`, `xq`/`xsc`,
-    /// `shared_out`) is either re-quantised or rewritten by the per-row loop.
+    /// it), the loop rewrites `ex_act` and `shared_out` in full, and `xq`/`xsc`
+    /// — the one buffer the fallback READS rather than writes — is never written
+    /// by this pass (step 2 writes `sh_aq`/`sh_aqsc`). The decline arm therefore
+    /// leaves the caller's `quant1(xn, bs*dim)` staging exactly as it found it,
+    /// which is what makes the per-row loop's `a = xq + r*dim` the right operand
+    /// on every path. (An earlier version emitted the swiglu pair into
+    /// `xq`/`xsc` and broke precisely that, reading `swiglu` bytes as the input:
+    /// draft-p3lite-segment-fusion §3.2 hole ①.)
     fn shared_expert_mrows(
         &self,
         w1: &DevTensor,
@@ -3383,22 +3421,29 @@ impl<'a> DsparkDev<'a> {
             return Ok(false);
         }
         // 2) swiglu + the fp8 pair the w2 GEMV reads, all `bs` rows in one launch.
+        //    The output goes to the pass's OWN `sh_aq`/`sh_aqsc`, NOT to
+        //    `xq`/`xsc`: a decline at step 3 below hands control back to the
+        //    caller's per-row loop, which reads `xq`/`xsc` as the BLOCK's
+        //    activation (`quant1(xn, bs*dim)`). Writing the swiglu bytes there
+        //    would leave that loop reading `swiglu(xn @ row 0)` for every row —
+        //    a silently wrong block, which is exactly the hole this arm had.
         if !self.dev.swiglu_limit_q(
             act,
             bs as i32,
             sh_il as i32,
             cfg.swiglu_limit,
-            self.xq.ptr as *mut u8,
-            self.xsc.ptr as *mut f32,
+            self.sh_aq.ptr as *mut u8,
+            self.sh_aqsc.ptr as *mut f32,
         )? {
             return Ok(false);
         }
         // 3) w2 for all rows — w2 is Cols-sharded ([dim, sh_il] locally), so its
         //    reduction runs over this rank's slice and the OUTPUT stays a partial
-        //    [bs, dim] block, exactly as the per-row arm's rows are.
+        //    [bs, dim] block, exactly as the per-row arm's rows are. Its
+        //    activation is the pair step 2 just wrote (`sh_aq` at pitch `sh_il`).
         if !self.dev.gemm_fp8_mrows(
-            self.xq.as_u8(),
-            self.xsc.as_f32(),
+            self.sh_aq.as_u8(),
+            self.sh_aqsc.as_f32(),
             w2.as_u8(),
             w2s.as_u8(),
             std::ptr::null(),

@@ -382,6 +382,15 @@ draft 的 `b=1, m=bs=5` ⇒ `b*m = 5 ≤ kAttnMaxBM = 8`（`:1498`）⇒ **split
 ⇒ **fallback 不是参考路径，而是"读被污染输入"的第三条路径。** 这正是任务书猜的那一类
 （"累积器状态/缓冲区状态"）。
 
+**已修（2026-09-13，方案 (b)）**：`shared_expert_mrows` 第 2 步的 `swiglu_limit_q` 输出改写到
+该 pass **自己的** `sh_aq` / `sh_aqsc`（`[bs, sh_il]` fp8 + `[bs, sh_il/32]` f32，构造期分配），
+`xq` / `xsc` 从此**只读**——它们只承载调用方的 `quant1(xn, bs*dim)` staging，
+于是 fallback 的 `a = xq + r*dim` 在任何路径上都是**块输入**。选 (b) 而非 (a)（fallback 前重跑
+`quant1`）的理由：`xq`/`xsc` 是**共享 scratch**（attention 投影等也读它），把"污染"这一类的
+可能性从根上删掉，比在每个可能读到它的消费者处补一次重算更安全，且与 verify 侧
+`chain_dev.rs` 的 `sh_aq_r` / `sh_aqsc_r`（"WHY THE fp8 OUTPUT NEEDS ITS OWN BUFFER"）
+是同一处理。该修复在 P3B gate 内，默认 OFF 路径的 launch 序列不变。
+
 #### 洞 ②（结构性，家族级）：b3 的"bit-identical **PROVIDED**…"是条件式，且同款条件式**已被实测证伪**
 
 `dspark_dev.rs:2311-2321`：
