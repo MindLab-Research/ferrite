@@ -1493,7 +1493,7 @@ struct Kernels {
     expert_down_reduce_fp4_batched: Option<
         unsafe extern "C" fn(
             *const f32, i64, *mut f32, c_int, c_int, c_int, *const f32, i64, c_int,
-            *const u8, i64, *const u8, i64, *const c_int, c_int, CuStream,
+            *const u8, i64, *const u8, i64, *const c_int, CuStream,
         ) -> c_int,
     >,
     /// TILELANG MoE grouped GEMM — up (gate‖up) arm (`DSV41_MOE_TILELANG`, default
@@ -1674,16 +1674,6 @@ struct Kernels {
     /// (reported once) instead of feeding e4m3 bytes to an fp4 kernel.
     moe_bs_act_e4m3_cap: Option<unsafe extern "C" fn() -> c_int>,
     moe_down_reduce: Option<unsafe extern "C" fn(*const f32, *mut f32, c_int, c_int, CuStream) -> c_int>,
-    /// `dsv41_moe_down_reduce_seq` (DSV41_SEQ_ALIGN #5): the same fixed-order sum,
-    /// plus the ascending-EXPERT-ID slot permutation when `seq_align != 0`.
-    /// A SEPARATE SYMBOL on purpose: a `.so` built before this change has only the
-    /// 5-argument `dsv41_moe_down_reduce`, and the ABI would silently swallow the
-    /// extra arguments — an armed gate would then measure the OLD order and say
-    /// nothing (this project's #1 trap). `None` => the gate is inert and the
-    /// caller keeps the legacy order, loudly.
-    moe_down_reduce_seq: Option<
-        unsafe extern "C" fn(*const f32, *mut f32, c_int, c_int, *const c_int, c_int, CuStream) -> c_int,
-    >,
     /// `dsv41_moe_down_reduce_st` (A1a): the same fixed-order sum, whose epilogue
     /// also copies `out` into every peer's staging slot (carries the following
     /// all-reduce's store). Valid only where this sum is `s.o`'s LAST writer.
@@ -1709,7 +1699,7 @@ struct Kernels {
             -> c_int,
     >,
     swiglu_limit_batched:
-        Option<unsafe extern "C" fn(*mut f32, c_int, c_int, f32, i64, c_int, c_int, CuStream) -> c_int>,
+        Option<unsafe extern "C" fn(*mut f32, c_int, c_int, f32, i64, c_int, CuStream) -> c_int>,
     /// ROUTED DOWN PREP (DSV41_ROUTED_DOWN_QUANT, default OFF): the official
     /// routed expert's activation pipeline in ONE in-place launch (route weight
     /// -> bf16 -> block-32 e4m3 quant+dequant), so the down GEMV consumes the
@@ -1830,12 +1820,12 @@ struct Kernels {
     engram_apply: Option<
         unsafe extern "C" fn(*mut f32, *const f32, *const f32, *const f32, *const u8, c_int, c_int, c_int, f32, CuStream) -> c_int,
     >,
-    swiglu_limit: Option<unsafe extern "C" fn(*mut f32, c_int, c_int, f32, c_int, CuStream) -> c_int>,
+    swiglu_limit: Option<unsafe extern "C" fn(*mut f32, c_int, c_int, f32, CuStream) -> c_int>,
     /// A4: swiglu + the fp8 pair the following GEMV consumes, in one launch.
     /// Returns 1 when the inter % 32 warp alignment cannot be met, so the caller
     /// keeps the swiglu_limit + quant1 pair.
     swiglu_limit_q:
-        Option<unsafe extern "C" fn(*mut f32, c_int, c_int, f32, c_int, *mut u8, *mut f32, CuStream) -> c_int>,
+        Option<unsafe extern "C" fn(*mut f32, c_int, c_int, f32, *mut u8, *mut f32, CuStream) -> c_int>,
     gather_rows: Option<unsafe extern "C" fn(*const f32, *const i32, *mut f32, c_int, c_int, CuStream) -> c_int>,
     scatter_add_rows: Option<
         unsafe extern "C" fn(*const f32, *const i32, *const f32, *mut f32, c_int, c_int, CuStream) -> c_int,
@@ -2382,7 +2372,6 @@ impl Device {
             interleave_gateup_fp4: ko!(rt, "dsv41_interleave_gateup_fp4"),
             expert_down_fp4_batched: ko!(rt, "dsv41_expert_down_fp4_batched"),
             moe_down_reduce: ko!(rt, "dsv41_moe_down_reduce"),
-            moe_down_reduce_seq: ko!(rt, "dsv41_moe_down_reduce_seq"),
             moe_down_reduce_ar: ko!(rt, "dsv41_moe_down_reduce_st"),
             expert_down_reduce_fp4_batched: ko!(rt, "dsv41_expert_down_reduce_fp4_batched"),
             moe_tilelang_gate_up_bf16: ko!(rt, "dsv41_moe_tilelang_gate_up_bf16"),
@@ -2917,13 +2906,6 @@ impl Device {
     /// DSV41_DOWN_FUSE inert and the (batched down, moe_down_reduce) pair runs.
     pub fn supports_down_fuse(&self) -> bool {
         self.kernels.expert_down_reduce_fp4_batched.is_some()
-    }
-
-    /// True when the loaded .so carries the DSV41_SEQ_ALIGN (#5) scratch-reduce
-    /// entry point (`dsv41_moe_down_reduce_seq`). Absent => the gate's non-fused
-    /// down path keeps the ascending-slot order, and the caller says so once.
-    pub fn supports_moe_down_reduce_seq(&self) -> bool {
-        self.kernels.moe_down_reduce_seq.is_some()
     }
 
     /// True when the loaded .so carries the w2 L2 prewarm entry point
@@ -5463,19 +5445,6 @@ impl Device {
         self.kernels.argmax_key_pub.is_some()
     }
 
-    /// DSV41_SEQ_ALIGN (#5/#13) as a kernel-argument value, 0 or 1. The gate
-    /// itself caches the env lookup (one `getenv` per process, never per call —
-    /// a per-call getenv is a CUDA-graph capture hazard and a hot-path slip).
-    /// Read here so every swiglu/down launch carries the SAME flag without
-    /// touching each call site.
-    fn seq_align_i32(&self) -> c_int {
-        if crate::dsv41::chain_dev::seq_align() {
-            1
-        } else {
-            0
-        }
-    }
-
     pub fn swiglu_limit(&self, gate_up: *mut f32, rows: i32, inter: i32, limit: f32) -> Result<()> {
         self.swiglu_limit_on(gate_up, rows, inter, limit, self.stream)
     }
@@ -5491,7 +5460,7 @@ impl Device {
         s: CuStream,
     ) -> Result<()> {
         let f = self.need(self.kernels.swiglu_limit, "dsv41_swiglu_limit")?;
-        let rc = unsafe { f(gate_up, rows, inter, limit, self.seq_align_i32(), s) };
+        let rc = unsafe { f(gate_up, rows, inter, limit, s) };
         self.kerr(rc, "dsv41_swiglu_limit")
     }
 
@@ -5529,7 +5498,7 @@ impl Device {
         s: CuStream,
     ) -> Result<bool> {
         let f = self.need(self.kernels.swiglu_limit_q, "dsv41_swiglu_limit_q")?;
-        let rc = unsafe { f(gate_up, rows, inter, limit, self.seq_align_i32(), xq, xsc, s) };
+        let rc = unsafe { f(gate_up, rows, inter, limit, xq, xsc, s) };
         if rc == 1 {
             return Ok(false);
         }
@@ -8825,42 +8794,11 @@ impl Device {
     }
 
     /// Fixed-order sum of the batched down scratch into `out` (see the kernel
-    /// comment: the ascending-slot order is the numerical contract). The
-    /// DSV41_SEQ_ALIGN (#5) variant with the official's order is
-    /// [`Self::moe_down_reduce_seq`].
+    /// comment: the ascending-slot order is the numerical contract).
     pub fn moe_down_reduce(&self, part: *const f32, out: *mut f32, n: i32, slots: i32) -> Result<()> {
         let f = self.need(self.kernels.moe_down_reduce, "dsv41_moe_down_reduce")?;
         let rc = unsafe { f(part, out, n, slots, self.stream) };
         self.kerr(rc, "dsv41_moe_down_reduce")
-    }
-
-    /// Fixed-order sum of the batched down scratch into `out` (see the kernel
-    /// comment: the ascending-slot order is the numerical contract).
-    ///
-    /// DSV41_SEQ_ALIGN (#5): when `seq_align != 0` the slot order is REPLACED by
-    /// the ascending-EXPERT-ID permutation (the official's accumulation order,
-    /// `ref_inference/model.py:895-900`) using `ids` = this row's `[slots]` router
-    /// output. `seq_align == 0` runs the legacy kernel/order.
-    ///
-    /// `Ok(false)` when the gate is armed but the loaded `.so` has no
-    /// `dsv41_moe_down_reduce_seq` (stale build): NOTHING was launched, so the
-    /// caller must fall back to [`Self::moe_down_reduce`] and say so once — an
-    /// armed-but-inert gate must never be silent.
-    pub fn moe_down_reduce_seq(
-        &self,
-        part: *const f32,
-        out: *mut f32,
-        n: i32,
-        slots: i32,
-        ids: *const i32,
-        seq_align: i32,
-    ) -> Result<bool> {
-        let Some(f) = self.kernels.moe_down_reduce_seq else {
-            return Ok(false);
-        };
-        let rc = unsafe { f(part, out, n, slots, ids, seq_align, self.stream) };
-        self.kerr(rc, "dsv41_moe_down_reduce_seq")?;
-        Ok(true)
     }
 
     /// [`Self::moe_down_reduce`] whose epilogue ALSO copies `out` into every
@@ -8920,7 +8858,6 @@ impl Device {
         w2s_base: *const u8,
         w2s_stride: i64,
         ids: *const i32,
-        seq_align: i32,
     ) -> Result<()> {
         let f = self.need(
             self.kernels.expert_down_reduce_fp4_batched,
@@ -8929,7 +8866,7 @@ impl Device {
         let rc = unsafe {
             f(
                 act_base, act_stride, out, rows, dim, inter, row_weight, rw_stride, slots, w2_base,
-                w2_stride, w2s_base, w2s_stride, ids, seq_align, self.stream,
+                w2_stride, w2s_base, w2s_stride, ids, self.stream,
             )
         };
         self.kerr(rc, "dsv41_expert_down_reduce_fp4_batched")
@@ -8987,8 +8924,7 @@ impl Device {
         slots: i32,
     ) -> Result<()> {
         let f = self.need(self.kernels.swiglu_limit_batched, "dsv41_swiglu_limit_batched")?;
-        let rc =
-            unsafe { f(gate_up, rows, inter, limit, slot_stride, slots, self.seq_align_i32(), self.stream) };
+        let rc = unsafe { f(gate_up, rows, inter, limit, slot_stride, slots, self.stream) };
         self.kerr(rc, "dsv41_swiglu_limit_batched")
     }
 

@@ -1205,146 +1205,6 @@ fn down_fuse() -> bool {
     *F.get_or_init(|| std::env::var("DSV41_DOWN_FUSE").map(|v| v != "0").unwrap_or(true))
 }
 
-/// `DSV41_SEQ_ALIGN=1` (default OFF) closes the two accumulation-order items the
-/// §77 audit judged "cheaply alignable" out of its 17 — both are ORDER/FORM
-/// fixes against the official reference, never a precision change:
-///
-/// **#5 — MoE down's slot -> expert-id summation order.** The official's
-/// `MoE.forward` (`ref_inference/model.py:895-900`) loops
-/// `for i in range(experts_start_idx, experts_end_idx)` and does
-/// `y[idx] += expert(...)`, so a row's top-k contributions enter its f32
-/// accumulator in ASCENDING EXPERT-ID order. Ferrite's down kernels walk
-/// ASCENDING SLOT order (the router's top-k rank = descending routing weight).
-/// Same terms, different sequence, fp addition is not associative => different
-/// low bits. With the gate ON the fused down+reduce kernel builds the
-/// ascending-expert-id permutation of its slots in smem and the serial slot loop
-/// walks it; the non-fused fallback gets the same treatment through
-/// `dsv41_moe_down_reduce_seq`. The loop stays serial in one warp with its
-/// explicitly rounded product/add pair — only the order changes.
-///
-/// **#13 — swiglu's silu.** The official's `F.silu` (`model.py:848`) is
-/// PyTorch's ActivationSiluKernel for float32: `x / (1 + expf(-x))` with the
-/// accurate libdevice expf and a correctly rounded divide. Ferrite's algebra is
-/// already that expression verbatim (`dsv41_glue.cu`, `dsv41_experts_mxf4.cu`),
-/// but `build.sh` compiles those UTs with `--use_fast_math`, which degrades BOTH
-/// operations (the divide becomes an approximate reciprocal, expf becomes
-/// __expf/ex2.approx). With the gate ON the three swiglu kernels use
-/// `__fdiv_rn` plus an accurately rounded exponential instead.
-///
-/// DEFAULT OFF, read ONCE and cached (a per-call getenv is a capture hazard and
-/// a hot-path slip), and only a value starting with `1` turns it ON.
-pub(crate) fn seq_align() -> bool {
-    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *F.get_or_init(|| {
-        std::env::var("DSV41_SEQ_ALIGN")
-            .map(|v| v.starts_with('1'))
-            .unwrap_or(false)
-    })
-}
-
-/// `DSV41_SEQ_ALIGN_DBG=1` (default OFF, only meaningful with the gate above)
-/// arms the ONE-SHOT comparison probe. It changes NO kernel: both probes are
-/// host-side and reuse the arithmetic the two implementations already have, so
-/// nothing in the OFF path (and nothing in the gated kernels' codegen) is
-/// touched.
-///
-///   * silu — snapshot the first slot row of the gate|up operand BEFORE the
-///     swiglu launch, snapshot the same row AFTER it, and recompute the official
-///     expression on the CPU in f32 (`g / (1 + exp(double -g))`, i.e. the
-///     correctly rounded pair) from the snapshot. The output shows, element by
-///     element, the pre-swiglu gate/up, the kernel's value, the CPU's official
-///     value and the difference in bf16-ulps.
-///   * down reduce — run the SAME fused kernel twice on the SAME inputs, once
-///     with seq_align = 0 (into a scratch row) and once with seq_align = 1 (into
-///     the real output), download both and print the per-row difference and the
-///     permutation the kernel derived. The kernel writes nothing but `out`, so
-///     the second launch is a pure re-derivation of the first.
-pub(crate) fn seq_align_dbg() -> bool {
-    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *F.get_or_init(|| {
-        std::env::var("DSV41_SEQ_ALIGN_DBG")
-            .map(|v| v.starts_with('1'))
-            .unwrap_or(false)
-    })
-}
-
-/// One-shot notice for an armed-but-inert `DSV41_SEQ_ALIGN`: the #1 measurement
-/// trap in this project is "a gate was exported and the OLD path answered the
-/// step", so every state in which the arm cannot do what its name says announces
-/// itself exactly once.
-pub(crate) fn seq_align_skipped_note(reason: &str) {
-    static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-    ONCE.get_or_init(|| {
-        eprintln!(
-            "warning: DSV41_SEQ_ALIGN is set, but the accumulation order was NOT aligned \
-             ({reason}) — the legacy (ascending-slot) order answered this step"
-        );
-    });
-}
-
-// ===========================================================================
-// DSV41_SEQ_ALIGN_DBG: the two one-shot comparison probes
-// ===========================================================================
-// Both probes are HOST-SIDE on purpose: no production kernel gains an argument,
-// a branch or a register, so neither the OFF path nor the gated kernels' codegen
-// can move. Both are DEFERRED while a capture is in flight — a D2H readback is
-// an illegal capture op (§58/§73) — so nothing is allocated and no one-shot flag
-// is consumed until the first UNCAPPED qualifying call.
-const SEQ_ALIGN_DBG_BLOCK: usize = 16;
-
-/// One-shot guards for the two probes: the flags are consumed only AFTER a
-/// successful report, exactly like the §79 fixed `[NC]` block, so a capture that
-/// defers a probe can never burn it.
-static SILU_DBG_ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-static DOWN_DBG_ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-
-/// The official's `F.silu(gate) * up` in f32, with the clamps in the SAME order as
-/// `ref_inference/model.py:845-848` and the two roundings the official has and
-/// `--use_fast_math` takes away from the kernel:
-///   * a CORRECTLY ROUNDED divide (Rust's f32 `/` is IEEE — the same value CUDA's
-///     `__fdiv_rn` produces, and NOT what `-prec-div=false` compiles to);
-///   * an ACCURATELY ROUNDED exponential, computed in double and rounded once —
-///     byte-for-byte the construction `dsv41_swiglu_silu(g, exact != 0)` uses in
-///     the kernels (`(float)exp((double)x)`).
-/// So this is the CPU twin of the gated kernel path, not a third implementation.
-fn silu_official(gate: f32, up: f32, limit: f32) -> f32 {
-    let (mut g, mut u) = (gate, up);
-    if limit > 0.0 {
-        g = g.min(limit); // gate: upper clamp only
-        u = u.clamp(-limit, limit); // up: both sides
-    }
-    let e = (-(g as f64)).exp() as f32;
-    g / (1.0 + e) * u
-}
-
-/// The reason string for a `.so` that predates `dsv41_moe_down_reduce_seq`.
-pub(crate) const SEQ_ALIGN_NO_SYMBOL: &str =
-    "the loaded .so has no `dsv41_moe_down_reduce_seq` (rebuild kernels/cuda: bash build.sh 103a)";
-
-/// DSV41_SEQ_ALIGN (#5): one per-row down-scratch reduction. With the gate ON
-/// and the `.so` carrying `dsv41_moe_down_reduce_seq`, the slot sum walks the
-/// ascending-EXPERT-ID permutation (the official's `for i in range(...)` order);
-/// otherwise it is the legacy ascending-slot sum, and an armed-but-inert gate
-/// says so ONCE. `ids_row` is this row's `[slots]` router output.
-fn moe_down_reduce_seq_or_plain(
-    dev: &Device,
-    part: *const f32,
-    out: *mut f32,
-    n: i32,
-    slots: i32,
-    ids_row: *const i32,
-) -> Result<()> {
-    if seq_align() {
-        if dev.supports_moe_down_reduce_seq() {
-            if dev.moe_down_reduce_seq(part, out, n, slots, ids_row, 1)? {
-                return Ok(());
-            }
-        }
-        seq_align_skipped_note(SEQ_ALIGN_NO_SYMBOL);
-    }
-    dev.moe_down_reduce(part, out, n, slots)
-}
-
 /// DSV41_ROUTED_DOWN_QUANT=1 (default OFF) aligns the routed experts' DOWN INPUT
 /// with the official reference — the second half of the D1 precision work.
 ///
@@ -18811,17 +18671,7 @@ impl<'a> DevChain<'a> {
                         let scratch =
                             (self.s.ex_down_r.ptr as *const f32).wrapping_add(r * topk * dim);
                         let out = (self.s.moe_out_r.ptr as *mut f32).wrapping_add(r * dim);
-                        // DSV41_SEQ_ALIGN (#5): the official's ascending-expert-id
-                        // order when armed (this row's router output is
-                        // `ids_base + r*topk`); legacy ascending-slot otherwise.
-                        moe_down_reduce_seq_or_plain(
-                            &self.dev,
-                            scratch,
-                            out,
-                            dim as i32,
-                            topk as i32,
-                            ids_base.wrapping_add(r * topk),
-                        )?;
+                        self.dev.moe_down_reduce(scratch, out, dim as i32, topk as i32)?;
                     }
                 } else {
                     Self::moe_tilelang_skipped_note(
@@ -18883,7 +18733,6 @@ impl<'a> DevChain<'a> {
                     w2s_base,
                     w2s_stride,
                     ids_base,
-                    if seq_align() { 1 } else { 0 },
                 )?;
             } else {
                 // The down WRITE is one rows = m launch too (out row pitch =
@@ -18913,16 +18762,8 @@ impl<'a> DevChain<'a> {
                     let scratch =
                         (self.s.ex_down_r.ptr as *const f32).wrapping_add(r * topk * dim);
                     let out = (self.s.moe_out_r.ptr as *mut f32).wrapping_add(r * dim);
-                    // DSV41_SEQ_ALIGN (#5): same per-row sum, in the official's
-                    // expert-id order when armed.
-                    moe_down_reduce_seq_or_plain(
-                        &self.dev,
-                        scratch,
-                        out,
-                        dim as i32,
-                        topk as i32,
-                        ids_base.wrapping_add(r * topk),
-                    )?;
+                    self.dev
+                        .moe_down_reduce(scratch, out, dim as i32, topk as i32)?;
                 }
             }
         }
@@ -20776,170 +20617,6 @@ fn oracle_tap() -> bool {
     /// must NOT pass `row_weight` to the down launch afterwards (nullptr means
     /// "no per-slot weight") — the weight is applied here.
     ///
-    /// ---- DSV41_SEQ_ALIGN_DBG: shared arming test ----------------------------
-    /// Armed only when BOTH env vars are set, no capture is in flight (a D2H
-    /// readback is an illegal capture op) and this probe has not reported yet.
-    /// Nothing is allocated and no flag is consumed while it returns false, so a
-    /// capture defers the probe instead of burning it.
-    fn seq_align_dbg_armed(&self, once: &'static std::sync::OnceLock<()>) -> bool {
-        seq_align() && seq_align_dbg() && !self.dev.capturing() && once.get().is_none()
-    }
-
-    /// ---- DSV41_SEQ_ALIGN_DBG (#13): the silu operand/output probe ----------
-    /// Phase 1: snapshot slot 0's `[2*inter]` gate|up row BEFORE the swiglu
-    /// launch. The kernel rewrites the gate half IN PLACE, so the operand is
-    /// gone afterwards — the snapshot has to happen first. `rows == 1` puts slot
-    /// 0 at offset 0 of `gate_up` whatever `act_slot` is.
-    fn silu_dbg_pre(
-        &self,
-        gate_up: *const f32,
-        inter: i32,
-        limit: f32,
-    ) -> Result<Option<(Vec<f32>, f32)>> {
-        if !self.seq_align_dbg_armed(&SILU_DBG_ONCE) {            return Ok(None);
-        }
-        let pre = self.dl(gate_up, inter as usize * 2)?;
-        eprintln!(
-            "[seq-align] DSV41_SEQ_ALIGN_DBG (#13) probe (ONE-SHOT) — swiglu operand snapshot: \
-             inter={inter} limit={limit:e} (slot 0, gate in [0,inter), up in [inter,2*inter))"
-        );
-        Ok(Some((pre, limit)))
-    }
-
-    /// Phase 2: read the written half back, recompute the official expression on
-    /// the CPU ([`silu_official`]) and print kernel vs CPU element by element, in
-    /// units of the value's own f32 ulp (2^-23 relative) — the ledger unit §77
-    /// uses. Consumes the one-shot only after a successful report.
-    fn silu_dbg_post(&self, d: &(Vec<f32>, f32), gate_up: *const f32, inter: i32) -> Result<()> {
-        let (pre, limit) = d;
-        let inter = inter as usize;
-        let post = self.dl(gate_up, inter)?;
-        let mut worst = 0.0f32;
-        let mut n_diff = 0usize;
-        let mut rows = Vec::new();
-        for i in 0..inter {
-            let g = pre[i];
-            let u = pre[inter + i];
-            let cpu = silu_official(g, u, *limit);
-            let kern = post[i];
-            let d = (kern - cpu).abs();
-            if d != 0.0 {
-                n_diff += 1;
-            }
-            worst = worst.max(d);
-            if i < SEQ_ALIGN_DBG_BLOCK {
-                let ulp = (cpu.abs() * (1.0 / 8388608.0)).max(f32::MIN_POSITIVE);
-                rows.push((i, g, u, kern, cpu, d, d / ulp));
-            }
-        }
-        for (i, g, u, kern, cpu, d, uu) in rows {
-            eprintln!(
-                "[seq-align]  i={i:02}  g={g:>14.7e} u={u:>14.7e}  KERNEL {kern:>14.7e}  CPU \
-                 {cpu:>14.7e}  |D|={d:e}  ({uu:.2} ulp)"
-            );
-        }
-        eprintln!(
-            "[seq-align] (#13) KERNEL(gated silu) vs CPU(official formula) over {inter} elements: \
-             {n_diff} differ, max|D| = {worst:e}"
-        );
-        SILU_DBG_ONCE.set(()).ok();
-        Ok(())
-    }
-
-    /// ---- DSV41_SEQ_ALIGN_DBG (#5): the down-reduce order probe --------------
-    /// Runs the SAME fused kernel TWICE on the SAME input — `seq_align = 0` into a
-    /// scratch row, `seq_align = 1` into another — and prints the two rows' spread
-    /// plus the permutation the second launch derived. The kernel writes nothing
-    /// but its `out` and reads only `act_base`/`ids`/`w2*`, so this is a pure
-    /// re-derivation of what the real launch below is about to produce: the probe
-    /// adds two launches and perturbs no operand.
-    #[allow(clippy::too_many_arguments)]
-    fn down_reduce_dbg_probe(
-        &self,
-        act_base: *const f32,
-        act_slot: i64,
-        dim: i32,
-        inter: i32,
-        row_weight: *const f32,
-        slots: i32,
-        w2_base: *const u8,
-        w2_stride: i64,
-        w2s_base: *const u8,
-        w2s_stride: i64,
-        ids: *const i32,
-    ) -> Result<()> {
-        let a = self.dev.alloc(dim as usize * 4)?;
-        let b = self.dev.alloc(dim as usize * 4)?;
-        for (buf, flag) in [(&a, 0i32), (&b, 1i32)] {
-            self.dev.expert_down_reduce_fp4_batched(
-                act_base,
-                act_slot,
-                buf.ptr as *mut f32,
-                1,
-                dim,
-                inter,
-                row_weight,
-                1,
-                slots,
-                w2_base,
-                w2_stride,
-                w2s_base,
-                w2s_stride,
-                ids,
-                flag,
-            )?;
-        }
-        let va = self.dl(a.ptr as *const f32, dim as usize)?;
-        let vb = self.dl(b.ptr as *const f32, dim as usize)?;
-        // `ids` is an i32 vector; read it as raw little-endian bytes (there is no
-        // i32 download helper, and reinterpreting the bits as f32 would print
-        // denormals for small ids).
-        let mut raw = vec![0u8; slots as usize * 4];
-        let view = Device::view(ids as *mut c_void, slots as usize * 4);
-        self.dev.download_u8(&view, &mut raw)?;
-        let idsv: Vec<i32> = raw
-            .chunks_exact(4)
-            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
-        // The permutation the kernel derives: rank r holds the slot whose id is
-        // the r-th smallest (slot index breaking ties).
-        let mut perm: Vec<usize> = (0..slots as usize).collect();
-        perm.sort_by_key(|&t| (idsv[t], t));
-        eprintln!(
-            "[seq-align] DSV41_SEQ_ALIGN_DBG (#5) probe (ONE-SHOT) — fused down+reduce run twice \
-             on the SAME input: ids (top-k order) = {:?}, official order (ascending expert id) = \
-             {:?}",
-            &idsv[..slots as usize],
-            perm.iter().map(|&t| idsv[t]).collect::<Vec<_>>()
-        );
-        let mut n_diff = 0usize;
-        let mut worst = 0.0f32;
-        let mut rows = Vec::new();
-        for i in 0..dim as usize {
-            let d = (va[i] - vb[i]).abs();
-            if d != 0.0 {
-                n_diff += 1;
-            }
-            worst = worst.max(d);
-            if i < SEQ_ALIGN_DBG_BLOCK {
-                let ulp = (va[i].abs() * (1.0 / 8388608.0)).max(f32::MIN_POSITIVE);
-                rows.push((i, va[i], vb[i], d, d / ulp));
-            }
-        }
-        for (i, a_v, b_v, d, uu) in rows {
-            eprintln!(
-                "[seq-align]  row={i}  slot-order {a_v:>14.7e}  expert-id-order {b_v:>14.7e}  \
-                 |D|={d:e}  ({uu:.2} ulp)"
-            );
-        }
-        eprintln!(
-            "[seq-align] (#5) ascending-slot vs ascending-expert-id over {dim} output rows: \
-             {n_diff} differ, max|D| = {worst:e}"
-        );
-        DOWN_DBG_ONCE.set(()).ok();
-        Ok(())
-    }
-
     /// The `DSV41_ROUTED_DOWN_QUANT_DBG` probe rides THIS launch rather than a
     /// second one: the prep is not idempotent (a second round trip re-quantises
     /// an already quantised operand), so a separate probe launch would perturb
@@ -23657,13 +23334,6 @@ fn oracle_tap() -> bool {
                     topk * act_slot as usize,
                 )?;
                 if !gateup_fused {
-                    // DSV41_SEQ_ALIGN_DBG (#13): snapshot the slot-0 gate|up row
-                    // BEFORE the in-place swiglu rewrites its gate half.
-                    let silu_dbg = self.silu_dbg_pre(
-                        self.s.ex_act_b.ptr as *const f32,
-                        inter_local as i32,
-                        cfg.swiglu_limit,
-                    )?;
                     self.dev.swiglu_limit_batched(
                         self.s.ex_act_b.ptr as *mut f32,
                         1,
@@ -23672,13 +23342,6 @@ fn oracle_tap() -> bool {
                         act_slot,
                         topk as i32,
                     )?;
-                    if let Some(d) = silu_dbg {
-                        self.silu_dbg_post(
-                            &d,
-                            self.s.ex_act_b.ptr as *const f32,
-                            inter_local as i32,
-                        )?;
-                    }
                 }
                 // D1 boundary — the experts' ACTIVATION, `F.silu(gate) * up`, which
                 // the reference rounds with `x.to(dtype)` before `w2` runs on it
@@ -23757,18 +23420,11 @@ fn oracle_tap() -> bool {
                             )?;
                         }
                         if !ar_carried {
-                            // DSV41_SEQ_ALIGN (#5): the official's
-                            // ascending-expert-id slot order when armed; the
-                            // legacy ascending-slot sum otherwise. (`route_idx`
-                            // is this row's [topk] router output — same buffer
-                            // the down launch above read.)
-                            moe_down_reduce_seq_or_plain(
-                                &self.dev,
+                            self.dev.moe_down_reduce(
                                 self.s.ex_down_b.ptr as *const f32,
                                 self.s.o.ptr as *mut f32,
                                 dim as i32,
                                 topk as i32,
-                                self.s.route_idx.ptr as *const i32,
                             )?;
                         }
                     } else {
@@ -23822,27 +23478,6 @@ fn oracle_tap() -> bool {
                     self.s.route_w.ptr as *const f32
                 };
                 if !tl_dn_done && down_fuse() && !bf16_truncate() && self.dev.supports_down_fuse() {
-                    // DSV41_SEQ_ALIGN (#5): the last argument is the gate — 1
-                    // makes the serial slot loop walk the ascending-expert-id
-                    // permutation (the official's accumulation order) instead of
-                    // the top-k rank. 0 is the unchanged legacy order.
-                    // DSV41_SEQ_ALIGN_DBG (#5): derive BOTH orders on the same
-                    // input and print the spread before the real launch runs.
-                    if self.seq_align_dbg_armed(&DOWN_DBG_ONCE) {
-                        self.down_reduce_dbg_probe(
-                            self.s.ex_act_b.ptr as *const f32,
-                            act_slot,
-                            dim as i32,
-                            inter_local as i32,
-                            rw_eff,
-                            topk as i32,
-                            w2_base,
-                            w2_stride,
-                            w2s_base,
-                            w2s_stride,
-                            ids,
-                        )?;
-                    }
                     self.dev.expert_down_reduce_fp4_batched(
                         self.s.ex_act_b.ptr as *const f32,
                         act_slot,
@@ -23858,7 +23493,6 @@ fn oracle_tap() -> bool {
                         w2s_base,
                         w2s_stride,
                         ids,
-                        if seq_align() { 1 } else { 0 },
                     )?;
                 } else {
                     self.dev.expert_down_fp4_batched(
@@ -23915,16 +23549,11 @@ fn oracle_tap() -> bool {
                         )?;
                     }
                     if !ar_carried {
-                        // DSV41_SEQ_ALIGN (#5): the official's ascending-expert-id
-                        // slot order when armed (`route_idx` is this row's [topk]
-                        // router output); the legacy ascending-slot sum otherwise.
-                        moe_down_reduce_seq_or_plain(
-                            &self.dev,
+                        self.dev.moe_down_reduce(
                             self.s.ex_down_b.ptr as *const f32,
                             self.s.o.ptr as *mut f32,
                             dim as i32,
                             topk as i32,
-                            self.s.route_idx.ptr as *const i32,
                         )?;
                     }
                 }
