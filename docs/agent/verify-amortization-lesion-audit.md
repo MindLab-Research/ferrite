@@ -81,3 +81,18 @@ B1 系三臂的断崖都在 line 52（1..51 正确然后跳 62）+ mean-k 0.64-0
 | 4 | 新二进制 + A0 基线 gate 集复刻（含 AR_PROBE） | 待出 | 回 62 ⇒ 四新增 gate 之过；仍 52 ⇒ 二进制（1b 回执/nwarps）或基线漂移 |
 
 注意：line 52/62 是模型退化边界的漂移（near-tie argmax 对 1ULP 敏感）——找到元凶 gate 后需评估"数值合法性"（逐位承诺 vs 实际）。
+
+## 8. 修复交付后的 GPU 验证序列（双门禁纪律）
+
+**双门禁**：每个优化臂必须同时报告 `step_ms`（[dspark] 分解）**AND** `mean-k`（A0 基线 1.34；掉了 = 数值回归，立即弃用该 gate）。
+
+1. **重编**：subagent 交付的 .cu/chain_dev 改动 → `build.sh 103a` + `cargo build --release`（双产物）+ 符号三证。
+2. **逐 gate A/B**（一臂一进程，计数 200 tok，读 [dspark] steps=50）：
+   - `DSV41_ATTN_MROWS=1`（TP8 row_pitch 修复后）——票面 −3-4ms
+   - `DSV41_MROWS_MPAR=1`（M 真并行）——票面 −8-10ms（分批）
+   - `DSV41_COMPRESSOR_PROJ_MROWS=1` / `DSV41_ENGRAM_PROJ_MROWS=1`——票面 −3.5-5ms
+3. **nsys 复测**：最优臂的 kernel 表 vs eager——病灶 kernel 的倍数应从 ~6× 降到 ~1×。
+4. **组合最优栈** → 全量计数 + 出师表红线 → 吞吐。
+5. **B2 MoE grouped**：`GATEUP_FUSE=0 + EXPERT_ACT_E4M3 + EXPERT_TCGEN05_E4M3 + EXPERT_GROUPED`（票面 −1-2ms，tcgen05 SF 根修已验证 pitch=16）。
+
+**nsys 轮实测注意**（v2 脚本 ~/nsys_dual.sh，2026-09-13 00:45）：AR_SAFE 模式（AR_V5=0 + GRAPH_STEP=0 + host barrier）下 verify=34.32ms / draft=5.72ms / **mean-k=1.820**（vs 生产模式 28.67/3.87/1.34）——**无图+host barrier 的代价 = verify +5.65ms + draft +1.85ms；mean-k 反而升**（时序变化影响 argmax 分布的信号，非生产口径）。nsys 轮数字只用于 kernel 相对倍数。
