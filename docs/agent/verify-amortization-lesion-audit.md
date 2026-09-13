@@ -55,3 +55,16 @@
 2. **per-kernel 时间**：nsys（多跑）；**死锁规避**：`DSV41_AR_V5=0 DSV41_GRAPH_STEP=0`（host barrier）+ `env -u FERRITE_P2P` + `NCCL_NVLS_ENABLE=0` + 5 分钟 SIGINT 硬帽；nsys 轮只看 kernel 相对倍数（AR 形态已变），吞吐数字必须来自非 nsys 轮。
 3. **kernel 深度分析**（占用/带宽/瓶颈）：NCU——**只跑特定 kernel 的 micro bench（tests 二进制），不能 e2e**。
 4. e2e 一律 background 模式（serve 启动 ssh 会挂住前台）。
+
+## 6. B1 快赢臂实测（2026-09-13 00:35，63.8 栈 + 五 gate + P3B + 1b）
+
+| 项 | 基线 | B1 实测 | 判读 |
+|---|---|---|---|
+| verify | 28.17ms | **27.53ms** | 仅 −0.6ms（噪声级）——五 gate 兑现远低于票面 ~5-7ms |
+| draft | 3.87ms | **3.44ms** | P3B −0.43ms ✓（票面 0.9-1.1 的一半） |
+| mean-k | 1.34 | **0.75-0.92** | ⚠️ 数值红线：断崖从 line 62 提前到 52，B6（WOB_MROWS_F32 非逐位）头号嫌疑，二分进行中 |
+| ATTN_MROWS | —（票面 3-4ms） | **declined: world != 1** | kernel 按 (row*h+hh)*d 索引 vs 行 pitch nh*hd——TP8 需要 row_pitch 参数（ABI 没有）⇒ attn-mrows-tp8 subagent 实施中 |
+| SF 根修 | pitch=10 | **pitch=16 ✓ pool geometry OK** | tcgen05 根修装载验证通过（928 行全对齐） |
+| 1b | scalar | **ARMED cp.async16** ✓ | m=5 n=288 k=5120 |
+
+**教训**：快赢 gate 的票面是"每层节省 × 40 层"的代数，实际兑现受 launch 依赖链/图节点结构调制——**gate A/B 必须看 [dspark] 分解实测，票面只作排序用**。verify 的真大头仍待 nsys per-kernel 表定位（27.53ms 的构成）。
