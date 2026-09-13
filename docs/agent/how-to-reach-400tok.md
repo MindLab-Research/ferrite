@@ -362,3 +362,21 @@ curl -sS --noproxy '*' https://mint-alpha.macaron.xin/v1/chat/completions \
 ② 检出 `ac69b054`（金标准 mtime 17:09:22 之前的最新提交，17:07:29）⇒ **强制重编**（部分检出后戳不可信 ✗）⇒ 同样比对。
 **两者都不落 A 簇 ⇒ 金标准不可复现 ⇒ 无代码回归（幻觉成立）** ✓；**若 `ac69b054` 落 A 簇 ⇒ 回归真实** ⇒ 再按"只碰过 4 个非 BS 文件的 9 个提交"收窄二分 ✓。
 
+## 18. 🎯 MMA（tcgen05）为什么"没跑"——三条硬事实与正路（用户红线："必须 mma"）
+
+**实测**：`DSV41_EXPERT_TCGEN05_E4M3=1 DSV41_EXPERT_GROUPED=1 DSV41_MOE_BATCH=1 DSV41_EXPERT_ILV=0`
+下单步仍是 **~52ms**（与 SIMT 完全一致）。臂自己的警告逐字解释了原因（**不是 kernel 坏，是没上场** ✗）：
+
+1. **dense 版 tc5::e4x 启动器要求 `m % 128 == 0`、`dim % 64 == 0`、`2*inter % 64 == 0`** ✗
+   —— verify 是 **m=6** ⇒ **算术上永远不被接受** ✓（与 kernel 正确性无关）。
+2. **为不规则行数设计的 GROUPED masked MMA 臂"没有拿到 stage"** ✗，原因写得很清楚：
+   > `DSV41_EXPERT_GROUPED` is set, but the routed MoE still runs the proven per-(row, slot) launches:
+   > gate/up is on the **FUSED swiglu shape** (`DSV41_GATEUP_FUSE` + fp4 mode 2 + `dim % 512 == 0`)
+   ⇒ **被 fused 形状抢先** ✓；而 `:17506/:17551` 的注释说明 **e4x epilogue 只 CLAMP、从不 fuse** ⇒
+   两者**互斥** ⇒ **关掉 `DSV41_GATEUP_FUSE`（默认 ON）才能让 grouped MMA 上场** ✓。
+3. **dense 单行臂另有 err 716 故障**（`docs/agent/tcgen05-716-e4m3-confound-verdict.md`）⇒ 单行路不可靠 ✓。
+
+**⇒ 正路（已封装成 `~/mma_take_over.sh`）**：`DSV41_GATEUP_FUSE=0` + grouped e4m3 武装，
+且**必须先确认 `declined / did not take the stage` 警告消失**，再相信任何计时 ✓。
+（`DSV41_GATEUP_FUSE` 默认 ON、`unwrap_or(true)`，`chain_dev.rs:4510-4512`；使用点 `18817 / 23943 / 24209 / dspark 2931`。）
+
