@@ -1075,3 +1075,31 @@ shim 里能力符号 `dsv41_moe_bs_act_e4m3_cap()` 的注释（`moe_bs_shim.cu` 
 **教训**：当 C ABI 的形状不变而语义变过（如上面 D2 那次），**必须靠能力符号/断言钉死语义**，
 否则就是"静默错值面"。我们对 W 侧的 staging 正是踩在同类面上：**形状对了（都是 u8 指针），
 语义错了（packed vs unpacked）**。
+
+## §38 候选 B 的**最强原理依据**：它是树内 canonical 结构的 packed 泛化
+
+树内自己的 blockscaled 实现（`dsv41_experts_mxf4.cu:4247-4284`）给出 canonical fp4 操作数布局：
+```
+constexpr int kLboBytes = 128;  // 8 x 16 B: K-chunk stride of the K=32 atom
+constexpr int kSboBytes = 256;  // 16 x 16 B: 8-row-group stride
+// a_op 是 canonical UMMA Major-K SWIZZLE_NONE 操作数布局，每个 K_STEP 一个 16-byte-chunk-atom：
+//     unit16(m, kb) = (m % 8) + 8*kb + 16*(m / 8)      kb in {0,1}
+// 即 LBO = 128 B（两个 K-chunk 之间）、SBO = 256 B（8 行组之间）
+```
+**⚠️ 关键**：它同处注释写明 `A = 128 rows x 32 B **unpacked** fp4 = 4096 B`（每 16 B chunk = 16 个元素）
+⇒ **它也是 unpacked**，所以它同样会被 packed 硬件读错（再次印证 §18/§29"树内无可用参考"）。
+
+**把该结构泛化到 packed（16 B chunk = 32 个 packed 元素 = 一整个 K-block）**：
+- 每个 K-block（32 元素）恰占 **16 B** ✓（与探针实测"一个 `scale_vec::1X` K-block = 16 B"**完全一致**）；
+- 一行 K=128 = 4 个 K-block = 4 个 chunk = 64 B ✓（与官方 W 子 tile 8192 B = 128×64 一致 ✓）；
+- 一个 8 行组 = 8 行 × 4 chunk × 16 B = **512 B** ✓ ⇒ **SBO = 32 units**；
+- 相邻 K-block 相距 **128 B** ⇒ **LBO = 8 units**（与树内 `kLboBytes = 128` **同值**！因为"K-chunk 步长"在
+  两种形态下都等于 128 B，只是 chunk 的**含义**从"16 个元素"变成"32 个元素"）。
+
+⇒ **候选 B = 把树内 canonical 公式按 packed 语义重算的必然结果**：
+`byte(row, kb) = (row%8)*16 + kb*128 + (row/8)*512`，`lbo=8, sbo=32, layout_type=0, 递进 ki*128 B`。
+（对比：候选 D 走的是"TMA swizzle（SWIZZLE_64B）"路线，与 canonical interleave 是两套不同编码；
+两者各自内部自洽，**由实测决定硬件接受哪一套**。§34 已验两者都是 8192 B 的双射。）
+
+**结论**：**候选 B 的优先级应高于 D/geom0**（它是"树内唯一 canonical 结构的正确泛化"，
+而 geom0/D 都含我推测的 swizzle 假设）。已同步给 `bs-packed-geometry` 以便其仪器优先扫 B。
