@@ -1211,3 +1211,35 @@ E3 = 候选 D（SWIZZLE_64B）。本轮同时应首次拿到 **`[NC]` 数值**�
 4. **最省时的下一步**：把官方的**最小参考**（`/home/smith/tl_bs_min_generated.cu`，已 PASS）
    当作 **oracle**，与我们的 kernel 在**同一批输入**上逐元素对拍 ⇒ 直接定位差异环节；
    或用它做**逐项消融**（改我们的一处参数看 relerr 是否掉到 0）。
+
+## §44 与官方 PASS 参考的逐项核对结果：**参数面全部一致** ⇒ 缺陷在别处
+
+读完官方已 PASS 的最小内核（`/home/smith/tl_bs_min_generated.cu`）与测试（`/home/smith/tl_bs_min.py`）后，
+把"我们 vs 官方"逐项对齐，**没有一项不同**：
+
+| 面 | 官方 PASS | 我们 | 一致？ |
+|---|---|---|---|
+| fp4 操作数 smem 形态 | 1 B/元素（16384 B/stage，128 B/行，TMA 展开） | unpacked（`packed&0xF`/`packed>>4` 写相邻两字节） | ✓ |
+| 布局公式 | SW128 `(r/8)*1024+(r%8)*128+(((c/16)^(r%8))*16)+(c%16)` | 同 | ✓ |
+| descriptor | A/B 都 `initialize_tcgen05_descriptor(…, 1, 64, 0, 0, 2)` | 同 | ✓ |
+| K-block 递进 | `desc + ki*32` | 同 | ✓ |
+| stage 递进 | `increase_descriptor_offset(desc, k*16384)`（**多 stage 才需要**；我们是单缓冲原地重写 ⇒ 无需） | 不适用 | ✓ |
+| idesc | `144708608 | (ki<<29) | (ki<<4)` | 逐位相同 | ✓ |
+| **`enable_d` 时机** | `((0 < ki) ? 1 : ((k == 0) ? 0 : 1))` = **只在最首个子 MMA 清零** | 同（kk=0,ki=0 清零一次） | ✓ |
+| SF 投递 | `tcgen05_cp_warpx4` + `sf_warp_transpose` + 3-warp 部分同步 + `fence_proxy_async` | 同（我们也是先 transpose 再 cp） | ✓ |
+| **SF 字节序** | `w[:,0::4]` 进 LSB ⇒ **byte 0 = 组内最低 K-block** | 同（`pack_wsf`/gather 都是 byte j = 第 j 个 K-block） | ✓ |
+| SF 词组布局 | group-major `[K/128][R]` | 同（W: `[E][40][row]`；激活: `[40][SEG][row]`） | ✓ |
+| SF 粒度 | `gran = 32`（1 字节覆盖 32 K，1 u32 = 4 字节 = 128 K） | 同 | ✓ |
+| sf_id | `ki` | 同 | ✓ |
+
+⇒ **参数面已排除**。剩余可能（全部在"我们自己的实现细节"里）：
+1. **A/B 两个 tile 的"内容装配"**：我们加载的是哪些行/列（激活行 = `seg*128+m` ✓；W 行 = `n_tile*64+row`（W1）/`64+row`（W3）；
+   W 的行距 2560 B、K 迭代步进 64 B）——**需要与"我们实际喂的 W 张量布局"再核对一次**（尤其 `w_stride` 与 `2560` 的取值来源）。
+2. **SF *内容* 与行的对应**：我们 `gather` 写 `sfa[g*M+seg*128+r]`、kernel 读 `SFA[k*(SEGCAP*128)+seg*128+i]`；
+   权重侧 `SFW1[e*(40*320)+k*320+n_tile*64+i]`——**K 组的 `k` 与 tile 的 `k` 是否同步**（我们逐 k 迭代重写 tile ⇒ 必须同步）。
+3. **朝向**（U 回合正在测）与 **M/N 角色**。
+4. 一处**非常容易静默错**的量：我们 `SFREV` 与 packed 门控都默认 OFF ✓，但 **`DSV41_MOE_BS_SCALEVEC1X`** 也默认 OFF——
+   官方生成码里 **没有** `.scale_vec::1X` 后缀 ⇒ **保持 OFF 是对的** ✓（这一点之前有过反复，记录以免再动）。
+
+**下一步（已交 subagent）**：拿官方 oracle 做**同输入逐元素对拍**，把差异按行/列/K-block 打成分布，
+直接指向上面 1–3 中的哪一个。
