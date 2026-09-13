@@ -359,6 +359,9 @@ struct Kernels {
     argmax: Option<unsafe extern "C" fn(*const f32, *mut c_int, c_int, *mut c_int, CuStream) -> c_int>,
     window_idxs: Option<unsafe extern "C" fn(*mut i32, *const c_int, c_int, CuStream) -> c_int>,
     win_kv_quant_rt: Option<unsafe extern "C" fn(*mut f32, c_int, c_int, CuStream) -> c_int>,
+    gate_gemv_f32: Option<
+        unsafe extern "C" fn(*const f32, *const c_void, *mut f32, c_int, c_int, f32, CuStream) -> c_int,
+    >,
     comp_placeholder:
         Option<unsafe extern "C" fn(*mut i32, *const c_int, c_int, c_int, CuStream) -> c_int>,
     ring_append:
@@ -815,6 +818,7 @@ impl Device {
             engram_hash_step: ko!(rt, "dsv41_engram_hash_step"),
             window_idxs: ko!(rt, "dsv41_window_idxs"),
             win_kv_quant_rt: ko!(rt, "dsv41_win_kv_quant_rt"),
+            gate_gemv_f32: ko!(rt, "dsv41_gate_gemv_f32"),
             comp_placeholder: ko!(rt, "dsv41_comp_placeholder"),
             compress_commit: ko!(rt, "dsv41_compress_commit"),
             ring_append: ko!(rt, "dsv41_ring_append"),
@@ -3047,6 +3051,24 @@ impl Device {
         let f = self.need(self.kernels.win_kv_quant_rt, "dsv41_win_kv_quant_rt")?;
         let rc = unsafe { f(kv, cols, block, self.stream) };
         self.kerr(rc, "dsv41_win_kv_quant_rt")
+    }
+
+    /// The official's gate domain: an f32 GEMV on bf16(x) × f32(bf16 w),
+    /// divided by gate_temp — exactly `linear(x.float(), weight.float()) /
+    /// gate_temp`. The bf16×bf16 products are exact in f32, so this matches
+    /// torch's f32 GEMM to accumulation-order noise (~1e-6).
+    pub fn gate_gemv_f32(
+        &self,
+        x: *const f32,
+        w: *const std::os::raw::c_void,
+        scores: *mut f32,
+        n_out: i32,
+        dim: i32,
+        gate_temp: f32,
+    ) -> Result<()> {
+        let f = self.need(self.kernels.gate_gemv_f32, "dsv41_gate_gemv_f32")?;
+        let rc = unsafe { f(x, w, scores, n_out, dim, gate_temp, self.stream) };
+        self.kerr(rc, "dsv41_gate_gemv_f32")
     }
 
     /// Publish the roped index key into the owner's group slot, with the slot

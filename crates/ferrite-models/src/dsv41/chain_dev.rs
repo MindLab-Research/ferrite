@@ -769,6 +769,16 @@ fn win_kv_quant() -> bool {
     *F.get_or_init(|| std::env::var("DSV41_WIN_KV_QUANT").map(|v| v != "0").unwrap_or(true))
 }
 
+/// The official's gate domain: the reference computes the gate scores in FULL
+/// F32 (`linear(x.float(), weight.float()) / gate_temp` — model.py Gate.forward);
+/// our old bf16/fp8 gate paths differ by ~1-2%, which flipped near-tie expert
+/// selections (245-vs-0/29: the moe_o 5-11% divergence's root cause). DEFAULT
+/// ON. `DSV41_GATE_F32=0` reverts to the old paths for A/B.
+fn gate_f32() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_GATE_F32").map(|v| v != "0").unwrap_or(true))
+}
+
 /// B3 (DSV41_COMP_PLACEHOLDER_FUSE, default ON): the recency-placeholder launch
 /// (30/step, ~1.0us each) writes `idxs[win, win+take)` into the SAME buffer the
 /// `ring_win_fuse` epilogue already writes `idxs[0, win)` into, and `sparse_attn`
@@ -4426,7 +4436,21 @@ fn hc_tail_split() -> bool {
                 )?;
         }
         let mut routed = false;
-        if !sh_via_mixed {
+        if gate_f32() {
+            // The official's gate domain: an f32 GEMV on bf16(x) × f32(bf16 w)
+            // / gate_temp. Runs AFTER the mixed GEMM (whose gate output this
+            // overwrites — MIX_GATE forces the serial path, so no stream race)
+            // and BEFORE route_topk below. `routed` stays false: the standalone
+            // route_topk consumes these f32 scores.
+            self.dev.gate_gemv_f32(
+                self.s.xn.ptr as *const f32,
+                ld.gate_w.as_ref().unwrap().ptr() as *const std::os::raw::c_void,
+                self.s.scores.ptr as *mut f32,
+                n_routed as i32,
+                dim as i32,
+                cfg.gate_temp,
+            )?;
+        } else if !sh_via_mixed {
             // Fused gate GEMV + route: the gate's LAST block runs the top-6
             // selection over the 384 finished scores (DSV41_ROUTE_FUSE, default
             // ON) — one launch where gate + route_topk used to be two, and

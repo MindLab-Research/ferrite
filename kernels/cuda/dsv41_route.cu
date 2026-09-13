@@ -162,3 +162,53 @@ extern "C" int dsv41_route_topk(const float* scores, const float* bias, float* w
     }
     return (int)cudaGetLastError();
 }
+
+// ---------------------------------------------------------------------------
+// The official's gate domain (model.py Gate.forward):
+//   scores = linear(x.float(), weight.float()) / gate_temp
+// where x is the model's BF16 collapse output and the weight is BF16. The
+// bf16xbf16 products are EXACT in f32, so this f32 GEMV differs from torch's
+// f32 GEMM only in accumulation order (~1e-6) — far below the ~1e-3 near-tie
+// margins that flipped expert selection (245-vs-0/29) through the old bf16/fp8
+// gate paths. Manual bf16 bit conversions (no cuda_bf16.h dependency).
+__device__ __forceinline__ float route_bf16_to_f(uint16_t b) {
+    return __uint_as_float((uint32_t)b << 16);
+}
+__device__ __forceinline__ uint16_t route_f_to_bf16(float v) {
+    // round-to-nearest-even narrowing (the __float2bfloat16 semantics)
+    uint32_t u = __float_as_uint(v);
+    u += 0x7fffu + ((u >> 16) & 1u);
+    return (uint16_t)(u >> 16);
+}
+
+__global__ void gate_gemv_f32_kernel(const float* __restrict__ x,
+                                     const uint8_t* __restrict__ w_bf16,
+                                     float* __restrict__ scores, int n_out, int dim,
+                                     float gate_temp) {
+    const int e = blockIdx.x;
+    if (e >= n_out) return;
+    const uint16_t* wr = reinterpret_cast<const uint16_t*>(w_bf16) + (size_t)e * dim;
+    const int lane = threadIdx.x & 31;
+    float acc = 0.f;
+    for (int d = threadIdx.x; d < dim; d += blockDim.x) {
+        // the official's x is bf16-valued: round our f32 xn to the same domain
+        const float xv = route_bf16_to_f(route_f_to_bf16(x[d]));
+        acc += xv * route_bf16_to_f(wr[d]);
+    }
+    for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, off);
+    __shared__ float red[32];
+    if (lane == 0) red[threadIdx.x >> 5] = acc;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float t = 0.f;
+        for (int i = 0; i < (int)((blockDim.x + 31) >> 5); ++i) t += red[i];
+        scores[e] = t / gate_temp;
+    }
+}
+
+extern "C" int dsv41_gate_gemv_f32(const float* x, const uint8_t* w_bf16, float* scores,
+                                   int n_out, int dim, float gate_temp, cudaStream_t s) {
+    if (n_out <= 0 || dim <= 0) return (int)cudaSuccess;
+    gate_gemv_f32_kernel<<<(unsigned)n_out, 256, 0, s>>>(x, w_bf16, scores, n_out, dim, gate_temp);
+    return (int)cudaGetLastError();
+}
