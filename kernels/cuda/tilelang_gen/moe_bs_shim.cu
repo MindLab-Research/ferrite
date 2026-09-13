@@ -894,11 +894,9 @@ extern "C" int dsv41_moe_tilelang_gate_up_bs_dev(
     const int* counts_dev,   // [SEG_CAP] i32 —— **DEVICE**
     const int* nseg_dev,     // [1] i32 —— **DEVICE**（dsv41_moe_align_from_group 的输出）
     int rows, int dim, int inter, int topk, int64_t w_stride, cudaStream_t s) {
-    { static bool _m1=false; if(!_m1){_m1=true; fprintf(stderr, "[NC-TRACE] dev entry ENTERED (NUMCHECK env=%s)\n", getenv("DSV41_MOE_BS_NUMCHECK")?"1":"0");} }
     if (xq4 == nullptr || xsc4 == nullptr || out == nullptr || w1 == nullptr || w3 == nullptr ||
         sfw1 == nullptr || sfw3 == nullptr || eid_dev == nullptr || order_dev == nullptr ||
         counts_dev == nullptr || nseg_dev == nullptr)
-        { static bool _r=false; if(!_r){_r=true; fprintf(stderr, "[NC-TRACE] dev EARLY-RETURN at shim line 901 -> 2;\n");} }
         return 2;
     if (dim != kDim || inter != kNp) return 2;
     // FALLBACK (2026-09-14): decline during CUDA-graph capture — the tcgen05
@@ -919,7 +917,6 @@ extern "C" int dsv41_moe_tilelang_gate_up_bs_dev(
                         "[moe-bs] DECLINE during graph capture (tcgen05 MMA illegal-instruction "
                         "workaround) — verify steps fall back to per-slot GEMV\n");
             }
-            { static bool _r=false; if(!_r){_r=true; fprintf(stderr, "[NC-TRACE] dev EARLY-RETURN at shim line 921 -> 2;\n");} }
             return 2;
         }
     }
@@ -932,7 +929,6 @@ extern "C" int dsv41_moe_tilelang_gate_up_bs_dev(
     // 16B 对齐：A/W 走 TMA（必需），out 是 float2 store。
     if ((((uintptr_t)xq4 & 0xF) != 0) || (((uintptr_t)w1 & 0xF) != 0) ||
         (((uintptr_t)w3 & 0xF) != 0) || (((uintptr_t)out & 0x1F) != 0))
-        { static bool _r=false; if(!_r){_r=true; fprintf(stderr, "[NC-TRACE] dev EARLY-RETURN at shim line 933 -> 2;\n");} }
         return 2;
 
     // P0-2 (graph-capture audit, v2 state-gated — matching the bf16 shim's pattern):
@@ -949,7 +945,6 @@ extern "C" int dsv41_moe_tilelang_gate_up_bs_dev(
 
     if (!tl_bs_init()) {
         bs_init_failed_note(rows, dim, inter);
-        { static bool _r=false; if(!_r){_r=true; fprintf(stderr, "[NC-TRACE] dev EARLY-RETURN at shim line 949 -> 2;\n");} }
         return 2;
     }
     // driver/tensormap：首次调用做一次 dlopen；A/SFA/C 的 map 在 INIT 后建一次；
@@ -963,7 +958,6 @@ extern "C" int dsv41_moe_tilelang_gate_up_bs_dev(
             fprintf(stderr,
                     "[moe-bs] ARMED (device tables) but tensormap init FAILED (dlopen libcuda / "
                     "cuTensorMapEncodeTiled) -> this run measures the OLD path\n");
-        { static bool _r=false; if(!_r){_r=true; fprintf(stderr, "[NC-TRACE] dev EARLY-RETURN at shim line 962 -> 2;\n");} }
         return 2;
     }
 
@@ -984,7 +978,6 @@ extern "C" int dsv41_moe_tilelang_gate_up_bs_dev(
     // (tests if the caller's device table POINTERS are the issue vs shim's own scratch)
     static const bool g_dev_table_copy = []() {
         const char* v = getenv("DSV41_MOE_BS_DEV_TABLE_COPY");
-        { static bool _r=false; if(!_r){_r=true; fprintf(stderr, "[NC-TRACE] dev EARLY-RETURN at shim line 982 -> v != nullptr && v[0] != '0';\n");} }
         return v != nullptr && v[0] != '0';
     }();
     if (g_dev_table_copy) {
@@ -1086,7 +1079,6 @@ extern "C" int dsv41_moe_tilelang_gate_up_bs_dev(
     // kernel faults. Default OFF (sync kills perf). Enable for debugging only.
     static const bool g_sync_diag = []() {
         const char* v = getenv("DSV41_MOE_BS_SYNC_DIAG");
-        { static bool _r=false; if(!_r){_r=true; fprintf(stderr, "[NC-TRACE] dev EARLY-RETURN at shim line 1083 -> v != nullptr && v[0] != '0';\n");} }
         return v != nullptr && v[0] != '0';
     }();
     if (g_sync_diag) {
@@ -1141,7 +1133,6 @@ extern "C" int dsv41_moe_tilelang_gate_up_bs_dev(
     // pipeline structure is the trigger.
     static const bool g_use_handwritten = []() {
         const char* v = getenv("DSV41_MOE_BS_HANDWRITTEN");
-        { static bool _r=false; if(!_r){_r=true; fprintf(stderr, "[NC-TRACE] dev EARLY-RETURN at shim line 1137 -> v != nullptr && v[0] != '0';\n");} }
         return v != nullptr && v[0] != '0';
     }();
     if (g_use_handwritten) {
@@ -1163,6 +1154,41 @@ extern "C" int dsv41_moe_tilelang_gate_up_bs_dev(
                 fprintf(stderr, "[moe-bs][SYNC-DIAG] HANDWRITTEN MMA done: %s\n",
                         ehw == cudaSuccess ? "OK" : cudaGetErrorString(ehw));
                 if (ehw != cudaSuccess) return (int)ehw;
+            }
+        }
+        // M2 FIX (found by the bs-wiring-audit review): this branch used to `goto
+        // scatter_launch`, which jumped OVER the MMA-DIAG and NUMCHECK probe blocks
+        // below — so on the HANDWRITTEN path the [NC] numeric probe was structurally
+        // unreachable (not an early return, a goto). Probe here as well, with the same
+        // non-capture guard and the same host-side copies the block below performs.
+        {
+            static bool g_nc_hw_done = false;
+            if (!g_nc_hw_done && getenv("DSV41_MOE_BS_NUMCHECK") != nullptr) {
+                fprintf(stderr, "[NC] entered (handwritten path; capture guard next)\n");
+                cudaStreamCaptureStatus nc_cap = cudaStreamCaptureStatusNone;
+                (void)cudaStreamIsCapturing(s, &nc_cap);
+                if (nc_cap == cudaStreamCaptureStatusNone) {
+                    g_nc_hw_done = true;
+                    static int ord_hw[NSEG_PROBE * 128];
+                    static int eid_hw[4];
+                    int e0w = 0, o0w = 0;
+                    if (cudaMemcpyAsync(&e0w, eid_dev, sizeof(int), cudaMemcpyDeviceToHost, s) == cudaSuccess &&
+                        cudaMemcpyAsync(&o0w, order_dev, sizeof(int), cudaMemcpyDeviceToHost, s) == cudaSuccess &&
+                        cudaStreamSynchronize(s) == cudaSuccess &&
+                        cudaMemcpyAsync(ord_hw, order_dev, NSEG_PROBE * 128 * sizeof(int),
+                                        cudaMemcpyDeviceToHost, s) == cudaSuccess &&
+                        cudaStreamSynchronize(s) == cudaSuccess &&
+                        cudaMemcpyAsync(eid_hw, eid_dev, 4 * sizeof(int),
+                                        cudaMemcpyDeviceToHost, s) == cudaSuccess &&
+                        cudaStreamSynchronize(s) == cudaSuccess) {
+                        (void)e0w; (void)o0w;
+                        tl_bs_numcheck(xq4, xsc4, (const uint8_t*)w1, (const uint8_t*)w3,
+                                       (const uint32_t*)sfw1, (const uint32_t*)sfw3,
+                                       eid_hw, ord_hw, topk, w_stride, g_c, s);
+                    } else {
+                        fprintf(stderr, "[NC] ABORT: host copy failed on the handwritten path\n");
+                    }
+                }
             }
         }
         // Skip the TileLang kernel — go straight to scatter
@@ -1249,7 +1275,6 @@ scatter_launch:
                     es == cudaSuccess ? "OK" : cudaGetErrorString(es));
         }
     }
-    { static bool _r=false; if(!_r){_r=true; fprintf(stderr, "[NC-TRACE] dev EARLY-RETURN at shim line 1244 -> (int)e;\n");} }
     return (int)e;
 }
 
