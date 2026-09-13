@@ -782,6 +782,16 @@ fn bf16_kv() -> bool {
     *F.get_or_init(|| std::env::var("DSV41_BF16_KV").map(|v| v != "0").unwrap_or(true))
 }
 
+/// The official's q chain carries the same bf16 boundaries (the wq_a GEMM's
+/// output, the q norm's output, the wq_b GEMV's output, the rope in-place on
+/// bf16) — the sparse_attn reads a bf16 q. Our chain stays f32. Measured: with
+/// the kv chain fixed to ~1.1%, attn_o still diverges 3.5-3.8%, so the q chain
+/// dominates the residual. DEFAULT ON; `DSV41_BF16_Q=0` opts out.
+fn bf16_q() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_BF16_Q").map(|v| v != "0").unwrap_or(true))
+}
+
 /// The official's gate domain: the reference computes the gate scores in FULL
 /// F32 (`linear(x.float(), weight.float()) / gate_temp` — model.py Gate.forward);
 /// our old bf16/fp8 gate paths differ by ~1-2%, which flipped near-tie expert
@@ -3162,6 +3172,11 @@ fn hc_tail_split() -> bool {
         if bf16_kv() {
             self.dev.bf16_round_inplace(self.s.kv.ptr as *mut f32, hd as i32)?;
         }
+        // Likewise the qr (the wq_a GEMM's output): the official's q chain is
+        // bf16 from its first projection onward.
+        if bf16_q() {
+            self.dev.bf16_round_inplace(self.s.qr.ptr as *mut f32, ql as i32)?;
+        }
         // op-level diagnostic: the post-GEMM kv (pre-norm, pre-rope, pre-RT)
         // at layer 0 — kind 6 — splits the fp8 GEMM {quant + codes + weight
         // scales} from the fused norm+rope. Runs on the MAIN stream before the
@@ -3711,6 +3726,13 @@ fn hc_tail_split() -> bool {
                     cfg.index_topk as i32,
                 )?;
             }
+        }
+
+        // The official's sparse_attn reads a bf16 q (its rope ran in-place on
+        // the bf16 tensor from the wq_b output onward); round ours to that
+        // domain before it enters the attention.
+        if bf16_q() {
+            self.dev.bf16_round_inplace(self.s.q.ptr as *mut f32, (nlh * hd) as i32)?;
         }
 
         // P1 (DSV41_SPARSE_OROPE, default ON): the sparse attention's epilogue
