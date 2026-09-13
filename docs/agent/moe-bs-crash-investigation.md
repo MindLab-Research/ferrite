@@ -1172,3 +1172,42 @@ E3 = 候选 D（SWIZZLE_64B）。本轮同时应首次拿到 **`[NC]` 数值**�
 
 **纪律**：看到 `step pos=… 191ms/375ms` 这种数字，先确认是不是 `arm_run.sh`（诊断口径）——
 它比真实值慢约一个数量级。性能结论一律来自 `arm_run_fast.sh` / `verify_correct.sh` / `push400_hw_test.sh`。
+
+# ⚠️⚠️ §43 【重大更正】§29 的"必须 packed"结论**是错的** —— 权威 PASS 配置是 **unpacked + SW128**
+
+`tl-blockscale-anchor` subagent 在本机（B300/sm_103a/GPU7）用 **TileLang 0.1.14 + 官方 blockscaled 入口**
+跑出了一个**通过 float64 金标准**的最小参考实现（**两种朝向都 PASS**）：
+
+```
+[a8b4] max|C|=31230.1  max|C-gold|=0.00390625  rel = 1.251e-07  -> PASS
+[a4b8] max|C|=32977.7  max|C-gold|=0.00439453  rel = 1.333e-07  -> PASS
+```
+其触发入口是 `T.tcgen05_gemm_blockscaled(...)`（**不是** `T.gemm`；`T.gemm` 没有 scale 参数），
+`sf_a_granularity_k = sf_b_granularity_k = 32`。
+
+## 从**已 PASS 的生成源码**里提取的权威约定（逐项）
+| 项 | 权威值 |
+|---|---|
+| **fp4 操作数 smem 形态** | **`T.float4_e2m1_unpacked` —— 1 值/字节**（TMA 把全局 packed **解包**：全局 8192 B/行组 → smem **16384 B**） |
+| fp4 操作数物理布局 | **SW128（SWIZZLE_128B）**，与 e4m3 操作数**同一套公式**：`addr(r,c)=(r/8)*1024+(r%8)*128+(((c/16)^(r%8))*16)+(c%16)` |
+| descriptor | **LBO=1（16 B）、SBO=64（1024 B）、base=0、lbo_mode=0、layout_type=2** —— **两种操作数相同** |
+| K-block(32) 递进 | `desc + ki*32` B（`reg32_[0] += bytes>>4`）⇒ **+32 B** |
+| stage 递进 | 每 stage **+16384 B**（= 一个操作数 stage 的字节数） |
+| idesc | `144708608 | (ki<<29) | (ki<<4)`；a8b4 = **0x08A01400**、a4b8 = **0x08A00280** ⇒ **与我们逐位相同** ✓ |
+| SF 投递 | `T.tcgen05_cp_warpx4(SFA_sh,...)` + `T.tcgen05_sf_warp_transpose(...)` + `T.fence_proxy_async()` ⇒ **与我们相同** ✓ |
+| **明确警告** | **"smem operand 必须 `float4_e2m1_unpacked`（1 值/字节）；packed `float4_e2m1fn` 能编译能跑但静默错值"** |
+
+## 更正与推论
+1. **§29 的"硬件按 packed(2 元素/字节) 读"结论错误**：权威 PASS 用的是 **1 值/字节（unpacked）**。
+   我那个冲激探针的"0x02 只剩一半"很可能是**探针自己**在 packed 假设下**只写了 64 B/行**
+   （而硬件读 128 B/行）⇒ 上半行未被写入 ⇒ 恰好一半响应。**探针的结论不可再作为判据。**
+2. **`DSV41_MOE_BS_PACKED` 门控方向是错的**（packed 会让数值静默错）⇒ 默认保持 OFF 是**正确的**，
+   **不要**把它转正（§29–§42 中依赖 packed 的推理全部作废；§38/§41 的推导作为"另一套编码"分析仍有参考价值）。
+3. **我们的 SW128 路径（`g_canon=0`）参数与权威逐项一致**（写公式 ✓、LBO=1/SBO=64/layout=2 ✓、
+   K 递进 32 B ✓、idesc ✓、SF 投递 ✓）⇒ **真正的残余差异不在这些参数里**，
+   必须在别处找：候选面 = ①我们的 **sf_id 语义**（§19 的 SFREV 假设）、②**SF 的 word 打包顺序**、
+   ③**A/B 谁持有 fp4**（朝向）、④**`enable_d`/clear_accum 的时机**（我方只在最首个子 MMA 清零一次；
+   官方是 `clear_accum=(k==0)` **每 stage** 清零）、⑤**我们的 B 行映射**（W1→0..63 / W3→64..127 是否与官方一致）。
+4. **最省时的下一步**：把官方的**最小参考**（`/home/smith/tl_bs_min_generated.cu`，已 PASS）
+   当作 **oracle**，与我们的 kernel 在**同一批输入**上逐元素对拍 ⇒ 直接定位差异环节；
+   或用它做**逐项消融**（改我们的一处参数看 relerr 是否掉到 0）。
