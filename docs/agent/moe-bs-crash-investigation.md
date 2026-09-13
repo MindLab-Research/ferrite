@@ -1020,3 +1020,19 @@ ssh ubuntu@43.202.208.136 'cd ~/ferrite && git fetch -q origin && \
 ⇒ 已做成运行期可切换（`DSV41_MOE_BS_PACKGEOM`，见 §32），并在
 `~/packed_matrix.sh` 里准备了 packed 版的受控矩阵（geom × 朝向 × SF 字节序，共享同一份构建、
 `[NC]` 为主判据、文本仅作参考）。
+
+## §35 `[NC]` 不打印的真正原因（补充 §16）：**per-op 图捕获**也必须关
+
+树内一共有 **5 个图开关**（grep 结果）：`DSV41_GRAPH_STEP`（整步）、以及
+`FERRITE_GRAPH`、`FERRITE_GRAPH_LAYER`、`FERRITE_GRAPH_MOE`、`FERRITE_GRAPH_MID`、`FERRITE_GRAPH_DSA`（per-op）。
+**只关 `DSV41_GRAPH_STEP` 不够**：per-op 捕获仍然会把 BS shim 的那次调用**套在捕获里** ⇒
+shim 按既有设计 `return 2`（decline），同时 NUMCHECK 的 `cudaStreamIsCapturing == none` 守卫也过不去 ⇒
+`[NC]` 永不打印（这正是 §33 观察到的现象）。
+
+**诊断/探针臂必须带全套**：
+```
+FERRITE_GRAPH=0 FERRITE_GRAPH_LAYER=0 FERRITE_GRAPH_MOE=0 FERRITE_GRAPH_MID=0 FERRITE_GRAPH_DSA=0
+DSV41_GRAPH_STEP=0
+```
+（已写进 `~/packed_matrix.sh` 的 `COMMON`。另：`arm_run.sh` 已加"失败时打印决定性日志行"，
+下次若有 build-id/decline 一类问题会直接看到。）
