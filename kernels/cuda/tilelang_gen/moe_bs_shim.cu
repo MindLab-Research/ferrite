@@ -1347,6 +1347,20 @@ extern "C" int dsv41_moe_tilelang_gate_up_bs_dev(
             fprintf(stderr, "[moe-bs] HANDWRITTEN kernel active (DSV41_MOE_BS_HANDWRITTEN=1) — "
                             "sequential execution, no TMA pipeline\n");
         }
+        // DSV41_MOE_BS_PRECLEAR=1: zero the caller's output first, so anything the scatter does NOT
+        // write is unambiguously "never written" instead of "left over from an earlier call". This is
+        // the sharpest available discriminator for the arm's garbage: if pre-clearing makes the
+        // output match the official oracle, the garbage was STALE RESIDUE (and pre-clearing is also
+        // the fix); if it stays wrong, the value really is computed. Async on the same stream => no
+        // sync inside the shim (the §119 lockstep deadlock class).
+        static const bool g_preclear = []() {
+            const char* v = getenv("DSV41_MOE_BS_PRECLEAR");
+            return v != nullptr && v[0] != '0';
+        }();
+        if (g_preclear) {
+            (void)cudaMemsetAsync(out, 0,
+                                  (size_t)rows * (size_t)topk * (size_t)kNup * sizeof(float), s);
+        }
         moe_bs_handwritten_kernel<<<dim3((unsigned)kGridX, (unsigned)kSegCap), 128,
                                         g_hw_cpasync ? kSmemHwDouble + kHwMbarExtra
                                                      : kSmemHwSingle + kHwMbarExtra, s>>>(
