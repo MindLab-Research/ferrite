@@ -1231,6 +1231,61 @@ struct Kernels {
             *const u8, i64, *const u8, i64, *const c_int, CuStream,
         ) -> c_int,
     >,
+    /// TILELANG MoE grouped GEMM — up (gate‖up) arm (`DSV41_MOE_TILELANG`, default
+    /// OFF). Replaces the routed gate/up launch with the TileLang bf16 grouped
+    /// MMA (`kernels/cuda/tilelang_gen/moe_bf16_shim.cu`): one dense operand block
+    /// per expert segment instead of a per-(row, slot) GEMV sweep, GPU-measured at
+    /// 45.5µs/layer vs the 250µs SIMT baseline (docs/agent/tilelang-moe-grouped.md
+    /// §3.3). It consumes the **bf16 copy** of the expert weights that the load-time
+    /// dequant (`DSV41_MOE_BF16_DEQUANT` / [`Self::moe_fp4_to_bf16`]) produces, the
+    /// host-computed moe_align tables and the f32 activations. See the shim's header
+    /// for the full ABI/rc contract (`0` fired / `2` DECLINED / else cuda error).
+    moe_tilelang_gate_up_bf16: Option<
+        unsafe extern "C" fn(
+            *const f32,
+            *mut f32,
+            *const c_void,
+            *const c_int,
+            *const c_int,
+            *const c_int,
+            c_int,
+            c_int,
+            c_int,
+            c_int,
+            c_int,
+            CuStream,
+        ) -> c_int,
+    >,
+    /// TILELANG MoE grouped GEMM — down arm (`DSV41_MOE_TILELANG`, the same runtime
+    /// gate as the up arm). Writes the per-slot down partials
+    /// (`24.5µs/layer`, grouped), which the existing `moe_down_reduce` still sums in
+    /// the fixed ascending-slot order.
+    moe_tilelang_down_bf16: Option<
+        unsafe extern "C" fn(
+            *const f32,
+            *mut f32,
+            *const c_void,
+            *const c_int,
+            *const c_int,
+            *const c_int,
+            c_int,
+            c_int,
+            c_int,
+            c_int,
+            c_int,
+            c_int,
+            CuStream,
+        ) -> c_int,
+    >,
+    /// Load-time fp4(e2m1 + ue8m0) -> bf16 dequant (`DSV41_MOE_BF16_DEQUANT`,
+    /// default OFF). The bf16 arm's PRECONDITION: the grouped kernel streams bf16
+    /// weights, so the expert fp4 pool has to be expanded ONCE at load time (4x the
+    /// fp4 bytes resident — the memory decision is the owner's, see
+    /// tilelang_gen/PROVENANCE.md §8). `k` must be a multiple of 32 (the ue8m0 block).
+    moe_fp4_to_bf16: Option<
+        unsafe extern "C" fn(*const c_void, *const c_void, *mut c_void, c_int, c_int, c_int, c_int, CuStream)
+            -> c_int,
+    >,
     moe_down_reduce: Option<unsafe extern "C" fn(*const f32, *mut f32, c_int, c_int, CuStream) -> c_int>,
     /// `dsv41_moe_down_reduce_st` (A1a): the same fixed-order sum, whose epilogue
     /// also copies `out` into every peer's staging slot (carries the following
@@ -1868,6 +1923,9 @@ impl Device {
             moe_down_reduce: ko!(rt, "dsv41_moe_down_reduce"),
             moe_down_reduce_ar: ko!(rt, "dsv41_moe_down_reduce_st"),
             expert_down_reduce_fp4_batched: ko!(rt, "dsv41_expert_down_reduce_fp4_batched"),
+            moe_tilelang_gate_up_bf16: ko!(rt, "dsv41_moe_tilelang_gate_up_bf16"),
+            moe_tilelang_down_bf16: ko!(rt, "dsv41_moe_tilelang_down_bf16"),
+            moe_fp4_to_bf16: ko!(rt, "dsv41_moe_fp4_to_bf16"),
             w2_l2_prewarm: ko!(rt, "dsv41_w2_l2_prewarm"),
             swiglu_limit_batched: ko!(rt, "dsv41_swiglu_limit_batched"),
             ar_reduce: ko!(rt, "dsv41_ar_reduce"),
@@ -6683,6 +6741,139 @@ impl Device {
             )
         };
         self.kerr(rc, "dsv41_expert_gate_up_fp4_batched")
+    }
+
+    /// TILELANG MoE grouped GEMM — up (gate‖up), the bf16 arm
+    /// (`DSV41_MOE_TILELANG`, default OFF; see `moe_tilelang()` in chain_dev.rs).
+    ///
+    /// Fires the shim's three-launch sequence (gather f32->bf16 → grouped MMA →
+    /// scatter) and writes the **RAW gate‖up** `[rows][topk][2*inter]` layout into
+    /// `out` (row pitch `topk*2*inter`), exactly the layout
+    /// `dsv41_expert_gate_up_fp4_batched` writes when swiglu is NOT fused — so the
+    /// existing separate swiglu pass still applies. `w_up` is the **bf16 copy**
+    /// `[E, 2*inter, dim]` produced by the load-time dequant
+    /// (`DSV41_MOE_BF16_DEQUANT`), `eid`/`order`/`counts` are the HOST moe_align
+    /// tables (see `moe_align_host` in chain_dev.rs), `ids` is not passed: the
+    /// segment expert table `eid` already IS the router's output, re-derived
+    /// host-side from `route_idx_r`.
+    ///
+    /// Returns `Ok(false)` on `rc == 2` (DECLINED: shape/mode not accepted) so the
+    /// caller keeps the proven SIMT launch, and an `Err` on any other non-zero rc
+    /// (the shim's own rc contract: `2` is the only fallback).
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_tilelang_gate_up_bf16(
+        &self,
+        act: *const f32,
+        out: *mut f32,
+        w_up: *const c_void,
+        eid: *const c_int,
+        order: *const c_int,
+        counts: *const c_int,
+        nseg: i32,
+        rows: i32,
+        dim: i32,
+        inter: i32,
+        topk: i32,
+    ) -> Result<bool> {
+        let f = self.need(
+            self.kernels.moe_tilelang_gate_up_bf16,
+            "dsv41_moe_tilelang_gate_up_bf16",
+        )?;
+        let rc = unsafe {
+            f(act, out, w_up, eid, order, counts, nseg, rows, dim, inter, topk, self.stream)
+        };
+        if rc == 2 {
+            return Ok(false);
+        }
+        self.kerr(rc, "dsv41_moe_tilelang_gate_up_bf16")?;
+        Ok(true)
+    }
+
+    /// TILELANG MoE grouped GEMM — down, the bf16 arm (`DSV41_MOE_TILELANG`).
+    ///
+    /// `act` is the swiglu'd `[rows*topk][inter]` activation (the existing
+    /// `dsv41_swiglu_limit_batched` output), `w_dn` the bf16 copy
+    /// `[E, dim, inter]`, and `out` the per-slot partials `[rows*topk][dim]` — the
+    /// same buffer `dsv41_expert_down_fp4_batched` writes, so the existing
+    /// fixed-order `moe_down_reduce` sum is unchanged. `act_pitch` is the SOURCE
+    /// slot stride in floats: the swiglu pass writes in place, so with the unfused
+    /// layout the live `inter` values of each assignment sit `2*inter` apart (the
+    /// fused layout uses `inter`). Same `rc` contract as the up arm.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_tilelang_down_bf16(
+        &self,
+        act: *const f32,
+        out: *mut f32,
+        w_dn: *const c_void,
+        eid: *const c_int,
+        order: *const c_int,
+        counts: *const c_int,
+        nseg: i32,
+        rows: i32,
+        dim: i32,
+        inter: i32,
+        topk: i32,
+        act_pitch: i32,
+    ) -> Result<bool> {
+        let f = self.need(
+            self.kernels.moe_tilelang_down_bf16,
+            "dsv41_moe_tilelang_down_bf16",
+        )?;
+        let rc = unsafe {
+            f(
+                act, out, w_dn, eid, order, counts, nseg, rows, dim, inter, topk, act_pitch,
+                self.stream,
+            )
+        };
+        if rc == 2 {
+            return Ok(false);
+        }
+        self.kerr(rc, "dsv41_moe_tilelang_down_bf16")?;
+        Ok(true)
+    }
+
+    /// Load-time fp4(e2m1 + ue8m0) → bf16 expand (`DSV41_MOE_BF16_DEQUANT`).
+    /// `wq` is `[n, k/2]` packed e2m1 (low nibble = even k), `ws` is `[n, k/32]`
+    /// ue8m0 (`scale = 2^(byte-127)`) and `out_bf16` is `[n, k]` bf16.
+    ///
+    /// `wq_pitch` / `ws_pitch` are the PHYSICAL row pitches in bytes (`<= 0` = the
+    /// natural `k/2` / `k/32`). They must be given explicitly: with
+    /// `DSV41_SF_STRIDE_PAD` (default ON) the loader pads every weight plane's row
+    /// pitch to a 16-byte multiple, so `w2.scale`'s rows are 16 B — not `k/32` — apart
+    /// and the natural stride would read the WRONG scales (a silent wrong answer).
+    /// `k % 32 == 0` and 16-byte-aligned bases are required (rc 2 otherwise).
+    pub fn moe_fp4_to_bf16(
+        &self,
+        wq: *const c_void,
+        ws: *const c_void,
+        out_bf16: *mut c_void,
+        n: i32,
+        k: i32,
+        wq_pitch: i32,
+        ws_pitch: i32,
+    ) -> Result<bool> {
+        let f = self.need(self.kernels.moe_fp4_to_bf16, "dsv41_moe_fp4_to_bf16")?;
+        let rc = unsafe { f(wq, ws, out_bf16, n, k, wq_pitch, ws_pitch, self.stream) };
+        if rc == 2 {
+            return Ok(false);
+        }
+        self.kerr(rc, "dsv41_moe_fp4_to_bf16")?;
+        Ok(true)
+    }
+
+    /// True when the `.so` carries BOTH TileLang MoE grouped-GEMM arms. A stock
+    /// `.so` (or a stale one from before the tilelang_gen MoE shim) has neither, so
+    /// `DSV41_MOE_TILELANG` must stay OFF and be reported — otherwise an armed gate
+    /// would silently measure the OLD path (the project's #1 measurement-bias trap).
+    pub fn supports_moe_tilelang(&self) -> bool {
+        self.kernels.moe_tilelang_gate_up_bf16.is_some()
+            && self.kernels.moe_tilelang_down_bf16.is_some()
+    }
+
+    /// True when the `.so` carries the load-time fp4→bf16 dequant
+    /// (`DSV41_MOE_BF16_DEQUANT` must then stay OFF and be reported).
+    pub fn supports_moe_bf16_dequant(&self) -> bool {
+        self.kernels.moe_fp4_to_bf16.is_some()
     }
 
     /// True when the loaded .so carries the DIRECT e4m3 activation path

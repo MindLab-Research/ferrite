@@ -14,10 +14,14 @@
 | `wkv_reduce_tl.cu` | **生成物（禁止手改）** | 确定性归约内核，同上 |
 | `wkv_tl_config.txt` | 生成物 | 冻结几何（grid/block/smem/ks/bN/threads）+ 两个内核的签名 |
 | `wkv_shim.cu` | **手写** | launcher shim（`dsv41_gemm_fp8_tilelang_wkv`），`#include` 两个生成物 |
+| `moe_up_tl.cu` | **生成物（禁止手改）** | up（gate‖up）grouped GEMM，见 §7 |
+| `moe_dn_tl.cu` | **生成物（禁止手改）** | down grouped GEMM，见 §7 |
+| `moe_tl_config.txt` | 生成物 | MoE 冻结几何（grid/block/smem/SEG_CAP）+ 两个内核的签名 |
+| `moe_bf16_shim.cu` | **手写** | MoE launcher shim + gather/scatter/dequant（3 个导出符号），见 §7 |
 
 生成物头部各有一行 `GENERATED — do not edit` banner（banner 之外逐字节等于 dump）。
-两个 dump 都定义 `extern "C" __global__ void main_kernel(...)`，所以 `wkv_shim.cu` 用
-`#define main_kernel ...` 改名后 include；**build.sh 只把 `wkv_shim.cu` 当一个 TU**。
+每个 dump 都定义 `extern "C" __global__ void main_kernel(...)`，所以每个 shim 用
+`#define main_kernel ...` 改名后 include；**build.sh 只把 `*_shim.cu` 当一个 TU**。
 
 ---
 
@@ -133,3 +137,124 @@ wkv 走通后，把第二个形状（建议 `wq_a`：`n=1280, k=5120`，n 大 �
   会变，升级 = 重生成 + 重跑微基准（门 1）+ 重新 vendor。
 - 生成物进 `build.sh` 的 `SRCS` ⇒ 自动进 `CU_HASH` ⇒ 进 `BUILD_ID`（same-source gate
   免改一行）。
+
+---
+
+## 7. 第二阶段：MoE grouped GEMM（bf16 臂）
+
+> 原型与全部结论：`docs/agent/tilelang-moe-grouped.md`（GPU 实测 bf16 臂
+> **70.0µs/层** = up 45.5 + dn 24.5 = SIMT 250µs 的 **28.0%**，判据 <40% 通过）。
+> 接线设计与验证手册：`docs/agent/tilelang-moe-wiring.md`。
+
+### 7.1 生成（唯一合法路径）
+
+```bash
+scp kernels/tilelang/gen_moe_aot.py ubuntu@43.202.208.136:~/tl_moe/
+ssh ubuntu@43.202.208.136 \
+  'cd ~/tl_moe && /opt/dlami/nvme/dsv41_venv/bin/python gen_moe_aot.py aot_gen'
+scp ubuntu@43.202.208.136:'~/tl_moe/aot_gen/moe_up_tl.cu' \
+                       :'~/tl_moe/aot_gen/moe_dn_tl.cu' \
+                       :'~/tl_moe/aot_gen/moe_tl_config.txt' kernels/cuda/tilelang_gen/
+# 再给两份 .cu 加 banner（banner 是唯一的、可复现的本地改动）
+```
+
+| 项 | 值 |
+|---|---|
+| 形状 | up `N=640 K=5120`；dn `N=5120 K=320`；`E=384`、`BM=16`、`NSEG=SEG_CAP=36` |
+| 几何 | up `BN=256 BK=64 th=256 stg=3`（grid 3×36，smem 104448）；dn `BN=512 BK=64 th=256 stg=2`（grid 10×36，smem 135168）|
+| 数值路线 | bf16 权重 × bf16 激活 → `mma.sync.m16n8k16` → fp32 累加（原型 §3 实测最优臂）|
+| ABI | **裸指针**（`TL_DISABLE_TMA_LOWER:1, TL_DISABLE_WARP_SPECIALIZED:1`，与第一阶段同路线）|
+| 签名 | `main_kernel(const bfloat16_t* A, float* C, const int* Eid, const bfloat16_t* W)` |
+| TileLang | 0.1.14；nvcc CUDA 13.2，`-arch=sm_103a` |
+
+**与原型 `moe_grouped_proto.py::k_bf16` 的两处生成差异**（都是为了接进 ferrite）：
+
+1. **裸指针 ABI**。原型的默认 lowering 产出 `CUtensorMap` + TMA + warp specialization
+   （原型 §6 的 89 行 device 形态）；那要求 host 用 driver API 的
+   `cuTensorMapEncodeTiled` 造描述符——`build.sh` 不链 `-lcuda`，且每层每方向每次
+   launch 都要重编码。裸指针 ABI 让 shim 直接吃 ferrite 的 device 指针，与第一阶段的
+   wkv 同一取舍。
+2. **`NSEG` 烘成上界 `SEG_CAP=36`**（`VERIFY_ROWS(6) × TOPK_MAX(6)`）。TileLang 的 grid
+   维度是编译期常量，而真实 `nseg` 随路由逐位变化（本形状 35）。host 的
+   `order`/`counts`/`eid` 表在 `nseg` 之后**零填充**（见 7.3），pad 段的输出不被
+   scatter，代价是 `grid.y` 从 35 抬到 36（≈3% 空转）。
+
+### 7.2 dump 的审计基准（banner 之前的 sha256）
+
+```
+7499f395cbc1e585cb8cb2838a062623b14f752079e43dcc7fbaac60cdd15d3c  moe_up_tl.cu (raw, 10766 B)
+ec5d36b79bc31c7369c3a8085818585d8869c922fdbd55c336938822a6822dc6  moe_dn_tl.cu (raw,  7517 B)
+```
+
+### 7.3 shim（`moe_bf16_shim.cu`）：三个导出符号 + rc 契约
+
+| 符号 | 作用 |
+|---|---|
+| `dsv41_moe_tilelang_gate_up_bf16` | gather(f32→bf16) + up grouped MMA + scatter（**RAW gate‖up**）|
+| `dsv41_moe_tilelang_down_bf16` | gather + down grouped MMA + scatter（per-slot partial）|
+| `dsv41_moe_fp4_to_bf16` | 加载期 fp4(e2m1+ue8m0) → bf16 副本 |
+
+rc 契约与 wkv shim / `dsv41_proj_mma_skel.cu` 一致：`0` 已发射 / `2` DECLINED / 其它 =
+`cudaGetLastError()`。Rust 只在 `rc == 2` 回退。
+
+**内核不做 gather/mask/atomic**（原型 §2.2）：gather/scatter 在 shim 里，输入输出契约：
+
+- `A`：`[SEG_CAP*BM, K]` bf16（host 已 gather + 每段 pad 到 16 行；pad 行写 0）
+- `W`：`[E=384, N, K]` bf16，**K 连续**；up 的 N 前半 = gate(w1)、后半 = up(w3)
+- `Eid`：`[SEG_CAP]` i32；`C`：`[SEG_CAP*BM, N]` f32
+- `order[SEG_CAP*BM]`：该 (段, 段内行) 的 assignment 下标（`row*topk + slot`，pad = -1）
+- `counts[SEG_CAP]` / `eid[SEG_CAP]`：段的 live 行数 / expert id，**`nseg` 之后零填充**
+
+⚠️ **INIT 的 SetAttribute 是必要条件**（up 104448 B / dn 135168 B 均 > 48 KiB 默认上限）——
+与 wkv 的「契约对齐」不同，这里不设就 launch 失败。
+
+### 7.4 唯一的运行期限制：EAGER（非 capture）
+
+`moe_align` 在 **host** 侧（`chain_dev.rs::moe_align_host`，纯函数：稳定按 expert 排序 +
+排他前缀和，无 atomic、不依赖 block 调度 ⇒ 同一路由表逐位可复现），而 `route_idx*` 是
+`route_topk` 写在 **device** 上的，所以这个臂需要一个 **D2H 回读 + 三个小 H2D 上行**，
+在 CUDA-graph capture 内非法。⇒ 调用方在 `dev.capturing()` 时不派遣（decline + 一次性
+提示）。**把 `nseg` 摊到 GPU 侧**是明确的后续项（原型 §8-3），届时才能进 graph。
+
+### 7.5 显存预算（⚠️ 需拥有者拍板）
+
+bf16 路径的前置是**加载期把专家权重 dequant 成 bf16 常驻**
+（`DSV41_MOE_BF16_DEQUANT=1` → `dsv41_moe_fp4_to_bf16`），代价是专家权重的 fp4 池 ×4。
+
+按 **ferrite 自己的加载布局**算（`load.rs::load_expert_pool` **不做 expert 并行**：每个
+rank 持有全部 384 个专家，只对 `inter` 做 TP 切分）：
+
+| 量 | 值 |
+|---|---|
+| per rank fp4 专家权重 | 40 层 × 384 专家 × (2·320·5120 + 5120·320) × 0.5 B ≈ **35–37 GiB** |
+| bf16 副本 | ×4 ≈ **141–148 GiB** |
+| **增量** | **≈ +105–113 GiB/rank** |
+
+⚠️ **与原型文档 §4.3 的「+15GB/rank」不一致，且必须由拥有者拍板。** 那 15 GB 的算法是
+「fp4 40GB → bf16 160GB，TP8 下 5GB→20GB/rank」——它隐含了 **8 路专家分片**（每 rank 48
+个专家）。ferrite 的 loader 不做专家并行，所以每 rank 的增量是上述的 **~7 倍**。两种口径
+的分母不同，部署前必须确认走哪一种：
+
+- 若接受 +105~113 GiB/rank ⇒ bf16 臂（本 shim）就是最终形态；
+- 若不可接受 ⇒ **唯一替代是 tcgen05 blockscaled 原生 fp4 MMA**
+  （`T.tcgen05_gemm_blockscaled` + `T.make_blockscaled_gemm_layout` + `T.alloc_tmem` +
+  mbarrier；原型 §4.3-2 / §8-1），预期 up 159.8µs → 15–25µs 量级；另一路 subagent 在探索。
+  ⚠️ **不要**退回「读 fp4 → 内核里展开成 bf16 → MMA」：那条路已判死（去掉 dequant ALU
+  仍 102.8µs > bf16 45.5µs，原型 §4.2）。
+
+### 7.6 与 fp4 ILV 布局互斥
+
+`DSV41_MOE_BF16_DEQUANT` 要求 gate/up 平面是**普通的连续 `[inter_local, dim]` 块**。在
+`DSV41_EXPERT_ILV` 下 w1 的 view 别名那个交错的加倍区域，dequant 会把交错字节当成普通的
+gate 平面读——**静默错值**。⇒ 两者互斥，`load.rs::ilv_ok` 在 bf16 dequant 打开时拒绝
+交错（`load_expert_pool` 里也有同样的守卫，防漂移）。
+
+### 7.7 验收证据（本阶段）
+
+| 检查 | 结果 |
+|---|---|
+| `nvcc -O3 -std=c++17 -shared -fPIC -arch=sm_103a -I tilelang_inc`（`moe_bf16_shim.cu`）| **EXIT=0** |
+| `nm -D` | `dsv41_moe_tilelang_gate_up_bf16` / `dsv41_moe_tilelang_down_bf16` / `dsv41_moe_fp4_to_bf16` 三个 T 符号 |
+| `cargo check -p ferrite-models` / `--workspace` | **EXIT=0** |
+| GPU e2e + parity | ⏳ 见 `docs/agent/tilelang-moe-wiring.md` §5（主 agent 职责）|
+

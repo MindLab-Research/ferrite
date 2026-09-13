@@ -271,6 +271,18 @@ pub struct DevExpert {
     pub w3_scale: DevTensor,
     pub w2: DevTensor,
     pub w2_scale: DevTensor,
+    /// `DSV41_MOE_BF16_DEQUANT=1` only: the **bf16 copy of gate‖up**
+    /// (`[2*inter_local, dim]`, rows `[0, inter_local)` = w1/gate and
+    /// `[inter_local, 2*inter_local)` = w3/up) that the TileLang grouped-GEMM arm
+    /// streams (`dsv41_moe_tilelang_gate_up_bf16`). Views into one contiguous
+    /// `[E, 2*inter_local, dim]` pool per layer, so the shim's `base + e*N*K` expert
+    /// arithmetic holds — the arm VERIFIES that stride before it fires
+    /// (`moe_tilelang_weights`). The fp4 planes above are untouched (the proven
+    /// paths still read them), so this is purely additive memory.
+    pub up_bf16: Option<DevTensor>,
+    /// The bf16 copy of w2 (`[dim, inter_local]`), same pool, for
+    /// `dsv41_moe_tilelang_down_bf16`.
+    pub dn_bf16: Option<DevTensor>,
 }
 
 /// A big device allocation that experts are carved out of. Dropped when the
@@ -321,6 +333,10 @@ pub struct LayerDev {
     pub experts: Vec<DevExpert>,
     /// owns the memory the experts' tensors view into
     pub expert_pool: Option<DevBuf>,
+    /// owns the memory the experts' `up_bf16`/`dn_bf16` views point into
+    /// (`DSV41_MOE_BF16_DEQUANT` only; `None` otherwise — no allocation, no
+    /// behaviour change).
+    pub expert_bf16_pool: Option<DevBuf>,
     /// The routed experts' w1/w3 are stored INTERLEAVED in one region
     /// (DSV41_EXPERT_ILV). The consumer MUST pass `ilv = 1` to the batched
     /// gate/up launcher; the sequential (unfused) fallback cannot read this
@@ -769,10 +785,16 @@ impl<'a> Loader<'a> {
         world: usize,
         rank: usize,
         ilv: bool,
-    ) -> Result<(Vec<DevExpert>, DevBuf, bool)> {
+    ) -> Result<(Vec<DevExpert>, DevBuf, bool, Option<DevBuf>)> {
         const NAMES: [&str; 6] = [
             "w1.weight", "w1.scale", "w3.weight", "w3.scale", "w2.weight", "w2.scale",
         ];
+        // DSV41_MOE_BF16_DEQUANT (§task 4): build the bf16 copies the TileLang MoE
+        // arm streams. Both halves must agree — the runtime gate AND the symbol —
+        // so a stale `.so` leaves the copies absent and the arm declines loudly
+        // rather than reading bytes that are not there.
+        let want_bf16 = crate::dsv41::chain_dev::moe_bf16_dequant()
+            && self.dev.supports_moe_bf16_dequant();
         // pass 1: plan every slice (no allocation)
         let mut plans: Vec<TensorPlan> = Vec::with_capacity(n_routed * 6);
         for e in 0..n_routed {
@@ -935,8 +957,92 @@ impl<'a> Loader<'a> {
         // Default OFF; this is the §6 V2 hook of
         // docs/agent/tcgen05-tma-bulk-align-design.md, and it is arm-agnostic
         // (it does not depend on any single arm's launcher gate).
+        // (Ordered ABOVE the DSV41_MOE_BF16_DEQUANT block below: the dequant
+        // consumes `plans[].pitch`, which is exactly what this audit validates.)
         if align_audit() {
             audit_expert_pool(layer, rank, n_routed, block, &poff, &plans, base, ilv);
+        }
+        // ---- DSV41_MOE_BF16_DEQUANT: the bf16 copies the TileLang arm streams ----
+        // DEFAULT OFF (the memory decision is the owner's; PROVENANCE.md §8). When
+        // armed, expand every expert's fp4 planes ONCE here (load time, seconds) into
+        // one contiguous bf16 pool per layer:
+        //   up : [E, 2*inter_local, dim]  rows [0, il) = w1/gate, [il, 2*il) = w3/up
+        //   dn : [E, dim, inter_local]    w2
+        // The TileLang shim derives each expert's base ARITHMETICALLY (`e*N*K`), so
+        // the pool has to be exactly this regular (the arm re-checks the stride).
+        // ⚠️ Requires the PLAIN (non-interleaved) gate/up planes: with DSV41_EXPERT_ILV
+        // the w1 view aliases the doubled interleaved region and this dequant would
+        // read interleaved bytes as if they were a contiguous gate plane — a silent
+        // wrong answer. `ilv_ok` therefore refuses to interleave when this gate is on.
+        let mut bf16_pool: Option<DevBuf> = None;
+        let mut up_views: Vec<Option<DevTensor>> = vec![None; n_routed];
+        let mut dn_views: Vec<Option<DevTensor>> = vec![None; n_routed];
+        if want_bf16 && !ilv && !plans.is_empty() {
+            let il = plans[0].local[0]; // inter_local (padded)
+            let dim = plans[0].local[1] * 2; // fp4 packs 2 values/byte
+            let up_bytes = 2 * il * dim * 2;
+            let dn_bytes = dim * il * 2;
+            debug_assert!(plans[2].local[0] == il && plans[4].local[0] == dim);
+            let pool_bf = self.dev.alloc((up_bytes + dn_bytes) * n_routed)?;
+            let base_bf = pool_bf.ptr as *mut u8;
+            let mut ok = true;
+            for e in 0..n_routed {
+                let eb = base_bf.wrapping_add(e * (up_bytes + dn_bytes));
+                let i = e * 6;
+                // w1 -> up[0..il) ; w3 -> up[il..2*il) ; w2 -> dn.
+                for (qk, sk, dst, n, k) in [
+                    (i, i + 1, eb, il, dim),
+                    (i + 2, i + 3, eb.wrapping_add(il * dim * 2), il, dim),
+                    (i + 4, i + 5, eb.wrapping_add(up_bytes), dim, il),
+                ] {
+                    let q = views[qk].ptr() as *const std::ffi::c_void;
+                    let s = views[sk].ptr() as *const std::ffi::c_void;
+                    let o = dst as *mut std::ffi::c_void;
+                    let ok_one = self.dev.moe_fp4_to_bf16(
+                        q,
+                        s,
+                        o,
+                        n as i32,
+                        k as i32,
+                        plans[qk].pitch as i32,
+                        plans[sk].pitch as i32,
+                    )?;
+                    ok &= ok_one;
+                }
+                up_views[e] = Some(DevTensor {
+                    buf: Device::view(eb as *mut std::ffi::c_void, up_bytes),
+                    shape: vec![2 * il, dim],
+                    dtype: "BF16".into(),
+                });
+                dn_views[e] = Some(DevTensor {
+                    buf: Device::view(
+                        eb.wrapping_add(up_bytes) as *mut std::ffi::c_void,
+                        dn_bytes,
+                    ),
+                    shape: vec![dim, il],
+                    dtype: "BF16".into(),
+                });
+            }
+            if ok {
+                bf16_pool = Some(pool_bf);
+            } else {
+                // The kernel declined (shape/alignment) or the symbol is missing:
+                // drop the pool and leave the experts without bf16 copies — the
+                // TileLang arm then declines loudly instead of reading garbage.
+                self.dev.free(&pool_bf);
+                up_views = vec![None; n_routed];
+                dn_views = vec![None; n_routed];
+                eprintln!(
+                    "[load] DSV41_MOE_BF16_DEQUANT armed but `dsv41_moe_fp4_to_bf16` declined \
+                     (missing symbol, or a shape/pitch outside its contract) -> the TileLang MoE \
+                     arm will decline"
+                );
+            }
+        } else if want_bf16 && ilv {
+            eprintln!(
+                "[load] DSV41_MOE_BF16_DEQUANT is armed but the gate/up planes are INTERLEAVED \
+                 (DSV41_EXPERT_ILV) -> no bf16 copy; the TileLang MoE arm will decline"
+            );
         }
         let mut experts = Vec::with_capacity(n_routed);
         for e in 0..n_routed {
@@ -948,9 +1054,11 @@ impl<'a> Loader<'a> {
                 w3_scale: views[i + 3].clone(),
                 w2: views[i + 4].clone(),
                 w2_scale: views[i + 5].clone(),
+                up_bf16: up_views[e].clone(),
+                dn_bf16: dn_views[e].clone(),
             });
         }
-        Ok((experts, pool, ilv))
+        Ok((experts, pool, ilv, bf16_pool))
     }
 
     /// Whether the routed experts' w1/w3 can be stored INTERLEAVED
@@ -977,6 +1085,14 @@ impl<'a> Loader<'a> {
             && cd::gateup_fuse()
             && cd::expert_fp4_mode() == 2
             && !cd::no_gemv_fp4()
+            // DSV41_MOE_BF16_DEQUANT (§task 4): the load-time bf16 copy reads each
+            // expert's gate/up planes as CONTIGUOUS `[inter_local, dim]` blocks.
+            // Under ILV the w1 view aliases the doubled interleaved region, so the
+            // dequant would read interleaved bytes as a plain gate plane — a silent
+            // wrong answer. The two layouts are therefore mutually exclusive, and
+            // this is the one place the decision is made (`load_expert_pool` also
+            // guards it, so a drift cannot slip through).
+            && !cd::moe_bf16_dequant()
             && cfg.dim % 512 == 0
             && self.dev.supports_moe_batch()
             && self.dev.supports_gateup_fuse()
@@ -1085,11 +1201,12 @@ impl<'a> Loader<'a> {
             // pooled allocation — 6 cudaMallocs per expert (92k over the model)
             // exhausted the 4 GB host's driver bookkeeping.
             let (n_routed, _) = cfg.moe_config(l);
-            let (experts, pool, experts_ilv) =
+            let (experts, pool, experts_ilv, bf16_pool) =
                 self.load_expert_pool(&p, n_routed, l, world, rank, ilv_ok)?;
             ld.experts = experts;
             ld.expert_pool = Some(pool);
             ld.experts_ilv = experts_ilv;
+            ld.expert_bf16_pool = bf16_pool;
             w.layers[l] = ld;
         }
 
@@ -1129,11 +1246,12 @@ impl<'a> Loader<'a> {
             take!(p, ld, "ffn.shared_experts.w2.weight", shared_w2);
             take!(p, ld, "ffn.shared_experts.w2.scale", shared_w2_scale);
             let (n_routed, _) = cfg.moe_config(cfg.n_layers + s);
-            let (experts, pool, experts_ilv) =
+            let (experts, pool, experts_ilv, bf16_pool) =
                 self.load_expert_pool(&p, n_routed, cfg.n_layers + s, world, rank, ilv_ok)?;
             ld.experts = experts;
             ld.expert_pool = Some(pool);
             ld.experts_ilv = experts_ilv;
+            ld.expert_bf16_pool = bf16_pool;
             if s == 0 {
                 // THE ROOT CAUSE of the 100% q divergence (unit-diff verdict):
                 // this block once "parked" main_proj's spec in the attn_norm

@@ -19737,3 +19737,66 @@ impl<'c> SpecStep for DevChain<'c> {
         self.dspark_spec_step(dspark, token, pos)
     }
 }
+
+#[cfg(test)]
+mod moe_tilelang_tests {
+    use super::{moe_align_host, TILELANG_BM, TILELANG_SEG_CAP};
+
+    /// The segmented layout contract (docs/agent/tilelang-moe-wiring.md §2): every
+    /// expert owns a CONTIGUOUS run, the run order is the SGLang/prototype
+    /// `(expert asc, flat index asc)` order, and every table is exactly SEG_CAP
+    /// long with a zero-filled tail (the generated kernels launch a fixed
+    /// `grid.y = SEG_CAP`, so a stale tail would be read — and a stale `counts`
+    /// would make the scatter write garbage).
+    #[test]
+    fn moe_align_host_groups_stably_and_zero_fills() {
+        // 3 tokens x topk 3:  [5,1,5] [1,5,2] [9,1,9]
+        let idx = [5, 1, 5, 1, 5, 2, 9, 1, 9];
+        let (order, counts, eid, nseg) = moe_align_host(&idx, 3).expect("expressible routing");
+        assert_eq!(nseg, 4);
+        assert_eq!(&eid[..nseg], &[1, 2, 5, 9]);
+        // Stable within an expert: expert 1 owns flat indices 1, 3, 7 (ascending);
+        // expert 5 owns 0, 2, 4; expert 9 owns 6, 8.
+        assert_eq!(&counts[..nseg], &[3, 1, 3, 2]);
+        assert_eq!(&order[0..3], &[1, 3, 7]);
+        assert_eq!(&order[TILELANG_BM..TILELANG_BM + 1], &[5]);
+        assert_eq!(&order[2 * TILELANG_BM..2 * TILELANG_BM + 3], &[0, 2, 4]);
+        assert_eq!(&order[3 * TILELANG_BM..3 * TILELANG_BM + 2], &[6, 8]);
+        // Pad rows inside a segment are -1; the tail past `nseg` is all pad/zero.
+        assert_eq!(order[3], -1);
+        assert!(order[nseg * TILELANG_BM..].iter().all(|&v| v == -1));
+        assert!(counts[nseg..].iter().all(|&v| v == 0));
+        assert_eq!(counts.len(), TILELANG_SEG_CAP);
+        assert_eq!(order.len(), TILELANG_SEG_CAP * TILELANG_BM);
+    }
+
+    /// The same routing table must always produce the same tables (the arm's
+    /// determinism claim: no atomics, no block-scheduling dependence).
+    #[test]
+    fn moe_align_host_is_deterministic() {
+        let idx = [11, 4, 11, 4, 7, 11, 4, 7, 2, 2, 4, 11];
+        let a = moe_align_host(&idx, 4).unwrap();
+        let b = moe_align_host(&idx, 4).unwrap();
+        assert_eq!(a.0, b.0);
+        assert_eq!(a.1, b.1);
+        assert_eq!(a.2, b.2);
+        assert_eq!(a.3, b.3);
+    }
+
+    /// Declines: an empty/degenerate routing table, a negative expert id (the
+    /// router would never emit one) and more segments than the kernels' baked
+    /// `grid.y`.
+    #[test]
+    fn moe_align_host_declines_out_of_contract() {
+        assert!(moe_align_host(&[], 6).is_none());
+        assert!(moe_align_host(&[0, 1, 2], 0).is_none());
+        assert!(moe_align_host(&[0, -1, 2], 3).is_none());
+        // All-distinct experts: one segment each, so > SEG_CAP is unexpressible.
+        let many: Vec<i32> = (0..TILELANG_SEG_CAP as i32 + 1).collect();
+        assert!(moe_align_host(&many, 1).is_none());
+        // One segment wider than the MMA M-tile.
+        let wide = vec![7i32; TILELANG_BM + 1];
+        assert!(moe_align_host(&wide, 1).is_none());
+    }
+}
+
