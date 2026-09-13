@@ -42,6 +42,26 @@ for S in 0 1 17 39; do
   fi
 done
 
+# Two zero-change controls:
+#  * CPASYNC=1 is a DIFFERENT staging implementation (cp.async + double buffering) of the same
+#    operands; the file claims bit-exactness with the sequential default. If they differ and the
+#    cp.async side is closer to the oracle, the defect is in the sequential staging.
+#  * a repeat of the same arm: any difference between the two runs is a race.
+rm -rf /tmp/ks_det_a /tmp/ks_det_b /tmp/ks_cpa
+run KS_DET_A DSV41_GATEUP_DUMP=/tmp/ks_det_a DSV41_MOE_BS_KEEP_STAGE=17
+run KS_DET_B DSV41_GATEUP_DUMP=/tmp/ks_det_b DSV41_MOE_BS_KEEP_STAGE=17
+run KS_CPA   DSV41_GATEUP_DUMP=/tmp/ks_cpa   DSV41_MOE_BS_KEEP_STAGE=17 DSV41_MOE_BS_CPASYNC=1
+echo "=== determinism: KS_DET_A vs KS_DET_B (must be bit-identical) ==="
+for f in gateup.f32; do
+  for d in /tmp/ks_det_a /tmp/ks_det_b; do [ -f "$d/eager/$f" ] && cp "$d/eager/$f" "$d/$f" 2>/dev/null; done
+  cmp -s /tmp/ks_det_a/$f /tmp/ks_det_b/$f && echo "$f IDENTICAL (deterministic)" || echo "$f DIFFERS (race!)"
+done
+echo "=== CPASYNC vs sequential (the file claims bit-exact) ==="
+for f in gateup.f32; do
+  [ -f /tmp/ks_cpa/eager/$f ] && cmp -s /tmp/ks_cpa/eager/$f /tmp/ks_det_a/$f \
+    && echo "$f IDENTICAL (claim holds)" || echo "$f DIFFERS — one of the two stagings is wrong"
+done
+
 echo "=== which stage's partial does each arm actually equal? ==="
 python3 - <<'PY'
 import os, subprocess, numpy as np
