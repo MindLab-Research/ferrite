@@ -472,6 +472,9 @@ idesc 用 a_fmt=5/b_fmt=0、epilogue 因 M=输出通道/N=token 而转置落盘�
 |---|---|
 | **swiglu（clamp + silu）** | **逐式一致**：`dsv41_glue.cu:1543-1560` 的 `swiglu_limit_batched_kernel` 做 `g=fminf(g,limit)`（gate 只 clamp 上限 ✓）、`u=fminf(fmaxf(u,-limit),limit)`（up 双侧 clamp ✓）、`(g/(1+expf(-g)))*u`（silu ✓）——与官方 `model.py:845-849` 的 `up=clamp(up,-lim,+lim)` / `gate=clamp(gate,max=+lim)` / `F.silu(gate)*up` **完全同构**。唯一差别是 `F.silu` 与 `g/(1+exp(-g))` 的浮点运算次序（≤1 ulp），以及该 TU 编译时带 fast-math（`expf` 精度 ~2 ulp）——量级可忽略 |
 | 激活量化输出 | 与官方**逐字节一致**（subagent official-numeric-parity 的 Q2 实测） |
+| **fp4 (e2m1) 解码表** | **逐值一致**：`kFp4Table`（`dsv41_kernels.cu:108-111`）与官方 `convert.py:13-15` 的 `FP4_TABLE` 16 个码点完全相同（`0, .5, 1, 1.5, 2, 3, 4, 6` 及其负值）|
+| **fp4→e4m3 无损性** | 成立（e2m1 的 8 个幅值 `{0,.5,1,1.5,2,3,4,6}` 都是 e4m3 精确可表示 ⇒ 官方"cast 到 fp8 再跑 FP8×FP8"与我们"e4m3×e2m1 混合 MMA"**数学等价**）|
+| **全零块的标度下限** | **数值无害**：官方 `max(amax,1e-4)`（`kernel.py:76`）vs 我方 `max(scale,1e-30)`（`dsv41_kernels.cu:156`）——全零块的**值**恒为 0，乘积恒 0，标度不会被当作除数使用 ⇒ 无影响（仅字面差异）|
 
 ### 未对齐 ⚠️（**待修，且必须等 BS 臂正确后再动**——一次只改一个变量）
 | # | 官方写法 | 我方写法 | 影响 |
