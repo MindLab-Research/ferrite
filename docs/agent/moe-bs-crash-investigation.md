@@ -1857,3 +1857,19 @@ else:
   5. 验收：本地 `cargo check --workspace` + 远端**单文件**编译冒烟（`dsv41_glue.cu`、`moe_bs_shim.cu`）。
 - ⚠️ **注意**：`git merge <worktree-branch>` **无效**——subagent 的改动通常是**未提交**的，
   分支尖端仍指向基线提交（本次 `git merge prec-a2` 返回 "Already up to date"）。
+
+## §71 【精度·独立 CPU 验证】已合入的两门单测 **12/12 全绿**（主 agent 实跑）
+
+```
+cargo test -p ferrite-models --lib win_kv_quant   → 6 passed; 0 failed
+cargo test -p ferrite-models --lib routed_down_prep → 6 passed; 0 failed
+```
+关键用例（都是"对照独立参考实现"型，不是自证）：
+- `win_kv_quant_tests::cpu_reference_matches_the_python_reference_{floor,all_ones,spike_and_tails,large_spike}` ✓
+  ⇒ Rust 参考实现与**复现官方 `act_quant` 语义的 Python 参考**逐值一致；
+- `win_kv_quant_tests::cpu_reference_scale_is_a_power_of_two` ✓（守住 §D1 依赖的那条契约）；
+- `routed_down_prep_tests::cpu_reference_matches_an_independent_python_implementation` ✓、
+  `cpu_reference_applies_route_weight_before_bf16` ✓（正是官方 `model.py:849` 的顺序）、
+  `bf16_rn_is_round_to_nearest_even` ✓、`cpu_reference_uses_the_reference_amax_floor` ✓。
+
+⇒ 这两门的**语义正确性**在 CPU 上已被独立参考背书；剩下的是 GPU 上的**端到端**对拍（§58 的 DBG 五点回读 + 文本红线）。

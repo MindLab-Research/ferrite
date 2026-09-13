@@ -544,6 +544,14 @@ __global__ void tl_moe_bs_gather_kernel(const uint8_t* __restrict__ xq4,
             // SF BYTE ORDER TEST: swap byte positions (s[0]→MSB, s[3]→LSB)
             // Hypothesis: tcgen05's sf_id=0 might select MSB not LSB
             // Synthetic data (all 0x7F) masked this — real data has varying scales
+            if ((tl_bs_sf_not_pow2(s[0]) || tl_bs_sf_not_pow2(s[1]) ||
+                 tl_bs_sf_not_pow2(s[2]) || tl_bs_sf_not_pow2(s[3])) &&
+                atomicExch(&g_nonpow2_sf_seen, 1) == 0) {
+                printf("[moe-bs] WARNING: activation SF is not a power of two (e.g. %.9g) — "
+                       "ue8m0 expresses only powers of two, so it is being rounded. Numerically "
+                       "inert for all-zero blocks, but the bs arm silently assumes quant_fp8 "
+                       "keeps round_scale=true.\n", s[0]);
+            }
             w = (uint32_t)tl_bs_f_pow2_to_ue8m0(s[0]) |
                 ((uint32_t)tl_bs_f_pow2_to_ue8m0(s[1]) << 8) |
                 ((uint32_t)tl_bs_f_pow2_to_ue8m0(s[2]) << 16) |
@@ -551,6 +559,16 @@ __global__ void tl_moe_bs_gather_kernel(const uint8_t* __restrict__ xq4,
         }
         sfa[(int64_t)g * m + row] = w;
     }
+}
+
+// D1 (audit) VISIBILITY FIX: ue8m0 can only express POWERS OF TWO. quant_fp8 with
+// round_scale=true always emits a power of two EXCEPT for its all-zero-block floor
+// (fmaxf(scale, 1e-30)); a non-power-of-two activation scale would therefore be silently
+// rounded here. That is numerically inert for an all-zero block (every product is 0), but
+// the whole bs arm silently depends on round_scale staying true, so make it visible.
+__device__ int g_nonpow2_sf_seen = 0;
+__device__ __forceinline__ bool tl_bs_sf_not_pow2(float v) {
+    return v > 0.f && ((__float_as_uint(v) & 0x7FFFFFu) != 0u);   // a power of two has a zero mantissa
 }
 
 // ---------------------------------------------------------------------------
