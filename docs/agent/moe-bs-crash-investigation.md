@@ -3023,3 +3023,31 @@ step_lines=0   ar5_hang=56   （与未剥离时完全相同）
    而在此之前我在环境层反复猜了数轮 ✗ ——**"先证伪整层，再进入下一层"**。
 3. **harness 的验证必须走真实执行**（§110/§111）；同理，**回归定位也必须走可观测证据**
    （`ps` / 日志 mtime / `grep -c step pos`），而不是继续加跑整轮。
+
+## §118 回归修复后的**两个决定性实验**（预先定好，探针一回来即可执行）
+
+修复已入库（§117：有界等待门控回默认 OFF、恢复原无界等待）。随后按**分阶段探针**（`~/stage_probe.sh`）
+判读；无论结果如何，下一步都已定好：
+
+### 实验 A：**关掉 BS 臂**跑同一探针（隔离"是否与 BS 臂相关"）
+```bash
+cd ~/ferrite && sed -e 's/DSV41_MOE_TILELANG_BS=1/DSV41_MOE_TILELANG_BS=0/' \
+    -e 's/DSV41_MOE_BS_HANDWRITTEN=1/DSV41_MOE_BS_HANDWRITTEN=0/' ~/stage_probe.sh > ~/stage_probe_nobs.sh
+chmod +x ~/stage_probe_nobs.sh && bash ~/stage_probe_nobs.sh
+```
+- **若关掉 BS 臂后正常** ⇒ 卡顿与 **BS 臂**相关（那么嫌疑落在其 gather/scatter/AR 交互，而不是等待原语）✗
+- **若仍然卡** ⇒ 与 BS 臂无关，进入实验 B ✓
+
+### 实验 B：**代码二分**（用已备好的脚本，把代码退回合并波之前）
+```bash
+bash ~/bisect_probe.sh 7e54fd25            # SEQ_ALIGN 合并之前的代码状态（docs commit，但其 kernels/crates 是前一版）
+# 若那一版正常 ⇒ 逐段前进（先回 SEQ_ALIGN、再回有界等待前的版本…）定位到具体提交
+bash ~/bisect_probe.sh origin/main --restore   # 用完恢复
+```
+（候选锚点：`807f1c23` = SEQ_ALIGN 合并；其父 `7e54fd25` = 合并前的代码状态。）
+
+### 为什么这两个实验能终结犹豫
+- 实验 A 只需**一条命令、约 4 分钟**，且**不动代码**（只改探针脚本里的两个 env）⇒ 零风险 ✓；
+- 实验 B 是**教科书式二分**：把"近期改动"这一层整体证伪或定位到某个提交 ✓；
+- 两者都是**可观测**的（`STAGE 2/3/4` 的输出直接给出"起没起、请求通不通、有没有 step"）✓
+  ⇒ 不再出现"跑一整轮才发现无效"的浪费 ✓。
