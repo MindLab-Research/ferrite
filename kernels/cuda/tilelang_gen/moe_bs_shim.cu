@@ -700,6 +700,15 @@ bool tl_bs_init() {
         (void)cudaGetLastError();
         fprintf(stderr, "[moe-bs] pack geometry = %d\n", pg);
     }
+    // g_bounded_wait: DSV41_MOE_BS_BOUNDED_WAIT (default OFF) — see the kernel's comment
+    if (ok) {
+        int bw = 0;
+        const char* e = getenv("DSV41_MOE_BS_BOUNDED_WAIT");
+        if (e != nullptr && e[0] == '1') bw = 1;
+        (void)cudaMemcpyToSymbol(g_bounded_wait, &bw, sizeof(int));
+        (void)cudaGetLastError();
+        fprintf(stderr, "[moe-bs] bounded MMA wait = %d (0 = original unbounded, the default)\n", bw);
+    }
     // g_packed: stage the fp4 operand PACKED (two K elements per byte, the way the
     // hardware reads it) instead of unpacked
     if (ok) {

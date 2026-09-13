@@ -292,6 +292,14 @@ __device__ __forceinline__ uint64_t hw_make_sf_desc(void *smem_ptr) {
 //     garbage C. Only the VERBOSE state dump is behind `DSV41_MOE_BS_WAITDBG=1`
 //     (default OFF).
 __device__ int g_waitdbg = 0;                         // DSV41_MOE_BS_WAITDBG
+// g_bounded_wait: DSV41_MOE_BS_BOUNDED_WAIT (DEFAULT OFF, 2026-09-14 regression fix).
+// The bounded MMA wait was made ALWAYS-ON by the §92/§101 patch, and that is exactly when this
+// campaign first saw the serve hang (the user's anchor: "之前从来没卡过"). The stripped-env
+// control arm still hung, so the env is exonerated and the always-on wait change is the prime
+// suspect. DEFAULT is therefore restored to the ORIGINAL unbounded wait — which this project
+// used for its entire history without hanging — and the bounded variant is kept, gated, because
+// the no-revert rule says a change is turned OFF, never deleted.
+__device__ int g_bounded_wait = 0;                    // DSV41_MOE_BS_BOUNDED_WAIT
 __device__ unsigned long long g_wait_abort_n = 0ull;  // expired waits, whole grid
 // Spin cap for ONE MMA-completion wait. A worst-case MMA group is O(10 us) and a
 // probe is O(10 ns), so this is ~4 orders of magnitude of headroom; the property
@@ -906,8 +914,21 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
         // the whole block takes the abort path together.
         if (tid == 0) {
             // mbarrier wait (phase 0 for first use, then alternating)
-            if (whp_mma_wait_bounded(mma_bar, k & 1, k, seg, n_tile)) {
-                hw_wait_fail = 1;   // published to all 128 threads by the barrier below
+            if (g_bounded_wait) {
+                if (whp_mma_wait_bounded(mma_bar, k & 1, k, seg, n_tile)) {
+                    hw_wait_fail = 1;   // published to all 128 threads by the barrier below
+                }
+            } else {
+                // DEFAULT (restored): the ORIGINAL unbounded wait used for this kernel's whole
+                // history. Kept as the default because the always-on bounded wait is the prime
+                // suspect for the regression that made the serve hang on its first request.
+                const uint32_t phase = k & 1;
+                asm volatile(
+                    "{\n\t.reg .pred P;\n\t"
+                    "WAIT:\n\t"
+                    "mbarrier.try_wait.parity.shared::cta.b64 P, [%0], %1;\n\t"
+                    "@!P bra WAIT;\n\t}"
+                    :: "r"((uint32_t)__cvta_generic_to_shared(mma_bar)), "r"(phase));
             }
         }
         // tcgen05 thread-sync fences (TileLang's pattern): the MMA is an async tcgen05
