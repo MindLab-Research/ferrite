@@ -1058,3 +1058,20 @@ git diff --stat | tail -6    # 4 files changed, 797 insertions(+), 8 deletions(-
 ```
 **纪律**：跨 worktree 搬代码时，**必须**用 `grep -c <新符号>` + `git diff --stat` **双向确认落地**，
 不要相信 apply 的"cleanly"字样。
+
+## §37 历史语义旁证（印证根因**在权重侧**）
+
+shim 里能力符号 `dsv41_moe_bs_act_e4m3_cap()` 的注释（`moe_bs_shim.cu` §8 导出符号 3）记载：
+
+> "D2 修复把 `xq4` 的**语义**从「packed fp4 半字节（dim/2 B/行）」改成「e4m3（dim B/行）」，
+>  但 **C ABI 的形状没变**（还是 `const uint8_t*` + 同样的形参序）⇒ 旧 `.so` 会**静默**把
+>  5120 B 的行当 2560 B 的 fp4 读（错值，不是报错）。"
+
+⇒ **历史上激活侧**曾是 fp4-packed 半字节（`dim/2` B/行，**正是 packed**！），后来被改成 e4m3（`dim` B/行）。
+即：**"packed 半字节"在这条代码线里本来就是既有语义**，只是用在了激活侧；
+而**权重侧的 fp4（W1/W3）一直是 fp4**，我们却把它按 **unpacked（1 字节/元素）** staging 到 smem
+——这正是 §29 定谳的那处错，且与"历史上 packed 语义确实存在"互相印证。
+
+**教训**：当 C ABI 的形状不变而语义变过（如上面 D2 那次），**必须靠能力符号/断言钉死语义**，
+否则就是"静默错值面"。我们对 W 侧的 staging 正是踩在同类面上：**形状对了（都是 u8 指针），
+语义错了（packed vs unpacked）**。
