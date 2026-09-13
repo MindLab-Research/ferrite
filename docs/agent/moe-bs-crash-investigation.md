@@ -3144,3 +3144,22 @@ SH_PAIR_MROWS=false INDEXER_MROWS=false COMPRESSOR_MROWS=false SH_EXP_TILELANG=f
 1. **若 `11e16d24` 通过** ⇒ 探针因果**定案**（§119）+ **验证通路首次打通** ✓ ⇒ 立即进入
    `staged_verify.sh arm1`（两朝向判据）✓；
 2. **若仍卡** ⇒ 按 §118 实验 B：`bash ~/bisect_probe.sh 7e54fd25`（把代码退回合并波之前）二分 ✓。
+
+## §123 【风险预警】出货回归脚本 `push400_hw_test.sh` 开着 `DSV41_ACC_HISTOGRAM` ⇒ 与 §119 同类风险
+
+按 §120 的规则把"回读类探针"普查推广到**出货/收尾脚本**，结果：
+
+| 脚本 | 回读类探针 | 判定 |
+|---|---|---|
+| `~/push400_hw_test.sh`（出货回归/400 压测） | **`DSV41_ACC_HISTOGRAM`** ✗ | **同类风险**（逐步回读 ⇒ 在 lockstep 多 rank 下可能拖死集群） |
+| `~/verify_correct.sh`（正确性验收） | 无 ✓ | 安全 |
+| `~/arm_run_fast.sh`（性能臂） | 无 ✓ | 安全（已把 NUMCHECK 从 `arm_run` 移除后 ✓） |
+
+**处置建议（收尾时执行）**：
+1. 用 `endgame.sh` / `staged_verify.sh bench` 跑**性能/压测**时，**先不带** `DSV41_ACC_HISTOGRAM` ✓；
+2. 若确实要看 accept 直方图 ⇒ **单独跑一臂**并接受"可能卡"的风险（此时按 §119：**先怀疑探针** ✗）；
+3. 若 `push400_hw_test.sh` 在收尾时卡住 ⇒ **第一步就把它里面的 `DSV41_ACC_HISTOGRAM` 去掉**再重跑 ✓，
+   而不是去查模型/kernel ✓（这正是 §119 的教训在新场景的应用）。
+
+**注**：该探针在此前的"能跑通"轮次里**没有被使用**（`arm_run` 的 COMMON 从未含它 ✓）⇒
+把它当作**新引入的变量**对待，符合本战役"一次一个变量"的纪律 ✓。
