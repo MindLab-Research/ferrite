@@ -1,12 +1,19 @@
 #!/bin/bash
-# Batch 10 (fix confirmation): if the mbarrier ring is the fix, the SAME measurements that exposed
-# the race must now come out clean —
-#   1. determinism: two runs of the ring config must be bit-identical;
+# Batch 10 (fix confirmation): if the mbarrier fix is right, the SAME measurements that exposed the
+# race must now come out clean —
+#   1. determinism: two runs must be bit-identical;
 #   2. ZERO_A: with the A operand actually consumed, zeroing g_a must give an output of EXACTLY 0;
-#   3. correctness: the ring arm vs the official-semantics oracle (full K);
+#   3. correctness: the arm vs the official-semantics oracle (full K);
 #   4. the text red line (the counting prompt must come back).
+#
+# Usage: batch10_fixconfirm.sh [MBAR_RING|MBAR_PERSTAGE|MBAR_RING+MBAR_PERSTAGE] [label]
 set -uo pipefail
 cd "$HOME/ferrite"
+MODE="${1:-MBAR_RING}"
+LABEL="${2:-${MODE//+/_}}"
+GATE=""
+for m in ${MODE//+/ }; do GATE="$GATE DSV41_MOE_BS_$m=1"; done
+echo "=== mode: $MODE  (gate:$GATE) label: $LABEL ==="
 
 echo "=== rebuild BOTH artefacts + freshness gate ==="
 (cd kernels/cuda && set -o pipefail; bash build.sh 103a 2>&1 | tail -2; echo KERNEL_RC=${PIPESTATUS[0]})
@@ -26,9 +33,9 @@ run () {
 }
 
 rm -rf /tmp/rn_a /tmp/rn_b /tmp/rn_za
-run RN_A  DSV41_GATEUP_DUMP=/tmp/rn_a  DSV41_MOE_BS_MBAR_RING=1
-run RN_B  DSV41_GATEUP_DUMP=/tmp/rn_b  DSV41_MOE_BS_MBAR_RING=1
-run RN_ZA DSV41_GATEUP_DUMP=/tmp/rn_za DSV41_MOE_BS_MBAR_RING=1 DSV41_MOE_BS_ZERO_A=1
+run RN_A  DSV41_GATEUP_DUMP=/tmp/rn_a  $GATE
+run RN_B  DSV41_GATEUP_DUMP=/tmp/rn_b  $GATE
+run RN_ZA DSV41_GATEUP_DUMP=/tmp/rn_za $GATE DSV41_MOE_BS_ZERO_A=1
 
 echo "=== 1. determinism (must be bit-identical) ==="
 cmp -s /tmp/rn_a/eager/gateup.f32 /tmp/rn_b/eager/gateup.f32 \
