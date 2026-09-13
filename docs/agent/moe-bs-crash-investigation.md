@@ -1618,3 +1618,18 @@ grep -E "routed-down-quant" ~/armrun_RQ1.log | head -20     # 5 组值 + 主机�
 
 ⇒ 权重 SF 的**每专家平面尺寸、K 组步长（HW_NP=320 词 = 一组的 inter 行）、行索引**三处自洽 ✓
 （`s_stride`/`t_stride` 也在 Rust 侧被断言等于该值，不满足则不 arm——而臂确实 arm 了 ✓）。
+
+## §60 排除：pad 段的 `eid` 取 0 ⇒ 不存在"越界 expert id"
+
+假设：手写 kernel 只取 `blockIdx.y` 作 seg（`moe_bs_handwritten.cu:267`，**自身无 `seg >= nseg` 守卫**），
+若 `seg ≥ nseg` 的块读到越界 expert id，就会让权重指针出界 ⇒ 非法访问 ⇒ 后续 launch 报错 ⇒
+入口在 `if (e != cudaSuccess) return` 处提前返回（同时解释 `[NC]` 不打印 + e2e 输出错）。
+
+**证伪**：shim 的 ABI 文档明写（`moe_bs_shim.cu:94-96`）：
+```
+counts[SEG_CAP] : i32 -- 该段的 live 行数（1..2；**pad 段 0**）
+eid[SEG_CAP]    : i32 -- 该段的 expert id（**pad 段任意，取 0**）
+```
+⇒ pad 段的 `eid = 0` 是**合法** id（expert 0 在池内）⇒ 不存在越界权重指针 ⇒ **该假设作废** ✓
+（pad 段算出的行不会被使用：scatter 侧按 `counts[seg]==0` 早退 ✓）。
+⇒ **`[NC]` 不进入的原因仍待 NC-TRACE 逐行探针回答**（T2 窗口运行中；9 处提前 return 都已带行号打印）。
