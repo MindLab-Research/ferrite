@@ -371,6 +371,31 @@ __device__ unsigned long long g_wait_abort_n = 0ull;  // expired waits, whole gr
 // that matters is that it is FINITE.
 #define WHP_MMA_SPIN_CAP (1u << 22)
 
+// Device-visible copy of the cap (DSV41_MOE_BS_SPIN_CAP=<n>, default WHP_MMA_SPIN_CAP).
+// A DIAGNOSTIC override, and the only way to exercise the abort path DETERMINISTICALLY:
+// SPIN_CAP=1 makes every wait expire, so one run proves the whole abort-visibility chain
+// (sentinel in C + grid counter + printf) end to end. Never set it in a measurement run.
+__device__ unsigned int g_spin_cap = WHP_MMA_SPIN_CAP;
+
+// ---------------------------------------------------------------------------
+// ABORT VISIBILITY (2026-09-14). The bounded wait's abort path used to `return`
+// WITHOUT writing C. C (`g_c` in moe_bs_shim.cu) is a cudaMalloc'd scratch that
+// every launch reuses, so the scatter then copied the PREVIOUS launch's numbers
+// into `out` — a silent wrong value, which is precisely the red line this project
+// forbids. These two knobs make that impossible:
+//   g_abort_mark     : 1 (DEFAULT) => the abort path overwrites THIS block's own
+//                      128x128 C tile with `g_abort_sentinel` before it returns;
+//                      DSV41_MOE_BS_ABORT_MARK=0 restores the historical (silently
+//                      wrong) behaviour for A/B purposes only.
+//   g_abort_sentinel : the f32 BIT PATTERN written (DEFAULT 0x7FC00000 = quiet NaN,
+//                      i.e. an obvious, self-propagating failure: NaN reaches the
+//                      scatter -> `out` -> swiglu -> the all-reduce -> the text).
+//                      DSV41_MOE_BS_ABORT_SENTINEL_BITS=<int> overrides it (0 => zero,
+//                      0x7F800000 => +inf) for callers that must not see NaN.
+// ---------------------------------------------------------------------------
+__device__ int g_abort_mark = 1;
+__device__ unsigned int g_abort_sentinel = 0x7FC00000u;   // quiet NaN
+
 // One mbarrier parity probe: the SAME instruction as the original loop, but the
 // result is returned to C instead of driving an asm-level back-branch. The bound
 // therefore lives in readable C — a counter inside an asm template is the kind
@@ -423,9 +448,11 @@ __device__ __noinline__ void whp_mma_timeout_report(
 // must stop and must NOT touch the TMEM accumulator).
 __device__ __forceinline__ bool whp_mma_wait_bounded(
     uint64_t* bar, uint32_t phase, int k, int seg, int n_tile) {
+    // Snapshot into a register: the cap must not be re-read (and must not change) mid-spin.
+    const unsigned int cap = g_spin_cap;
     for (uint32_t spins = 0;; ++spins) {
         if (whp_mbar_probe(bar, phase)) return false;
-        if (spins >= WHP_MMA_SPIN_CAP) {
+        if (spins >= cap) {
             whp_mma_timeout_report(bar, phase, k, seg, n_tile, threadIdx.x >> 5,
                                    threadIdx.x & 31);
             return true;
@@ -864,7 +891,17 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
         // this splits "even a single stage is wrong in production" (host-side ingest / staging)
         // from "the stage-to-stage progression is wrong". `k` is block-uniform, so the branch and
         // the break are legal.
-        if (g_stage1 && k > 0) break;
+        if (g_stage1 && k > 0) {
+            // DRAIN before leaving (gate DSV41_MOE_BS_CPASYNC, default OFF): the k=0 body
+            // issued the k=1 prefetch into the OTHER stage and `wait_group 1` left it in
+            // flight. C_sh ALIASES the operand region ([0,65536)), so an undrained group
+            // lands AFTER the epilogue's C_sh writes and silently corrupts C. All threads
+            // reach this point (k and g_stage1 are block-uniform) and the wait cannot hang
+            // — a cp.async group is a plain memory transaction, unlike the MMA's mbarrier
+            // arrival that the abort path exists for.
+            if (g_cpasync) hw_cp_async_wait<0>();
+            break;
+        }
         const int s = g_cpasync ? (k & 1) : 0;
         uint8_t* A_s = A_sh + (size_t)s * HW_BM * HW_BK;   // this iteration's A stage
         uint8_t* B_s = B_sh + (size_t)s * HW_BM * HW_BK;
@@ -1116,15 +1153,42 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
     }
 
     // ---- ABORT PATH: the MMA completion never arrived inside the bounded window ----
-    // Do NOT read TMEM (the accumulator holds an unknown mix of K-iterations) and do
-    // NOT write C_sh: the only correct behaviour is to release the TMEM columns and
-    // return so the caller's next CUDA call reports the failure instead of the rank
-    // hanging the whole serve. The loud report already happened in
-    // whp_mma_timeout_report. With the cp.async gate ON there may still be in-flight
-    // groups here; they are abandoned deliberately — nothing on this path reads the
-    // staged smem, and adding a drain would put a second wait on the failure path.
+    // Do NOT read TMEM (the accumulator holds an unknown mix of K-iterations).
+    // What we DO have to do is make the failure IMPOSSIBLE TO MISREAD: C is a
+    // cudaMalloc'd scratch reused by every launch, so simply returning left the
+    // PREVIOUS launch's numbers in this block's tile and the scatter copied them into
+    // `out` as if they were this round's result. Instead (g_abort_mark, default ON):
+    // overwrite this block's own 128x128 C tile with g_abort_sentinel and count the
+    // abort grid-wide (g_wait_abort_n, incremented in whp_mma_timeout_report; read back
+    // by `dsv41_moe_bs_wait_abort_n` in moe_bs_shim.cu).
     if (hw_wait_fail) {
+        // Drain in-flight cp.async groups FIRST. Unlike the mbarrier arrival (which is
+        // exactly what failed to show up), these copies are plain memory transactions and
+        // always complete — and an abandoned group can land in smem AFTER this CTA exits,
+        // i.e. inside whichever CTA the scheduler hands the same smem to. The old comment
+        // here ("adding a drain would put a second wait on the failure path") traded a
+        // bounded wait for a cross-CTA smem write; the drain is the safer side.
+        if (g_cpasync) hw_cp_async_wait<0>();
         __syncthreads();
+        if (g_abort_mark) {
+            const float mark = __uint_as_float(g_abort_sentinel);
+            // Same address set the epilogue would have written, and identical under
+            // swapAB (the epilogue's two branches permute r/c inside the SAME tile).
+            for (int i = tid; i < HW_BM * HW_BN; i += 128) {
+                const int r = i >> 7;
+                const int c = i & 127;
+                C[(int64_t)(seg * HW_BM + r) * HW_NUP + n_tile * HW_BN + c] = mark;
+            }
+        }
+        // One line per aborted block, rate-limited exactly like whp_mma_timeout_report so a
+        // grid-wide failure cannot flood the device printf buffer.
+        if (tid == 0 && g_abort_mark && g_wait_abort_n <= 8ull) {
+            printf("[moe-bs-wait] ABORT block=(%d,%d): C tile -> sentinel 0x%08x "
+                   "(abort_n=%llu)... callers MUST NOT treat this output as a result\n",
+                   seg, n_tile, g_abort_sentinel, g_wait_abort_n);
+        }
+        // No threadfence needed: the following scatter kernel is launched on the SAME stream,
+        // and CUDA orders a kernel's global writes before subsequent work on that stream.
         if (warp == 0) {
             hw_tc_dealloc(C_tmem, 128);
             hw_tc_dealloc(SF_tmem, 32);

@@ -277,6 +277,32 @@ uint8_t* g_sfdump_buf = nullptr;   // kSfDumpBytes
 bool g_sfdump_armed = false;
 extern "C" void* dsv41_moe_bs_sfdump_ptr() { return g_sfdump_buf; }
 extern "C" int dsv41_moe_bs_sfdump_bytes() { return (int)kSfDumpBytes; }
+// Host mirror of the abort sentinel (initialized in tl_bs_init, defaults to quiet NaN).
+unsigned int g_abort_sentinel_host = 0x7FC00000u;
+
+// DSV41_MOE_BS_ABORT_FAIL=1 (default OFF): turn a detected MMA-wait abort into a hard ERROR
+// (`cudaErrorLaunchFailure`) instead of letting the NaN-marked output flow on. The sentinel
+// already makes the wrongness impossible to MISS; this makes it impossible to CONTINUE, which
+// is what an unattended e2e run wants. Only consulted on the synchronising diagnostic path.
+static bool g_abort_fail = []() {
+    const char* v = getenv("DSV41_MOE_BS_ABORT_FAIL");
+    return v != nullptr && v[0] != '0';
+}();
+
+// ABORT COUNTER READBACK: how many MMA-completion waits have expired (== how many
+// (seg, n_tile) C tiles the hand-written kernel marked with the abort sentinel) since
+// the .so was loaded. THE machine-readable half of the abort report — the device printf
+// is rate-limited to 8 lines and can be missed in a log; this number cannot.
+//   * never call it inside a CUDA-graph capture (it is a D2H copy -> illegal there);
+//   * negative return = the readback itself failed, so the value is NOT meaningful.
+// Grows monotonically ⇒ a caller compares it before/after a run (or uses the shim's own
+// [moe-bs][WAIT-ABORT] line, which does exactly that).
+extern "C" long long dsv41_moe_bs_wait_abort_n() {
+    unsigned long long v = 0ull;
+    const cudaError_t e = cudaMemcpyFromSymbol(&v, g_wait_abort_n, sizeof(v));
+    if (e != cudaSuccess) { (void)cudaGetLastError(); return -1; }
+    return (long long)v;
+}
 // The MMA's RAW output tile (before the scatter). The caller copies it back exactly like the SFDUMP
 // scratch — deliberately NOT here, because a stream sync inside the shim's decode path is the §119
 // lockstep deadlock class. It splits "the MMA/epilogue produced this" from "the scatter or a stale
@@ -753,6 +779,29 @@ bool tl_bs_init() {
         (void)cudaGetLastError();
         fprintf(stderr, "[moe-bs] bounded MMA wait = %d (0 = original unbounded, the default)\n", bw);
     }
+    // ABORT VISIBILITY knobs (kernel `g_abort_mark` / `g_abort_sentinel` /
+    // `g_spin_cap`). DEFAULT = mark ON with NaN: the moment a bounded wait expires,
+    // this block's C tile stops being "whatever the previous launch left there" and
+    // becomes a NaN the caller cannot mistake for a result. `DSV41_MOE_BS_SPIN_CAP=<n>`
+    // lowers the spin cap (1 = EVERY wait expires) so the abort path can be exercised
+    // deterministically — a self-test of the whole visibility chain, not a measurement.
+    if (ok) {
+        int am = 1;
+        const char* e = getenv("DSV41_MOE_BS_ABORT_MARK");
+        if (e != nullptr && e[0] == '0') am = 0;
+        (void)cudaMemcpyToSymbol(g_abort_mark, &am, sizeof(int));
+        unsigned long cap = (unsigned long)WHP_MMA_SPIN_CAP;
+        const char* c = getenv("DSV41_MOE_BS_SPIN_CAP");
+        if (c != nullptr && c[0] != '\0') cap = strtoul(c, nullptr, 0);
+        unsigned int caps = (unsigned int)cap;
+        (void)cudaMemcpyToSymbol(g_spin_cap, &caps, sizeof(unsigned int));
+        const char* b = getenv("DSV41_MOE_BS_ABORT_SENTINEL_BITS");
+        if (b != nullptr && b[0] != '\0') g_abort_sentinel_host = (unsigned int)strtoul(b, nullptr, 0);
+        (void)cudaMemcpyToSymbol(g_abort_sentinel, &g_abort_sentinel_host, sizeof(unsigned int));
+        (void)cudaGetLastError();
+        fprintf(stderr, "[moe-bs] abort mark = %d, sentinel bits = 0x%08x, spin cap = %u\n",
+                am, g_abort_sentinel_host, caps);
+    }
     // g_packed: stage the fp4 operand PACKED (two K elements per byte, the way the
     // hardware reads it) instead of unpacked
     if (ok) {
@@ -918,6 +967,17 @@ bool tl_bs_init() {
              cudaMalloc(&g_counts, kSegCap * sizeof(int)) == cudaSuccess &&
              cudaMalloc(&g_nseg, sizeof(int)) == cudaSuccess &&
              cudaMalloc(&g_sfdump_buf, kSfDumpBytes) == cudaSuccess;
+        // cudaMalloc leaves the buffers UNINITIALISED, so the first call of a process reads whatever
+        // the driver handed back — which is one half of the "identical inputs, different outputs"
+        // anomaly. Zeroing them at init turns that half into a deterministic 0, so the ZERO_* probes
+        // and the raw-tile check become clean binary questions instead of "is it exactly zero yet".
+        if (ok) {
+            (void)cudaMemset(g_a, 0, (size_t)kSegCap * kBm * kDim);
+            (void)cudaMemset(g_sfa, 0, (size_t)kSfWords * kSegCap * kBm * 4);
+            (void)cudaMemset(g_c, 0, (size_t)kSegCap * kBm * kNup * 4);
+            (void)cudaMemset(g_sfdump_buf, 0, kSfDumpBytes);
+            (void)cudaDeviceSynchronize();
+        }
         (void)cudaGetLastError();
     }
     if (!ok) {
@@ -1391,6 +1451,22 @@ extern "C" int dsv41_moe_tilelang_gate_up_bs_dev(
                 fprintf(stderr, "[moe-bs][SYNC-DIAG] HANDWRITTEN MMA done: %s\n",
                         ehw == cudaSuccess ? "OK" : cudaGetErrorString(ehw));
                 if (ehw != cudaSuccess) return (int)ehw;
+                // ABORT REPORT (machine-readable half): the kernel completes "successfully"
+                // even when a block took the bounded-wait abort path, so the ONLY host-side
+                // evidence is this counter. The stream is already synchronised above, so the
+                // device symbol is final; reading it never happens inside a capture (this
+                // whole block is guarded).
+                const long long n_now = dsv41_moe_bs_wait_abort_n();
+                static long long n_seen = 0;
+                if (n_now > n_seen) {
+                    fprintf(stderr,
+                            "[moe-bs][WAIT-ABORT] MMA-completion waits expired: total=%lld "
+                            "(delta=%lld) — those C tiles were overwritten with sentinel "
+                            "0x%08x; THE OUTPUT OF THIS LAUNCH IS NOT A RESULT\n",
+                            n_now, n_now - n_seen, g_abort_sentinel_host);
+                    n_seen = n_now;
+                    if (g_abort_fail) return (int)cudaErrorLaunchFailure;
+                }
             }
         }
         // M2 FIX (found by the bs-wiring-audit review): this branch used to `goto
