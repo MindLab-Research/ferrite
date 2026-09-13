@@ -654,6 +654,49 @@ struct Kernels {
             c_int, c_int, c_int, c_int, CuStream,
         ) -> c_int,
     >,
+    // PROJ-MMA (`dsv41_gemm_fp8_mrows_mma`, from the dedicated PROJ-MMA TU
+    // `kernels/cuda/dsv41_proj_mma_skel.cu`): the TENSOR-CORE form of the
+    // multi-row fp8 GEMV above — `gemm_fp8_mrows_mma_kernel<M>`, ONE
+    // `mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32` retiring
+    // 16x8x32 = 4096 MACs, with the WEIGHT on the MMA's M (16 output channels
+    // per tile) and the ACTIVATION on its N (8 rows). The mapping is the M<=8
+    // generalisation of `dsv41_gemm_fp8_swapab` (M=1 decode on the tensor core),
+    // i.e. the same axis choice the tree already ships. See
+    // docs/agent/tensorcore-proj-design.md §3 (implementation framework) §7
+    // (merge timing).
+    //
+    // ⚠️ NUMERICS: this program is NOT bit-identical to `gemm_fp8_mrows` — the
+    // k-block scale is applied to the 32-element SUM instead of per element, and
+    // the tensor core's intra-block summation order is hardware-defined (§2 of
+    // the design proves the SIMT parity impossible, not merely unproven). What
+    // this program DOES guarantee, bit for bit, is
+    //     row r of an M-row launch == row r of the M=1 launch of THIS program
+    // because column r of the mma's D is a function of column r of B and A
+    // alone (same program at every m ⇒ (b′) program-consistent parity). The arm
+    // is therefore judged by the dual gate (step_ms AND mean-k), never by a byte
+    // compare against the SIMT path.
+    //
+    // ROUND 1 (`ks == 1`) needs NO scratch, so the wrapper below passes
+    // `partial`/`ctr` null: the C entry only proceeds when its resolved K-split
+    // is 1 (any ks > 1 hits its own scratch guard and returns 2 = declined).
+    // Consequence: the arm needs `DSV41_PROJ_MMA_KS=1` until the `[ks][M][n]`
+    // partial scratch is sized on this side. `pmma_n` follows the launcher's
+    // contract (the caller's promise that `partial` covers `n` rows) and takes
+    // the tightest truthful value with no scratch: `n` itself.
+    //
+    // Optional: a stale .so without the symbol keeps the `gemm_fp8_mrows` path,
+    // and the C entry returns 2 (declined, never cudaErrorInvalidValue) for `m`
+    // outside 1..=8, `n` not a multiple of 16, `k` not a multiple of 32,
+    // `out_stride < n`, a non-16B-aligned activation/weight base, or a K-split
+    // that resolves above 1 with no scratch pointer.
+    // ABI: (a, a_scale, w, w_scale, bias, out, m, n, k, out_stride, partial,
+    //       ctr, pmma_n, s).
+    gemm_fp8_mrows_mma: Option<
+        unsafe extern "C" fn(
+            *const u8, *const f32, *const u8, *const u8, *const f32, *mut f32,
+            c_int, c_int, c_int, c_int, *mut f32, *mut c_uint, c_int, CuStream,
+        ) -> c_int,
+    >,
     // K2, from dsv41_kernels.cu (`dsv41_gemm_fp8_mrows_rope_norm`): the verify's
     // q-chain tail folded into ONE launch — rmsnorm + fp8 quantisation + the
     // wq_b multi-row fp8 GEMV + RoPE, each segment reproduced from the kernel the
@@ -1629,6 +1672,7 @@ impl Device {
             bf16_roundtrip: ko!(rt, "dsv41_bf16_roundtrip"),
             wo_a_grouped_fp8: ko!(rt, "dsv41_wo_a_grouped_fp8"),
             gemm_fp8_mrows: ko!(rt, "dsv41_gemm_fp8_mrows"),
+            gemm_fp8_mrows_mma: ko!(rt, "dsv41_gemm_fp8_mrows_mma"),
             gemm_fp8_mrows_rope_norm: ko!(rt, "dsv41_gemm_fp8_mrows_rope_norm"),
             gemm_fp8_mrows2: ko!(rt, "dsv41_gemm_fp8_mrows2"),
             gemm_fp8_mrows_f32: ko!(rt, "dsv41_gemm_fp8_mrows_f32"),
@@ -4786,6 +4830,85 @@ impl Device {
     /// per-row loop, which is the bit-exact reference they were verified against.
     pub fn supports_gemm_fp8_mrows(&self) -> bool {
         self.kernels.gemm_fp8_mrows.is_some()
+    }
+
+    /// PROJ-MMA: the TENSOR-CORE program for the same call shape as
+    /// [`Self::gemm_fp8_mrows`] — `dsv41_gemm_fp8_mrows_mma` /
+    /// `gemm_fp8_mrows_mma_kernel<M>` (see the `Kernels::gemm_fp8_mrows_mma`
+    /// field for the mapping and the numerics contract, and
+    /// docs/agent/tensorcore-proj-design.md §3).
+    ///
+    /// Deliberately the SAME argument list as `gemm_fp8_mrows`, so a caller can
+    /// swap the program without touching its activation staging: `a` [rows, k]
+    /// fp8 e4m3, `a_scale` [rows, k/32] f32, `out` f32 with row `r` at
+    /// `+r*out_stride` (`out_stride` a separate parameter, for the wq_b site
+    /// whose row is `nh*head_dim` wide while this rank writes `nlh*head_dim`).
+    ///
+    /// The K-split scratch (`partial` [ks][M][n], `ctr` [n/16]) is NOT wired on
+    /// this side yet — round 1 is `ks == 1`, which needs none — so this wrapper
+    /// passes both null and `pmma_n = n`. A K-split the C entry resolves above 1
+    /// then DECLINES (returns 2) instead of touching scratch, and the caller
+    /// keeps its `gemm_fp8_mrows` readout. Arming therefore requires
+    /// `DSV41_PROJ_MMA=1` AND a ks that resolves to 1 (`DSV41_PROJ_MMA_KS=1`)
+    /// until the `[ks][M][n]` sizing lands.
+    ///
+    /// `Ok(false)` means NOT performed — either the loaded .so predates the
+    /// symbol (PROJ-MMA TU absent from the build) or the C entry declined (it
+    /// returns 2, never cudaErrorInvalidValue, so a decline can never read as a
+    /// launch failure).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_fp8_mrows_mma(
+        &self,
+        a: *const u8,
+        a_scale: *const f32,
+        w: *const u8,
+        w_scale: *const u8,
+        bias: *const f32,
+        out: *mut f32,
+        rows: i32,
+        n: i32,
+        k: i32,
+        out_stride: i32,
+    ) -> Result<bool> {
+        let Some(f) = self.kernels.gemm_fp8_mrows_mma else {
+            return Ok(false);
+        };
+        if !(1..=8).contains(&rows) {
+            return Ok(false);
+        }
+        let rc = unsafe {
+            f(
+                a,
+                a_scale,
+                w,
+                w_scale,
+                bias,
+                out,
+                rows,
+                n,
+                k,
+                out_stride,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                n, // pmma_n: no scratch claim — the C entry only proceeds at ks == 1
+                self.stream,
+            )
+        };
+        // 2 = the kernel's "declined" (shape / mode / scratch), the caller falls back.
+        if rc == 2 {
+            return Ok(false);
+        }
+        self.kerr(rc, "dsv41_gemm_fp8_mrows_mma")?;
+        Ok(true)
+    }
+
+    /// True when the loaded .so carries the PROJ-MMA entry
+    /// (`dsv41_gemm_fp8_mrows_mma`, compiled in by default from the PROJ-MMA TU
+    /// — see `kernels/cuda/build.sh`). A stale .so that predates the TU leaves
+    /// the projection sites on `gemm_fp8_mrows` (MPAR > legacy), which is the
+    /// program they were verified against.
+    pub fn supports_gemm_fp8_mrows_mma(&self) -> bool {
+        self.kernels.gemm_fp8_mrows_mma.is_some()
     }
 
     /// K2: the verify's q-chain tail in ONE launch — rmsnorm(`qr_raw`) + its fp8

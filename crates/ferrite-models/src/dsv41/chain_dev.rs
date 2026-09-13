@@ -1532,6 +1532,31 @@ fn engram_proj_mrows_declined_note() {
     });
 }
 
+/// One-shot receipt for [`DevChain::proj_mma`], same trap and same discipline as
+/// the mrows notes above: `DSV41_PROJ_MMA=1` is armed but the TENSOR-CORE
+/// program was NOT taken (a `.so` without the PROJ-MMA TU, a shape the C entry
+/// declines, or a K-split that resolves above 1 while the `[ks][M][n]` scratch
+/// is still unwired on this side), so the projections fall back to
+/// `dsv41_gemm_fp8_mrows` (MPAR > SIMT legacy). Printed once per process, and
+/// only when the gate is armed, so the shipped default log is unchanged.
+///
+/// The ARMED side needs no line here: the C launcher prints its own
+/// `[proj-mma] ARMED m=.. n=.. k=.. ks=.. -> grid=..` receipt on the first armed
+/// launch, and the arm's kernel name (`gemm_fp8_mrows_mma_kernel`) is visible to
+/// nsys. This line closes the other half — the "armed but inert" phantom gate.
+fn proj_mma_declined_note() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        eprintln!(
+            "[proj-mma] ARMED but DECLINED: no `dsv41_gemm_fp8_mrows_mma` take in \
+             this build (.so / shape / scratch) -> the projections keep \
+             `dsv41_gemm_fp8_mrows` (MPAR > SIMT legacy). Round 1 arms ks=1 only \
+             (DSV41_PROJ_MMA_KS=1): any ks>1 needs the [ks][M][n] partial scratch, \
+             which is not sized yet. Do NOT read this run as a PROJ_MMA measurement."
+        );
+    });
+}
+
 /// ENGRAM-GATHER-MROWS (`DSV41_ENGRAM_GATHER_MROWS=1`, DEFAULT OFF): the
 /// multi-row engram gather runs as ONE `dsv41_engram_gather_rows` launch for all
 /// `m` rows, instead of `m` one-row gathers (12 launches per verify block at
@@ -5353,6 +5378,22 @@ impl<'a> DevChain<'a> {
     /// it, or the swapAB opt-in is on (that arm is explicitly NOT bit-identical to
     /// the SIMT gemv and keeps its own kernel).
     ///
+    /// **PROJ-MMA (`DSV41_PROJ_MMA=1`, default OFF)** — checked FIRST, and before
+    /// the swapAB refusal: when armed, the whole projection family runs the
+    /// tensor-core program [`Device::gemm_fp8_mrows_mma`] (see
+    /// [`Self::proj_mma`]) and this function returns its verdict. The switch
+    /// order is ① PROJ_MMA > ② MPAR > ③ SIMT legacy; ②/③ both live inside the C
+    /// entry, so the mma arm simply selects the other symbol. On a decline (a
+    /// stale `.so`, a shape the C entry refuses, or a K-split resolving above 1
+    /// with no scratch) the note fires once and the C entry runs — a decline IS
+    /// the unarmed sequence, by construction rather than by argument.
+    ///
+    /// ⚠️ ① vs ② is EXCLUSIVE: when the mma program is taken, no `[mrows-mpar]
+    /// ARMED` receipt appears for that launch (they change the same product
+    /// chain, so an A/B mixing them would measure nothing). ⚠️ `DSV41_PROJ_MMA`
+    /// is NOT bit-identical to this function's SIMT reference; arm it for the
+    /// dual-gate measurement (step_ms AND mean-k), never for byte parity.
+    ///
     /// `DSV41_GEMV_A32` (Direction B, LANDED): the mrows kernel carries BOTH
     /// activation forms and selects on the same process gate the M=1 GEMV reads,
     /// so the multi-row launch is the same program at either setting —
@@ -5371,6 +5412,34 @@ impl<'a> DevChain<'a> {
         k: i32,
         out_stride: i32,
     ) -> Result<bool> {
+        // ① PROJ_MMA (numerics-changing): checked FIRST, and BEFORE the swapAB
+        // refusal below. Switch order ① MMA > ② MPAR > ③ SIMT legacy; ②/③ both
+        // live inside the C entry `dsv41_gemm_fp8_mrows`, so from here the choice
+        // is simply "mma program or the C entry". The ORDER matters: the (b′)
+        // arm pairs `DSV41_PROJ_MMA=1` with `DSV41_SWAPAB=1` (attention's m=1
+        // half on the tensor core too), and with the refusal first the mma arm
+        // would be unreachable under exactly that pairing — the "armed but inert"
+        // phantom gate this tree has been bitten by repeatedly.
+        if Self::proj_mma() {
+            if self.dev.gemm_fp8_mrows_mma(
+                self.s.xq_r.ptr as *const u8,
+                self.s.xsc_r.ptr as *const f32,
+                w,
+                ws,
+                std::ptr::null(),
+                out,
+                rows as i32,
+                n,
+                k,
+                out_stride,
+            )? {
+                return Ok(true);
+            }
+            // Declined: say so once, then run the unarmed sequence below (C
+            // entry, then the caller's per-row loop if the swapAB refusal
+            // applies) — never a half-swapped chain.
+            proj_mma_declined_note();
+        }
         if Self::swapab() {
             return Ok(false);
         }
@@ -5537,6 +5606,35 @@ impl<'a> DevChain<'a> {
     fn swapab() -> bool {
         static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *F.get_or_init(|| std::env::var("DSV41_SWAPAB").map(|v| v == "1").unwrap_or(false))
+    }
+
+    /// PROJ-MMA (`DSV41_PROJ_MMA=1`, DEFAULT OFF). Routes the projection family
+    /// (`proj_mrows`: wq_a / wkv / wq_b / wo_b, plus the indexer's wq_b) through
+    /// the TENSOR-CORE program `dsv41_gemm_fp8_mrows_mma`
+    /// (`gemm_fp8_mrows_mma_kernel<M>`) instead of the SIMT `dsv41_gemm_fp8_mrows`.
+    ///
+    /// This is a PROGRAM SWAP, not a knob on the SIMT kernel: the mma program's
+    /// k-block scale is applied to the 32-element sum (not per element) and the
+    /// tensor core's intra-block summation order is hardware-defined, so it is
+    /// NOT bit-identical to the SIMT mrows program — and §2 of
+    /// docs/agent/tensorcore-proj-design.md proves that parity is unreachable for
+    /// ANY mma route (the association order is not specifiable). What it does
+    /// guarantee, bit for bit, is `row r of an M-row launch == row r of the M=1
+    /// launch OF THE SAME PROGRAM` (column r of the mma's D depends on column r
+    /// of B and A alone), i.e. (b′) program-consistent parity — the property the
+    /// verify's amortisation actually needs, against a new reference program.
+    ///
+    /// Consequently the arm is judged by the DUAL GATE (step_ms AND mean-k, one
+    /// arm per process) and never by a byte compare against the SIMT path. The
+    /// `mean-k` leg is not optional: this is the WOB shape (a non-bit-identical
+    /// projection) which cannot be excluded by argument.
+    ///
+    /// Strict `== "1"`, the convention `DSV41_TAP_PARITY` / `DSV41_COMP_PARITY` /
+    /// `DSV41_SWAPAB` use. Read ONCE and cached — this is read at every
+    /// projection of every verify layer inside graph capture.
+    fn proj_mma() -> bool {
+        static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *F.get_or_init(|| std::env::var("DSV41_PROJ_MMA").map(|v| v == "1").unwrap_or(false))
     }
 
     /// The plain M=1 fp8 GEMV with the swapAB dispatch in front of it: when the

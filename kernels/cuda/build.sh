@@ -14,7 +14,19 @@ DIR="$(dirname "$0")"
 SRCS=("$DIR/ferrite_kernels.cu")
 # the tcgen05 MXFP4 expert GEMM is its own TU; tests_*.cu carry a main
 # and are deliberately NOT linked into the shared object.
-for f in "$DIR"/dsv41_kernels.cu "$DIR"/dsv41_experts_mxf4.cu "$DIR"/dsv41_vision.cu "$DIR"/dsv41_glue.cu "$DIR"/dsv41_route.cu; do
+#
+# PROJ-MMA (`dsv41_proj_mma_skel.cu`, 2026-09-13): the TENSOR-CORE form of the
+# multi-row fp8 projection GEMV. It rides here as its OWN TU on purpose — the
+# kernel, its launcher (`dsv41_gemm_fp8_mrows_mma`) and the `DSV41_PROJ_MMA`
+# gate are self-contained (their only in-tree neighbours are the swapAB gemv
+# they generalise), so linking the file directly keeps the future move into
+# `dsv41_kernels.cu` a pure relocation.
+# ⚠️ The symbol now being present in EVERY `.so` is NOT a behaviour change: the
+# runtime gate is default OFF and the Rust arm is the only way in
+# (docs/agent/tensorcore-proj-design.md §3.3/§7). The build-vs-runtime split is
+# the same contract the tcgen05 blocks below carry — a build that omitted the
+# TU would make a `DSV41_PROJ_MMA=1` A/B silently measure the OLD path.
+for f in "$DIR"/dsv41_kernels.cu "$DIR"/dsv41_experts_mxf4.cu "$DIR"/dsv41_vision.cu "$DIR"/dsv41_glue.cu "$DIR"/dsv41_route.cu "$DIR"/dsv41_proj_mma_skel.cu; do
     [ -f "$f" ] && SRCS+=("$f")
 done
 
