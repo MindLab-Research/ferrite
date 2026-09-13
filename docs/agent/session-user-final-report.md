@@ -38,7 +38,8 @@ AR 是 SWALLOW #1 开销（36.0%，6.58ms/步 = 84 轮）和 lazy #1（27.1%）�
 2. **tcgen05 "rank 7" 叙事作废 + 根因定谳**（`docs/agent/tcgen05-rank7-verdict.md` §10）：均匀分片在数学上产生不出 {7} 不对齐集合；`serve.rs:250` 只保留第一个 Err ⇒ "总是 rank 7"是上报竞态产物（历史 5/6/7 都出现过）。**第 5 轮判定实验（观测修复合入后）确凿定谳**：`[tp] step failed on 8/8 ranks` 全部同文本 cuda error 716 + ALIGN_AUDIT 唯一 violation = **w2 SF 行 pitch 10 字节**（rank 对称布局缺陷，row1&15=10 ⇒ 每行偏离 16B 网格）。根修 = SF 行 stride 与逻辑 k/32 解耦（行间 padding + 内核索引参数化），属 L4-3/L4-4 收尾。
 3. **A0 探针判决：AR 已无肉**（`docs/agent/swallow-ar-first-step-design.md` §7）：site 分流落地后 SWALLOW 63.8 栈实测——**稳态 avg_spin = 6179 cyc ≈ 3.4µs/轮 ≪ 17.3µs 判读线**。nsys 账本（78.3µs/轮、6.58ms/步、36% kernel-sum）是**自旋放大假象**；真值 AR ≈ 0.3-0.6ms/步 ≈ 28ms 步时的 **~2%**。AR 四分支 T1-T3（负载均衡/协议/向量化）全部失去靶子——**SWALLOW 28ms 的肉在真实计算 kernel（MoE 17.4%/投影 15.1%/hc_dots）= L4/L5 的对象**。
 
-## 七、400 的诚实评估
+## 七、400 的诚实评估（⛔ 2026-09-13 终局订正：本节口径作废）
+> **⛔ 终局订正**：本节"15ms@accept5 / L4/L5 25-40 人日 / lazy 上限 145"全部建立在"verify(6行)=28ms 是结构性代价"的**错误前提**上，作废。正确口径（`mtp-verify-amortization-model.md`）：**verify(m) ≈ eager(1)+ε（权重读共享）⇒ 400 = step ~8ms + acc 2-3（375-500 tok/s）**；28.17ms = eager 4.45× 是**实现未摊薄的病**（逐 kernel 找 ~6× 项：MoE per-row 路由展开 / per-row kernel 未进 m=6 块 / 图 launch 结构）。以下仅存档。
 - 400 ladder（需全部优化兑现）：AR 28→21.6→18.6→17.1→14.7ms = **441 tok/s @ accept 5**（AR 每步实际 6.58ms 不是 10.1ms）
 - lazy 上限 ~145；**400 必须走 batched 且需 L4/L5 全面重写（25-40 人日）**——仅计数口径成立（accept 5）
 - 60% 兑现 → ~300 tok/s

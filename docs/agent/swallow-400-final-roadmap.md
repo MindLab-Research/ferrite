@@ -114,7 +114,9 @@ DSV41_ATTN_MROWS_ROPE_NORM=1        # mrows b2
 
 ---
 
-## 5. 到 400 的缺口算术（口径已分离）
+## 5. 到 400 的缺口算术（⛔ 本节 15ms/accept-5 口径已整体作废 — 2026-09-13 用户裁决）
+
+> **⛔ 终局订正（2026-09-13）**：本节及 §6 的阶梯/口径建立在"verify(6 行)=28ms 是结构性代价"的**错误前提**上，**整体作废**。正确模型见 `docs/agent/mtp-verify-amortization-model.md`：**verify(m 行) ≈ eager(1 行) + ε**（单并发 decode 是 memory-bound、权重读共享一次）⇒ **400 = step ~8ms + acc 2-3**（375-500 tok/s）。28.17ms = eager 的 **4.45× 是实现未摊薄的病**（逐 kernel 找 ~6× 未摊薄项），不是物理极限；"L4/L5 25-40 人日唯一路径"作废重估。以下表格仅存档。
 
 **400 的代数口径**（accept 5 ⇒ k_emit = 6）：
 ```
@@ -136,7 +138,9 @@ DSV41_ATTN_MROWS_ROPE_NORM=1        # mrows b2
 
 ---
 
-## 6. 优先级排序（订正 2026-09-12：A0 + tcgen05 观测 > L4/L5；R2/R1 已判死）
+## 6. 优先级排序（⛔ 2026-09-13 终局订正：主战场 = verify 未摊倍数排查，旧排序作废）
+
+> **⛔ 终局订正（2026-09-13）**：下表"L4/L5 25-40 人日是唯一闭合通道"建立在错误前提（28ms 是物理事实）上，**作废**。正确主战场：**逐 kernel 对比 eager(1 行) vs verify(6 行)，找出所有 ~6× 未摊薄项并批量化修复**（MoE per-row 路由展开 / per-row kernel 未进 m=6 块 / 图 launch 结构 / attention per-row 计算）——见 `mtp-verify-amortization-model.md` §2/§5。tcgen05 根修（已实施待 GPU 复验）是 MoE grouped GEMM 的载体，保留价值。以下表格仅存档。
 
 | 优先 | 项 | 收益 | 人日 | ROI 理由 |
 |---:|---|---|---:|---|

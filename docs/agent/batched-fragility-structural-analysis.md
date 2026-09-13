@@ -1,5 +1,7 @@
 # batched (SWALLOW m=6) 优化脆弱性结构分析 — 判词
 
+> ⛔ **框架订正（2026-09-13 用户裁决）**：本文档 §1 把"每步代价固定 C(6)"当作结构性常数——**该框架错误**。正确模型（`docs/agent/mtp-verify-amortization-model.md`）：**C(6) 应 ≈ C(1)**（单并发 decode 是 memory-bound，verify 6 行共享一次权重读 ⇒ verify(m) ≈ eager(1)+ε）；实测 C(6)=28.17ms = eager 的 4.45× 是**实现未摊薄的病**。本文档**保留有效**的部分：accept 乘数观察（`tok/s ∝ k_emit/step_ms`）、量级判据（倍数 ≈k_emit/m → 先查 accept）、FORBIDDEN 清单（fold_r/A1a/R1/V5_LEDGER 实证退化）、"lazy 坐在零角"的结构性解释。§1 的"C(6) 固定"表述按此理解。
+
 > 来源：ministry-justice / batched-fragility-rootcause（2026-09-12，代码基线只读审查）。
 > 审查对象：为什么同一族优化在 lazy m=1 全兑现（+15.6%）、在 batched m=6 上反复 6-8× 灾难。
 > 本文档取代此前散落的"SWALLOW 脆弱"直觉描述，给出**结构性机制**与**量级判据**。

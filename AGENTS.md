@@ -90,7 +90,7 @@ LD_LIBRARY_PATH=$HOME/ferrite/kernels/cuda ./target/release/ferrite-serve --back
 - **lazy 干净栈：91.1 tok/s（+15.6%）**：R2(+10.2%) + MARKOV(+3.2%) + VERIFY_FORK(+1.5%) + RING_WIN(+0.3%)
 - **🎉 SWALLOW 完全解锁！**（11 次修复：OOB 根因（staging 被越界清零→canary 抓到！）→ OOB 修复（guard band + bounds check）→ engram slot 修复（147456 ≥ payload）→ **300 token 正常生成 + 出师表红线通过（零拉丁 ✓）+ 全 gate 58.3 tok/s**）
 - **AR Step 2 (A1a) 教训**：+665 行 store fold 在两条路径破坏数值（lazy 90.9/输出退化 + SWALLOW 7.1/8× 退化）——**AR_STORE_FUSE 永久 OFF**
-- **修正后的 400 路线（终局版 2026-09-12 深夜）**：AR R2 拓扑不可能 + R1 GPU 判死 + **A0 探针实测 AR 已无肉**（稳态 avg_spin 3.4µs/轮 ≪ 17.3µs 判读线；nsys 的 78.3µs/轮、36% kernel-sum 是自旋放大假象；真值 AR ≈ 0.5ms/步 ≈ 28ms 步时 ~2%）⇒ **400 缺口全部在真实计算 kernel（MoE 17.4%/投影 15.1%/hc_dots）= 纯 L4/L5 口径**（25-40 人日）；**任何提案引用 nsys 的 AR µs 数必须先过 A0 探针复测**
+- **400 路线（⛔ 终局订正 2026-09-13，旧口径作废）**：**正确模型 = MTP verify 摊薄**（`docs/agent/mtp-verify-amortization-model.md`，必读）：单并发 decode 是 memory-bound，**verify(m 行) 应 ≈ eager(1 行)+ε**（权重读共享）⇒ **400 = step ~8ms + acc 2-3**（375-500 tok/s）。实测 verify=28.17ms = eager 6.33ms 的 **4.45× = 实现未摊薄的病**（不是物理极限）——主战场 = **逐 kernel 对比 eager(1) vs verify(6)，找出所有 ~6× 未摊薄项**（MoE per-row 路由展开 / per-row kernel 未进 m=6 块 / 图 launch 结构 / attention per-row 计算）并批量化修复。~~"L4/L5 25-40 人日唯一路径"~~ 作废重估。A0 判决（AR 无肉，nsys 78µs 是自旋假象）保留有效；**任何提案引用 nsys 的 AR µs 数必须先过 A0 探针复测**
 - **tcgen05 根因已定谳（第 5 轮判定实验）**（`docs/agent/tcgen05-rank7-verdict.md §10`）：**8/8 ranks 同文本 cuda error 716**（"只有 rank 7"= serve.rs 上报竞态，正式作废）+ ALIGN_AUDIT 唯一 violation = **w2 SF 行 pitch 10B**（rank 对称）⇒ 根修 = SF 行 stride 与逻辑 k/32 解耦（行间 padding + 内核索引参数化，inter/world 需被 512 整除），属 L4-3/L4-4 收尾
 
 **400 的诚实判定**：lazy 上限 ~145；SWALLOW 需要全部优化兑现（mrows + hc/B6 + tcgen05 + AR 重设计 + L4/L5）；60% 兑现 → ~300 tok/s；**先钉死 S0 步时（28ms）是 G2 的全部意义**。
