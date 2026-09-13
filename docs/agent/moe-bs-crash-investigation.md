@@ -1589,3 +1589,19 @@ python3 wq_check.py --selftest
 （`expect_transaction` 只报"数据字节"= 槽的一半，正是这件事的直接证据）。
 ⇒ 结论：**err700 不在描述符层**；TL 路径真正的剩余风险是 **3-stage TMA+mbarrier 流水线在 m>1 下的行为**，
 这条**只能 GPU 验证**（留给主 agent，且与当前 e2e 缺陷是两件事）。
+
+## §58 前置检查：精度 DBG 回读**同样带图捕获守卫** ⇒ 验收必须用"图全关"的臂
+
+主 agent 实读代码发现（`crates/ferrite-models/src/dsv41/chain_dev.rs:19770`）：
+```
+"[routed-down-quant] DSV41_ROUTED_DOWN_QUANT_DBG is set but a capture is in …"
+```
+⇒ 与 `[NC]` 同一类陷阱（§16/§35/§42）：**若该 launch 处在 CUDA-graph capture 内，DBG 五点回读会被静默跳过**。
+
+**因此 §39 的验收命令必须走 `~/arm_run.sh`（它已内置 5 个图门全关）**，正确写法：
+```bash
+bash ~/arm_run.sh RQ1 DSV41_ROUTED_DOWN_QUANT=1 DSV41_ROUTED_DOWN_QUANT_DBG=1
+grep -E "routed-down-quant" ~/armrun_RQ1.log | head -20     # 5 组值 + 主机参考 + 逐元素差
+```
+**判据**：①–⑤ 逐元素差为 0（±1 ulp）；随后同 env 跑 `~/verify_correct.sh` 做文本红线（配合 `~/wq_check.py`）。
+⚠️ 性能数字仍必须来自 **无 DBG** 的快速臂（`~/arm_run_fast.sh`）——DBG 本身会 D2H 回读、污染计时。
