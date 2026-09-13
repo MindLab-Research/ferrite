@@ -300,6 +300,18 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
         }
         __syncthreads();
 
+        // (4.5) ★ ASYNC-PROXY FENCE (root cause fix 2026-09-14):
+        // The MMA (tcgen05.mma) and the SF copy (tcgen05.cp) read shared memory through
+        // the ASYNC proxy, while A_sh / B_sh / SFA_sh / SFB_sh were just written with
+        // GENERIC stores. Per the PTX memory model the generic writes must be made
+        // visible to the async proxy with `fence.proxy.async` — TileLang's generated
+        // code does exactly this (tl::fence_proxy_async() in its consumer path) but our
+        // hand-written kernel only fenced once outside the k-loop. Without it the MMA
+        // can read STALE smem from the previous k-iteration/launch. This is invisible
+        // with uniform test data (stale == current) and produces garbage on real data.
+        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+        __syncthreads();
+
         // (5) warp 1: SF copy to TMEM + MMA
         if (warp == 1) {
             // SF copy: SFA → SF_tmem+0, SFB → SF_tmem+4
