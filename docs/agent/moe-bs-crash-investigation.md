@@ -1788,3 +1788,18 @@ else:
 （`precompute_freqs_cis(..., original_seq_len, base, factor, ...)`，`model.py:369`）**惰性**、
 `rope_factor` 不参与计算 ⇒ **出货配置下该项对齐** ✓（若要改 `original_seq_len` 才需重新核对，
 这一条已记入"NEEDS-GPU/需配置确认"清单）。
+
+## §68 【精度·新开线】I3：attention PV 的**概率操作数 bf16 舍入**（我方精度偏高）
+
+审计 §61 的"PV 操作数"一项，取回原文后的确切语义：
+- 官方 `ref_inference/kernel.py:339` 与 `:377-380`：在线 softmax 的 `acc_s`（= exp 后的**概率**）先
+  **`acc_s_cast = acc_s.to(BF16)`**，然后 `T.gemm(acc_s_cast, kv_shared, acc_o)`
+  ⇒ **概率被舍到 bf16 后才进 PV 乘加**（`acc_o` 累加器仍是 f32；KV 侧另有 bf16 容器 + e4m3 网格 = A2 那条线）。
+- 我方（`ops.rs:347-388`、`kernels.cu:1611-1705` 一带）`my_acc[i] = my_acc[i]*corr + e*kb[i]` **全程 f32**
+  ⇒ **我方精度偏高** ✗。
+
+**已开实现线 `prec-i3-pv-bf16-p`**（隔离 worktree、门控 `DSV41_ATTN_PBf16` 默认 OFF、带 DBG 五点回读、
+要求列出**全部** PV 乘加点——含 spec/verify 复用路径，**半挂配置是设计内非法**）。
+⚠️ **关键待确认（决定实现正确性）**：官方是"**先**舍 bf16 概率**再**乘 KV"，以及在线 softmax 的
+`corr` rescale 作用在**累积器**还是**概率**上——若作用在累积器，则只有"当前块的概率"需要 bf16 舍入。
+已要求该 subagent 读代码确认并在报告中写明顺序。
