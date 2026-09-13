@@ -2246,3 +2246,32 @@ bash ~/merge_worktree.sh <worktree-dir> <新符号> [必须仍存在的符号...
    就会**留下游荡的 `TEMP` 提交**（本次真实发生）。已改为**临时目录 scp + 原地编译**，历史零扰动。
 3. **验证顺序不可颠倒**：符号检查通过 ≠ 能编译。本次我先提交后验证，导致"坏提交进了主干"再回滚。
    工具已改为**先过真实编译门、再允许提交**（失败自动恢复工作树）。
+
+## §90 【根因】近期每一轮"OUT 为空"的真因：诊断臂**缺 AR 死锁规避配方** ⇒ all-reduce v5 挂死
+
+**现象**：连续数轮（F/T/U/W 之前的几轮）`wq_check` 报 `NO-OUT-LINE`，`arm_run` 打印的 `OUT:` 为空。
+
+**根因**（主 agent 读 serve 日志尾部发现）：
+```
+[ar5-hang] rank=2 site=0 peer=6 need=2 cur=1 spins>5000000 TIMEOUT -> PARK     ← 刷屏
+[ar5-hang] rank=5 site=0 peer=6 need=2 cur=1 spins>5000000 TIMEOUT -> PARK
+```
+⇒ serve 卡在 **all-reduce v5** 路径上（等待 peer 6、自旋超时后 PARK）⇒ **completions 请求永不返回**
+⇒ `curl` 拿到空 body ⇒ 那一轮**根本没有文本可判** ✗。
+
+**这与 BS 臂的正确性无关**——是**诊断臂的 env 缺了 AGENTS.md 明写必带的死锁规避配方**：
+`DSV41_AR_V5=0` + `NCCL_NVLS_ENABLE=0` + `env -u FERRITE_P2P`（AGENTS.md「测量与工具纪律」第 3 条：
+"死锁规避必带：`DSV41_AR_V5=0 DSV41_GRAPH_STEP=0` + `env -u FERRITE_P2P` + `NCCL_NVLS_ENABLE=0`"）。
+
+**修复**（已落地 `~/arm_run.sh`）：
+1. `COMMON` 增加 `DSV41_AR_V5=0 NCCL_NVLS_ENABLE=0`；
+2. 发射行改为 `setsid nohup env -u FERRITE_P2P $BASE $COMMON …`；
+3. 顺带加固请求：捕获 HTTP 码 + **有界重试 6 次** + 失败时把 `http=`/`body_head=` 写进日志
+   （原先 `curl -s` 静默吞错 ⇒ 空 body 无迹可寻）。
+
+**教训（流程级，比本次 bug 更值钱）**：
+- **"无文本"必须先怀疑工具/环境，而不是模型**。本轮差点把"OUT 为空"误读成"BS 臂没修好"。
+- **诊断臂的 env 配方应当从文档里"抄全"**（AGENTS.md 把死锁规避三件套写在测量纪律里，
+  而 `arm_run.sh` 只带了 `FERRITE_GRAPH*` 那五个 ⇒ 漏了 AR 相关三件套）。
+- 已给 `wq_check` 的提示补上"arm_run 的 OUT 只到 stdout"的历史坑；本次再加一条：
+  **看到 OUT 为空先 `grep -c ar5-hang`**。
