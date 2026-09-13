@@ -13172,6 +13172,13 @@ impl<'a> DevChain<'a> {
             m,
             ffn_done,
         )?;
+        // D1 boundary 6/10 (verify path): `ffn_norm`'s bf16 output — the official
+        // PyTorch's FFN sublayer input is bf16 (model.py:288-293). The eager path
+        // has this snap at :19244 (`self.bf16_snap(self.s.xn.ptr, dim)`); the
+        // verify path writes `xn_r` via `collapse_norm_rows` above and `moe_rows`
+        // below reads it — this is the same boundary, between producer and consumer.
+        // [User directive 2026-09-14: "latent必须bf16不能fp32"]
+        self.bf16_snap(self.s.xn_r.ptr as *mut f32, m * dim)?;
         let moe_folded = self.moe_rows(layer, ld, m)?;
         // Same `DSV41_VERIFY_AR_FOLD` contract as the attention side.
         if !moe_folded {
