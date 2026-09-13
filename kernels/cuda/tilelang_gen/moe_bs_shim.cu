@@ -222,6 +222,13 @@ constexpr int kThreads = 128;    // 3 个工作 warp + 1 空转（原型 §2 的
 //    上限 ⇒ cudaFuncSetAttribute 直接失败。
 // ⚠️ 不符 ⇒ launch err 1（cudaErrorInvalidValue），这是静默回退老路径的入口。
 constexpr size_t kSmem = 166912;  // stages=3: ab 98304 + sf 3072 + c 65536
+// ⚠️ 与上一条「权威值 202752」的关系（别当成矛盾）：202752 是**生成物自己的 launch** 值
+//    （TileLang TMA 版；它的 stage 账是 B_sh=98304 | SFA=196608+3072 | SFW=199680+3072），
+//    166912 是本 shim **给手写 kernel 用的**值（手写 kernel 的 smem 布局不同：A/B/SF/mbar
+//    共 33800 B + 与 A/B 别名共享 offset 0 的 C staging 65536 B，另按 stages=3 预留）。
+//    两者都 < sm_100 的 227 KiB/block 上限；launch 时按各自 kernel 的 SetAttribute 值传。
+//    真正的硬约束只有一条：**传给每个 kernel 的 smem 值必须 ≥ 该 kernel 的 buf_dyn_shmem
+//    最高偏移 + 尾区**，否则 launch 返回 err 1（cudaErrorInvalidValue）而静默回退老路径。
 // 每 expert 的 packed SF 池字节（w1 与 w3 各一份）
 constexpr size_t kSfPlaneBytes = (size_t)kSfWords * kNp * 4;  // 51200 B/面/expert
 
