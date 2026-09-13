@@ -637,3 +637,30 @@ subagent `bs-impulse-probe` 的第一件事是给 micro harness 打了一个"补
      只有 (a) 或"读回恒为常量"能做到。
 
 ⇒ 在探针给出"MMA 确实发射过"的自证之前，**任何**基于 harness 的布局/朝向结论都不成立（§18 已述）。
+
+## §21 精度对齐的具体实现路径（已查明的可行方案，待 BS 臂正确后执行）
+
+§14 记录了两处不对齐。补查后，**路径已经清晰**：
+
+### 关键事实
+- `quant1_on(src, k, stream)` 处理的是**单行** `k` 个元素 → `s.xq`（`[dim]` e4m3）+ `s.xsc`（`[dim/32+8]` f32）
+  （`chain_dev.rs:201-202` 的分配注释、`:5867`/`:5876` 的定义）⇒ **不能直接用于 routed 的 `[rows*topk][2*inter]` 矩阵**。
+- 但**激活侧量化本身已经是批量的**：`dsv41_quant_fp8(x, y, s, m, dim, block=32, round_scale=true)`
+  处理 `m` 行 × `dim` 列（这正是 BS 臂 gate/up 输入在用的那个）⇒ 对 routed down 只需**一次发射**：
+  `dsv41_quant_fp8(ex_act_b, xq_dn, xsc_dn, rows*topk, 2*inter, 32, true)`。
+- 障碍在下游：`dsv41_expert_down_reduce_fp4_batched` 的签名**只吃 f32**
+  （`dsv41_experts_mxf4.cu:3833-3837`）⇒ 需要给它加 **AQ 支持**（e4m3 字节 + 标度两条入参），
+  或改成调用已有 AQ 模式的 `expert_gemv_fp4_kernel`（M=1 的 gate/up 正走这条，
+  `:751` + `:440` 的 `a_f32 // [rows,k] f32 (AQ=true)`）。
+  ⚠️ 历史警告不变：把那条 GEMV 扩到 down 路径**曾把模型搞坏**（`:3268-3273`）⇒
+  必须先把 down 的 `rows/dim/inter/act_stride/slots/ids/epi_mode` 语义与 epilogue 的组合钉死，再动。
+
+### 顺序（必须与官方一致）
+`silu(gate)*up` → **×route_w[slot]（per-slot 标量，官方在 w2 之前乘）** → `bf16` → `e4m3(block 32, ue8m0 ceil)` → down GEMM。
+我们当前是 `... → bf16 → f32 → down GEMM → ×route_w`（在 epilogue）⇒ 两处都要挪/改。
+
+### 代价
+routed 路径多 1 次批量量化 + 1 次 per-slot 加权（可融合进量化前的 pass），约 +1~2 launch/step，µs 级 —— 对 400 tok/s 目标可忽略。
+
+### 执行纪律
+**等 BS 臂正确性钉死之后再动**（一次只改一个变量：先让模型输出正确，再改精度路径并单独验证）。
