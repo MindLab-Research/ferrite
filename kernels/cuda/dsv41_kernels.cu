@@ -110,11 +110,21 @@ __device__ __forceinline__ float e2m1_to_f(uint8_t code) {
 }
 
 // The reference's power-of-two scale: 2^ceil(log2(amax / maxv)).
-// `DSV41_ACTQ_FLOOR=1` (default OFF) puts the floor where the official puts it: on amax
-// (`max(amax, 1e-4)`, kernel.py:76) rather than on the scale (`fmaxf(s, 1e-30)` here, which can also
-// produce a non-power-of-two scale). The two are equivalent for amax >= 1e-4, so this is inert for
-// routed activations and only matters for near-empty blocks at the other reuse sites.
 __device__ int g_actq_floor = 0;
+__device__ __forceinline__ float fast_round_scale(float amax, float max_inv) {
+    const uint32_t bits = __float_as_uint(amax * max_inv);
+    const int exp = (int)((bits >> 23) & 0xFFu);
+    const uint32_t man = bits & 0x7FFFFFu;
+    const int e = exp - 127 + (man != 0 ? 1 : 0);
+    return __int_as_float((e + 127) << 23);
+}
+
+// `DSV41_ACTQ_FLOOR=1` (default OFF) puts the quantiser's floor where the official puts it: on amax
+// (`max(amax, 1e-4)`, kernel.py:76) rather than on the scale (`fmaxf(s, 1e-30)`, which can also yield
+// a non-power-of-two scale). The two agree for amax >= 1e-4 — i.e. for every routed activation — so
+// this is inert on the MoE path and only matters for near-empty blocks at the other reuse sites
+// (o/wo/qr/engram/KV). Defined AFTER `fast_round_scale` (it calls it; the earlier placement ahead of
+// the definition was a compile error, caught by compiling the TU rather than by assuming).
 __device__ __forceinline__ float actq_scale(float amax, float maxv, bool round_scale) {
     if (g_actq_floor) {
         const float a = fmaxf(amax, 1e-4f);
@@ -125,13 +135,6 @@ __device__ __forceinline__ float actq_scale(float amax, float maxv, bool round_s
 }
 extern "C" int dsv41_quant_set_actq_floor(int v) {
     return (int)cudaMemcpyToSymbol(g_actq_floor, &v, sizeof(int));
-}
-__device__ __forceinline__ float fast_round_scale(float amax, float max_inv) {
-    const uint32_t bits = __float_as_uint(amax * max_inv);
-    const int exp = (int)((bits >> 23) & 0xFFu);
-    const uint32_t man = bits & 0x7FFFFFu;
-    const int e = exp - 127 + (man != 0 ? 1 : 0);
-    return __int_as_float((e + 127) << 23);
 }
 
 // ---------------------------------------------------------------------- quant
