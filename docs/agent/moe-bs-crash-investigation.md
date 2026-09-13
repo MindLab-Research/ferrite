@@ -2637,8 +2637,21 @@ compressor 投影 mrows、`ATTN_PROJ_ALIGN` 等**代码已在**，出货脚本�
 | `DSV41_GEMM_TILELANG` / `DSV41_MOE_TILELANG_BS` | — | `=1` ✓ | 已生效 |
 | **`DSV41_ATTN_PROJ_ALIGN`** | **`dspark_dev.rs:134` 有完整文档** | **计数 = 0 ⇒ 未开** ✗ | **唯一"就绪未开"项** ✓ |
 
-⇒ **行动**：`DSV41_ATTN_PROJ_ALIGN` 属于"零新代码、只差一个 env"的低风险收益
-⇒ 走 §87 的**性能门**判据转正：**门开/门关数值必须逐字节一致**（它是程序对齐 ⇒ 不应改数值）+ 同轮背靠背 p50 比较。
+⇒ **行动（已更正）**：⚠️ 主 agent 起初把它当**性能门**是**错的** ✗ —— 读其自带文档（`dspark_dev.rs:134-160`）后确认：
+**"Why this is a NUMERICAL fix, not a perf one."** 原因：`dsv41_gemm_fp8_mx` 按 `m` 分派
+（`m==1` 走 SIMT warp-per-row GEMV；**`m>1` 走 16-row TILE MMA**），而 **draft 恰好在 `m = bs = 5`**
+⇒ draft 的四个 attention 投影落在 **TILE 程序**上，其 k-walk 与归约树**跨 tile 共享** ⇒
+与 verify 的 `proj_mrows`（复现 `m==1` 的 consume 表达式、升序 kb 走法、per-row `shfl_xor` 树）
+**求和结构不同（不是 ulp 级）** ✗。而官方 `model.py` 里 **draft 块与 verify 链对这些权重调用的是同一个 `F.linear`**
+⇒ 两侧**必须同程序** ✓。
+⇒ 因此它必须按**精度门**（§87 的第一类判据）转正：**开/关数值允许变化**，判据是
+**红线不破 + 与 EAGER/对照的一致性**（而不是逐字节一致 ✗）。
+
+### 🎯 由此得到一条**直指最大杠杆**的线索（已同步给 `accept-2p2-vs-5p5` 线）
+该门修的正是 **spec 路径上 "draft 侧程序 ≠ verify 侧程序"** 的不一致；而 **accept 长度取决于 draft 与目标的一致性**
+⇒ **这种程序不一致会压低 accept** ⇒ **`DSV41_ATTN_PROJ_ALIGN=1` 很可能直接把 accept 从 2.24 抬上去**，
+且文档明确写着"**with it ON ... the accept comparison stops measuring the kernel mismatch**" ✓
+⇒ 这是"零新代码、现成一门、直击最大杠杆"的候选，应**优先上机验证**（在 spec 臂上，看 accept 与 `[acc-hist]`）。
 **注意**：它作用在 **draft（MTP）侧的 attention 投影**（`dspark_dev.rs`），因此
 **只在 spec 臂上才有意义**（plain decode 不经过）⇒ 验证必须在 `DSV41_SPEC=1` 的臂上做，
 且要与 `DSV41_DIFF_EAGER`/accept 长度一起看（对齐若改动了程序，accept 可能变）。
