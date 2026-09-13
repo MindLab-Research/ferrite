@@ -65,6 +65,22 @@ probe_bin "SFDUMP env in serve"           crates/ferrite-models/src/dsv41/chain_
 say "sanity: .so newer than its sources?" \
     "$([ "$SO" -nt kernels/cuda/tilelang_gen/moe_bs_shim.cu ] && echo yes || echo 'NO (rebuild!)')"
 
+# The engine itself refuses to start on a build-id mismatch (so vs binary) and the arm then reports
+# 0 steps with an empty output — one whole wasted round, and easy to misread as a kernel problem. So
+# compare them HERE, before any arm runs: a batch whose two artefacts come from different checks must
+# never reach a measurement.
+SO_ID=$(strings "$SO" 2>/dev/null | grep -oE 'build_id [0-9a-f]+-dirty\+cu[0-9a-f]+' | head -1)
+BIN_ID=$(strings "$BIN" 2>/dev/null | grep -oE 'build_id [0-9a-f]+-dirty\+cu[0-9a-f]+' | head -1)
+if [ -z "$SO_ID" ] || [ -z "$BIN_ID" ]; then
+  say "build-id readable in both artefacts?" "NO (so='$SO_ID' bin='$BIN_ID') — cannot verify; treating as stale"
+  fail=1
+elif [ "$SO_ID" != "$BIN_ID" ]; then
+  say "so/binary build-id match" "MISMATCH — $SO_ID vs $BIN_ID (engine would refuse to start)"
+  fail=1
+else
+  say "so/binary build-id match" "ok ($SO_ID)"
+fi
+
 echo "=== verdict ==="
 if [ "$fail" = 0 ]; then echo "ARTIFACTS_FRESH"; else echo "ARTIFACTS_STALE — rebuild BOTH (build.sh 103a + cargo build) before any measurement"; fi
 exit $fail
