@@ -1337,3 +1337,10 @@ __device__ __forceinline__ int hw_pack_sw128(int row, int p) {
 `kernels/cuda/tilelang_gen/moe_bs_handwritten.cu`：新增 `hw_pack_sw128()`；
 `g_packed` 分支的 W1/W3 staging 改用它（源字节原样写入）；packed 分支的描述符固定为
 `hw_make_desc(..., 1, 64, 2)`、递进固定 `ki*2`（= 32 B）。门控 `DSV41_MOE_BS_PACKED=1` 开启即用此布局。
+
+## §48 修复的足迹核验（纯算术）
+`hw_pack_sw128(row,p)` 的最大值 = `(127>>3)*1024 + (127&7)*128 + (((7^7)&7)<<4) + 7`
+= `15*1024 + 7*128 + 0 + 7` = **16375 < 16384** ✓——
+即恰好装满**一个操作数 stage**（16384 B），与描述符 `sbo=64`（1024 B/8 行组 × 16 组）完全吻合，
+且不越界进入 SF 区（A=0/SFA=32768/SFB=33280）✓。
+⇒ 修复**不改变 smem 占用**（仍 16384 B/操作数），只是把数据摆到硬件真正会读的那 8 B/槽上。
