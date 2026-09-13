@@ -261,7 +261,17 @@ __global__ void swiglu_limit_kernel(float* __restrict__ gate_up, int rows, int i
 // translation unit from dsv41_kernels.cu (build.sh compiles each .cu on its own
 // and links the objects), so the __device__ helper there is not visible here.
 // Same arithmetic as dsv41_kernels.cu's fast_round_scale, term for term.
+// `DSV41_ACTQ_FLOOR=1`: the official reference floors amax (max(amax, 1e-4), kernel.py:76) BEFORE
+// deriving the scale, so its smallest scale is 2^-22. Putting the floor INSIDE this helper fixes every
+// call site at once: with amax floored to 1e-4 the resulting scale is >= 2^-22, so each caller's own
+// `fmaxf(scale, 1e-30)` becomes inert, and the sites that had no floor at all simply gain it — which
+// is what the official does. Gate is inert for any block with amax >= 1e-4 (every routed activation).
+__device__ int g_glue_actq_floor = 0;
+extern "C" int dsv41_glue_set_actq_floor(int v) {
+    return (int)cudaMemcpyToSymbol(g_glue_actq_floor, &v, sizeof(int));
+}
 __device__ __forceinline__ float glue_fast_round_scale(float amax, float max_inv) {
+    if (g_glue_actq_floor) amax = fmaxf(amax, 1e-4f);
     const uint32_t bits = __float_as_uint(amax * max_inv);
     const int exp = (int)((bits >> 23) & 0xFFu);
     const uint32_t man = bits & 0x7FFFFFu;

@@ -1678,6 +1678,10 @@ struct Kernels {
     /// the official has it. Inert for routed activations (amax >> 1e-4); the promotion plan covers
     /// the other reuse sites.
     quant_set_actq_floor: Option<unsafe extern "C" fn(c_int) -> c_int>,
+    /// The same gate for the fused-quant kernels in `dsv41_glue.cu`
+    /// (`dsv41_glue_set_actq_floor`). Both TUs must be told together or the fused and unfused paths
+    /// would disagree on the scale floor.
+    glue_set_actq_floor: Option<unsafe extern "C" fn(c_int) -> c_int>,
     ///
     /// The COPY-BACK lives in Rust on purpose: a stream sync inside the shim's decode path is the
     /// §119 lockstep deadlock class (one rank waiting on its sync while its peers sit in an
@@ -2415,6 +2419,7 @@ impl Device {
             moe_bs_gc_ptr: ko!(rt, "dsv41_moe_bs_gc_ptr"),
             moe_bs_gc_bytes: ko!(rt, "dsv41_moe_bs_gc_bytes"),
             quant_set_actq_floor: ko!(rt, "dsv41_quant_set_actq_floor"),
+            glue_set_actq_floor: ko!(rt, "dsv41_glue_set_actq_floor"),
             w2_l2_prewarm: ko!(rt, "dsv41_w2_l2_prewarm"),
             attn_p_dbg_read: ko!(rt, "dsv41_attn_p_dbg_read"),
             swiglu_limit_batched: ko!(rt, "dsv41_swiglu_limit_batched"),
@@ -3895,12 +3900,18 @@ impl Device {
         // yield a non-power-of-two scale. Set once per process, on the first quantisation.
         static ACTQ: std::sync::OnceLock<()> = std::sync::OnceLock::new();
         if ACTQ.set(()).is_ok() {
+            let on = std::env::var("DSV41_ACTQ_FLOOR")
+                .map(|v| v != "0" && !v.is_empty())
+                .unwrap_or(false);
             if let Some(f) = self.kernels.quant_set_actq_floor {
-                let on = std::env::var("DSV41_ACTQ_FLOOR")
-                    .map(|v| v != "0" && !v.is_empty())
-                    .unwrap_or(false);
                 let rc = unsafe { f(on as c_int) };
-                eprintln!("[actq] floor-on-amax = {on} (setter rc={rc})");
+                eprintln!("[actq] floor-on-amax = {on} (kernels setter rc={rc})");
+            }
+            // Both TUs must agree, or the fused and unfused quantisation paths would use different
+            // scale floors and the model would be internally inconsistent.
+            if let Some(f) = self.kernels.glue_set_actq_floor {
+                let rc = unsafe { f(on as c_int) };
+                eprintln!("[actq] floor-on-amax = {on} (glue setter rc={rc})");
             }
         }
         self.quant_fp8_on(x, y, scale, rows, cols, block, round_scale, self.stream)
