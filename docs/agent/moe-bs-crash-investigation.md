@@ -2655,3 +2655,14 @@ compressor 投影 mrows、`ATTN_PROJ_ALIGN` 等**代码已在**，出货脚本�
 **注意**：它作用在 **draft（MTP）侧的 attention 投影**（`dspark_dev.rs`），因此
 **只在 spec 臂上才有意义**（plain decode 不经过）⇒ 验证必须在 `DSV41_SPEC=1` 的臂上做，
 且要与 `DSV41_DIFF_EAGER`/accept 长度一起看（对齐若改动了程序，accept 可能变）。
+
+## §104 两个"就绪未开"的门都在 **spec 路径**上，但**判据不同**（勿混用）
+
+| env | 代码文档 | 性质 | 判据（§87 的两类） |
+|---|---|---|---|
+| `DSV41_ATTN_PROJ_ALIGN` | `dspark_dev.rs:134-160` | **数值修复**：draft 四个 attention 投影原走 `gemm_fp8_mx(m=bs=5)` 的 **16-row TILE MMA**，与 verify 的 `proj_mrows` **求和结构不同**；官方两侧用**同一个 `F.linear`** ⇒ 必须同程序 | **精度门**：允许数值变化；判据 = 红线不破 + 与 EAGER/对照一致 + `[acc-hist]`/accept 观察（**不是**逐字节一致） |
+| `DSV41_DRAFT_MOE_MROWS` | `dspark_dev.rs:112-130` | **发射形状 A/B**：`rows` 是 launcher 的**第三维 `blockIdx.z`** ⇒ per-row 形式每 stage 每 MTP 块要付 **`bs` 次 kernel launch**；mrows 形式一次调用内部派生每行指针。其文档明写"**两条臂是同一批 kernel、同一批实参** ⇒ A/B 只是发射形状的比较" | **性能门**：**必须逐位一致**（其文档自述 ROW INDEPENDENCE 论证：`rows = m` 的第 r 行 == 该行的 `rows = 1` 发射，行间不共享输出/累加器/smem staging）+ 同轮背靠背 p50 |
+
+⇒ **行动**：两者都在**出货脚本里为 0**（`DSV41_SPEC=1`/`DSV41_DSPARK=1` 已开 ✓，与此二者无关）⇒
+   都属于"零新代码、只差一个开关"的收益，且**都作用在 spec 路径**（博客最大单步杠杆所在）✓
+   ⇒ 上机验证时**先各测一条**（一次一个变量）：`ATTN_PROJ_ALIGN` 看 accept/红线；`DRAFT_MOE_MROWS` 看 p50 与逐位一致。
