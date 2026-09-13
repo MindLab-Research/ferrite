@@ -3102,7 +3102,8 @@ __global__ void indexer_topk_kernel(const float* __restrict__ q, const float* __
                                     const float* __restrict__ w, const uint8_t* __restrict__ cand,
                                     const int32_t* __restrict__ lens, int32_t* __restrict__ out,
                                     int m, int nh, int hd, int n_pos, int topk, int offset,
-                                    float softmax_scale, float head_scale, int uses_cand) {
+                                    float softmax_scale, float head_scale, int uses_cand,
+                                    int out_stride = 0) {
     // n_pos arrives as a launch argument, and it is a PER-STEP value (the number of
     // committed latents). A CUDA graph capture freezes launch arguments, so every
     // replay would apply the capture step's bound and the compressed-slot
