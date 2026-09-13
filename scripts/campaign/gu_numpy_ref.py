@@ -59,6 +59,8 @@ def main():
     ap.add_argument("--ckpt", default="/opt/dlami/nvme/models/DeepSeek-V4.1-Flash")
     ap.add_argument("--inter-rank", type=int, default=0)
     ap.add_argument("--layer", type=int, default=0)
+    ap.add_argument("--kmax", type=int, default=DIM,
+                    help="limit K to this many elements (pair with DSV41_MOE_BS_STAGE1=1)")
     ap.add_argument("--out", default="/tmp/gu_numpy.f32")
     a = ap.parse_args()
 
@@ -185,7 +187,8 @@ def main():
             wv[:, 1::2] = e2m1_to_f(hi.astype(np.uint8))
             av = e4m3_to_f(our_codes[:DIM]).astype(np.float32)
             acc = np.zeros(seg_w.shape[0], dtype=np.float32)
-            for b in range(blocks):
+            kmax = max(32, min(a.kmax, DIM))
+            for b in range(kmax // 32):
                 part = (av[b * 32:(b + 1) * 32] * wv[:, b * 32:(b + 1) * 32]).sum(axis=1)
                 acc += part * our_s[b] * e8m0_to_f(seg_s[:, b]).astype(np.float32)
             out[0, slot, half * 320:(half + 1) * 320] = acc.astype(np.float32)
