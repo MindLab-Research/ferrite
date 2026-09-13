@@ -23,11 +23,15 @@
 // =============================================================================
 // 导出符号
 // =============================================================================
-//   int dsv41_moe_tilelang_gate_up_bs(...)   -- up（gate‖up）block-scaled grouped GEMM
-//                                               + gather + scatter（RAW gate‖up 布局）
-//   int dsv41_moe_bs_pack_wsf(...)           -- **装载期**：w1/w3 的 ue8m0 面
-//                                               row-major [NP, K/32] -> group-major
-//                                               packed uint32 [sf_words*NP]（每 expert）
+//   int dsv41_moe_tilelang_gate_up_bs(...)     -- up（gate‖up）block-scaled grouped GEMM
+//                                                 + gather + scatter（RAW gate‖up 布局）。
+//                                                 **HOST 段表**（A/B 基线）
+//   int dsv41_moe_tilelang_gate_up_bs_dev(...) -- 同一计算，**DEVICE 段表 + DEVICE
+//                                                 `nseg` 指针**：无 D2H 回读、无 H2D 上行
+//                                                 ⇒ 可在 CUDA-graph capture 内运行
+//   int dsv41_moe_bs_pack_wsf(...)             -- **装载期**：w1/w3 的 ue8m0 面
+//                                                 row-major [NP, K/32] -> group-major
+//                                                 packed uint32 [sf_words*NP]（每 expert）
 //
 // rc 契约（与 wkv / bf16 shim / proj_mma 完全一致）：
 //   * `0` = 已发射；
@@ -79,18 +83,29 @@
 // 纯函数、无 atomic、不依赖 block 调度 ⇒ 同一路由表重复计算逐位相同。
 //
 // =============================================================================
-// ⚠️ 这是 EAGER 臂（不是 capture 臂）—— 与 bf16 臂同一条限制
+// 两条臂：host-table（A/B 基线）与 device-table（**capture 臂**）
 // =============================================================================
-// moe_align 要在 HOST 上读 `route_idx_r`（device 侧由 route_topk 写出），所以本臂天然
-// 需要一次 D2H 回读 + 小 H2D 上行，在 CUDA-graph capture 内非法。
-//   * 调用方在 `dev.capturing()` 时**不派遣**（decline 回老路径）；
-//   * shim 自身也在 capture 内 decline（防御性）。
+// `dsv41_moe_tilelang_gate_up_bs` 取三张段表为 **HOST 数组**，自己做一次 D2H 回读
+// （`moe_align` 读 `route_idx_r`）+ 小 H2D 上行 ⇒ 在 CUDA-graph capture 内非法，
+// 所以调用方在 `dev.capturing()` 时不派遣它。它是 A/B 基线，保留逐位不变。
+//
+// `dsv41_moe_tilelang_gate_up_bs_dev` 是同一计算的 capture 孪生体：三张段表 +
+// `nseg` 都**已经在 device 上**（由 `dsv41_moe_align_from_group` 从
+// `dsv41_route_group` 的输出投影出来，与 host 侧 `moe_align_host` 逐位相同），
+// 因此**没有 D2H 回读、没有 H2D 上行** —— 整条链在 capture 内合法。
+//   * 两个 mover kernel 的 `nseg` 形参统一成**指针**（`seg >= *nseg` 守卫），
+//     两条臂共用同一 launch 序列（host 臂传常驻 scratch `g_nseg`，device 臂传
+//     `tl_nseg`）；
+//   * `nseg` 是 device 值时**没有 host 形状检查**（host 读不到），边界由
+//     `dsv41_moe_align_from_group` 的 `min(n_active, SEG_CAP)` 与 mover 守卫保证；
+//   * 两条臂都保留 capture guard v2（`g_a == nullptr` → decline），确保 INIT 期的
+//     `cudaFuncSetAttribute` / `cudaMalloc` / `dlopen` 不可能落进 capture。
 //
 // =============================================================================
 // 形状域（冻结，来自 moe_bs_tl_config.txt）
 // =============================================================================
-// dim==5120 && inter==320 && topk∈[1,6] && rows∈[1,6] && nseg∈[1,36]，其余一律
-// decline，由调用方回退 `expert_gate_up_fp4_batched`。
+// dim==5120 && inter==320 && topk∈[1,6] && rows∈[1,6]（host 臂另有 nseg∈[1,36]），
+// 其余一律 decline，由调用方回退 `expert_gate_up_fp4_batched`。
 //
 // =============================================================================
 // ⚠️⚠️ 唯一需要人工转写的地方：`moe_bs_encode_tmaps()`（本文件 §3）
@@ -200,6 +215,10 @@ float* g_c = nullptr;           // [SEG_CAP*BM, 2*NP] f32
 int* g_eid = nullptr;           // [SEG_CAP]
 int* g_order = nullptr;         // [SEG_CAP*BM]
 int* g_counts = nullptr;        // [SEG_CAP]
+// `nseg` 的 device 副本：host-table 入口每调用上行一次（4 字节），device-table
+// 入口不用它（直接传调用方的 `tl_nseg`）。两个 mover kernel 的 `nseg` 形参因此
+// 统一成指针 —— 两条臂共用同一 launch 序列（与 bf16 shim 同构）。
+int* g_nseg = nullptr;          // [1]
 
 // ===========================================================================
 // §2 driver API 的 dlopen 绑定（build.sh 不链 -lcuda，见文件头约束 1）
@@ -430,15 +449,19 @@ __device__ __forceinline__ uint8_t tl_bs_f_pow2_to_ue8m0(float s) {
 //                                 = tl_bs_f_pow2_to_ue8m0(xsc4[assign][g*4 + b])
 // 一个 block = (段, 段内行)；kThreads 个线程覆盖 dim/2 = 2560 字节 + 40 个字。
 // pad 行的 nibble 与标度都写 0（内核无 mask，脏字节会进 MMA）。
+//
+// `nseg` 是**指针**：host-table 入口传常驻 scratch `g_nseg`（上行一次），
+// device-table 入口直接传调用方由 `dsv41_moe_align_from_group` 写出的 `tl_nseg`。
+// 两条臂因此共用同一个 kernel，只有表的来源不同（A/B 基线）。
 // ---------------------------------------------------------------------------
 __global__ void tl_moe_bs_gather_kernel(const uint8_t* __restrict__ xq4,
                                         const float* __restrict__ xsc4,
                                         uint8_t* __restrict__ a, uint32_t* __restrict__ sfa,
                                         const int* __restrict__ order,
                                         const int* __restrict__ counts, int k2, int nsc,
-                                        int sf_words, int nseg) {
+                                        int sf_words, const int* nseg) {
     const int seg = blockIdx.y;
-    if (seg >= nseg) return;
+    if (seg >= *nseg) return;
     const int r = blockIdx.x;
     const int row = seg * kBm + r;
     const int64_t m = (int64_t)kSegCap * kBm;
@@ -476,13 +499,15 @@ __global__ void tl_moe_bs_gather_kernel(const uint8_t* __restrict__ xq4,
 //   对每个 C 列 c（全局，0..2*NP)：
 //     half = c / kBn; j = c % kBn; bx = ...  — 直接由生成物的索引反推：
 //     col = bx*kBn + j； n = (j < NH) ? bx*NH + j : kNp + bx*NH + (j - NH)
+//
+// `nseg` 是指针，与 gather 同约定（见上）。
 // ---------------------------------------------------------------------------
 __global__ void tl_moe_bs_scatter_kernel(const float* __restrict__ c, float* __restrict__ out,
                                          const int* __restrict__ order,
                                          const int* __restrict__ counts, int nup, int out_pitch,
-                                         int split, int nseg) {
+                                         int split, const int* nseg) {
     const int seg = blockIdx.y;
-    if (seg >= nseg) return;
+    if (seg >= *nseg) return;
     const int r = blockIdx.x;
     const int live = counts[seg];
     const int idx = (r < live) ? order[seg * kBm + r] : -1;
@@ -545,7 +570,8 @@ bool tl_bs_init() {
              cudaMalloc(&g_c, (size_t)kSegCap * kBm * kNup * 4) == cudaSuccess &&
              cudaMalloc(&g_eid, kSegCap * sizeof(int)) == cudaSuccess &&
              cudaMalloc(&g_order, kSegCap * kBm * sizeof(int)) == cudaSuccess &&
-             cudaMalloc(&g_counts, kSegCap * sizeof(int)) == cudaSuccess;
+             cudaMalloc(&g_counts, kSegCap * sizeof(int)) == cudaSuccess &&
+             cudaMalloc(&g_nseg, sizeof(int)) == cudaSuccess;
         (void)cudaGetLastError();
     }
     if (!ok) {
@@ -654,10 +680,14 @@ extern "C" int dsv41_moe_tilelang_gate_up_bs(
     if (e != cudaSuccess) return (int)e;
     e = cudaMemcpyAsync(g_counts, counts, (size_t)nseg * sizeof(int), cudaMemcpyHostToDevice, s);
     if (e != cudaSuccess) return (int)e;
+    // `nseg` 也上行到常驻 scratch —— 两个 mover 的 `nseg` 形参已统一成指针，
+    // 这样本入口与 device-table 孪生体共用同一 launch 序列（见文件头「EAGER 臂」）。
+    e = cudaMemcpyAsync(g_nseg, &nseg, sizeof(int), cudaMemcpyHostToDevice, s);
+    if (e != cudaSuccess) return (int)e;
 
     // (1) gather + 激活 SF pack：fp4 nibble + f32 标度 -> ue8m0 group-major u32
     tl_moe_bs_gather_kernel<<<dim3((unsigned)kBm, (unsigned)kSegCap), kMovThreads, 0, s>>>(
-        xq4, xsc4, g_a, g_sfa, g_order, g_counts, kDim / 2, kDim / 32, kSfWords, nseg);
+        xq4, xsc4, g_a, g_sfa, g_order, g_counts, kDim / 2, kDim / 32, kSfWords, g_nseg);
     e = cudaGetLastError();
     if (e != cudaSuccess) return (int)e;
 
@@ -683,7 +713,115 @@ extern "C" int dsv41_moe_tilelang_gate_up_bs(
 
     // (3) scatter：RAW gate‖up 写回 out（swiglu 由既有 kernel 做，与本臂无关）
     tl_moe_bs_scatter_kernel<<<dim3((unsigned)kBm, (unsigned)kSegCap), kMovThreads, 0, s>>>(
-        g_c, out, g_order, g_counts, kNup, topk * kNup, topk, nseg);
+        g_c, out, g_order, g_counts, kNup, topk * kNup, topk, g_nseg);
+    e = cudaGetLastError();
+    return (int)e;
+}
+
+// ===========================================================================
+// §6b DEVICE-TABLE 入口 —— 让本臂进 CUDA-graph capture
+// ===========================================================================
+// 与上面的 host-table 入口**逐行相同**，只有一个本质区别：三张段表 + `nseg`
+// **已经在 device 上**，由 `dsv41_moe_align_from_group`（kernels/cuda/
+// dsv41_moe_align.cu）从 `dsv41_route_group` 的输出投影出来 —— 与 host 侧
+// `moe_align_host` 的表逐位相同（等价性论证见该文件的头注释）。因此：
+//   * **没有 D2H 回读、没有 H2D 上行**：整条链在 capture 内合法，这正是本入口
+//     存在的理由（host-table 入口的 `cudaMemcpyAsync(..., HostToDevice, s)` 是
+//     capture 里的非法操作，所以它被 `moe_tilelang_bs_ready()` 的 `!capturing()`
+//     挡在 graph 外）；
+//   * `nseg` 是 DEVICE 指针：没有 host 形状检查（设备上的值 host 读不到），
+//     边界由 `dsv41_moe_align_from_group` 的 `min(n_active, SEG_CAP)` 和两个
+//     mover 的 `seg >= *nseg` 守卫保证；`grid.y = SEG_CAP` 恒定；
+//   * TMA 描述符的构建**完全不变**：W/SFW 的 map 按专家池基址缓存重建
+//     （`ensure_w_tmaps` 只写 host 侧 128 B 结构体，不产生 stream 操作 ⇒
+//     capture 内合法），A/SFA/C 的 map 在 INIT 后建一次。
+// 旧入口保留为 A/B 基线：同一 `ARMED` 回执格式，便于逐行对比两条臂。
+// ===========================================================================
+extern "C" int dsv41_moe_tilelang_gate_up_bs_dev(
+    const uint8_t* xq4,      // [rows*topk][dim/2] u8 —— routed 的 fp4 打包激活（行距 dim/2）
+    const float* xsc4,       // [rows*topk][dim/32] f32 —— routed 的 per-(row,32) 标度
+    float* out,              // [rows][topk][2*inter] f32（RAW gate‖up；swiglu 仍走既有 pass）
+    const void* w1,          // u8 [E, NP, K/2]（浅指一个 expert 面；shim 用 base + e*NP*K/2）
+    const void* w3,          // u8 [E, NP, K/2]
+    const void* sfw1,        // u32 [E, sf_words*NP]
+    const void* sfw3,        // u32 [E, sf_words*NP]
+    const int* eid_dev,      // [SEG_CAP] i32 —— **DEVICE**
+    const int* order_dev,    // [SEG_CAP*BM] i32 —— **DEVICE**（pad = -1）
+    const int* counts_dev,   // [SEG_CAP] i32 —— **DEVICE**
+    const int* nseg_dev,     // [1] i32 —— **DEVICE**（dsv41_moe_align_from_group 的输出）
+    int rows, int dim, int inter, int topk, cudaStream_t s) {
+    if (xq4 == nullptr || xsc4 == nullptr || out == nullptr || w1 == nullptr || w3 == nullptr ||
+        sfw1 == nullptr || sfw3 == nullptr || eid_dev == nullptr || order_dev == nullptr ||
+        counts_dev == nullptr || nseg_dev == nullptr)
+        return 2;
+    if (dim != kDim || inter != kNp) return 2;
+    if (topk < 1 || topk > kTopkMax) return 2;
+    if (rows < 1 || rows > kRowsMax) return 2;
+    // nseg 的形状检查在这里**不存在**（device 上的值 host 读不到）——见上方文件头。
+    // 16B 对齐：A/W 走 TMA（必需），out 是 float2 store。
+    if ((((uintptr_t)xq4 & 0xF) != 0) || (((uintptr_t)w1 & 0xF) != 0) ||
+        (((uintptr_t)w3 & 0xF) != 0) || (((uintptr_t)out & 0x1F) != 0))
+        return 2;
+
+    // P0-2 (graph-capture audit, v2 state-gated — matching the bf16 shim's pattern):
+    // decline ONLY when INIT hasn't completed (g_a == nullptr — can't cudaMalloc
+    // inside capture); once scratch is allocated, launches are capture-safe and
+    // SHOULD enter the verify graph. This is the guard that makes `cudaMalloc`
+    // unreachable from inside a capture.
+    cudaStreamCaptureStatus cap_st = cudaStreamCaptureStatusNone;
+    if (s && cudaStreamIsCapturing(s, &cap_st) == cudaSuccess
+        && cap_st != cudaStreamCaptureStatusNone
+        && g_a == nullptr) {
+        return 2;  // INIT hasn't run yet — decline without touching capture
+    }
+
+    if (!tl_bs_init()) {
+        bs_init_failed_note(rows, dim, inter);
+        return 2;
+    }
+    // driver/tensormap：首次调用做一次 dlopen；A/SFA/C 的 map 在 INIT 后建一次；
+    // W/SFW 的 map 按专家池基址缓存重建（池是每层一份 ⇒ 基址每层都变）。这三步
+    // 都是 host 侧动作（无 stream 操作、无 INIT 期动作）⇒ capture 内合法。
+    if (g_encode == nullptr) load_driver();
+    if (g_encode == nullptr || !encode_fixed_tmaps() ||
+        !ensure_w_tmaps(w1, w3, sfw1, sfw3)) {
+        static int once = 0;
+        if (once++ == 0)
+            fprintf(stderr,
+                    "[moe-bs] ARMED (device tables) but tensormap init FAILED (dlopen libcuda / "
+                    "cuTensorMapEncodeTiled) -> this run measures the OLD path\n");
+        return 2;
+    }
+
+    {
+        static int reported = 0;
+        if (reported++ == 0)
+            fprintf(stderr,
+                    "[moe-bs] ARMED gate_up_bs (device tables) rows=%d dim=%d inter=%d topk=%d "
+                    "nseg_dev=<device> -> grid=(%d,%d)x%d smem=%zu BM=%d BN=%d BK=%d + "
+                    "gather/scatter\n",
+                    rows, dim, inter, topk, kGridX, kSegCap, kThreads, kSmem, kBm, kBn, kBk);
+    }
+
+    // 表已在 device 上 ⇒ 没有 (0) 元数据上行这一步。
+
+    // (1) gather + 激活 SF pack：fp4 nibble + f32 标度 -> ue8m0 group-major u32
+    tl_moe_bs_gather_kernel<<<dim3((unsigned)kBm, (unsigned)kSegCap), kMovThreads, 0, s>>>(
+        xq4, xsc4, g_a, g_sfa, order_dev, counts_dev, kDim / 2, kDim / 32, kSfWords, nseg_dev);
+    cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) return (int)e;
+
+    // (2) block-scaled grouped GEMM（生成物）。ABI 与 host-table 入口一字不差 ——
+    //     权威配方见那里的长注释（C 是描述符、SFA 是裸指针、W 排在最后）。
+    //     唯一的变化：Eid 直接用调用方的 device 表（`eid_dev`），不再是常驻 scratch。
+    moe_bs_up_tl_kernel<<<dim3((unsigned)kGridX, (unsigned)kSegCap), kThreads, kSmem, s>>>(
+        g_tmap_a, g_tmap_c, eid_dev, g_sfa, g_tmap_sfw1, g_tmap_sfw3, g_tmap_w1, g_tmap_w3);
+    e = cudaGetLastError();
+    if (e != cudaSuccess) return (int)e;
+
+    // (3) scatter：RAW gate‖up 写回 out（swiglu 由既有 kernel 做，与本臂无关）
+    tl_moe_bs_scatter_kernel<<<dim3((unsigned)kBm, (unsigned)kSegCap), kMovThreads, 0, s>>>(
+        g_c, out, order_dev, counts_dev, kNup, topk * kNup, topk, nseg_dev);
     e = cudaGetLastError();
     return (int)e;
 }
