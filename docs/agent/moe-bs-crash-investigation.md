@@ -664,3 +664,21 @@ routed 路径多 1 次批量量化 + 1 次 per-slot 加权（可融合进量化�
 
 ### 执行纪律
 **等 BS 臂正确性钉死之后再动**（一次只改一个变量：先让模型输出正确，再改精度路径并单独验证）。
+
+## §22 编译检查的正确做法（避免虚惊 + 避免浪费 GPU 窗口）
+
+**事实**：`kernels/cuda/tilelang_gen/moe_bs_handwritten.cu` **不是独立 TU** —— 它被
+`moe_bs_shim.cu:154` 用 `#include "moe_bs_handwritten.cu"` **文本包含**（因此它自己只 include
+`<cuda.h>/<cstdint>/<cstdio>`，不 include TileLang 头；`build.sh` 里也**没有**它的单独规则）。
+⇒ 单独 `nvcc -c moe_bs_handwritten.cu` **必然**报
+`error: expected a ";"`（`tl::tcgen05_ld_32dp32bNx` 未声明），这是**假警报**，不是代码坏了。
+
+**正确的一文件 compile-only 检查**（CPU only，可在没有 GPU 窗口时做）：
+```bash
+ssh ubuntu@43.202.208.136 'cd ~/ferrite/kernels/cuda/tilelang_gen && \
+  nvcc -c moe_bs_shim.cu -o /tmp/shim_check.o -gencode arch=compute_103a,code=sm_103a \
+       -O2 -std=c++17 -I. -I../tilelang_inc 2>&1 | tail -6; echo RC=$?'
+```
+（`SHIM_RC=0` = 手写 kernel + shim 全部编译通过。）
+
+**本轮实测**：该检查在 `DSV41_MOE_BS_SFREV`（§19）落地后**通过** ⇒ 下一个 GPU 窗口不会因编译错误浪费。
