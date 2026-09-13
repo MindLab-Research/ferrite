@@ -615,6 +615,13 @@ bool tl_bs_init() {
                                    cudaFuncAttributeMaxDynamicSharedMemorySize,
                                    (int)kSmem) == cudaSuccess;
     (void)cudaGetLastError();
+    // HANDWRITTEN kernel 也需要自己的 SetAttribute（smem=65536 > 48KB 默认）
+    if (ok) {
+        ok = cudaFuncSetAttribute(moe_bs_handwritten_kernel,
+                                  cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                  65536) == cudaSuccess;
+        (void)cudaGetLastError();
+    }
 
     // (b) 常驻 scratch
     if (ok) {
@@ -1018,8 +1025,7 @@ extern "C" int dsv41_moe_tilelang_gate_up_bs_dev(
             fprintf(stderr, "[moe-bs] HANDWRITTEN kernel active (DSV41_MOE_BS_HANDWRITTEN=1) — "
                             "sequential execution, no TMA pipeline\n");
         }
-        moe_bs_handwritten_kernel<<<dim3((unsigned)kGridX, (unsigned)kSegCap), 128, 65536, s>>>(
-            g_a, (const uint8_t*)w1, (const uint8_t*)w3, g_sfa,
+        moe_bs_handwritten_kernel<<<dim3((unsigned)kGridX, (unsigned)kSegCap), 128, 65536, s>>>(            g_a, (const uint8_t*)w1, (const uint8_t*)w3, g_sfa,
             (const uint32_t*)sfw1, (const uint32_t*)sfw3, eid_dev, g_c, w_stride);
         cudaError_t ehw = cudaGetLastError();
         if (ehw != cudaSuccess) return (int)ehw;
