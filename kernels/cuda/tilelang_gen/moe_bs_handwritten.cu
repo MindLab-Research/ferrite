@@ -79,6 +79,12 @@ __device__ int g_mbar_ring = 0;
 // arrived exactly once per launch, so its phase is always 0 and the wait needs no parity
 // accounting at all — the most robust option when the shared-barrier accounting desynchronises.
 __device__ int g_mbar_perstage = 0;
+// 1 = one final commit+wait on a dedicated barrier AFTER the K loop (DSV41_MOE_BS_DRAIN=1). The commit
+// tracks ALL prior async tcgen05 ops of the issuing thread, so a single wait whose phase is
+// structurally 0 gives "every MMA this launch issued has completed" without relying on any per-stage
+// parity accounting — the minimal conservative patch for the DEFAULT single-barrier path, where parity
+// drift can let a wait pass early.
+__device__ int g_drain = 0;
 // 1 = zero the D tile via tcgen05.st before the K loop (DSV41_MOE_BS_DCLEAR=1), so a lost/inverted
 // first-MMA accumulator clear can no longer leave foreign TMEM residue in the output.
 __device__ int g_dclear = 0;
@@ -824,25 +830,34 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
     const uint32_t SF_tmem = hw_SF_tmem;
     // `tcgen05.alloc` leaves TMEM UNINITIALISED and its result was never inspected. A failed or
     // unexpected allocation therefore makes the epilogue read columns THIS LAUNCH NEVER WROTE — i.e.
-    // the residue of whatever previously ran on this SM — which explains the two live anomalies
-    // better than any other mechanism (identical inputs but different outputs; and a NON-zero result
-    // with every operand zeroed, since zeroing the operands cannot change foreign TMEM). A fresh
-    // allocation must have lane field 0 and a non-zero column base.
-    if (warp == 0 && (C_tmem == 0u || SF_tmem == 0u ||
-                      ((C_tmem >> 16) & 0x1FFu) != 0u || ((SF_tmem >> 16) & 0x1FFu) != 0u)) {
-        printf("[moe-bs-handwritten] BAD TMEM ALLOC C=%08x SF=%08x — D would not be this launch's\n",
+    // the residue of whatever previously ran on this SM — which explains the two live anomalies better
+    // than any other mechanism (identical inputs but different outputs; and a NON-zero result with
+    // every operand zeroed). Only the LANE field is checked: a column base of 0 is a perfectly legal
+    // allocation for the first CTA on an SM (PTX ISA 9.7.18.1.1), so testing `C_tmem == 0` would be a
+    // false positive. This is a fail-safe, not a print: it routes into the abort path, which writes
+    // the qNaN sentinel into this block's own tile, so a bad allocation cannot masquerade as a number.
+    if (warp == 0 &&
+        (((C_tmem >> 16) & 0x1FFu) != 0u || ((SF_tmem >> 16) & 0x1FFu) != 0u)) {
+        printf("[moe-bs-handwritten] BAD TMEM ALLOC C=%08x SF=%08x (lane field set) — aborting this "
+               "block so the output is a sentinel, not foreign TMEM\n",
                C_tmem, SF_tmem);
+        hw_wait_fail = 1;
     }
+    __syncthreads();
 
-    // DSV41_MOE_BS_DCLEAR=1: zero the D tile through TMEM stores BEFORE the K loop, so "the first
-    // MMA's enable_d=0 clears the accumulator" stops being load-bearing. tcgen05.alloc does NOT zero
-    // TMEM, so if that single clearing MMA is lost (or its predicate inverted), every later MMA
-    // accumulates onto foreign residue — which is exactly a non-zero result with ALL operands zeroed,
-    // plus run-to-run variation (whose residue it is depends on which CTA had the columns before).
-    // Same primitive the isolated instrument uses (tcgen05.st.32x32b.x4), so it is exercised code.
+    // DSV41_MOE_BS_DCLEAR=1|2: zero (1) or qNaN-sentinel (2) the D tile through TMEM stores BEFORE the
+    // K loop, so "the first MMA's enable_d=0 clears the accumulator" stops being load-bearing.
+    // tcgen05.alloc does NOT zero TMEM, so a lost or inverted clearing MMA makes every later MMA
+    // accumulate onto foreign residue — a non-zero result with ALL operands zeroed, varying run to run
+    // with whichever CTA had those columns before. Mode 2 is BOTH the fix and a detector: the MMA's
+    // first (enable_d=0) write covers all 128 columns, so on the correct path every sentinel is
+    // overwritten; any column the launch never wrote keeps the NaN and propagates it into the output
+    // — a loud failure instead of a plausible number (the project's red line).
     if (g_dclear) {
+        const uint32_t sentinel = (g_dclear == 2) ? 0x7FC00000u /* quiet NaN */ : 0u;
         for (int i = 0; i < 32; ++i) {
-            hw_tc_st_x4(((uint32_t)(warp * 32) << 16) | (C_tmem + 4 * i), 0u, 0u, 0u, 0u);
+            hw_tc_st_x4(((uint32_t)(warp * 32) << 16) | (C_tmem + 4 * i), sentinel, sentinel, sentinel,
+                        sentinel);
         }
         hw_tc_wait_st();
         __syncthreads();
@@ -868,6 +883,11 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
                 asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;"
                              :: "r"((uint32_t)__cvta_generic_to_shared(mma_bar + i)));
             }
+        }
+        if (g_drain) {
+            // Slot HW_KITER (40) is the drain barrier: arrived once, waited once, phase 0.
+            asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;"
+                         :: "r"((uint32_t)__cvta_generic_to_shared(mma_bar + HW_KITER)));
         }
         // mbarrier-init visibility uses the DEDICATED fence and must come BEFORE the
         // first barrier (TileLang: moe_bs_up_tl.cu:63 tl::fence_barrier_init() is
@@ -1211,6 +1231,25 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
             hw_tc_dealloc(SF_tmem, 32);
         }
         return;
+    }
+
+    // ---- DSV41_MOE_BS_DRAIN=1: final drain before the epilogue ----
+    // One commit+wait on a dedicated barrier. `tcgen05.commit` tracks ALL prior async tcgen05 ops of
+    // the issuing thread (PTX 9.7.18.12.1), so this single wait — phase structurally 0, no parity
+    // arithmetic — guarantees every MMA this launch issued has completed, independent of the per-stage
+    // protocol. Cheap insurance for the default single-barrier path.
+    if (g_drain) {
+        if (warp == 1 && lane == 0) {
+            hw_tc_commit(&mma_bar[HW_KITER]);
+        }
+        if (tid == 0) {
+            asm volatile(
+                "{\n\t.reg .pred P;\n\tDRAIN:\n\t"
+                "mbarrier.try_wait.parity.shared::cta.b64 P, [%0], 0;\n\t"
+                "@!P bra DRAIN;\n\t}"
+                :: "r"((uint32_t)__cvta_generic_to_shared(&mma_bar[HW_KITER])));
+        }
+        __syncthreads();
     }
 
     // ---- epilogue: read TMEM → registers → smem → global ----
