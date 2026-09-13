@@ -88,8 +88,6 @@ def main():
     gu = np.fromfile(os.path.join(a.gu, "gateup.f32"), dtype="<f4")
     act = 2 * (dim // 16) if dim else 640
     # the dump's layout is [m][topk][act_slot]; act_slot = 2*inter_local, taken from the file size
-    gu3 = gu.reshape(m_rows, topk, 640)
-    print(f"meta: nseg={nseg} topk={topk} dim={dim}  gu has {m_rows} row(s); eid={eid[:nseg]}")
     m_rows = gu.size // (topk * 640)
     gu3 = gu.reshape(m_rows, topk, 640)
     print(f"meta: nseg={nseg} topk={topk} dim={dim}  gu has {m_rows} row(s); eid={eid[:nseg]}")

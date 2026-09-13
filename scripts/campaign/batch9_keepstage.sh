@@ -62,6 +62,25 @@ for f in gateup.f32; do
     && echo "$f IDENTICAL (claim holds)" || echo "$f DIFFERS — one of the two stagings is wrong"
 done
 
+# ---- THE MBARRIER HEALTH PROBE (existing kernel instrumentation, zero code change) ------------
+# defect-synthesis's E6: armrun_GD4_BS.log / armrun_GD4_LDOLD.log were killed by the watchdog with
+# the "§92 unbounded mbar spin" signature, i.e. the MMA-completion arrival is SOMETIMES MISSING.
+# With the unbounded wait (default) that hangs; with the bounded wait the kernel proceeds on an
+# INCOMPLETE MMA => the operand smem gets overwritten while the async MMA still reads it => the
+# output is a mixture of stages = right magnitude, element-wise uncorrelated, not a permutation,
+# and invisible to a one-stage instrument (which commits/wait exactly once at phase 0). The kernel
+# already has the probe; this arm just turns it on and reports what it saw.
+rm -rf /tmp/ks_wdbg
+run KS_WDBG DSV41_GATEUP_DUMP=/tmp/ks_wdbg DSV41_MOE_BS_BOUNDED_WAIT=1 DSV41_MOE_BS_WAITDBG=1
+echo "=== mbarrier probe verdict ==="
+grep -a "moe-bs-wait" "$HOME/armrun_KS_WDBG.log" | head -12
+echo "-- counts --"
+printf 'wait-dbg lines        : %s\n' "$(grep -ac 'moe-bs-wait-dbg' "$HOME/armrun_KS_WDBG.log" || true)"
+printf 'TIMEOUT lines        : %s\n' "$(grep -ac 'TIMEOUT' "$HOME/armrun_KS_WDBG.log" || true)"
+printf 'other_parity_ready=1 : %s\n' "$(grep -ac 'other_parity_ready=1' "$HOME/armrun_KS_WDBG.log" || true)"
+printf 'arrived-never (both parities not ready) : %s\n' \
+    "$(grep -ac 'other_parity_ready=0' "$HOME/armrun_KS_WDBG.log" || true)"
+
 echo "=== which stage's partial does each arm actually equal? ==="
 python3 - <<'PY'
 import os, subprocess, numpy as np
