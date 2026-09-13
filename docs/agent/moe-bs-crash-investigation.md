@@ -920,3 +920,47 @@ case 2/4 还出现粘性 `misaligned address`）。它是 swapAB 朝向（fp4 �
 
 **校验方式**：`bs-packed-geometry` subagent 的实测（要求 `const` 稠密 parity **relerr=0** 且 `sweep1d k`
 **128/128**）若与本预测一致 ⇒ 直接落地；若不一致 ⇒ 以实测为准，并回头修正本节的推导（把差异原因记下来）。
+
+## §31 packed 修复的实施清单（几何定标后机械落地）
+
+**改动面**：只在 `kernels/cuda/tilelang_gen/moe_bs_handwritten.cu`（+ 若需要新门控则加 shim 的 setter）。
+
+**新增门控**：`DSV41_MOE_BS_PACKED`（默认先 OFF，跑通受控对比后再考虑转正）。
+**注意**：swapAB 下 fp4 操作数在 **A_sh**、否则在 **B_sh**；e4m3 操作数路径**完全不动**。
+即门控只影响"fp4 那一个操作数"的 (a) staging、(b) descriptor 参数、(c) K-block 递进。
+
+### 1) staging（fp4 操作数）
+```c
+// 现在（错）：把一个 packed 字节拆成 2 个 1-byte 元素写成 unpacked
+//   (g_swapab ? A_sh : B_sh)[hw_smem_idx(row, k0, g_canon)] = packed & 0xF;
+//   (g_swapab ? A_sh : B_sh)[hw_smem_idx(row, k1, g_canon)] = packed >> 4;
+// 改成（对）：**原字节一次写入**（2 元素/字节），地址用 packed 几何
+if (g_packed) {
+    (g_swapab ? A_sh : B_sh)[hw_pack_idx(row, col)] = packed;   // col = packed 字节下标 0..63
+} else { /* 保留旧路径，供受控 A/B 对比 */ ... }
+```
+- 行字节数：**K/2 = 64 B**（K=128）—— tile 从 16384 B 降到 **8192 B** ✓（与官方 W 子 tile 一致）。
+- `hw_pack_idx(row, col)` 的确切 swizzle 形式**以 `bs-packed-geometry` 的实测为准**；
+  §30 的预测是"16 B chunk 在行内按行号 XOR"。
+
+### 2) descriptor 参数（fp4 操作数）
+预期（§30 推导）：**`lbo=1（16 B）、sbo=64（1024 B）、layout_type=2（SWIZZLE_128B）`** ——
+即与 e4m3 侧的 `lbo=1, sbo=64, layout=2` **数值相同**（这也与官方给 W 的 descriptor 一致）。
+⚠️ 若实测给出不同的 lbo/sbo，以实测为准。
+
+### 3) K-block 递进（fp4 操作数）
+**`ki × 16 B`（ki × 1 unit）** ---- 因为一个 K-block（32 元素）在 packed 形态下就是 16 B（= LBO ✓）。
+（e4m3 侧仍是 `ki × 32 B` = `ki × 2 units`，不动。）
+
+### 4) 不改的部分（已核对）
+- `hw_make_idesc` 的 `b_format`/`a_format` **不变**（`bs-impulse-probe` 的 PASS 用的就是现有 idesc `0x08A01400`）；
+- e4m3 操作数的 staging / descriptor / 递进不变；
+- SF 的打包与投递（`pack_wsf` / gather / transpose / `tcgen05.cp`）不变；
+- epilogue / scatter 不变。
+
+### 5) 验证顺序（**每次只改一个变量**）
+1. 先只改 fp4 staging + descriptor + 递进（门控 ON），**朝向与 SF 字节序都保持现状**；
+2. 用 `~/arm_run.sh` + **`DSV41_GRAPH_STEP=0`** 拿 in-situ `[NC]`：期望 `WORST rel` 从"1e0–1e2 档"掉到 **≤1e-2**（§28 的指纹表）；
+3. `[NC]` 达标后再用 `~/verify_correct.sh` 验文本（1..100 前 61 行）——**文本只是辅助判据**；
+4. **然后**才用 `~/orient_controlled.sh` 重新受控判定朝向（SWAPAB）与 SF 字节序（SFREV）——
+   因为之前所有"全错"的文本结论都是在 B 打包错的条件下得到的（§27）。
