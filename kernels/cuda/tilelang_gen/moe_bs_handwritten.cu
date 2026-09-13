@@ -86,6 +86,11 @@ __device__ __forceinline__ int hw_pack_sw128(int row, int p) {
     return (row >> 3) * 1024 + (row & 7) * 128 + (((c ^ (row & 7)) & 7) << 4) + (p & 7);
 }
 
+// ⚠️ SUPERSEDED AND MEASURED WRONG — DO NOT USE (kept as a reference only, per the
+// no-revert rule). This was the §30 guess; the hardware-calibrated layout is
+// hw_pack_sw128 above (§47), which reaches EXACT parity (relerr = 0), whereas this
+// one measures 1.031 and the GLOBAL env switch DSV41_MOE_BS_PACKGEOM is now moot for
+// the packed path (it is pinned to the vendor descriptor + hw_pack_sw128).
 __device__ __forceinline__ int hw_pack_idx(int row, int col /* packed byte index, 0..63 */) {
     if (g_packgeom == 3) {
         // candidate E (most likely): PLAIN row-major, no swizzle at all. Derived from the
