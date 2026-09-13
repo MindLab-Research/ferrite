@@ -574,6 +574,37 @@ def moe_bs_down(NSEG, BM, N, KDIM, E_, BN, BK, threads=THREADS,
 
 def _dump(kern, path):
     src = kern.get_kernel_source()
+    # POST-PROCESS (2026-09-14): inject tcgen05.relinquish_alloc_permit after the
+    # tmem_allocate calls. TileLang 0.1.14's codegen omits this, violating the PTX
+    # ISA precondition for tcgen05.dealloc (the CTA must relinquish its allocation
+    # permit before dealloc). Without this, the kernel traps with "illegal
+    # instruction" at the tail dealloc. Verified convention:
+    # tests_tcgen05_mxf8f6f4_1x.cu:874-875, dsv41_experts_mxf4.cu:327-332.
+    _RELINQUISH = ('    asm volatile('
+                   '"tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;"'
+                   ' ::: "memory");\n')
+    _ALLOC_TAIL = '  }'
+    _NEEDLE = 'tl::tmem_allocate'
+    if _NEEDLE in src and 'relinquish_alloc_permit' not in src:
+        lines = src.split('\n')
+        out = []
+        in_alloc_block = False
+        alloc_seen = False
+        for i, ln in enumerate(lines):
+            out.append(ln)
+            if _NEEDLE in ln:
+                alloc_seen = True
+                # The alloc calls are inside `if (warp==0) { ... }` — find the
+                # closing brace of that block and inject before it.
+                # Simpler: the very next `  }` line after the last alloc.
+                in_alloc_block = True
+            elif in_alloc_block and ln.rstrip() == _ALLOC_TAIL:
+                # This is the closing brace of the alloc block.
+                out.pop()  # remove the brace
+                out.append(_RELINQUISH.rstrip('\n'))
+                out.append(_ALLOC_TAIL)
+                in_alloc_block = False
+        src = '\n'.join(out)
     with open(path, "w") as f:
         f.write(src)
     return src
