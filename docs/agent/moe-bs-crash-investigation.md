@@ -425,6 +425,11 @@ for k in 0..40:
 4. ue8m0 转换：gather 的 `f_pow2_to_ue8m0` 对 2 的幂 s=2^e 返回 e+127 ✓（解码 2^(b-127) 一致）
 5. B 行映射：W1 行 `n_tile*64+row` → B_sh 行 `row`；W3 行 `n_tile*64+row` → B_sh 行 `64+row`；scatter 列映射 `c<64 → gate(n_tile*64+c)`、`c>=64 → up(n_tile*64+c-64)` ✓
 6. SF 字节序：gather `byte j = 第 j 个 K-block`，MMA `sf_id=ki` 选 byte ki，descriptor 递进到 K-atom ki ✓
+7. **scatter 的列布局**：`tl_moe_bs_scatter_kernel`（`moe_bs_shim.cu`）把 C 的第 `col` 列映射为
+   `n = (j<64) ? (bx*64+j) : (320 + bx*64 + (j-64))`（`bx = col/128`、`j = col%128`）⇒ **gate 落 [0,320)、up 落 [320,640)**，
+   与手写 kernel 的 epilogue 列布局**完全一致**，也与下游 swiglu 的 `row[i]`（gate）/`row[inter+i]`（up）读法一致 ✓。
+   `dst = (idx/split)*out_pitch + (idx%split)*nup`（up 路径 split=topk、out_pitch=topk*2*inter、nup=2*inter）
+   = 该 assignment 的槽内偏移 ✓。**该项排除**。（注：NUMCHECK 只验 scatter **之前**的 g_c，所以专门查了这一环。）
 
 ## §13 微基准定谳：非 swapAB 朝向算不出正确乘积（第 7 个真 bug 级发现）
 
