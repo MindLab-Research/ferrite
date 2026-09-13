@@ -59,11 +59,34 @@
    - device_kernel.cu vs moe_bs_up_tl.cu：仅差手加的 relinquish asm
    - vendored 模板 vs 安装模板：逐文件一致
 
-## 当前嫌疑（按可能性排序）
+## 完整 Kernel 分析（2026-09-14 下午——173 行逐行审读）
 
-1. **~~TMA descriptor 运行时差异~~** → **已被 SYNC-DIAG 否定**：eager 路径（m=1）MMA 完全正常
-2. **~~tcgen05 指令环境依赖~~** → **已被 .scale_vec::1X 修复**（待验证）
-3. **spec 路径（m=6）特有问题** → `.scale_vec::1X` + `"memory"` clobber 修复已提交（472fe57）
+**Warp 分工**：
+- Warp 0 (0-31): TMA producer（A, W1, W3, SFA, SFW1, SFW3 → smem）
+- Warp 1 (32-63): MMA consumer（tcgen05_cp SF→TMEM + tcgen05.mma + commit）
+- Warp 2 (64-95): SF transpose（smem 内 SF 数据转置 → sf_full 信号）
+- Warp 3 (96-127): idle（只参与 barrier）
+
+**Barrier 结构**（全部验证自洽）：
+- `loaded[3]` (init=32): warp 0 arrive → warp 1/2 wait
+- `sf_full[3]` (init=32): warp 2 arrive → warp 1 wait
+- `consumed[3]` (init=1): MMA commit arrive → warp 0 wait（防 stage 覆写）
+- `tmem_full[1]` (init=1): 最后 MMA commit → 全部 wait（epilogue 前）
+
+**SF 转置验证**（tcgen05_sf_warp_transpose）：
+- 4×32 uint32 块内转置，XOR swizzle 避 bank conflict
+- 读写 index 均在 [0, 128) 内 ✓
+- SFW chunk = SFW1[0,64) + SFW3[64,128)——cp 复制全部 128 到 TMEM sfa_data+4
+
+**已验证正确的项**：
+- 所有 smem 偏移和大小
+- 所有 mbarrier init/arrive/wait 计数
+- TMEM 分配（128+32=160 < 512）和读取（128 列恰好）
+- tcgen05_ld 的 128 f32/thread × 128 threads = C 的 128×128
+- epilogue 的 swizzled C_sh 写入
+- TMA store 的 4×32 列分片
+
+**结论**：静态分析已穷尽——kernel 结构在 m=1 和 m=6 之间没有区别。crash 必须用 compute-sanitizer 定位。
 
 ## ROOT CAUSE 分析（2026-09-14 下午更新）
 
