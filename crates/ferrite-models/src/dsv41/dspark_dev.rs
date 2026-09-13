@@ -502,6 +502,22 @@ struct DraftP3Lite {
     /// exactly the P3b-class claim rule R1 forbids. With ALIGN on, both sides run
     /// the same program and the fold is a pure launch-count change.
     q_ropenorm: bool,
+    /// **segment A** (the hc front end, `DSV41_P3LITE_HC_FRONT`, alias
+    /// `DSV41_DRAFT_P3LITE_A_SEG`): `hc_mixes` + `hc_collapse_norm` as ONE
+    /// `dsv41_draft_hc_front` launch, at BOTH of the draft block's sub-blocks
+    /// (attention and FFN). `pre_collapse` -- the incoming premix the collapse
+    /// reads -- is never the `pre` the mixes write, so the two phases share no
+    /// buffer and the fused launch is bit-identical to the pair (phase 1 is
+    /// `hc_mixes_kernel`'s program at its own `mix * 32` width, phase 2 is
+    /// `hc_collapse_norm_kernel`'s body at its own 1024).
+    ///
+    /// ⚠️ Phase 2 IS `hc_collapse_norm`, i.e. the P3a a1 fold. With
+    /// `DSV41_BF16_TRUNCATE=1` AND `DSV41_P3A_COLLAPSE_NORM=0` the un-fused
+    /// attention site would run `hc_collapse` + `rmsnorm` (no truncate) while the
+    /// fused launch applies truncate -- so the attention site's wiring declines
+    /// that combination. The FFN site has only the `hc_collapse_norm` form, so it
+    /// takes the fold unconditionally.
+    hc_front: bool,
 }
 
 /// `DSV41_DRAFT_P3LITE=1` (**DEFAULT OFF**) — the draft chain's **P3-lite**
@@ -514,6 +530,7 @@ struct DraftP3Lite {
 /// | l2 | `DSV41_P3LITE_KV_NORM_ROPE` | kv: `rmsnorm(kv)` + `apply_rope(kv)` -> `dsv41_rmsnorm_rope` | 1/block |
 /// | l3 | `DSV41_P3LITE_ATTN_OROPE` | `sparse_attn` + `rope_inv(o)` x bs + `quant1(o)` -> `dsv41_sparse_attn_orope` | 6/block |
 /// | l4 | `DSV41_P3LITE_Q_ROPENORM` | q chain: `rmsnorm(qr)` + `quant1(qr)` + `gemm(wq_b)` + `rope(q)` -> `dsv41_gemm_fp8_mrows_rope_norm` (K2) | 7/block |
+/// | A | `DSV41_P3LITE_HC_FRONT` | hc front end: `hc_mixes` + `hc_collapse_norm` -> `dsv41_draft_hc_front` | 1/block x2 |
 ///
 /// A per-item override, when SET, wins over the master (`=0` turns that one fold
 /// off for an A/B that isolates it; any other value turns it on). An unset
@@ -557,6 +574,12 @@ fn draft_p3lite() -> DraftP3Lite {
             kv_norm_rope: item("DSV41_P3LITE_KV_NORM_ROPE"),
             attn_orope: item("DSV41_P3LITE_ATTN_OROPE"),
             q_ropenorm: item("DSV41_P3LITE_Q_ROPENORM"),
+            // Segment A's own env, plus the task-book alias
+            // `DSV41_DRAFT_P3LITE_A_SEG` (an explicit set of either wins).
+            hc_front: match std::env::var("DSV41_DRAFT_P3LITE_A_SEG") {
+                Ok(v) => v != "0",
+                Err(_) => item("DSV41_P3LITE_HC_FRONT"),
+            },
         }
     })
 }
@@ -1862,6 +1885,69 @@ impl<'a> DsparkDev<'a> {
             self.hc as i32,
             self.cfg.hc_sinkhorn_iters as i32,
             self.cfg.hc_eps,
+        )
+    }
+
+    /// **P3-lite segment A** (`DSV41_P3LITE_HC_FRONT` / `DSV41_DRAFT_P3LITE_A_SEG`):
+    /// the hc front end — `hc_mixes` AND the collapse+rmsnorm — as ONE
+    /// `dsv41_draft_hc_front`, for one sub-block (`ffn` selects the trio, exactly
+    /// as [`Self::hc_mixes`] does).
+    ///
+    /// The collapse's `pre_collapse` is the caller's INCOMING premix slot, never
+    /// the `pre` this call's mixes write (the draft walks the premix slots), so
+    /// the two phases share no buffer: phase 1 is `hc_mixes_kernel`'s program at
+    /// its own `mix * 32` logical width, phase 2 is
+    /// `dsv41_hc_collapse_norm_kernel`'s body at its own 1024. The barrier between
+    /// them only orders them, so the fused launch is bit-identical to the pair.
+    ///
+    /// `Ok(false)` = no symbol in the loaded `.so`, or a reachable decline (see
+    /// the kernel header) — the caller then runs the `hc_mixes` +
+    /// `hc_collapse_norm` pair, which is the reference path.
+    #[allow(clippy::too_many_arguments)]
+    fn hc_front_fused(
+        &self,
+        x: *const f32,
+        ld: &LayerDev,
+        ffn: bool,
+        pre_out: *mut f32,
+        post: *mut f32,
+        comb: *mut f32,
+        pre_collapse: *const f32,
+        out: *mut f32,
+    ) -> Result<bool> {
+        let (f, sc, base, norm_w) = if ffn {
+            (
+                need(&ld.hc_ffn_fn, "mtp.*.hc_ffn_fn")?,
+                need(&ld.hc_ffn_scale, "mtp.*.hc_ffn_scale")?,
+                need(&ld.hc_ffn_base, "mtp.*.hc_ffn_base")?,
+                need(&ld.ffn_norm, "mtp.*.ffn_norm.weight")?,
+            )
+        } else {
+            (
+                need(&ld.hc_attn_fn, "mtp.*.hc_attn_fn")?,
+                need(&ld.hc_attn_scale, "mtp.*.hc_attn_scale")?,
+                need(&ld.hc_attn_base, "mtp.*.hc_attn_base")?,
+                need(&ld.attn_norm, "mtp.*.attn_norm.weight")?,
+            )
+        };
+        self.dev.draft_hc_front(
+            x,
+            f.as_f32(),
+            sc.as_f32(),
+            base.as_f32(),
+            pre_out,
+            post,
+            comb,
+            pre_collapse,
+            norm_w.as_f32(),
+            out,
+            self.bs as i32,
+            self.hc as i32,
+            self.dim as i32,
+            self.cfg.hc_sinkhorn_iters as i32,
+            self.cfg.hc_eps,
+            self.cfg.norm_eps,
+            crate::dsv41::chain_dev::bf16_truncate(),
         )
     }
 

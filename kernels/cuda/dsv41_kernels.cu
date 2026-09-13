@@ -1538,13 +1538,20 @@ __global__ void sparse_attn_split_kernel(const float* __restrict__ q,
                                          int d, const int* __restrict__ clen, int window,
                                          int index_topk, float scale, int C,
                                          const int* __restrict__ clen_rows, int idx_stride,
-                                         int row_pitch) {
+                                         int row_pitch, const int* __restrict__ base,
+                                         const float* __restrict__ kv_rows) {
     const int ck = blockIdx.x;
     const int row = blockIdx.y;
     if (row >= b * m || ck >= C) return;
     const int hh = blockIdx.z;
     if (hh >= h) return;
     const int bb = row / m, mm = row % m;
+    // SPARSE-ATTN-ROPE-MROWS: see `dsv41_kv_win_fetch`'s header. `kv_rows` != null
+    // turns the window reads into the deferred-append substitution; `base` is the
+    // same live counter the single-block kernel reads (`*base + mm` is row mm's
+    // position). `kv_rows == null` leaves every read as `kv[kBase + idx*d + c]`.
+    const int pos_base = base != nullptr ? *base : 0;
+    const int pos_r = pos_base + mm;
     // W2-MROWS (DSV41_ATTN_MROWS): per-row bound (`clen_rows == nullptr` keeps the
     // scalar read, byte-for-byte); `idx_stride` is the caller's row pitch, see
     // `sparse_attn_kernel`.
@@ -1588,21 +1595,21 @@ __global__ void sparse_attn_split_kernel(const float* __restrict__ q,
 #pragma unroll
         for (int i = 0; i < kMaxPerW; ++i) {
             const int c = lane + i * 32;
-            if (c < d) kb0[i] = kv[kBase + (size_t)ia * d + c];
+            if (c < d) kb0[i] = dsv41_kv_win_fetch(kv + kBase, kv_rows, pos_base, pos_r, ia, c, window, d);
         }
     }
     if (ib >= 0) {
 #pragma unroll
         for (int i = 0; i < kMaxPerW; ++i) {
             const int c = lane + i * 32;
-            if (c < d) kb1[i] = kv[kBase + (size_t)ib * d + c];
+            if (c < d) kb1[i] = dsv41_kv_win_fetch(kv + kBase, kv_rows, pos_base, pos_r, ib, c, window, d);
         }
     }
     if (ic >= 0) {
 #pragma unroll
         for (int i = 0; i < kMaxPerW; ++i) {
             const int c = lane + i * 32;
-            if (c < d) kb2[i] = kv[kBase + (size_t)ic * d + c];
+            if (c < d) kb2[i] = dsv41_kv_win_fetch(kv + kBase, kv_rows, pos_base, pos_r, ic, c, window, d);
         }
     }
     // Main loop: three slots per pass. Slot t lives in kb0, t+nwarp in kb1,
@@ -1644,7 +1651,7 @@ __global__ void sparse_attn_split_kernel(const float* __restrict__ q,
 #pragma unroll
             for (int i = 0; i < kMaxPerW; ++i) {
                 const int c = lane + i * 32;
-                if (c < d) kb0[i] = kv[kBase + (size_t)id * d + c];
+                if (c < d) kb0[i] = dsv41_kv_win_fetch(kv + kBase, kv_rows, pos_base, pos_r, id, c, window, d);
             }
         }
         if (ib >= 0) {
@@ -1673,7 +1680,7 @@ __global__ void sparse_attn_split_kernel(const float* __restrict__ q,
 #pragma unroll
             for (int i = 0; i < kMaxPerW; ++i) {
                 const int c = lane + i * 32;
-                if (c < d) kb1[i] = kv[kBase + (size_t)ie * d + c];
+                if (c < d) kb1[i] = dsv41_kv_win_fetch(kv + kBase, kv_rows, pos_base, pos_r, ie, c, window, d);
             }
         }
         if (ic >= 0) {
@@ -1702,7 +1709,7 @@ __global__ void sparse_attn_split_kernel(const float* __restrict__ q,
 #pragma unroll
             for (int i = 0; i < kMaxPerW; ++i) {
                 const int c = lane + i * 32;
-                if (c < d) kb2[i] = kv[kBase + (size_t)iff * d + c];
+                if (c < d) kb2[i] = dsv41_kv_win_fetch(kv + kBase, kv_rows, pos_base, pos_r, iff, c, window, d);
             }
         }
         ia = id;
@@ -2102,6 +2109,117 @@ __global__ void apply_rope_mrows_kernel(float* __restrict__ x, const float* __re
 // plain call would have selected `sparse_attn_pf_kernel` and the emission shape
 // is exact (d <= 512, d % 32 == 0, 0 < rope_rd <= d, rope_rd even); the caller
 // then runs the old three-launch sequence, bit-identical by construction.
+//
+// SPARSE-ATTN-ROPE-MROWS (`DSV41_VERIFY_OROPE_MROWS`, `kv_rows != nullptr`): the
+// verify block's rows form, and it is the ONLY form that is correct in the
+// steady state (the ring has turned over). The three kernels below
+// (`sparse_attn_orope_kernel`, `sparse_attn_split_kernel`) read a row's KV from
+// the ring `kv[kBase + idx*d + c]`; a batch of m rows CANNOT do that, because
+// once `pos_base + m - 1 >= window` a LATER row's own append overwrites a slot an
+// EARLIER row's window still enumerates (audit defect #2 - the block-wide
+// `verify_ring_win` was reverted for exactly this, and it is why `ATTN_MROWS`
+// declines in steady state).
+//
+// THE FIX: DEFER the block's appends to AFTER every row's attention, and let a
+// window slot whose position falls inside the block be read from the block's own
+// KV rows (`kv_rows`, i.e. `s.kv_r`) instead of the ring. For a window-slot
+// index `idx` (0 <= idx < window) row `r` of the block wants the UNIQUE position
+// `p` with `p % window == idx` inside its causal window `[pos_r-window+1, pos_r]`:
+//
+//     p = pos_r - ((pos_r - idx) mod window)
+//
+// With the appends deferred, the ring still holds the PRE-BLOCK state, so for
+// `p < pos_base` the ring slot IS the value row r wants (the largest position
+// <= pos_base-1 congruent to `idx` is `p` itself, because `p < pos_base`), and
+// for `p >= pos_base` the value is `kv_rows[p - pos_base]` - the same bytes the
+// per-row path had just appended there. Either branch returns the exact bytes
+// the per-row interleave's `sparse_attn_orope` read at row r, so the whole batch
+// is bit-identical to `m` single-row calls AND needs no turnover precondition.
+//
+// `kv_rows == nullptr` makes the helper return the plain ring address - the
+// pre-existing single-row / ATTN_MROWS behaviour, byte for byte.
+__device__ __forceinline__ float dsv41_kv_win_fetch(const float* __restrict__ ring,
+                                                    const float* __restrict__ kv_rows,
+                                                    int pos_base, int pos_r, int idx, int c,
+                                                    int window, int d) {
+    if (kv_rows != nullptr && idx >= 0 && idx < window) {
+        int dd = pos_r - idx;
+        dd %= window;
+        if (dd < 0) dd += window;
+        const int p = pos_r - dd;
+        if (p >= pos_base) return kv_rows[(size_t)(p - pos_base) * (size_t)d + (size_t)c];
+    }
+    return ring[(size_t)idx * (size_t)d + (size_t)c];
+}
+
+// SPARSE-ATTN-ROPE-MROWS support #1: the block's window indices, ONE launch for
+// all m rows - `window_idxs_kernel`'s decode branch VERBATIM (same `oldest`,
+// same wrap, same `idx > start_pos -> -1`, same `start_pos == 0` case), with
+// row `r`'s position from `pos_rows[r]` and its output row at `r * idx_stride`
+// (the verify's `idxs_r` pitches rows at `ist = window + index_topk`, NOT at
+// `window`). An m-row call emits exactly the bytes `m` single-row
+// `dsv41_window_idxs(idxs + r*ist, pos_rows + r, window)` calls emit: the row
+// index only shifts the two base pointers and every index depends on nothing
+// but that row's own position.
+__global__ void window_idxs_mrows_kernel(int32_t* __restrict__ idxs,
+                                         const int* __restrict__ pos_rows, int window, int m,
+                                         int idx_stride) {
+    const int r = blockIdx.y;
+    if (r >= m) return;
+    const int c = threadIdx.x + (int)blockIdx.x * blockDim.x;
+    if (c >= window) return;
+    const int start_pos = pos_rows[r];
+    int32_t* orow = idxs + (size_t)r * (size_t)idx_stride;
+    if (start_pos == 0) {
+        orow[c] = (c == 0) ? 0 : -1;
+        return;
+    }
+    const int oldest = (start_pos % window) + 1;
+    long long idx = ((long long)c < (long long)window - oldest)
+                        ? (long long)oldest + c
+                        : (long long)c - ((long long)window - oldest);
+    if (idx > (long long)start_pos) idx = -1;
+    orow[c] = (int)idx;
+}
+
+extern "C" int dsv41_window_idxs_mrows(int32_t* idxs, const int* pos_rows, int window, int m,
+                                       int idx_stride, cudaStream_t s) {
+    if (window <= 0 || idxs == nullptr || pos_rows == nullptr) return (int)cudaSuccess;
+    if (m <= 0 || idx_stride < window) return (int)cudaSuccess;
+    window_idxs_mrows_kernel<<<dim3((unsigned)((window + 127) / 128), (unsigned)m), 128, 0, s>>>(
+        idxs, pos_rows, window, m, idx_stride);
+    return (int)cudaGetLastError();
+}
+
+// SPARSE-ATTN-ROPE-MROWS support #2: the block's ring APPEND, deferred to AFTER
+// every row's attention (that deferral is what makes the batched attention
+// correct - see `dsv41_kv_win_fetch`). `ring_append_kernel`'s body per row: slot
+// `pos_rows[r] % window`, `kv_rows[r*hd + i] -> ring[slot*hd + i]`. The writes
+// are the same set, to the same addresses, with the same values the per-row
+// `ring_append` calls made; only their order relative to the attention reads
+// moved, so the FINAL ring state is byte-identical to the per-row interleave's.
+__global__ void ring_append_mrows_kernel(float* __restrict__ ring,
+                                         const float* __restrict__ kv_rows,
+                                         const int* __restrict__ pos_rows, int window, int hd,
+                                         int m) {
+    const int e = threadIdx.x + (int)blockIdx.x * blockDim.x;
+    const int total = m * hd;
+    if (e >= total) return;
+    const int r = e / hd, i = e % hd;
+    const int slot = pos_rows[r] % window;
+    ring[(size_t)slot * (size_t)hd + (size_t)i] = kv_rows[(size_t)e];
+}
+
+extern "C" int dsv41_ring_append_mrows(float* ring, const float* kv_rows, const int* pos_rows,
+                                       int window, int hd, int m, cudaStream_t s) {
+    if (ring == nullptr || kv_rows == nullptr || pos_rows == nullptr) return (int)cudaSuccess;
+    if (hd <= 0 || window <= 0 || m <= 0) return (int)cudaSuccess;
+    const int total = m * hd;
+    ring_append_mrows_kernel<<<(unsigned)((total + 127) / 128), 128, 0, s>>>(
+        ring, kv_rows, pos_rows, window, hd, m);
+    return (int)cudaGetLastError();
+}
+
 __global__ void sparse_attn_orope_kernel(
     const float* __restrict__ q, const float* __restrict__ kv,
     const float* __restrict__ sink, const int32_t* __restrict__ idxs,
@@ -2110,10 +2228,16 @@ __global__ void sparse_attn_orope_kernel(
     const float* __restrict__ cos, const float* __restrict__ sin,
     const int* __restrict__ base, int rope_rd, int half, int mul, int off, int step,
     int inverse, uint8_t* __restrict__ xq, float* __restrict__ xsc,
-    const int* __restrict__ clen_rows, int idx_stride, int row_step, int row_pitch) {
+    const int* __restrict__ clen_rows, int idx_stride, int row_step, int row_pitch,
+    const float* __restrict__ kv_rows) {
     const int row = blockIdx.x;
     if (row >= b * m) return;
     const int bb = row / m, mm = row % m;
+    // SPARSE-ATTN-ROPE-MROWS: the position source is the SAME live device counter
+    // the per-row path reads with `off = r` (`tt = pos_ctr + r`), so the two forms
+    // agree row for row; `pos_base` is that counter's block value.
+    const int pos_base = *base;
+    const int pos_r = pos_base + mm;
     // W2-MROWS-TP: q/out row pitch, 0 -> `h*d` (see `sparse_attn_kernel`). The
     // `xq`/`xsc` emission below deliberately does NOT use `rp`: those two are the
     // caller's COMPACT per-rank block (`nlh*hd` per row), so the `h*d` pitch is
@@ -2157,21 +2281,21 @@ __global__ void sparse_attn_orope_kernel(
 #pragma unroll
             for (int i = 0; i < kMaxPerW; ++i) {
                 const int c = lane + i * 32;
-                if (c < d) kb0[i] = kv[kBase + (size_t)ia * d + c];
+                if (c < d) kb0[i] = dsv41_kv_win_fetch(kv + kBase, kv_rows, pos_base, pos_r, ia, c, window, d);
             }
         }
         if (ib >= 0) {
 #pragma unroll
             for (int i = 0; i < kMaxPerW; ++i) {
                 const int c = lane + i * 32;
-                if (c < d) kb1[i] = kv[kBase + (size_t)ib * d + c];
+                if (c < d) kb1[i] = dsv41_kv_win_fetch(kv + kBase, kv_rows, pos_base, pos_r, ib, c, window, d);
             }
         }
         if (ic >= 0) {
 #pragma unroll
             for (int i = 0; i < kMaxPerW; ++i) {
                 const int c = lane + i * 32;
-                if (c < d) kb2[i] = kv[kBase + (size_t)ic * d + c];
+                if (c < d) kb2[i] = dsv41_kv_win_fetch(kv + kBase, kv_rows, pos_base, pos_r, ic, c, window, d);
             }
         }
         // Main loop: three slots per pass. Slot t lives in kb0, t+nwarp in kb1,
@@ -2212,7 +2336,7 @@ __global__ void sparse_attn_orope_kernel(
 #pragma unroll
                 for (int i = 0; i < kMaxPerW; ++i) {
                     const int c = lane + i * 32;
-                    if (c < d) kb0[i] = kv[kBase + (size_t)id * d + c];
+                    if (c < d) kb0[i] = dsv41_kv_win_fetch(kv + kBase, kv_rows, pos_base, pos_r, id, c, window, d);
                 }
             }
             if (ib >= 0) {
@@ -2241,7 +2365,7 @@ __global__ void sparse_attn_orope_kernel(
 #pragma unroll
                 for (int i = 0; i < kMaxPerW; ++i) {
                     const int c = lane + i * 32;
-                    if (c < d) kb1[i] = kv[kBase + (size_t)ie * d + c];
+                    if (c < d) kb1[i] = dsv41_kv_win_fetch(kv + kBase, kv_rows, pos_base, pos_r, ie, c, window, d);
                 }
             }
             if (ic >= 0) {
@@ -2270,7 +2394,7 @@ __global__ void sparse_attn_orope_kernel(
 #pragma unroll
                 for (int i = 0; i < kMaxPerW; ++i) {
                     const int c = lane + i * 32;
-                    if (c < d) kb2[i] = kv[kBase + (size_t)iff * d + c];
+                    if (c < d) kb2[i] = dsv41_kv_win_fetch(kv + kBase, kv_rows, pos_base, pos_r, iff, c, window, d);
                 }
             }
             ia = id;
@@ -6210,12 +6334,19 @@ gemm_fp8_mtile_kernel(const uint8_t* __restrict__ a, const float* __restrict__ a
         for (int kb = 0; kb < nb_k; ++kb) {
             const int j = kb * 32 + lane;
             // ONE activation decode per (q, kb), shared by the warp's whole N tile.
-            // The byte comes from L1 (`__ldg`): the legacy kernel's `s_a[q*k+j]` is
-            // a PURE COPY of this address, and a copy's width is not observable.
+            // The byte comes from L1 (`__ldg`), and it is decoded through the SAME
+            // `s_lut` the legacy kernel reads: the legacy `s_a[q*k+j]` is a PURE COPY
+            // of this address (a copy's width is not observable), so
+            // `s_lut[__ldg(a + q*k + j)]` IS the legacy `s_lut[s_a[q*k+j]]` -- the
+            // identical expression. The LUT (1 LDS) is used rather than an inline
+            // `e4m3_to_f` (the 5a family's form, ~7 ALU ops) precisely because this
+            // kernel HAS a smem block for the weight slab, so the 1 KB table is
+            // free -- and because a LUT read is 1 instruction where the inline
+            // decode is seven, which is the quantity this arm is buying.
             float av[RN];
             #pragma unroll
             for (int q = 0; q < RN; ++q)
-                av[q] = e4m3_to_f(__ldg(a + (size_t)q * (size_t)k + j)) *
+                av[q] = s_lut[__ldg(a + (size_t)q * (size_t)k + j)] *
                         __ldg(a_scale + (size_t)q * (size_t)nb_k + kb);
             #pragma unroll
             for (int nn = 0; nn < BN_MAX; ++nn) {
@@ -10510,7 +10641,7 @@ static int dsv41_sparse_attn_impl(const float* q, const float* kv, const float* 
             sparse_attn_split_kernel<<<dim3((unsigned)split_c, (unsigned)(b * m),
                                             (unsigned)h), 128, 0, s>>>(
                 q, kv, idxs, b, m, h, d, clen, window, index_topk, scale, split_c, clen_rows,
-                idx_stride, row_pitch);
+                idx_stride, row_pitch, nullptr, nullptr);
             cudaError_t e2 = cudaGetLastError();
             if (e2 != cudaSuccess) return (int)e2;
             sparse_attn_merge_kernel<<<dim3((unsigned)(b * m), (unsigned)h), 128, 0, s>>>(
@@ -10597,7 +10728,7 @@ static int dsv41_sparse_attn_orope_impl(
     int m, int h, int d, const int* clen, int window, int index_topk, float scale,
     const float* cos, const float* sin, const int* base, int rope_rd, int half, int mul, int off,
     int step, int inverse, uint8_t* xq, float* xsc, const int* clen_rows, int idx_stride,
-    int row_step, int row_pitch, cudaStream_t s) {
+    int row_step, int row_pitch, const float* kv_rows, cudaStream_t s) {
     if (b <= 0 || m <= 0 || h <= 0 || d <= 0) return 1;
     if (d > 512) return 1;              // accumulator is d-wide per thread group
     if ((d & 31) != 0) return 1;        // fp8 per-32-block index must stay head-local
@@ -10605,6 +10736,10 @@ static int dsv41_sparse_attn_orope_impl(
     if (half != rope_rd / 2) return 1;
     if (cos == nullptr || sin == nullptr || base == nullptr) return 1;
     if (xq == nullptr || xsc == nullptr) return 1;
+    // SPARSE-ATTN-ROPE-MROWS: `kv_rows != nullptr` is the deferred-append substitution
+    // and is well-defined only for ONE batch element (the block IS `[1, m]`), so the
+    // arm refuses `b != 1` rather than mis-indexing a second element's positions.
+    if (kv_rows != nullptr && b != 1) return 2;
     // Same selection the plain launcher makes, through the SAME resolver (the env
     // is read once per process either way, and the two must agree or the fused
     // path declines shapes it could have carried).
@@ -10629,7 +10764,7 @@ static int dsv41_sparse_attn_orope_impl(
         sparse_attn_split_kernel<<<dim3((unsigned)split_c, (unsigned)(b * m),
                                         (unsigned)h), 128, 0, s>>>(
             q, kv, idxs, b, m, h, d, clen, window, index_topk, scale, split_c, clen_rows,
-            idx_stride, row_pitch);
+            idx_stride, row_pitch, base, kv_rows);
         cudaError_t e2 = cudaGetLastError();
         if (e2 != cudaSuccess) return (int)e2;
         sparse_attn_merge_kernel<<<dim3((unsigned)(b * m), (unsigned)h), 128, 0, s>>>(
@@ -10641,7 +10776,7 @@ static int dsv41_sparse_attn_orope_impl(
     sparse_attn_orope_kernel<<<dim3(b * m, h), 128, 0, s>>>(
         q, kv, sink, idxs, out, b, m, h, d, clen, window, index_topk, scale, cos, sin, base,
         rope_rd, half, mul, off, step, inverse, xq, xsc, clen_rows, idx_stride, row_step,
-        row_pitch);
+        row_pitch, kv_rows);
     return (int)cudaGetLastError();
 }
 
@@ -10671,6 +10806,36 @@ extern "C" int dsv41_sparse_attn_orope_rp(
                                         index_topk, scale, cos, sin, base, rope_rd, half, mul, off,
                                         step, inverse, xq, xsc, clen_rows, idx_stride, row_step,
                                         row_pitch, s);
+}
+
+// SPARSE-ATTN-ROPE-MROWS (`DSV41_VERIFY_OROPE_MROWS=1`, the verify block's ONE
+// fused sparse-attention + inverse o-rope + fp8 launch, correct in the STEADY
+// STATE):
+//
+//     dsv41_sparse_attn_orope_mrows(q, ring, kv_rows, sink, idxs, out, b=1, m, h, d,
+//                                   clen, window, index_topk, scale, cos, sin,
+//                                   pos_ctr, rope_rd, half, 1, 0, 0, inverse,
+//                                   xq, xsc, clen_rows, idx_stride, row_step=1, row_pitch,
+//                                   stream)
+//
+// `kv_rows` is the block's OWN `[m, d]` KV rows (`s.kv_r`) and `pos_ctr` is the
+// live device counter; the launcher loads them into every window read via
+// `dsv41_kv_win_fetch` (see its header for the position algebra and the
+// bit-identity argument). The caller MUST then run `dsv41_ring_append_mrows`
+// AFTER this launch - the appends are deferred precisely so no row of the block
+// can clobber a slot an earlier row still reads. A stale `.so` without this
+// symbol leaves the caller on the per-row sequence, byte for byte.
+extern "C" int dsv41_sparse_attn_orope_mrows(
+    const float* q, const float* kv, const float* kv_rows, const float* sink, const int32_t* idxs,
+    float* out, int b, int m, int h, int d, const int* clen, int window, int index_topk,
+    float scale, const float* cos, const float* sin, const int* base, int rope_rd, int half,
+    int mul, int off, int step, int inverse, uint8_t* xq, float* xsc, const int* clen_rows,
+    int idx_stride, int row_step, int row_pitch, cudaStream_t s) {
+    if (kv_rows == nullptr) return 2;
+    return dsv41_sparse_attn_orope_impl(q, kv, sink, idxs, out, b, m, h, d, clen, window,
+                                        index_topk, scale, cos, sin, base, rope_rd, half, mul, off,
+                                        step, inverse, xq, xsc, clen_rows, idx_stride, row_step,
+                                        row_pitch, kv_rows, s);
 }
 
 extern "C" int dsv41_indexer_topk(const float* q, const float* index_k, const float* weights,
@@ -11767,6 +11932,237 @@ extern "C" int dsv41_hc_collapse_norm(float* x, const float* pre, const float* w
     if (rows <= 0 || hc <= 0 || dim <= 0) return (int)cudaErrorInvalidValue;
     dsv41_hc_collapse_norm_kernel<<<(unsigned)rows, 1024, 0, s>>>(x, pre, w, out, hc, dim, eps,
                                                                   truncate);
+    return (int)cudaGetLastError();
+}
+
+// ===========================================================================
+// P3-LITE SEGMENT A (draft) -- `DSV41_P3LITE_HC_FRONT` / `DSV41_DRAFT_P3LITE_A_SEG`.
+//
+// WHAT IT REPLACES. The draft's hyper-connection front end is TWO launches per
+// sub-block: `dsv41_hc_mixes` (`hc_mixes_kernel`, grid = rows, one block per
+// draft row) and `dsv41_hc_collapse_norm` (`dsv41_hc_collapse_norm_kernel`,
+// grid = rows, 1024 threads). With P3a's a1 gate OFF the second of those is
+// itself the pair (`hc_collapse` + `rmsnorm`), so the whole front end is three
+// launches. Both phases are one block per row, and the collapse reads the
+// caller's `pre_collapse` -- the INCOMING premix slot, NOT the `pre` the mixes
+// just wrote (`dspark_dev.rs` walks the premix slots: the attention half
+// collapses with the previous layer's coefficients) -- so the two phases share
+// no buffer and one launch can carry both.
+//
+// THE ONE HAZARD, AND WHY IT IS A WIDTH. `hc_mixes_kernel` is launched at
+// `nthreads = mix * 32` (= 768 at hc = 4) and BOTH of its reductions are sized
+// by that launch width: the sum of squares walks `c += blockDim.x`, and the
+// cross-warp fold sums `nwarp = blockDim.x / 32` warp partials. Re-launching the
+// same body at 1024 threads would re-partition every one of those sums (a
+// different term grouping AND a different fold length), which is exactly the
+// class of change rule R1 of docs/agent/draft-p3lite-segment-fusion.md forbids.
+// Phase 1 below therefore pins its logical width to `mix * 32` EXPLICITLY --
+// threads `>= mix * 32` are parked, the ss walk strides by `mix * 32`, and both
+// folds size themselves by `mix` -- which IS `hc_mixes_kernel`'s program, lane
+// for lane, whenever the reference launch used `mix * 32` threads. The launcher
+// declines on the two arms that would have changed that width (the
+// `DSV41_HC_MIXES_SPREAD` variant's own partition, and an explicit
+// `DSV41_HC_MIXES_THREADS` override), so those keep the pair.
+//
+// PHASE 2 is `dsv41_hc_collapse_norm_kernel`'s body, term for term: the
+// ascending-`i` `fmaf` collapse chain, `ss += acc * acc`, the
+// `__shfl_down_sync` tree + `red[32]` + the ascending cross-warp fold by thread
+// 0, `rsqrtf(t / dim + eps)`, and the in-place `o * inv * w` pass. Its launch
+// width IS 1024 (`hc_collapse_norm` launches `<<<rows, 1024>>>`), which is the
+// width here. The `__syncthreads()` between the phases only ORDERS them -- the
+// two phases touch disjoint buffers, so no value can move.
+//
+// The accumulator form of the dot is carried verbatim behind the same
+// `hc_mixes_acc4` flag the reference reads (the shipped arm is the `float4`
+// three-accumulator chain), so `DSV41_HC_MIXES_ACC4` moves this kernel exactly
+// as it moves `hc_mixes_kernel`.
+//
+// Returns 0 (launched) or 2 (declined). NEVER 1 -- 1 collides with
+// cudaErrorInvalidValue and would make a real launch failure look like a
+// graceful decline (the r42 argument the sibling entries record).
+// ===========================================================================
+__global__ void dsv41_draft_hc_front_kernel(const float* __restrict__ x,
+                                            const float* __restrict__ hc_fn,
+                                            const float* __restrict__ hc_scale,
+                                            const float* __restrict__ hc_base,
+                                            float* __restrict__ pre, float* __restrict__ post,
+                                            float* __restrict__ comb,
+                                            const float* __restrict__ pre_collapse,
+                                            const float* __restrict__ w_norm,
+                                            float* __restrict__ out, int hc, int dim,
+                                            int sinkhorn_iters, float eps, float eps_norm,
+                                            int truncate, bool hc_mixes_acc4) {
+    const int r = blockIdx.x;
+    const int mix = hc * (2 + hc);
+    const int hc_dim = hc * dim;
+    const int w1 = mix * 32;             // phase 1's logical width == the reference launch
+    extern __shared__ float sm[];
+    float* mixes = sm;                   // [mix]
+    float* cm = sm + mix;                // [hc*hc]
+    __shared__ float sss;
+    __shared__ float wpart[32];
+    __shared__ float red[32];
+    const float* xr = x + (size_t)r * hc_dim;
+
+    // ---------------- phase 1: hc_mixes, at its OWN width ----------------
+    {
+        float ss = 0.f;
+        if (threadIdx.x < (unsigned)w1) {
+            for (int c = threadIdx.x; c < hc_dim; c += w1) ss += xr[c] * xr[c];
+            for (int off = 16; off > 0; off >>= 1) ss += __shfl_xor_sync(0xFFFFFFFFu, ss, off);
+            if ((threadIdx.x & 31) == 0) wpart[threadIdx.x >> 5] = ss;
+        }
+        __syncthreads();
+        if (threadIdx.x < 32) {
+            float v = (threadIdx.x < mix) ? wpart[threadIdx.x] : 0.f;
+            for (int off = 16; off > 0; off >>= 1) v += __shfl_xor_sync(0xFFFFFFFFu, v, off);
+            if (threadIdx.x == 0) sss = v;
+        }
+        __syncthreads();
+        const float inv = rsqrtf(sss / (float)hc_dim + eps);
+        {
+            const int lane = threadIdx.x & 31;
+            const int wid = threadIdx.x >> 5;
+            // Reference stride is `nwarp = blockDim.x >> 5` at blockDim = mix*32,
+            // i.e. exactly `mix`; warps `>= mix` start at `m = wid >= mix` and
+            // never enter (the same no-op the reference's extra warps have when
+            // `DSV41_HC_MIXES_THREADS` widens the launch -- the launcher declines
+            // that arm, but the shape is kept identical here).
+            for (int m = wid; m < mix; m += mix) {
+                const float* wr = hc_fn + (size_t)m * hc_dim;
+                float acc = 0.f;
+                if (hc_mixes_acc4) {
+                    float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+                    int c = lane;
+                    for (; c + 96 < hc_dim; c += 128) {
+                        a0 += wr[c] * xr[c];
+                        a1 += wr[c + 32] * xr[c + 32];
+                        a2 += wr[c + 64] * xr[c + 64];
+                        a3 += wr[c + 96] * xr[c + 96];
+                    }
+                    for (; c < hc_dim; c += 32) a0 += wr[c] * xr[c];
+                    acc = (a0 + a1) + (a2 + a3);
+                } else {
+                    const float4* wr4 = reinterpret_cast<const float4*>(wr);
+                    const float4* xr4 = reinterpret_cast<const float4*>(xr);
+                    const int n4 = hc_dim >> 2;
+                    float a0 = 0.f, a1 = 0.f, a2 = 0.f;
+                    int c = lane;
+                    for (; c + 64 < n4; c += 96) {
+                        const float4 w0 = wr4[c], w1v = wr4[c + 32], w2 = wr4[c + 64];
+                        const float4 v0 = xr4[c], v1 = xr4[c + 32], v2 = xr4[c + 64];
+                        a0 += w0.x * v0.x + w0.y * v0.y + w0.z * v0.z + w0.w * v0.w;
+                        a1 += w1v.x * v1.x + w1v.y * v1.y + w1v.z * v1.z + w1v.w * v1.w;
+                        a2 += w2.x * v2.x + w2.y * v2.y + w2.z * v2.z + w2.w * v2.w;
+                    }
+                    for (; c < n4; c += 32) {
+                        const float4 w = wr4[c], v = xr4[c];
+                        a0 += w.x * v.x + w.y * v.y + w.z * v.z + w.w * v.w;
+                    }
+                    for (int k = (n4 << 2) + lane; k < hc_dim; k += 32) a0 += wr[k] * xr[k];
+                    acc = (a0 + a1) + a2;
+                }
+                for (int off = 16; off > 0; off >>= 1) {
+                    acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
+                }
+                if (lane == 0) mixes[m] = acc * inv;
+            }
+        }
+        __syncthreads();
+        if (threadIdx.x < (unsigned)hc) {
+            const int j = threadIdx.x;
+            pre[(size_t)r * hc + j] =
+                (1.f / (1.f + expf(-(mixes[j] * hc_scale[0] + hc_base[j])))) + eps;
+            post[(size_t)r * hc + j] =
+                2.f / (1.f + expf(-(mixes[hc + j] * hc_scale[1] + hc_base[hc + j])));
+        }
+        for (int jk = threadIdx.x; jk < hc * hc; jk += w1) {
+            const int j = jk / hc, k = jk % hc;
+            cm[jk] = mixes[2 * hc + j * hc + k] * hc_scale[2] + hc_base[2 * hc + j * hc + k];
+        }
+        __syncthreads();
+        // the sinkhorn lives in ONE WARP's registers (`hc` is 4, so comb is
+        // sixteen values on lanes 0..15) -- hc_mixes_kernel's body, verbatim
+        {
+            const int hh = hc * hc;
+            const int lane = threadIdx.x & 31;
+            const int warp = threadIdx.x >> 5;
+            if (warp == 0) {
+                float c = (lane < hh) ? cm[lane] : 0.f;
+                float mx = c;
+                for (int off = 1; off < hc; off <<= 1)
+                    mx = fmaxf(mx, __shfl_xor_sync(0xFFFFFFFFu, mx, off));
+                c = expf(c - mx);
+                float rs = c;
+                for (int off = 1; off < hc; off <<= 1) rs += __shfl_xor_sync(0xFFFFFFFFu, rs, off);
+                c = c / rs + eps;
+                for (int it = 0; it < sinkhorn_iters; ++it) {
+                    if (it > 0) {
+                        float s = c;
+                        for (int off = 1; off < hc; off <<= 1)
+                            s += __shfl_xor_sync(0xFFFFFFFFu, s, off);
+                        c = c / (s + eps);
+                    }
+                    float t = c;
+                    for (int off = hc; off < hh; off <<= 1)
+                        t += __shfl_xor_sync(0xFFFFFFFFu, t, off);
+                    c = c / (t + eps);
+                }
+                if (lane < hh) cm[lane] = c;
+            }
+        }
+        __syncthreads();
+        for (int jk = threadIdx.x; jk < hc * hc; jk += w1)
+            comb[(size_t)r * hc * hc + jk] = cm[jk];
+    }
+
+    // ---------------- phase 2: collapse + rmsnorm (1024-wide) ----------------
+    // `dsv41_hc_collapse_norm_kernel`'s body, statement for statement. Reads
+    // `pre_collapse` (the INCOMING premix) and `x`, writes `out`; it shares no
+    // buffer with phase 1, so the barrier above is ordering only.
+    {
+        float* o_r = out + (size_t)r * dim;
+        float s2 = 0.f;
+        for (int c = threadIdx.x; c < dim; c += blockDim.x) {
+            float acc = 0.f;
+            for (int i = 0; i < hc; ++i) acc = fmaf(pre_collapse[(size_t)r * hc + i], xr[(size_t)i * dim + c], acc);
+            if (truncate) acc = __bfloat162float(__float2bfloat16(acc));
+            o_r[c] = acc;
+            s2 += acc * acc;
+        }
+        for (int off = 16; off > 0; off >>= 1) s2 += __shfl_down_sync(0xffffffffu, s2, off);
+        if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = s2;
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float t = 0.f;
+            for (int i = 0; i < (int)(blockDim.x >> 5); i++) t += red[i];
+            red[0] = rsqrtf(t / dim + eps_norm);
+        }
+        __syncthreads();
+        const float inv = red[0];
+        for (int c = threadIdx.x; c < dim; c += blockDim.x) o_r[c] = o_r[c] * inv * w_norm[c];
+    }
+}
+
+extern "C" int dsv41_draft_hc_front(const float* x, const float* hc_fn, const float* hc_scale,
+                                    const float* hc_base, float* pre, float* post, float* comb,
+                                    const float* pre_collapse, const float* w_norm, float* out,
+                                    int rows, int hc, int dim, int sinkhorn_iters, float eps,
+                                    float eps_norm, int truncate, cudaStream_t s) {
+    if (x == nullptr || hc_fn == nullptr || hc_scale == nullptr || hc_base == nullptr) return 2;
+    if (pre == nullptr || post == nullptr || comb == nullptr) return 2;
+    if (pre_collapse == nullptr || w_norm == nullptr || out == nullptr) return 2;
+    if (rows <= 0 || hc <= 0 || dim <= 0) return 2;
+    const int mix = hc * (2 + hc);
+    if (mix * 32 > 1024) return 2;                       // phase 1 must fit the 1024-wide launch
+    // Any arm that would have changed the reference launch's thread count keeps
+    // the pair: the fused phase 1 IS `hc_mixes_kernel` at `nthreads = mix * 32`.
+    if (g_hc_spread && rows <= DSV41_HC_SPREAD_MAXR && mix <= 64) return 2;
+    if (getenv("DSV41_HC_MIXES_THREADS") != nullptr) return 2;
+    const size_t smem = (size_t)(mix + hc * hc) * sizeof(float);
+    dsv41_draft_hc_front_kernel<<<(unsigned)rows, 1024, smem, s>>>(
+        x, hc_fn, hc_scale, hc_base, pre, post, comb, pre_collapse, w_norm, out, hc, dim,
+        sinkhorn_iters, eps, eps_norm, truncate, g_hc_acc4);
     return (int)cudaGetLastError();
 }
 

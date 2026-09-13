@@ -95,8 +95,15 @@ warp w  → (m_block = 0, n_block = w)     // BM=8 覆盖全部 M ⇒ m 轴恰�
 
 **结论**：只有 M-tile 的比值 < 1。`bn=2` 每元素 −35%，`bn=4` −53%。
 **FMA 是唯一随 M 增长的项且不可压缩**（`n·M·k` 是 GEMM 的算术下界）——M-tile 把
-「激活 decode 3M」从「服务 1 行」抬到「服务 bn 行」，把「权重 decode + 读」摊到 M，
-于是 `M + bn + M·bn` 替代了 `5M + 4`。
+「激活的 `LDS byte + LUT decode + scale`（3 条/元素）」从「服务 **1** 行」抬到「服务 **bn** 行」，
+把「权重的 `byte + LUT + scale + decode`（4 条/元素）」摊到 **M** 行，
+于是每元素 `(4M/bn + 4 + M)` 替代了 legacy 的 `5M + 4`（M=6：`4M/bn` 项是节省的全部来源）。
+
+**一个实现级的取舍必须点名**（它决定这张表的符号）：激活的**解码**用 `s_lut`（1 条 LDS）
+而**不是** 内联 `e4m3_to_f`（⑤a 家族的形式，~7 条 ALU）。M-tile 有 smem（权重 slab），
+1 KB 的 LUT 是免费的；若用内联解码，激活侧每元素要 10 条而不是 4 条，**总指令会反超 legacy**
+（bn=2 时 40n vs 34n）——即"照抄 ⑤a 的 consume 形式"会把本设计的正号变成负号。
+
 
 ### 2.3 smem 预算
 
@@ -219,7 +226,40 @@ latency-bound」，那是第三种病（例如 LDS 通道饱和 / 依赖链）�
 gate 未设时**不打印**。armed 而日志无此行 ⇒ launcher 更早就 decline 了
 （mode<3 / NO_GEMV_FP8 / 形状拒绝 / `fold_r != m` / smem 超 ceiling）。
 
-### 5.3 编译结果（本机 + 远端，见提交信息）
+### 5.3 编译结果（本机 + 远端，compile-only，无 GPU）
+
+**远端 nvcc（CUDA 13.2, `ubuntu@43.202.208.136`, `/tmp/mtile_smith/`, `sm_100a`, `-Xptxas -v`）**：
+
+```
+nvcc -gencode arch=compute_100a,code=sm_100a -O3 --use_fast_math -std=c++17 \
+     -Xptxas -v -c dsv41_kernels.cu -o dsv41_kernels.o        # EXIT=0
+nvcc -gencode arch=compute_100a,code=sm_100a -O3 --use_fast_math -std=c++17 \
+     -o t_gemm_mrows tests_dsv41_gemm_mrows.cu                # EXIT=0
+```
+
+`gemm_fp8_mtile_kernel<M>` 的 ptxas 账（**全部 0 spill / 0 stack**）：
+
+| M | regs | spill | barriers |
+|---:|---:|---|---:|
+| 1 | 40 | 0 | 1 |
+| 2 | 53 | 0 | 1 |
+| 3 | 63 | 0 | 1 |
+| 4 | 73 | 0 | 1 |
+| 5 | 80 | 0 | 1 |
+| **6** | **96** | **0** | 1 |
+| 7 | 92 | 0 | 1 |
+| 8 | 96 | 0 | 1 |
+
+**读表**：96 regs @ M=6（= `RN=6 × BN_MAX=4 = 24` 个 acc + `av[6]` + 地址/索引 + LUT/slab 索引）。
+`__launch_bounds__(256)` 下 96 regs 允许 **2 块/SM**（寄存器侧）；smem 侧 wkv 是 11 KB（20 块/SM）、
+wq_a 41 KB（5 块/SM）——**两个 resource 都不构成瓶颈**（唯一的瓶颈是 grid 的 SM 覆盖，见 §2.4）。
+`0 spill` 说明寄存器 tile 没有把编译器逼到本地内存，这是 M-tile 可行的前提。
+（LUT 版比内联解码版高 1 reg：多一个 `s_lut` 基址，但省掉每元素 ~6 条 ALU——**这笔换算是本设计的正号来源**，见 §2.2。）
+
+**唯一的既存 warning**（非本次改动，前序 commit 已有）：`k1max` / `nwarp` / `nt` 未引用。
+
+> 本机 `cargo check --workspace --all-targets`：**EXIT=0**（Rust 侧不编译 `.cu`——运行时 dlopen
+> `libferrite_kernels.so`，其校验走远端 nvcc；`.cu` 不在 cargo 编译图内）。
 
 ---
 

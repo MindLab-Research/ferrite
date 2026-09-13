@@ -61,6 +61,16 @@
 //                        launches, bit for bit" is checked on it. Unset / `0` is
 //                        the shipped default: the M-in-register program, byte
 //                        for byte. See docs/agent/mrows-mpar-design.md.
+//   DSV41_MROWS_MTILE    selects the M-INTO-THE-GEMM-TILE program
+//                        (`gemm_fp8_mtile_kernel<m>`, a warp-local (M x bn)
+//                        register tile, the block's weight tile staged once, the
+//                        activation read from L1). Also FILE-SCOPE at LOAD time:
+//                          for bn in 1 2 3 4; do DSV41_MROWS_MTILE=1 \
+//                              DSV41_MROWS_MTILE_BN=$bn ./t_gemm_mrows; done
+//                        `DSV41_MROWS_MTILE_BN` (1..4, default 2) is the tile's N
+//                        extent. With the gate set EVERY mr_case arm dispatches to
+//                        the M-tile kernel, so the same bit-for-bit contract is
+//                        checked on it. See docs/agent/mrows-mtile-design.md.
 //
 // THE TWO L4/L5 GATES THIS SUITE NOW COVERS (2026-09-12, plan
 // docs/agent/l4l5-next-batch-implementation-plan.md §6 N1 "parity 扩轴"):

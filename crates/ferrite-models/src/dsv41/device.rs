@@ -878,6 +878,57 @@ struct Kernels {
         *mut i32,
         CuStream,
     ) -> c_int>,
+    // SPARSE-ATTN-ROPE-MROWS (`DSV41_VERIFY_OROPE_MROWS=1`): the verify block's
+    // ONE fused sparse-attention + inverse o-rope + fp8 launch, valid in the
+    // STEADY STATE (the `kv_rows` substitution reads the block's own KV rows for
+    // every window slot whose position falls inside the block, so the ring's
+    // turns over do not matter). The caller MUST follow it with
+    // `ring_append_mrows`. Optional: a stale .so leaves the caller on the per-row
+    // `sparse_attn_orope` sequence.
+    sparse_attn_orope_mrows: Option<unsafe extern "C" fn(
+        *const f32,
+        *const f32,
+        *const f32,
+        *const f32,
+        *const i32,
+        *mut f32,
+        c_int,
+        c_int,
+        c_int,
+        c_int,
+        *const c_int,
+        c_int,
+        c_int,
+        f32,
+        *const f32,
+        *const f32,
+        *const c_int,
+        c_int,
+        c_int,
+        c_int,
+        c_int,
+        c_int,
+        c_int,
+        *mut u8,
+        *mut f32,
+        *const c_int,
+        c_int,
+        c_int,
+        c_int,
+        CuStream,
+    ) -> c_int>,
+    // SPARSE-ATTN-ROPE-MROWS support: the block's window indices, ONE launch for
+    // all m rows (`window_idxs`'s decode branch per row, `idxs` rows pitched at
+    // `idx_stride = window + index_topk`). Optional: falls back to the per-row
+    // `window_idxs` / `ring_win_fuse` calls.
+    window_idxs_mrows:
+        Option<unsafe extern "C" fn(*mut i32, *const c_int, c_int, c_int, c_int, CuStream) -> c_int>,
+    // SPARSE-ATTN-ROPE-MROWS support: the block's ring APPEND, run AFTER the
+    // fused attention (the deferral is what makes the batch correct). Optional:
+    // falls back to the per-row `ring_append` / `ring_win_fuse` calls.
+    ring_append_mrows: Option<
+        unsafe extern "C" fn(*mut f32, *const f32, *const c_int, c_int, c_int, c_int, CuStream) -> c_int,
+    >,
     // DSpark verify snapshot/rollback (P0): ONE launch per layer per direction
     // replaces the per-slot `cudaMemcpyAsync` loop. Same bytes, device-side slot
     // arithmetic, so the pair is CUDA-graph capturable. Optional: a stale .so
@@ -1306,6 +1357,24 @@ struct Kernels {
         *mut f32, *const f32, *const f32, *mut f32,
         c_int, c_int, c_int, f32, c_int, CuStream,
     ) -> c_int,
+    /// P3-lite segment A (draft): the whole hyper-connection front end --
+    /// `hc_mixes` AND the collapse+rmsnorm -- as ONE launch, one block per draft
+    /// row. Optional: a stale `.so` (or a reachable decline) leaves the caller on
+    /// the `hc_mixes` + `hc_collapse_norm` pair. Returns 2 on a decline, 0 on a
+    /// launch; the caller reads 2 as "use the pair".
+    ///
+    /// ABI: (x, hc_fn, hc_scale, hc_base, pre, post, comb, pre_collapse, w_norm,
+    ///       out, rows, hc, dim, sinkhorn_iters, eps, eps_norm, truncate, stream)
+    /// -- `pre_collapse` is the INCOMING premix slot the collapse reads, which is
+    /// NOT the `pre` the mixes write (the draft walks the premix slots).
+    draft_hc_front: Option<
+        unsafe extern "C" fn(
+            *const f32, *const f32, *const f32, *const f32,
+            *mut f32, *mut f32, *mut f32,
+            *const f32, *const f32, *mut f32,
+            c_int, c_int, c_int, c_int, f32, f32, c_int, CuStream,
+        ) -> c_int,
+    >,
     /// L4-9: the dim-split twin of [`Self::hc_collapse_norm`]
     /// (`dsv41_hc_collapse_norm_split_kernel`), `DSV41_CNORM_SPLIT` (default
     /// OFF). Same arguments plus a trailing `nchunks` before the stream, and
@@ -1704,6 +1773,9 @@ impl Device {
             ring_win_fuse_ph: ko!(rt, "dsv41_ring_win_fuse_ph"),
             ring_win_fuse_mrows: ko!(rt, "dsv41_ring_win_fuse_mrows"),
             verify_ring_win: ko!(rt, "dsv41_verify_ring_win"),
+            sparse_attn_orope_mrows: ko!(rt, "dsv41_sparse_attn_orope_mrows"),
+            window_idxs_mrows: ko!(rt, "dsv41_window_idxs_mrows"),
+            ring_append_mrows: ko!(rt, "dsv41_ring_append_mrows"),
             dspark_ring_save: ko!(rt, "dsv41_dspark_ring_save"),
             dspark_ring_restore: ko!(rt, "dsv41_dspark_ring_restore"),
             dspark_comp_save: ko!(rt, "dsv41_dspark_comp_save"),
@@ -1747,6 +1819,7 @@ impl Device {
             hc_post_inplace: km!(rt, "dsv41_hc_post_inplace"),
             hc_post_inplace_rows: ko!(rt, "dsv41_hc_post_inplace_rows"),
             hc_collapse_norm: km!(rt, "dsv41_hc_collapse_norm"),
+            draft_hc_front: ko!(rt, "dsv41_draft_hc_front"),
             hc_collapse_norm_split: ko!(rt, "dsv41_hc_collapse_norm_split"),
             hc_front: km!(rt, "dsv41_hc_front"),
             hc_front_persist: ko!(rt, "dsv41_hc_front_persist"),
@@ -6012,6 +6085,117 @@ impl Device {
         Ok(true)
     }
 
+    // -----------------------------------------------------------------------
+    // SPARSE-ATTN-ROPE-MROWS (`DSV41_VERIFY_OROPE_MROWS=1`): the verify block's
+    // fused attention + o-rope + fp8, correct in the steady state.
+    // -----------------------------------------------------------------------
+
+    /// Whether the loaded `.so` carries `dsv41_sparse_attn_orope_mrows` (and the
+    /// two support entries). A stale `.so` answers `false` and the caller keeps
+    /// the per-row `sparse_attn_orope` sequence, byte for byte.
+    pub fn supports_sparse_attn_orope_mrows(&self) -> bool {
+        self.kernels.sparse_attn_orope_mrows.is_some()
+            && self.kernels.window_idxs_mrows.is_some()
+            && self.kernels.ring_append_mrows.is_some()
+    }
+
+    /// SPARSE-ATTN-ROPE-MROWS: `n` fused m-row sparse-attention launches with the
+    /// block's OWN KV rows (`kv_rows`, `[m, d]` at pitch `d`) substituted for
+    /// every window slot whose position falls inside the block. `ring` is the
+    /// attention's KV source (the owner's cache); the block's appends are DEFERRED
+    /// and must be issued by [`Self::ring_append_mrows`] after this launch.
+    ///
+    /// `Ok(false)` = fall back (symbol absent, or the C launcher's shape /
+    /// `b != 1` decline returned 2/3).
+    #[allow(clippy::too_many_arguments)]
+    pub fn sparse_attn_orope_mrows(
+        &self,
+        q: *const f32,
+        kv: *const f32,
+        kv_rows: *const f32,
+        sink: *const f32,
+        idxs: *const i32,
+        out: *mut f32,
+        b: i32,
+        m: i32,
+        h: i32,
+        d: i32,
+        clen: *const c_int,
+        window: i32,
+        index_topk: i32,
+        scale: f32,
+        cos: *const f32,
+        sin: *const f32,
+        base: *const c_int,
+        rope_rd: i32,
+        half: i32,
+        mul: i32,
+        off: i32,
+        step: i32,
+        inverse: bool,
+        xq: *mut u8,
+        xsc: *mut f32,
+        clen_rows: *const c_int,
+        idx_stride: i32,
+        row_step: i32,
+        row_pitch: i32,
+    ) -> Result<bool> {
+        let Some(f) = self.kernels.sparse_attn_orope_mrows else {
+            return Ok(false);
+        };
+        let rc = unsafe {
+            f(q, kv, kv_rows, sink, idxs, out, b, m, h, d, clen, window, index_topk, scale, cos,
+              sin, base, rope_rd, half, mul, off, step, inverse as i32, xq, xsc, clen_rows,
+              idx_stride, row_step, row_pitch, self.stream)
+        };
+        if (2..=3).contains(&rc) {
+            return Ok(false);
+        }
+        self.kerr(rc, "dsv41_sparse_attn_orope_mrows")?;
+        Ok(true)
+    }
+
+    /// SPARSE-ATTN-ROPE-MROWS support: the block's `m` window-index rows in ONE
+    /// launch, `window_idxs`'s decode branch per row (row r's position is
+    /// `pos_rows[r]`, its output row at `idxs + r * idx_stride`). Byte-identical
+    /// to `m` single-row `window_idxs` calls. `Ok(false)` = keep the per-row path.
+    pub fn window_idxs_mrows(
+        &self,
+        idxs: *mut i32,
+        pos_rows: *const c_int,
+        window: i32,
+        m: i32,
+        idx_stride: i32,
+    ) -> Result<bool> {
+        let Some(f) = self.kernels.window_idxs_mrows else {
+            return Ok(false);
+        };
+        let rc = unsafe { f(idxs, pos_rows, window, m, idx_stride, self.stream) };
+        self.kerr(rc, "dsv41_window_idxs_mrows")?;
+        Ok(true)
+    }
+
+    /// SPARSE-ATTN-ROPE-MROWS support: the block's ring append, ONE launch for
+    /// all `m` rows (`ring[slot(pos_rows[r])] = kv_rows[r]`). Issued AFTER the
+    /// fused attention, which is what makes the batch correct. `Ok(false)` =
+    /// keep the per-row append.
+    pub fn ring_append_mrows(
+        &self,
+        ring: *mut f32,
+        kv_rows: *const f32,
+        pos_rows: *const c_int,
+        window: i32,
+        hd: i32,
+        m: i32,
+    ) -> Result<bool> {
+        let Some(f) = self.kernels.ring_append_mrows else {
+            return Ok(false);
+        };
+        let rc = unsafe { f(ring, kv_rows, pos_rows, window, hd, m, self.stream) };
+        self.kerr(rc, "dsv41_ring_append_mrows")?;
+        Ok(true)
+    }
+
     /// The fused compressor commit: reads `out_rows` on the device, ropes the
     /// latent at (*clen) * ratio, stores it into the ring at row window + *clen
     /// and advances the counter. Replaces the host's download + branch + rope +
@@ -7186,6 +7370,73 @@ impl Device {
             )
         };
         self.kerr(rc, "dsv41_hc_collapse_norm")
+    }
+
+    /// P3-lite segment A (draft): the hyper-connection front end in ONE launch.
+    ///
+    /// Phase 1 is `hc_mixes_kernel`'s program at its OWN logical width (`mix *
+    /// 32` threads: the ss walk strides by that literal and the cross-warp fold
+    /// sums `mix` partials), phase 2 is `dsv41_hc_collapse_norm_kernel`'s body at
+    /// its own 1024. The collapse reads `pre_collapse` -- the caller's INCOMING
+    /// premix slot, never the `pre` phase 1 just wrote -- so the two phases share
+    /// no buffer and `__syncthreads()` between them only orders the launches it
+    /// replaces. See the kernel header for the full argument.
+    ///
+    /// `Ok(false)` = no symbol in the loaded `.so`, or a decline (an `hc` whose
+    /// reference launch width is not `mix * 32`, the spread variant, or a
+    /// `DSV41_HC_MIXES_THREADS` override) -- the caller then runs the
+    /// `hc_mixes` + `hc_collapse_norm` pair, which is the reference.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draft_hc_front(
+        &self,
+        x: *const f32,
+        hc_fn: *const f32,
+        hc_scale: *const f32,
+        hc_base: *const f32,
+        pre: *mut f32,
+        post: *mut f32,
+        comb: *mut f32,
+        pre_collapse: *const f32,
+        w_norm: *const f32,
+        out: *mut f32,
+        rows: i32,
+        hc: i32,
+        dim: i32,
+        sinkhorn_iters: i32,
+        eps: f32,
+        eps_norm: f32,
+        truncate: bool,
+    ) -> Result<bool> {
+        let Some(f) = self.kernels.draft_hc_front else {
+            return Ok(false);
+        };
+        let rc = unsafe {
+            f(
+                x,
+                hc_fn,
+                hc_scale,
+                hc_base,
+                pre,
+                post,
+                comb,
+                pre_collapse,
+                w_norm,
+                out,
+                rows,
+                hc,
+                dim,
+                sinkhorn_iters,
+                eps,
+                eps_norm,
+                truncate as c_int,
+                self.stream,
+            )
+        };
+        if rc == 2 {
+            return Ok(false);
+        }
+        self.kerr(rc, "dsv41_draft_hc_front")?;
+        Ok(true)
     }
 
     /// Fused, spread hc front end: the mixes dot products on one block per

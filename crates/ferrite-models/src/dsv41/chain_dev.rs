@@ -3157,6 +3157,64 @@ fn ring_win_mrows() -> bool {
     *F.get_or_init(|| std::env::var("DSV41_RING_WIN_MROWS").map(|v| v == "1").unwrap_or(false))
 }
 
+/// OROPE-MROWS (`DSV41_VERIFY_OROPE_MROWS=1`, DEFAULT OFF — A/B first): the verify
+/// block's sparse attention, inverse o-rope and fp8 emission as ONE m-row launch
+/// (`dsv41_sparse_attn_orope_mrows`), **valid in the steady state**.
+///
+/// WHY THIS IS NOT `ATTN_MROWS`. `ATTN_MROWS` defers the whole block's attention
+/// to a single launch but leaves the appends in the per-row interleave, so the
+/// batch reads the ring AFTER every row of the block has been appended to: once
+/// `pos_base + m - 1 >= window` a later row's append overwrites a slot an earlier
+/// row's window still enumerates (audit defect #2), which is why its gate carries
+/// `pos_base + m - 1 < window` and DECLINES in production (`g3-per-row-batched-audit`
+/// §0.1). This arm removes the precondition structurally instead:
+///
+///   * the block's appends are **DEFERRED** to [`Self::ring_append_mrows`] AFTER
+///     the fused launch, so the ring holds only PRE-BLOCK history while the
+///     attention runs - no row can clobber another's slot; and
+///   * every window-slot read is resolved by position (`dsv41_kv_win_fetch`): a
+///     slot whose position falls inside the block is served from `s.kv_r` (the
+///     block's OWN KV rows) instead of the ring.
+///
+/// Both branch results are the exact bytes the per-row `sparse_attn_orope` read
+/// at that row, so the batch is bit-identical to `m` single-row calls (the
+/// position algebra and the proof are in `dsv41_kv_win_fetch`'s header). The
+/// window indices are hoisted into ONE [`Self::window_idxs_mrows`] launch, whose
+/// row `r` bytes are `window_idxs(idxs_r + r*ist, pos_rows + r, window)`'s.
+///
+/// Mutual exclusion: it is refused when `ATTN_MROWS` or `RING_WIN_MROWS` is on
+/// (those arms batch the very launches this one owns and carry their own append
+/// ordering), and when `VERIFY_OROPE` is off (then there is no epilogue to fold).
+///
+/// Read ONCE and cached: the check runs 40x/step inside graph capture.
+fn verify_orope_mrows() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("DSV41_VERIFY_OROPE_MROWS")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
+}
+
+/// The C launcher's OWN env declines, mirrored on the host so the arm's
+/// skip-the-per-row-launches decision cannot be taken for a call the fused entry
+/// would then refuse (the two MUST agree; a mismatch would drop the block's whole
+/// attention). `sparse_attn_orope` declines on `DSV41_ATTN_SEQ` (the sequential
+/// kernel) and on `DSV41_ATTN_PF=0` (the warp A/B kernel) because the fused body
+/// IS `sparse_attn_pf_kernel`'s body. Same names, same readings the launcher's
+/// `static` initialisers make.
+fn sparse_orope_env_ok() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        let seq = std::env::var_os("DSV41_ATTN_SEQ").is_some();
+        let pf_off = std::env::var("DSV41_ATTN_PF")
+            .ok()
+            .map(|v| v.trim().parse::<i64>().map(|n| n == 0).unwrap_or(false))
+            .unwrap_or(false);
+        !seq && !pf_off
+    })
+}
+
 /// B3 (DSV41_COMP_PLACEHOLDER_FUSE, default ON): the recency-placeholder launch
 /// (30/step, ~1.0us each) writes `idxs[win, win+take)` into the SAME buffer the
 /// `ring_win_fuse` epilogue already writes `idxs[0, win)` into, and `sparse_attn`
