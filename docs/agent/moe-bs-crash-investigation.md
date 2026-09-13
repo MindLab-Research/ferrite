@@ -2224,3 +2224,25 @@ bash ~/merge_worktree.sh <worktree-dir> <新符号> [必须仍存在的符号...
    b. `DSV41_DIFF_EAGER=1`（给出**第一个 mismatch 的绝对位置**，把问题钉到某一轮/某一 token）；
    c. `DSV41_MOE_BS_NUMCHECK=1` + 延迟探针（若能在重放期命中 ⇒ 直接给出**哪个 (row, col) 的数值与参考差多少**）。
 3. 每次只改**一个变量**并重跑；**每次改动后必须用 `bash build.sh 103a` 走真实构建**（§83：单文件检查会漏）。
+
+## §89 两条筹备线的合并处置（一成一败）+ 三条流程教训
+
+### (a) `cheap-align-two`（`DSV41_SEQ_ALIGN`，累加序 #5/#13）—— **回滚，待修正重交**
+合并后**完整构建失败**，两处都是**结构性**错误（不是标志差异）：
+1. `dsv41_experts_mxf4.cu:3811`：把 **Rust 门函数名 `seq_align`** 当内核实参传进 `.cu`
+   （`.cu` 看不到 Rust 符号）⇒ 必须**穿过 C ABI 新增形参**，由 Rust 调用点传入。
+2. `dsv41_glue.cu:244`：注释的 `//` 丢了 ⇒ `} The f32 this kernel writes back` 变成语法错误。
+**处置**：把 5 个文件恢复到合并前（**不做 `git revert`、不改写历史**，改动完整保留在 worktree
+`/tmp/cheap-align`），并**已开 `cheap-align-redo` 线**带上这两条错误 + "必须在真实标志下自验"的要求。
+
+### (b) `bs-cpasync-pipeline`（`DSV41_MOE_BS_CPASYNC`，cp.async 双缓冲）—— **已落地并权威复验**
+在 origin/main 上用真实口径编译（`tilelang_gen/*` 用 `-O2`）⇒ **0 error** ✓（1.9 KB 目标文件）。
+它是以一个 `TEMP` 临时提交的形式落地的（见下教训 2），补丁本身经权威复验无问题。
+
+### 三条流程教训（已写进 `scripts/merge_worktree.sh` 与 AGENTS.md）
+1. **`moe_bs_handwritten.cu` 不能单独编译**（被 `moe_bs_shim.cu` `#include`；单编必假报错）。
+   我的合并工具最初单编它 ⇒ **误报 4 个 error、错误拒收了一个好补丁**。已修：这类文件改判为**编 shim**。
+2. **不要用"临时提交 + push"做远端编译门**：会污染 origin/main，且脚本若在 push 后、本地回滚前被打断，
+   就会**留下游荡的 `TEMP` 提交**（本次真实发生）。已改为**临时目录 scp + 原地编译**，历史零扰动。
+3. **验证顺序不可颠倒**：符号检查通过 ≠ 能编译。本次我先提交后验证，导致"坏提交进了主干"再回滚。
+   工具已改为**先过真实编译门、再允许提交**（失败自动恢复工作树）。
