@@ -1896,3 +1896,26 @@ cargo test -p ferrite-models --lib routed_down_prep → 6 passed; 0 failed
 **处理**：按用户"完全对齐"的要求，这类项**必须由 GPU 量化其实际影响**（属 NEEDS-GPU N3），
 在逐门转正时用 `wq_check.py` + `[NC]`/DBG 对拍观察是否出现可观测漂移；若只是 ≤ulp 抖动则记录为
 "顺序差、量级 ≤ulp"并保留（不强求逐位）。
+
+## §73 `[NC]` 探针被挡住**最终根因**：整步图/MoE 图的 **capture 录制期覆盖了 BS 调用**
+
+决定性窗口（`5f5721cd`）的输出预览首次出现：
+```
+[moe-bs][DIAG] Eid[0..36): 0 0 0 0 0 0 0 0  [NC] entered (handwritten path; capture guard next)
+```
+⇒ ① **M2 修复生效**（手写路径的探针已可达 ✓）；② 探针随后**停在捕获守卫** ⇒ 该调用当时**确实处在 capture 内**。
+
+**根因（主 agent 查证）**：本仓唯一的 `cudaStreamBeginCapture` 入口是
+`ferrite-kernel/src/cuda.rs:graph_capture_begin`（置位 capturing 标志），其**调用点**在
+`crates/ferrite-models/src/dsv41/chain_dev.rs:8470`（step 图发射路径）、`:9524`（`capture_verify`）、
+`:20074`（**per-layer MoE 图** `self.moe_graph` 的录制/重放路径）。
+⇒ **图的录制是"把整个 step（含 MoE）录一遍"**，所以录制期间任何在该 stream 上发起的调用——
+包括我们的 BS 探针——都会看到 `cudaStreamIsCapturing != None`。
+`DSV41_GRAPH_STEP=0` / `FERRITE_GRAPH*`=0 只能影响**是否使用**图，**不能避免"首次录制"这一瞬间**。
+
+**结论与处置**：
+- `[NC]` 五点回读是**诊断增强**，不是判定必要条件 ⇒ **不再为它投入**。
+- **判定改用已具备且机械化的手段**：`~/wq_check.py --log`（重复/乱码/1..61 计数/EAGER 豁免）+ `[NC] entered` 标记
+  + BS 臂自身的 GATHER-DIAG/Eid DIAG 行；性能用 `~/arm_run_fast.sh`。
+- 若要真正拿到设备侧数值，正确做法是**把对拍整体搬到设备内**（参考值与待测值都在 device 上比，
+  只把"结论计数"带回 host）——记为**可选后续**，不与当前主线争资源。
