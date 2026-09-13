@@ -65,21 +65,22 @@
 2. **~~tcgen05 指令环境依赖~~** → **已被 .scale_vec::1X 修复**（待验证）
 3. **spec 路径（m=6）特有问题** → `.scale_vec::1X` + `"memory"` clobber 修复已提交（472fe57）
 
-## ROOT CAUSE 分析（2026-09-14 中午更新）
+## ROOT CAUSE 分析（2026-09-14 下午更新）
 
-**SYNC-DIAG 揭示的关键事实**：
-- eager 路径（m=1）：gather OK → MMA OK → scatter OK（多个 step 全部通过）
-- spec 路径（m=6 verify）：pos 15 处 crash
-- **crash 只发生在 spec/verify 路径**，eager 路径完全正常
+**SYNC-DIAG 带捕获守卫的最终判决**：
+- `.scale_vec::1X` + `"memory"` clobber 实验：**打破 eager 路径**（之前 MMA OK → 现在 ALL MMA illegal instruction）——**已撤销（4a28cdc）**
+- 手写验证代码的 `.scale_vec::1X` 适用于它的探针数据布局，但不适用于我们的 TileLang 生产布局
 
-**修复（对比验证过的手写代码发现）**：
-TileLang 模板 `tcgen05mma.h:694-710` 与验证代码 `tests_tcgen05_mxf8f6f4_1x.cu:781-797` 的两个差异：
-1. **`.scale_vec::1X` 后缀缺失**：没有它硬件用默认 SF 布局 → 可能读 TMEM 越界 → illegal memory access
-2. **`"memory"` clobber 缺失**：没有它编译器可能重排内存操作 → 与 TMA 加载竞态 → 硬件检测到非法访问模式
+**真实错误类型**（SYNC-DIAG 揭示）：
+- MMA kernel 的错误是 **"illegal instruction"**（不是 "illegal memory access"）
+- 之前看到的 "illegal memory access" 是 context poisoning 的二级效应
+- eager 路径（m=1）MMA 正常，spec 路径（m=6 verify）MMA illegal instruction
 
-**为什么 spec 路径才 crash**：
-- m=1（eager）：段全空，SF 数据全 0，MMA 计算量最小，竞态窗口小
-- m=6（verify）：36 个活段，真实 SF 数据，MMA 计算密集，竞态窗口大 → 触发 crash
+**关键待解问题**：什么导致 MMA 在 spec 路径（m=6 / CUDA graph capture）下遇到 illegal instruction？
+- 可能：idesc 的 sf_id 字段在真实 SF 数据下的行为
+- 可能：CUDA graph capture/replay 的执行上下文差异
+- 可能：TMEM 布局在 m=6 下的越界
+- 需求：compute-sanitizer 精确定位（~/sanitizer_run.sh 已部署）
 
 ## 诊断工具（已部署远端）
 
