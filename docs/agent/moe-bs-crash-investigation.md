@@ -24,6 +24,7 @@
 | **接线缺陷与审计** | §62（**swapAB 输出打包错位：修复前 512/640 位置错**）、§65（六项映射 OK）、§69（**差异法十项全 SAME** + D3/D4/D5 已修） |
 | **精度：实现与验证** | §61（8 缺陷）、§66（四项语义交叉确证）、§70（合入台账 + 合并方法教训）、**§71（单测 12/12 全绿）**、§72（关闭 engram/vision + 剩余累加序项） |
 | **精度：配置与转正** | §63/§64（出货脚本未开 `DSV41_ROUTED_DOWN_QUANT`）、§58（DBG 也受图捕获守卫）、`~/promote_precision.sh` |
+| **`[NC]` 仪器为何拿不到数** | **§73**（整步图/MoE 图的 capture 录制期覆盖了 BS 调用；⇒ 判定改用 `~/wq_check.py` + 差异测试 `~/bs_vs_old.sh`） |
 | **下一步入口** | 顶部「下一步」+ 本文件末节的 TODO 快照 |
 
 ## 三个"别再犯"的方法论
@@ -1919,3 +1920,18 @@ cargo test -p ferrite-models --lib routed_down_prep → 6 passed; 0 failed
   + BS 臂自身的 GATHER-DIAG/Eid DIAG 行；性能用 `~/arm_run_fast.sh`。
 - 若要真正拿到设备侧数值，正确做法是**把对拍整体搬到设备内**（参考值与待测值都在 device 上比，
   只把"结论计数"带回 host）——记为**可选后续**，不与当前主线争资源。
+
+## §74 规划洞察：精度转正**不被 BS 臂阻塞**，可与 MoE 正确性解耦推进
+
+四处精度改动的作用阶段与 fp4 MoE BS 臂（gate/up 的 tcgen05 路径）**互不相交**：
+| 门控 | 作用阶段 |
+|---|---|
+| `DSV41_ROUTED_DOWN_QUANT` | MoE 的 **down**（w2）投影，且是"路由权重/输入量化"层面，与 gate/up 的 MMA 无关 |
+| `DSV41_WINDOW_KV_QUANT` (A2) | attention 的 **窗口 KV**（ring），在注意力之前 |
+| `DSV41_COMPRESS_LATENT_QUANT` (A3) | **压缩 KV latent**（compressor），在压缩投影处 |
+| `DSV41_INDEXER_FP4_RT` (A4) | **indexer** 的 q/k |
+| `DSV41_ATTN_P_BF16` (I3) | attention 的 **PV**（概率操作数） |
+
+⇒ **它们的验收（DBG 对拍 + 文本红线 + 全 gate 回归）只需 GPU 窗口，不依赖 BS 臂是否已正确**。
+⇒ 因此窗口分配上可以**并行推进两条线**：一条修 BS 臂正确性，另一条逐门转正精度。
+（唯一注意：两者都会改变文本 ⇒ 做**文本红线**时最好**分窗口**，避免归因混淆；DBG 对拍则完全独立。）
