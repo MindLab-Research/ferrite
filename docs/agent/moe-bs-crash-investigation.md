@@ -1103,3 +1103,21 @@ constexpr int kSboBytes = 256;  // 16 x 16 B: 8-row-group stride
 
 **结论**：**候选 B 的优先级应高于 D/geom0**（它是"树内唯一 canonical 结构的正确泛化"，
 而 geom0/D 都含我推测的 swizzle 假设）。已同步给 `bs-packed-geometry` 以便其仪器优先扫 B。
+
+## §39 packed 修复的两个副产品（验收方案 + 性能红利）
+
+### (a) 精度门控的验收方案（已就绪，等 BS 臂正确后执行）
+补丁自带的 DBG 回读（`DSV41_ROUTED_DOWN_QUANT=1 DSV41_ROUTED_DOWN_QUANT_DBG=1`）会打印**同一 (row, slot) 的 32 个元素**
+的 5 组值：① 加权前 ② 加权后 ③ bf16 取整后 ④ e8m0 标度字节 ⑤ 量化→反量化后；
+并同时打印**主机侧按官方语义独立算的同一 5 组值**与逐元素差。
+**判据**：①–⑤ 逐元素差应为 0（除 ±1 ulp 舍入）。
+**然后**（同样的 env）跑 `~/verify_correct.sh <port> <label>`：1..100 前 61 行 + 拉丁探针 + step p50，
+要求"不能重复、不能乱码"（用户红线）且文本与 **gate OFF** 的对照一致（官方语义下输出应几乎不变，
+因为差异只有 0.2% vs 1-2% 的量化误差）。
+
+### (b) 性能红利（顺带）
+packed staging 后，fp4（权重）操作数的 smem tile 从 **16384 B 降到 8192 B**（每行 128 B → 64 B），
+而权重侧是每 k-iteration 每 n_tile 都要重新装载的那个面 ⇒ **权重装载的 smem 写入流量减半**
+（40 k-iter × 5 n_tile × 128 行）。这是"修正确"顺带带来的收益，不计入 §10 的性能预期也应当出现。
+⚠️ 注意：**几何必须与写公式成对**（B 配 canonical、D 配 SWIZZLE_64B），混配必然错——
+这也是 §34 强调"两者各自内部自洽"的原因。
