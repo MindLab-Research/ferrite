@@ -4639,7 +4639,18 @@ fn hc_tail_split() -> bool {
         // attention residual AR#1 just summed into it. The sequential path below
         // still needs both zeros as its add base.
         let ne = ld.experts.len();
-        let batched = moe_batch() && topk > 0 && ne >= 2 && self.dev.supports_moe_batch();
+        // NOTE: this `batched` gates the s.o/ex_out ZEROING below — the
+        // sequential path's downs ACCUMULATE (+=) and need the zeroed base,
+        // while the batched path's moe_down_reduce WRITES s.o outright. The
+        // e4m3 activation domain forces the sequential path (the batched
+        // kernel has no e4m3 arm), so its disable MUST appear HERE TOO —
+        // mismatching the two computations ran the sequential downs against
+        // an un-zeroed s.o (the stale accumulation was the 40x explosion).
+        let batched = moe_batch()
+            && topk > 0
+            && ne >= 2
+            && self.dev.supports_moe_batch()
+            && !expert_act_e4m3();
         // The routed experts' gate/up pools may be stored INTERLEAVED
         // (DSV41_EXPERT_ILV, decided at load time). Only the FUSED batched
         // gate/up read can address that layout, so the batched path stops being
