@@ -75,6 +75,10 @@ __device__ int g_sfdump_k = 0;   // which K-stage the snapshot captures (k == 0 
 // instead of one barrier absorbing all 40 arrivals, where a single skipped/extra arrival
 // desynchronises the parity sequence (early return => no smem protection; or a permanent spin).
 __device__ int g_mbar_ring = 0;
+// 1 = one dedicated mbarrier per K-stage (dsv41: DSV41_MOE_BS_MBAR_PERSTAGE=1). Each barrier is
+// arrived exactly once per launch, so its phase is always 0 and the wait needs no parity
+// accounting at all — the most robust option when the shared-barrier accounting desynchronises.
+__device__ int g_mbar_perstage = 0;
 __device__ uint8_t* g_sfdump = nullptr;
 constexpr size_t kSfDumpA = 0;                                  // [36][128][128] u8
 constexpr size_t kSfDumpB = kSfDumpA + 36 * 128 * 128;          // [36][5][128][64] u8
@@ -800,6 +804,16 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
             asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;"
                          :: "r"((uint32_t)__cvta_generic_to_shared(mma_bar + 1)));
         }
+        if (g_mbar_perstage) {
+            // One barrier per K-stage (40 * 8 B = 320 B, placed right after the first — the operand
+            // region ends at 33792 B and the launch reserves 65536 B, and C_sh only aliases the
+            // region AFTER the last MMA). Each is arrived exactly once per launch, so the wait's
+            // phase is always 0 and needs no parity accounting.
+            for (int i = 0; i < HW_KITER; ++i) {
+                asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;"
+                             :: "r"((uint32_t)__cvta_generic_to_shared(mma_bar + i)));
+            }
+        }
         // mbarrier-init visibility uses the DEDICATED fence and must come BEFORE the
         // first barrier (TileLang: moe_bs_up_tl.cu:63 tl::fence_barrier_init() is
         // emitted ahead of tl:65's __syncthreads).
@@ -1026,12 +1040,15 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
                 }
             }
 
-            // Commit: signal the barrier when all MMAs COMPLETE. With the ring gate on the commit
-            // targets this stage's own ring slot, so each barrier receives exactly one arrival per
-            // round (the official DeepGEMM structure, `consumed[k%3]`) instead of one barrier
-            // absorbing all 40 arrivals.
+            // Commit: signal the barrier when all MMAs COMPLETE. Three modes:
+            //   default            : one barrier absorbing all 40 arrivals (historical, parity k&1);
+            //   g_mbar_ring        : 2-entry ring (the official DeepGEMM structure, consumed[k%3]);
+            //   g_mbar_perstage    : a dedicated barrier per K-stage — each barrier is arrived
+            //                        exactly once per launch, so its phase is always 0 and the wait
+            //                        needs NO parity arithmetic at all (immune to desync).
             if (lane == 0) {
-                hw_tc_commit(g_mbar_ring ? &mma_bar[k & 1] : mma_bar);
+                hw_tc_commit(g_mbar_perstage ? &mma_bar[k]
+                                             : (g_mbar_ring ? &mma_bar[k & 1] : mma_bar));
             }
         }
 
@@ -1052,8 +1069,10 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
             // parity sequence: one wait returns early (no protection, so the operand smem is
             // overwritten while the async MMA still reads it => cross-stage mixtures) and another
             // spins forever (the `[ar5-hang]` / watchdog signature actually observed on the arms).
-            uint64_t* bar = g_mbar_ring ? &mma_bar[k & 1] : mma_bar;
-            const uint32_t phase = g_mbar_ring ? ((k >> 1) & 1) : (k & 1);
+            uint64_t* bar = g_mbar_perstage ? &mma_bar[k]
+                                            : (g_mbar_ring ? &mma_bar[k & 1] : mma_bar);
+            const uint32_t phase =
+                g_mbar_perstage ? 0u : (g_mbar_ring ? ((k >> 1) & 1) : (k & 1));
             if (g_bounded_wait) {
                 if (whp_mma_wait_bounded(bar, phase, k, seg, n_tile)) {
                     hw_wait_fail = 1;   // published to all 128 threads by the barrier below

@@ -788,6 +788,15 @@ bool tl_bs_init() {
         (void)cudaGetLastError();
         fprintf(stderr, "[moe-bs] mbarrier ring = %d\n", mr);
     }
+    // g_mbar_perstage: one dedicated mbarrier per K-stage — DSV41_MOE_BS_MBAR_PERSTAGE=1.
+    if (ok) {
+        int mp = 0;
+        const char* e = getenv("DSV41_MOE_BS_MBAR_PERSTAGE");
+        if (e != nullptr && e[0] == '1') mp = 1;
+        (void)cudaMemcpyToSymbol(g_mbar_perstage, &mp, sizeof(int));
+        (void)cudaGetLastError();
+        fprintf(stderr, "[moe-bs] mbarrier per-stage = %d\n", mp);
+    }
     // g_keep_stage: keep only one 128-K stage's A bytes (DSV41_MOE_BS_KEEP_STAGE=<s>), so the
     // arm's output is that stage's partial and the per-stage base advances can be checked against
     // each other with the oracle's matching K range.
