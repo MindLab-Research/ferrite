@@ -280,3 +280,28 @@ for k in 0..40:
 4. （测试中）正确输出？
 
 **验证**：gather verify MATCH（数据流正确）+ kernel bit-exact（合成数据自洽但错）
+
+## lbo 修复（2026-09-14 深夜——K-block fix 不够，lbo 也错了）
+
+**发现**：K-block advance fix (ki*16) 单独不够——仍乱码。lbo 也需要修复。
+
+**CUTLASS 文档**：
+- LBO (Leading Byte Offset) = "core matrices 间 K 方向的距离"
+- Core matrix = 8行 × 16B = 128B
+- LBO = 128 bytes = **8 units**（不是 1 unit = 16 bytes）
+
+**修复**：lbo 1→8（commit 45aa679）
+
+**完整的 descriptor 参数**（修复后）：
+| 参数 | 值 | 含义 |
+|------|-----|------|
+| start_address | A_sh/B_sh | tile 起始 |
+| lbo | 8 (128B) | K-atom 间距 |
+| sbo | 64 (1024B) | M-atom 间距 |
+| layout | 0 | 无 swizzle |
+| K-block advance | ki*16 (256B) | K-block ki 起始位置 |
+
+**与 TileLang 的差异**：
+- TileLang: lbo=1, ki*32（TMA + swizzle 布局）
+- 手写: lbo=8, ki*16（core matrix + layout=0）
+- 两者不可互换！
