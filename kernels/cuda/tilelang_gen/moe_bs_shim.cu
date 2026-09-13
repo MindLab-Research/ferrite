@@ -151,6 +151,7 @@
 #define main_kernel moe_bs_up_tl_kernel
 #if __has_include("moe_bs_up_tl.cu")
 #include "moe_bs_up_tl.cu"
+#include "moe_bs_handwritten.cu"  // HANDWRITTEN alternative — DSV41_MOE_BS_HANDWRITTEN=1 gate
 #else
 // [capture-guard-landing fix] The AOT artifact is not generated yet (bs-moe
 // peer's gen_moe_bs_aot.py output lands separately) — without this guard the
@@ -980,6 +981,39 @@ extern "C" int dsv41_moe_tilelang_gate_up_bs_dev(
             }
         }
     }
+    // HANDWRITTEN alternative (DSV41_MOE_BS_HANDWRITTEN=1): use the hand-written
+    // kernel (verified tcgen05 primitives, sequential execution, no TMA/mbarrier
+    // pipeline) instead of the TileLang-generated kernel. Diagnostic path for
+    // the m>1 crash — if this works where TileLang doesn't, the TileLang
+    // pipeline structure is the trigger.
+    static const bool g_use_handwritten = []() {
+        const char* v = getenv("DSV41_MOE_BS_HANDWRITTEN");
+        return v != nullptr && v[0] != '0';
+    }();
+    if (g_use_handwritten) {
+        static bool noted = false;
+        if (!noted) {
+            noted = true;
+            fprintf(stderr, "[moe-bs] HANDWRITTEN kernel active (DSV41_MOE_BS_HANDWRITTEN=1) — "
+                            "sequential execution, no TMA pipeline\n");
+        }
+        moe_bs_handwritten_kernel<<<dim3((unsigned)kGridX, (unsigned)kSegCap), 128, 65536, s>>>(
+            g_a, w1, w3, g_sfa, sfw1, sfw3, eid_dev, g_c, w_stride);
+        cudaError_t ehw = cudaGetLastError();
+        if (ehw != cudaSuccess) return (int)ehw;
+        if (g_sync_diag) {
+            cudaStreamCaptureStatus csh = cudaStreamCaptureStatusNone;
+            cudaStreamIsCapturing(s, &csh);
+            if (csh == cudaStreamCaptureStatusNone) {
+                ehw = cudaStreamSynchronize(s);
+                fprintf(stderr, "[moe-bs][SYNC-DIAG] HANDWRITTEN MMA done: %s\n",
+                        ehw == cudaSuccess ? "OK" : cudaGetErrorString(ehw));
+                if (ehw != cudaSuccess) return (int)ehw;
+            }
+        }
+        // Skip the TileLang kernel — go straight to scatter
+        goto scatter_launch;
+    }
     moe_bs_up_tl_kernel<<<dim3((unsigned)kGridX, (unsigned)kSegCap), kThreads, kSmem, s>>>(
         g_tmap_a, g_tmap_c, eid_dev, g_sfa, g_tmap_sfw1, g_tmap_sfw3, g_tmap_w1, g_tmap_w3);
     e = cudaGetLastError();
@@ -996,6 +1030,7 @@ extern "C" int dsv41_moe_tilelang_gate_up_bs_dev(
     }
 
     // (3) scatter：RAW gate‖up 写回 out（swiglu 由既有 kernel 做，与本臂无关）
+scatter_launch:
     tl_moe_bs_scatter_kernel<<<dim3((unsigned)kBm, (unsigned)kSegCap), kMovThreads, 0, s>>>(
         g_c, out, order_dev, counts_dev, kNup, topk * kNup, topk, nseg_dev);
     e = cudaGetLastError();
