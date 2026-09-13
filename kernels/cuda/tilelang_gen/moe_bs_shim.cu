@@ -388,7 +388,7 @@ TmapSpec spec_c(void* c) {
     s.gdim[0] = (cuuint64_t)kNup;
     s.gdim[1] = (cuuint64_t)(kSegCap * kBm);
     s.gstride[0] = (cuuint64_t)kNup * 4;
-    s.box[0] = (cuuint32_t)kBn;
+    s.box[0] = (cuuint32_t)(kBn / 4);  // f32: 128/4=32 elements = 128 B = swizzle span
     s.box[1] = (cuuint32_t)kBm;
     s.ilv = CU_TENSOR_MAP_INTERLEAVE_NONE;
     s.swz = kSwzC;
@@ -400,15 +400,17 @@ TmapSpec spec_c(void* c) {
 
 CUtensorMap g_tmap_a, g_tmap_w1, g_tmap_w3, g_tmap_sfa, g_tmap_sfw1, g_tmap_sfw3, g_tmap_c;
 
+// FIX(2026-09-13): driver 595.91.07 (CUDA 13.2) rejects NULL array pointers —
+// elementStrides AND globalStrides must both be non-NULL. Verified on B300:
+// es=NULL→1, es=[1,1]→0; rank1 gs=NULL→1, gs=[0]→0.
+// elementStrides[0] is ignored when interleave==NONE but must still be >=1 ([0,0]→1).
+static constexpr cuuint32_t kElemStrideOnes[5] = {1, 1, 1, 1, 1};
+
 bool encode_one(CUtensorMap* out, const TmapSpec& s) {
-    // FIX(estride): TmapSpec{} zero-initializes estride to all 0s, but
-    // cuTensorMapEncodeTiled requires elementStrides to be either nullptr
-    // (= all 1s, contiguous) or an array with every entry >= 1. Passing
-    // zeros gives CUDA_ERROR_INVALID_VALUE (CUresult=1). All our tensors
-    // are box-contiguous → nullptr is the correct spelling.
     const CUresult r = g_encode(out, s.dtype, s.rank, const_cast<void*>(s.addr), s.gdim,
-                                s.rank > 1 ? s.gstride : nullptr, s.box,
-                                nullptr,  // elementStrides: NULL = all 1s
+                                s.gstride,        // never nullptr (rank=1 with gstride=[0] is fine)
+                                s.box,
+                                kElemStrideOnes,  // never nullptr
                                 s.ilv, s.swz, s.l2, s.oob);
     if (r != CUDA_SUCCESS) {
         fprintf(stderr, "[moe-bs] cuTensorMapEncodeTiled(%s) failed: CUresult=%d\n", s.what, (int)r);
