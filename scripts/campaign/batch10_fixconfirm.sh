@@ -16,6 +16,8 @@ for m in ${MODE//+/ }; do GATE="$GATE DSV41_MOE_BS_$m=1"; done
 echo "=== mode: $MODE  (gate:$GATE) label: $LABEL ==="
 
 echo "=== rebuild BOTH artefacts + freshness gate ==="
+git fetch -q origin && git reset -q --hard origin/main
+touch kernels/cuda/*.cu kernels/cuda/tilelang_gen/*.cu 2>/dev/null || true
 (cd kernels/cuda && set -o pipefail; bash build.sh 103a 2>&1 | tail -2; echo KERNEL_RC=${PIPESTATUS[0]})
 source "$HOME/.cargo/env"
 (set -o pipefail; cargo build --release 2>&1 | tail -2; echo CARGO_RC=${PIPESTATUS[0]})
