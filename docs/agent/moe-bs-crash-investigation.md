@@ -3505,3 +3505,15 @@ CUDA_VISIBLE_DEVICES=<空闲卡> BSPACK=4 BSLAYOUT=1 /tmp/bsimp const
 ```
 **判读**：`[PASS]`（relerr≈0）⇒ kernel 内部无罪 ✓；`[FAIL]` ⇒ kernel 在此构建下退化 ✓。
 ⇒ 两臂合起来即可把缺陷**二分成"数据"或"kernel"**，再用 §28 的指纹表定位具体环节 ✓。
+
+### §139 补：第三臂（同队列）——**首次实测 accept 直方图**（accept 是与 verify 相乘的杠杆）
+依据 §131：acc 2.2→3.5 可把"要 450"所需的 verify 从 **2.86 ms 放宽到 5.66 ms** ✓ ⇒ **提 accept 与压 verify 同等重要**。
+而 §106 已确认：**当前栈的 `[acc-hist]` 直方图从未实测过** ✗（`acc_hist.rs:16-18` 自述；
+`r0-r1-accept-diagnosis-manual.md:80` 那条示例数字**不是测量值**，不得引用 ✗）。
+⇒ 加一条同队列的 1–2 分钟 GPU 臂（**按 §124 纪律：它是回读类探针 ⇒ 单臂诊断，卡住先判探针** ✗）：
+```bash
+bash ~/arm_run.sh ACC DSV41_ACC_HISTOGRAM=1            # 需 SPEC/DSPARK 路径：按 staged_verify.sh spec 的 SPEC_ENV
+grep -E "\[acc-hist" ~/armrun_ACC.log | tail -30       # 逐 step 直方图 + 收尾 summary
+```
+**判读**：拿到真实 `k_acc` 分布后，才能回答 §106 留下的问题——**2.24 是"draft 质量的合理值"还是"有条件被浪费"** ✗；
+若分布显示大量 step 打满块长（k_acc=5 ✓）而均值仍低 ⇒ 说明**部分 step 空转**（可修的机制问题 ✓）。
