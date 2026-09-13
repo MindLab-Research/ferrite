@@ -5641,6 +5641,33 @@ gemm_fp8_mrows_kernel(const uint8_t* __restrict__ a, const float* __restrict__ a
 // issue-bound (docs/agent/mrows-mpar-design.md §2.3 has the count table, and §4
 // the micro-benchmark that settles the sign if it is wrong).
 //
+// ⚠️ CORRECTION, 2026-09-13 (the first GPU round measured this arm NEGATIVE:
+// rpb=1 +0.52ms and auto +0.76ms on verify, not the predicted -8-10ms). Two of
+// the design's premises do not survive contact with the shapes:
+//
+//   (a) `rpb` IS NOT AN OCCUPANCY KNOB. Warps in flight are `grid * rpb * M =
+//       ceil(n/rpb) * rpb * M ~ n * M` for every rpb -- the M-warp-per-row
+//       layout FIXES the total. What rpb actually moves is (i) how many blocks
+//       carry a prologue (grid) and (ii) whether the grid still covers the SM
+//       count. That is why `auto` (the widest block, cap = 5 at M = 6) lost the
+//       MOST: wkv (n = 512) lands at 103 blocks and the shared expert (n = 288)
+//       at 58, both below a 148-SM part, so a third to two thirds of the chip
+//       idled. `auto` now resolves to the widest block that still puts ~one
+//       block per SM (see `dsv41_mrows_mpar_for`).
+//   (b) THE PROLOGUE IS REPLICATED `grid` TIMES AND WAS FULLY EXPOSED. The
+//       first cut built the table, THEN issued the slab, THEN waited with
+//       nothing in flight, so each block's DRAM round trip was on the critical
+//       path -- and at rpb = 1 there are up to `nwarps` (8x) more of them than
+//       the legacy program has. Reordered: issue -> commit -> build the table
+//       (the cover) -> wait -> barrier.
+//
+// The instruction surplus (1.59x) is real and unchanged, and the M-warp layout
+// cannot exceed `n * M` warps however rpb is chosen, so this kernel's ceiling is
+// the legacy program's ceiling multiplied by 1.59 -- which is why the honest
+// rework target is "beat the legacy arm on the shapes where the legacy B
+// geometry under-covers the SMs", not "-8ms". See the audit's §10 and the
+// verification manual in docs/agent/mrows-mpar-design.md.
+//
 // NUMERICS -- BIT-IDENTICAL to `gemm_fp8_mrows_kernel<M>` and therefore to the
 // m = 1 launch of the same row (the legacy kernel's C1-C6):
 //   * same K walk: `kb` ascends 0..nb_k-1, `j = kb*32 + lane` (C1);
@@ -5693,29 +5720,63 @@ gemm_fp8_mrows_mp_kernel(const uint8_t* __restrict__ a, const float* __restrict_
     extern __shared__ uint8_t smem[];
     uint8_t* s_w = smem;
     float* s_lut = reinterpret_cast<float*>(s_w + (size_t)rpb * (size_t)k);
-    for (int i = threadIdx.x; i < 256; i += blockDim.x) s_lut[i] = e4m3_to_f((uint8_t)i);
+    // -----------------------------------------------------------------------
+    // PROLOGUE ORDER (MPAR rework, 2026-09-13) -- WEIGHT FIRST, THE LUT AS ITS
+    // COVER. The first cut built the e4m3 table, THEN issued the slab, THEN
+    // called `cp_wait_all()` as the very next instruction: nothing was in
+    // flight while the transfer ran, so the block's WHOLE DRAM round trip was
+    // exposed on every one of the grid's blocks -- and at rpb = 1 the grid is
+    // `n` blocks against the legacy program's `ceil(n/nwarps)`, i.e. up to 8x
+    // the exposed prologues per launch. This is the same lesson the gemv's P3
+    // prologue records (`g_gemv_cpasync`: "issue it here, let the staging below
+    // run underneath it, and let loop iteration 0 only WAIT for it"); the MPAR
+    // prologue was simply written in the wrong order.
+    //
+    // What can cover the transfer here is exactly the table build: it depends
+    // on nothing, it is the only producer-independent work the block has before
+    // the barrier, and it is 256 entries over `rpb*M` warps. So: ISSUE -> COMMIT
+    // -> BUILD THE TABLE -> WAIT -> BARRIER. The bytes staged, the slots they
+    // land in, the table's 256 values and the consume order are all identical,
+    // so the output is bit-identical (instruction order is not observable).
+    // -----------------------------------------------------------------------
     // Weight slab: `rpb` rows of `k` bytes starting at `w + row0*k`. The model
     // constant keeps the rows `k` apart, so the slab is ONE contiguous global
     // range and a flat 16B-unit index maps onto it 1:1; the whole block stages
-    // it cooperatively (`nwarp` units per sweep, `nwarp` warps).
+    // it cooperatively.
     const int avail = min(rpb, n - row0);  // >= 1: the grid is ceil(n / rpb)
     const uint8_t* __restrict__ wsrc = w + (size_t)row0 * (size_t)k;
-    if (dsv41_f4_ok(wsrc) && dsv41_f4_ok(s_w)) {
+    const bool w16 = dsv41_f4_ok(wsrc) && dsv41_f4_ok(s_w);   // block-uniform
+    if (w16) {
         const int nflat = avail * n16;
-        for (int t = warp; t < nflat; t += nwarp)
-            dsv41_cp_async16(s_w + ((size_t)t << 4), wsrc + ((size_t)t << 4));
+        // ONE 16B UNIT PER THREAD, not per warp. The previous form was
+        //     for (int t = warp; t < nflat; t += nwarp) cp_async16(...(t<<4));
+        // and `t` depends only on `warp`, so all 32 lanes of a warp issued the
+        // SAME 16B copy: 16 useful bytes per warp-issue where this loop's
+        // thread-indexed form moves 32 x 16 = 512 B -- the same "SIXTEEN times
+        // the instructions" the legacy mrows weight staging records (:5505,
+        // there as a byte-per-lane walk), here paid as a 32x redundant request
+        // on every staged unit. Same units, same slots, same bytes; only which
+        // thread issues which unit changes.
+        for (int i = threadIdx.x; i < nflat; i += blockDim.x)
+            dsv41_cp_async16(s_w + ((size_t)i << 4), wsrc + ((size_t)i << 4));
         dsv41_cp_commit();
+    }
+    // The e4m3 decode table, built UNDER the slab transfer (see the order note
+    // above). 256 entries from the SAME `e4m3_to_f`, so every decoded value is
+    // bit-identical to the old build.
+    for (int i = threadIdx.x; i < 256; i += blockDim.x) s_lut[i] = e4m3_to_f((uint8_t)i);
+    if (w16) {
+        // Retire the slab here: the reader of `s_w[rr*k + ...]` is a DIFFERENT
+        // warp than the writer, so the transfer must be complete before the
+        // barrier publishes it (the legacy prologue could leave it in flight
+        // across the barrier because each warp staged its OWN row).
         dsv41_cp_wait_all();
     } else {
         // k % 16 tail / unaligned arm: unreachable for every launcher (they all
         // reject `k & 31`, which also makes `row0*k` and `rpb*k` 16B multiples).
         for (int i = threadIdx.x; i < avail * k; i += blockDim.x) s_w[i] = wsrc[i];
     }
-    // Cross-warp publication. The slab is staged FLAT -- `s_w[rr*k + ...]` is
-    // written by warps other than its reader -- so the transfer must be retired
-    // BEFORE the barrier. This is the one line that differs from the legacy
-    // prologue, where each warp staged its OWN row and deliberately overlapped
-    // the barrier with its transfer.
+    // Cross-warp publication (see the order note above).
     __syncthreads();
     if (row < n) {
         const uint8_t* __restrict__ rs = s_w + (size_t)rr * (size_t)k;
@@ -5742,29 +5803,79 @@ gemm_fp8_mrows_mp_kernel(const uint8_t* __restrict__ a, const float* __restrict_
 
 // MPAR gate (DSV41_MROWS_MPAR, 2026-09-13). `=N` (N >= 1) selects the
 // M-parallel kernel with N OUTPUT ROWS per block; `=auto` (or a negative value)
-// takes the widest block that fits (`1024 / (32*M)` rows), which keeps the
-// legacy block's rows-per-block at M = 8 and widens it at small M; unset / `=0`
-// is OFF, i.e. the M-in-register program, byte for byte.
+// takes the widest block that still leaves at least one block per SM; unset /
+// `=0` is OFF, i.e. the M-in-register program, byte for byte.
 //
 // The knob is the ROW COUNT, not the warp count, because that is the quantity
 // the two programs share: `rpb` rows per block is the legacy `nwarps`, and the
 // MPAR block is `rpb * M` warps. Sweeping it walks from "one output row per
 // block, M warps on it" (rpb = 1: the most parallelism, the most LUT-build and
 // activation-read replication) to "as many rows as fit one 1024-thread block"
-// (auto: the least replication, one block per SM at M = 6).
+// (the cap: the least replication, but the grid may fall below the SM count).
+//
+// ⚠️ WHAT `rpb` DOES *NOT* CHANGE (the rework's key correction). The warps in
+// flight are `grid * rpb * M = n * M` for EVERY rpb: the M-warp-per-row layout
+// fixes the total, so `rpb` is NOT an occupancy knob -- it only moves
+// (a) how many blocks carry a prologue (grid = ceil(n/rpb)) and (b) whether the
+// grid still covers the machine. The first cut read `rpb` as an occupancy knob
+// and `auto` as "the least prologue replication"; measured, `auto` (the widest
+// block) was the WORSE arm on the small-n shapes precisely because `cap = 5` at
+// M = 6 leaves wkv (n = 512) at 103 blocks and the shared expert's w1/w3
+// (n = 288) at 58 blocks -- both BELOW the 148-SM part, so a third to two
+// thirds of the chip idled for the whole launch. `auto` therefore resolves to
+// the widest block THAT STILL COVERS THE SMs (see `dsv41_mrows_mpar_for`); the
+// old behaviour is still reachable by passing an explicit large `=N`, which the
+// clamp turns into the cap.
 //
 // Read once (static): the launcher runs a few hundred times per step.
 static const int g_mrows_mpar = [] {
     const char* e = getenv("DSV41_MROWS_MPAR");
     if (e == nullptr) return 0;
-    if (e[0] == 'a' || e[0] == 'A') return -1;  // "auto" -> widest block
+    if (e[0] == 'a' || e[0] == 'A') return -1;  // "auto" -> coverage-aware
     return atoi(e);
 }();
-static inline int dsv41_mrows_mpar_for(int m) {
+// Device SM count, cached (the same pattern `dsv41_smem_ceiling` uses: read
+// once, because the launcher runs a few hundred times per step and a per-call
+// cudaDeviceGetAttribute is a driver round trip).
+static int dsv41_sm_count() {
+    static int cached = -1;
+    if (cached < 0) {
+        int dev = 0, sms = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+        cached = (sms > 0) ? sms : 1;
+    }
+    return cached;
+}
+// NOTATION: `n` defaults to 0 = "the caller did not supply the output width", in
+// which case the auto arm keeps the pre-rework "widest block" answer. The test
+// binary (`tests_dsv41_gemm_mrows.cu`) pins the resolution through this entry
+// with one argument, and it is outside this task's write scope, so the
+// coverage-aware rule is reached only by the launcher (which always passes `n`).
+// A defaulted parameter rather than a second name keeps that pin compiling; it
+// does NOT weaken it -- the pin only asserts `rpb in [1, cap]`, which both rules
+// satisfy.
+static inline int dsv41_mrows_mpar_for(int m, int n = 0) {
     if (g_mrows_mpar == 0) return 0;  // OFF: today's program
     const int mm = (m > 0) ? m : 1;
     const int cap = 1024 / (32 * mm);  // rpb*m warps must fit ONE block
-    int rpb = (g_mrows_mpar < 0) ? cap : g_mrows_mpar;
+    int rpb;
+    if (g_mrows_mpar < 0) {
+        // auto: the widest block whose grid still puts ~one block on every SM.
+        // `n / sms` rows per block keeps grid = ceil(n / rpb) >= sms, so no SM
+        // is left without a block; clamped by `cap` (the 1024-thread ceiling).
+        // With `n` unknown (0) this is the widest block, i.e. the first cut's
+        // `auto`, which measured WORSE than rpb=1 on the small-n shapes for
+        // exactly the reason above -- so the launcher always passes `n`.
+        int cover = cap;
+        if (n > 0) {
+            cover = n / dsv41_sm_count();
+            if (cover < 1) cover = 1;
+        }
+        rpb = (cover < cap) ? cover : cap;
+    } else {
+        rpb = g_mrows_mpar;
+    }
     if (rpb > cap) rpb = cap;
     if (rpb < 1) rpb = 1;
     return rpb;
@@ -5848,7 +5959,7 @@ extern "C" int dsv41_gemm_fp8_mrows(const uint8_t* a, const float* a_scale,
     // fold_r == m always, so this only bites if both knobs are armed at once --
     // the mpar arm then declines and the legacy arm runs (loudly, see the
     // receipt below).
-    const int mpar = dsv41_mrows_mpar_for(m);
+    const int mpar = dsv41_mrows_mpar_for(m, n);
     if (mpar > 0 && fold_r == m) {
         // weight rows (rpb*k) + the e4m3 table. NO activation slab: the MPAR
         // kernel reads each activation row from global once per kb (see the
@@ -7101,8 +7212,9 @@ extern "C" int dsv41_gemm_fp8_mrows_rope_norm(
 // the epilogue's `acc + (bias ? bias[row] : 0.f)` is the very same expression --
 // including its `-0.0 + 0.f` corner -- the m=1 launcher writes.
 // `__launch_bounds__(256)` states the one block shape the launcher below can
-// build: `nwarps = (n >= 8) ? 8 : n`, so `block = nwarps * 32` is NEVER more
-// than 256. Without the pin the compiler has no reason to assume anything
+// build: `nwarps` is at most 8 (the `(n >= 8) ? 8 : n` default, itself only ever
+// REDUCED by the `DSV41_WO_A_NWARPS` override -- see the launcher), so
+// `block = nwarps * 32` is NEVER more than 256. Without the pin the compiler has no reason to assume anything
 // smaller than the architectural maximum, which is a strictly harder register
 // budget than this kernel's real occupancy needs. (R1, 2026-09-12: the pin was
 // missing here while the `gemm_fp8_mrows_kernel` sibling -- same one-warp-per-
@@ -7231,8 +7343,40 @@ extern "C" int dsv41_wo_a_grouped_fp8(const uint8_t* a, const float* a_scale,
     if (groups <= 0 || groups > 65535 || rows <= 0 || rows > 8) return 2;
     if (n <= 0 || k <= 0 || (k & 31) || (n & 31) || (a_stride & 31)) return 2;
     // One warp per output row, and the block must own a whole number of them.
-    const int nwarps = (n >= 8) ? 8 : n;
+    //
+    // NWARPS IS THE OCCUPANCY KNOB (2026-09-13, verify-side 2.49ms lesion). The
+    // body below never changes with `nwarps` -- a warp still owns exactly ONE
+    // whole output row, stages that row once and folds all M activation rows
+    // against it with the same serial `acc` chain, so shrinking `nwarps` changes
+    // ONLY the grid/block shape and every output bit is unchanged (same staged
+    // bytes per row, same `j = kb*32 + lane` ascending-kb walk, same
+    // `#pragma unroll 32` chain, same `shfl_xor` tree; the row is never split
+    // across warps). What it buys: `grid.x = n / nwarps` RISES as `nwarps`
+    // falls. The verify site (nlg=1, groups/world=1, n=1024, k=4096) launches
+    // 128 x 8-row blocks = 128 blocks on a 148-SM B300 -- <1 block/SM, the SMs
+    // idle and the whole kernel is latency/occupancy bound (72 GB/s ~= 1% of
+    // peak, measured 57.9us for 4MiB). nwarps=4 -> 256 blocks (2/SM at 22KB
+    // smem), 2 -> 512 (3/SM at 13.8KB), 1 -> 1024 (4/SM at 9.7KB). The block
+    // gets smaller, the grid gets wider, the per-row work is identical.
+    //
+    // `DSV41_WO_A_NWARPS=N` (default 8 = the original shape, N clamped to
+    // [1,8]) selects it. The override can only REDUCE the warp count, so the
+    // default path keeps the exact accept/decline set it had; an N that does not
+    // divide `n` steps down to the largest power-of-two divisor so a valid
+    // shape still launches instead of declining the optimisation.
+    static const int wo_a_nwarps_env = [] {
+        const char* v = getenv("DSV41_WO_A_NWARPS");
+        if (v == nullptr || v[0] == '\0') return 8;
+        const int x = atoi(v);
+        return (x >= 1 && x <= 8) ? x : 8;
+    }();
+    int nwarps = (n >= 8) ? 8 : n;
     if (n % nwarps) return 2;
+    if (wo_a_nwarps_env < nwarps) {
+        int nw = wo_a_nwarps_env;
+        while (nw > 1 && (n % nw)) nw >>= 1;
+        nwarps = nw;
+    }
     // The parity argument above is the ORDER-PRESERVING consume form. The
     // vectorised/scalar arms (mode 0/1) reorder a lane's elements, so a run
     // configured for them keeps the per-(group, row) loop.

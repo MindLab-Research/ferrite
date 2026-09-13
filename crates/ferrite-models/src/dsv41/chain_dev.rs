@@ -11633,22 +11633,26 @@ impl<'a> DevChain<'a> {
         };
         // W2-MROWS (`DSV41_ATTN_MROWS=1`, DEFAULT OFF): ONE m-row sparse-attention
         // launch for the whole block instead of one per row. [`attn_mrows`]'s header
-        // carries the full argument; this is where its two PRECONDITIONS become
+        // carries the full argument; this is where its PRECONDITIONS become
         // concrete host tests, because a wrong one is silent corruption and not a
         // slow path:
-        //   * `world == 1` — the kernels index the q/out rows as `(row*h + hh)*d`
-        //     while this call's rows live at pitch `nh*hd` (`h = nlh = nh/world`),
-        //     so a `world > 1` batch needs a `row_pitch` argument the ABI does not
-        //     have yet;
+        //   * `world == 1`, or a `.so` carrying the pitched entries — the kernels
+        //     index the q/out rows as `(row*h + hh)*d` while this call's rows live
+        //     at pitch `nh*hd` (`h = nlh = nh/world`), so a `world > 1` batch needs
+        //     the `row_pitch` argument (`dsv41_sparse_attn_rp` /
+        //     `dsv41_sparse_attn_orope_rp`) the original ABI did not have;
         //   * `pos_base + m - 1 < win` — the block must not have turned the ring
         //     over, or rows `0..m-2` read the block's own FUTURE rows as history
         //     while losing the oldest `m-1-r` entries (audit defect #2: the
         //     `verify_ring_win` fusion was reverted for exactly this).
+        // The third precondition — a per-row bound for every row — is not a test
+        // any more: both compressor arms now publish `clen_rows_r[owner]` (the
+        // hoisted kernel, or this loop's own copies), see `attn_own_snapshot`.
         // ON-but-declined announces itself once (the bring-up failure mode this
         // project keeps re-hitting is a gate that is ON and changes nothing).
         let mrows_attn = if attn_mrows() && m > 1 && m <= ATT_MROWS_MAX_BM {
             // W2-MROWS-TP preconditions, in the order that keeps the cheapest and
-            // the most structural first. The two former declines are GONE:
+            // the most structural first. ALL THREE former declines are now GONE:
             //   * `world != 1` no longer refuses — `dsv41_sparse_attn_rp` /
             //     `dsv41_sparse_attn_orope_rp` take the q/out `row_pitch` the ABI
             //     was missing, and the arm passes `nh*hd`;
@@ -11656,25 +11660,19 @@ impl<'a> DevChain<'a> {
             //     compressor's per-row snapshots are in DEVICE memory
             //     (`clen_rows_r[owner]`), which is exactly the buffer the m-row
             //     launch now reads (`attn_clen` below), so the "no snapshot a
-            //     device kernel can use" objection no longer holds.
+            //     device kernel can use" objection no longer holds;
+            //   * and the fence's REMAINING case — a compressor that ran the
+            //     PER-ROW path and therefore left no device snapshot at all — is
+            //     answered where the snapshot can be taken: the row loop below
+            //     publishes its own counter into `clen_rows_r[layer]`
+            //     (`attn_own_snapshot`), one device copy per row, so the m-row
+            //     launch has a real per-row bound here too. The two arms now
+            //     differ only in WHO writes the snapshot, not in whether one
+            //     exists.
             if !self.dev.supports_sparse_attn_rp() && world != 1 {
                 attn_mrows_decline(
                     "world > 1 and the `.so` has no `dsv41_sparse_attn_rp`: the kernels \
                      index the q/out rows as `h*d`, this block's rows are `nh*hd` apart",
-                );
-                false
-            } else if is_comp_src && comp_proj && !mrows_own_owner {
-                // The one surviving stop: THIS layer's compressor ran the per-row
-                // path, so its commits advanced the live counter row by row and no
-                // device snapshot of the intermediate values exists (`clen_rows_r`
-                // is written by the hoisted launch only). An m-row launch reads ONE
-                // counter for every row, which would bound rows `0..m-2` with the
-                // block-FINAL count — their own future. Refuse; the per-row loop
-                // stays exact.
-                attn_mrows_decline(
-                    "this block's compressor commits per row and left no device \
-                     snapshot: an m-row launch would bound every row with the \
-                     block-final counter",
                 );
                 false
             } else if (pos_base as i64) + (m as i64) - 1 >= win as i64 {
@@ -11689,20 +11687,44 @@ impl<'a> DevChain<'a> {
         } else {
             false
         };
+        // The PER-ROW ARM'S OWN snapshot — the case the old fence refused. When the
+        // hoist above did not take, `compress_row` runs once per row inside the
+        // loop below and advances the live counter row by row; the block-wide
+        // launch that follows would then read ONE counter for every row, the
+        // block-FINAL one, and bound rows `0..m-2` with their own future (exactly
+        // audit defect #1 — it is how the gate's decline message reads). The
+        // snapshot is not missing, it is simply not taken: nothing but the hoisted
+        // kernel writes `clen_rows_r`. So the loop takes it — after row r's commit
+        // it copies the live counter into `clen_rows_r[layer][r]` on the main
+        // stream (`memcpy_d2d`, i.e. a DEVICE read of a DEVICE value, which is what
+        // keeps it capturable: an H2D upload would bake the value into the graph).
+        // The copy is ordered behind row r's commit and ahead of the block's
+        // attention launch by stream order, so `clen_rows_r` holds exactly the
+        // snapshots the hoisted kernel writes for a layer that DID hoist.
+        //
+        // The per-row READERS keep the live counter (`clen_row` below is unchanged,
+        // `mrows_own_owner` stays the hoist predicate), so the interleave's own
+        // launches are byte-for-byte the ones this path always ran; only the
+        // deferred block-wide launch reads the new snapshot. `false` whenever the
+        // block-wide launch is not taken, so the default path pays nothing.
+        let attn_own_snapshot = mrows_attn && is_comp_src && comp_proj && !mrows_compress;
         // Row `r`'s bound for that launch. `mrows_own_owner` (this layer's or its
-        // owner's hoisted compressor) hands the DEVICE snapshot the hoisted launch
-        // wrote — `clen_rows_r[owner][r]` = the counter after row r's commit, i.e.
-        // the per-row value the interleave below also passes as each row's own
-        // `clen`. Otherwise `null`, and the kernel reads the OWNER's live counter:
-        // that is the same value the per-row calls read (a consumer's owner has
-        // already finished its whole block, so its counter is constant here, and a
-        // layer that commits nothing never moves it — see the gate above for the
-        // one case that would break this).
+        // owner's hoisted compressor) and `attn_own_snapshot` (this layer's
+        // per-row compressor, which just took its own copy above) both hand the
+        // DEVICE snapshot — `clen_rows_r[owner][r]` = the counter after row r's
+        // commit, i.e. the per-row value the interleave below also passes as each
+        // row's own `clen` on the paths that read it. `owner == layer` on both
+        // (`attn_own_snapshot` needs `is_comp_src`, and a source owns its own
+        // ring), so the layer-indexed write and the owner-indexed read are the
+        // same slots. Otherwise `null`, and the kernel reads the OWNER's live
+        // counter: that is the same value the per-row calls read (a consumer's
+        // owner has already finished its whole block, so its counter is constant
+        // here, and a layer that commits nothing never moves it).
         //
         // ⚠️ The old arm built a HOST array and passed `as_ptr()` into a device
         // kernel — a pre-existing defect of `DSV41_ATTN_MROWS` that never produced
         // a valid row bound. It is gone.
-        let attn_clen: *const std::os::raw::c_int = if mrows_own_owner {
+        let attn_clen: *const std::os::raw::c_int = if mrows_own_owner || attn_own_snapshot {
             (self.s.clen_rows_r.ptr as *const std::os::raw::c_int)
                 .wrapping_add(owner * VERIFY_ROWS)
         } else {
@@ -11776,7 +11798,27 @@ impl<'a> DevChain<'a> {
                     // rule is the deterministic one the commit kernel applied.
                     (pos_base + r as i32 + 1) % (comp_ratio as i32) == 0
                 } else {
-                    self.compress_row(layer, r, pos_base)?
+                    let committed = self.compress_row(layer, r, pos_base)?;
+                    // `attn_own_snapshot`: the per-row arm's device snapshot (see
+                    // the `attn_clen` comment above). Taken AFTER row r's commit
+                    // whatever that commit did — the counter is unchanged on a row
+                    // that completes no group, and the hoisted kernel records the
+                    // (then unchanged) value for such a row too, so the two
+                    // snapshots agree row for row. `memcpy_d2d` is an async D2D on
+                    // the main stream: ordered behind the commit and ahead of the
+                    // block-wide attention launch, and it reads the DEVICE counter,
+                    // so a captured graph replays with the current value instead of
+                    // a frozen one.
+                    if attn_own_snapshot {
+                        self.dev.memcpy_d2d(
+                            (self.s.clen_rows_r.ptr as *mut std::os::raw::c_int)
+                                .wrapping_add(owner * VERIFY_ROWS + r)
+                                as *mut c_void,
+                            clen_owner as *const c_void,
+                            std::mem::size_of::<std::os::raw::c_int>(),
+                        )?;
+                    }
+                    committed
                 }
             } else {
                 false

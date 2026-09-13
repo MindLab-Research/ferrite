@@ -490,6 +490,18 @@ struct DraftP3Lite {
     /// l3 (attention output): `sparse_attn` + `apply_rope_inv(o)` x bs +
     /// `quant1(o)` as ONE `dsv41_sparse_attn_orope` call.
     attn_orope: bool,
+    /// l4 (**segment B / K2**, the q chain): `rmsnorm(qr)` + `quant1(qr)` +
+    /// `gemm(wq_b)` + `rope(q)` as ONE `dsv41_gemm_fp8_mrows_rope_norm` launch
+    /// (`DSV41_P3LITE_Q_ROPENORM`).
+    ///
+    /// ⚠️ **R1 — it REQUIRES `DSV41_ATTN_PROJ_ALIGN`**, and the wiring refuses to
+    /// fire without it. K2's gemm segment is `gemm_fp8_mrows_kernel<M>` — the
+    /// program `proj_attn_mrows` runs — while the unaligned draft's `wq_b`
+    /// `gemm_fp8_mx@m=bs` is the 16-row TILE MMA. Folding K2 onto the unaligned
+    /// chain would fuse across two contraction programs *and* swap one, which is
+    /// exactly the P3b-class claim rule R1 forbids. With ALIGN on, both sides run
+    /// the same program and the fold is a pure launch-count change.
+    q_ropenorm: bool,
 }
 
 /// `DSV41_DRAFT_P3LITE=1` (**DEFAULT OFF**) — the draft chain's **P3-lite**
@@ -501,6 +513,7 @@ struct DraftP3Lite {
 /// | l1 | `DSV41_P3LITE_SEED_NORM_ROPE` | seed: `rmsnorm(mk)` + `apply_rope(mk)` -> `dsv41_rmsnorm_rope` | 1/block |
 /// | l2 | `DSV41_P3LITE_KV_NORM_ROPE` | kv: `rmsnorm(kv)` + `apply_rope(kv)` -> `dsv41_rmsnorm_rope` | 1/block |
 /// | l3 | `DSV41_P3LITE_ATTN_OROPE` | `sparse_attn` + `rope_inv(o)` x bs + `quant1(o)` -> `dsv41_sparse_attn_orope` | 6/block |
+/// | l4 | `DSV41_P3LITE_Q_ROPENORM` | q chain: `rmsnorm(qr)` + `quant1(qr)` + `gemm(wq_b)` + `rope(q)` -> `dsv41_gemm_fp8_mrows_rope_norm` (K2) | 7/block |
 ///
 /// A per-item override, when SET, wins over the master (`=0` turns that one fold
 /// off for an A/B that isolates it; any other value turns it on). An unset
@@ -510,22 +523,18 @@ struct DraftP3Lite {
 ///
 /// **P3-LITE'S FIVE RULES** (the design doc's §3.3 — each one closes a hole the
 /// P3b post-mortem found). 1) *same-program*: only launches running the SAME
-/// contraction program may merge — which is why the q chain's `gemm_fp8_mx@m=bs`
-/// (the 16-row TILE MMA) is NOT folded here: `K2`/`mrows` is a different program
-/// and swapping it is a numerical change, not a launch saving. 2) *all-or-nothing
-/// at the LAUNCH level*: every fold below is ONE launch taking over the whole
-/// phase chain, never "try N launches, fall back at the Nth". 3) *no clobbered
-/// fallback*: the fallback never reads a buffer the attempt wrote. 4) anything
-/// feeding a discrete consumer (argmax / the top-k router) needs a parity receipt
-/// at the CONSUMER's granularity. 5) one env per fold.
+/// contraction program may merge — which is why l4 (segment B / K2) is gated on
+/// `DSV41_ATTN_PROJ_ALIGN`: the q chain's `gemm_fp8_mx@m=bs` (the 16-row TILE MMA)
+/// is a DIFFERENT program from `mrows`, and swapping it is a numerical change, not
+/// a launch saving; with ALIGN on, both sides run `gemm_fp8_mrows_kernel<M>` and
+/// the fold only removes launches. 2) *all-or-nothing at the LAUNCH level*: every
+/// fold below is ONE launch taking over the whole phase chain, never "try N
+/// launches, fall back at the Nth". 3) *no clobbered fallback*: the fallback never
+/// reads a buffer the attempt wrote. 4) anything feeding a discrete consumer
+/// (argmax / the top-k router) needs a parity receipt at the CONSUMER's
+/// granularity. 5) one env per fold.
 ///
-/// **WHAT IS NOT HERE, and why.** The q chain's `rmsnorm(qr) + quant(qr) +
-/// gemm(wq_b) + rope` fold (`dsv41_gemm_fp8_mrows_rope_norm`, "K2") is the
-/// biggest single win (-7 launches/block), but it necessarily moves the draft's
-/// `wq_b` off the m=bs TILE program onto the verify's `mrows` GEMV program. That
-/// is the SAME claim `DSV41_ATTN_PROJ_ALIGN` makes, so K2 must be enabled
-/// together with that gate and A/B'd in the same arm (rule R1) — not bolted on
-/// here as a third independent fold. `wo_a/wo_b`'s `quant1(wo)` fold is
+/// **WHAT IS NOT HERE, and why.** `wo_a/wo_b`'s `quant1(wo)` fold is
 /// `gemm_fp8_mrows_f32` (gate `WOB_MROWS_F32`, already in tree): it is a
 /// DIFFERENT quantiser program and therefore not bit-identical, so it stays out
 /// of P3-lite by decision, not by oversight.
@@ -547,6 +556,7 @@ fn draft_p3lite() -> DraftP3Lite {
             seed_norm_rope: item("DSV41_P3LITE_SEED_NORM_ROPE"),
             kv_norm_rope: item("DSV41_P3LITE_KV_NORM_ROPE"),
             attn_orope: item("DSV41_P3LITE_ATTN_OROPE"),
+            q_ropenorm: item("DSV41_P3LITE_Q_ROPENORM"),
         }
     })
 }
@@ -1955,48 +1965,104 @@ impl<'a> DsparkDev<'a> {
                 dim as i32,
             )?;
         }
-        self.dev.rmsnorm(
-            self.qr.ptr as *const f32,
-            q_norm.as_f32(),
-            self.qr.ptr as *mut f32,
-            bs as i32,
-            ql as i32,
-            cfg.norm_eps,
-        )?;
-        self.quant1(self.qr.ptr as *const f32, bs * ql)?;
-        // wq_b is [nh * hd, ql]; one fp8 GEMM covers all bs draft rows.
-        // Same program choice as `wq_a` above: `DSV41_ATTN_PROJ_ALIGN` puts this
-        // on the verify's `gemm_fp8_mrows` (the `m == 1` GEMV program, the
-        // verify's `proj_mrows` for wq_b), OFF keeps the `m = bs` TILE launch.
-        if !(attn_proj_align()
-            && self.proj_attn_mrows(
-                wq_b.as_u8(),
-                wq_b_s.as_u8(),
-                self.q.ptr as *mut f32,
-                bs,
-                (nh * hd) as i32,
-                ql as i32,
-                (nh * hd) as i32,
-            )?)
+        // P3-lite l4 — **segment B / K2** (`DSV41_P3LITE_Q_ROPENORM`): the q
+        // chain's tail `rmsnorm(qr)` + `quant1(qr)` + `gemm(wq_b)` + `rope(q)` as
+        // ONE `dsv41_gemm_fp8_mrows_rope_norm` launch (10 -> 3 launches for the
+        // whole q chain, the largest single fold in the design's §4 table).
+        //
+        // R1 IS A PRECONDITION, NOT A COMMENT. The fold is refused unless
+        // `attn_proj_align()` is on: K2's gemm segment is
+        // `gemm_fp8_mrows_kernel<M>` — `proj_attn_mrows`'s program — while the
+        // unaligned draft's `gemm_fp8_mx@m = bs` is the 16-row TILE MMA. Folding
+        // K2 onto the unaligned chain would fuse ACROSS two contraction programs
+        // while swapping one of them: the exact compound claim that sank P3b.
+        // With ALIGN on, `wq_a`/`wq_b`/`wkv` already run the mrows program, so
+        // the only difference this fold makes is the launch count.
+        //
+        // ⚠️ THE POSITION SOURCE. K2 contains NO `pos_ctr`, NO `mul`/`off`/`step`:
+        // its rope segment reads `pos_rows[r]` (the array `rope_at`'s multi-row
+        // form has used since P3a a4). That array holds `pos_dev + r`, so the call
+        // is only valid when the uploaded base IS this chain's `rope_pos` —
+        // `rope_queries` requires the very same thing (`rope_mrows`'s guard). The
+        // check below is therefore a SHAPE/BASE check, not a fallback nicety; and
+        // it is STEP-INVARIANT (`pos_dev` and `rope_pos` advance together within an
+        // arm), which is what keeps the captured graph's branch valid on replay.
+        // Under `DSV41_SEED_POS` the two differ, so `l4` declines there and the
+        // four launches below are the untouched reference.
+        //
+        // The `q_pre_rope` dump is unfused-arm-only, for the same reason P3a a1's
+        // `h_premix_block` is: K2 performs the RoPE inside the launch, so the
+        // pre-RoPE bytes of `q` no longer exist as a separate buffer state.
+        let mut q_fused = false;
+        if draft_p3lite().q_ropenorm
+            && attn_proj_align()
+            && self.pos_dev == Some(rope_pos as i32)
         {
-            self.dev.gemm_fp8_mx(
-                self.xq.as_u8(),
-                self.xsc.as_f32(),
-                wq_b.as_u8(),
-                wq_b_s.as_u8(),
-                std::ptr::null(),
-                self.q.ptr as *mut f32,
-                bs as i32,
-                (nh * hd) as i32,
-                ql as i32,
+            q_fused = self.dev.gemm_fp8_mrows_rope_norm(
+                self.qr.ptr as *const f32,        // qr_raw
+                q_norm.as_f32(),                  // qr_w
+                cfg.norm_eps,                     // qr_eps
+                self.qr.ptr as *mut f32,          // qr_norm_out: in place, as `rmsnorm` did
+                wq_b.as_u8(),                     // w (wq_b [nh*hd, ql])
+                wq_b_s.as_u8(),                   // w_scale
+                std::ptr::null(),                 // bias
+                self.q.ptr as *mut f32,           // out
+                bs as i32,                        // m
+                (nh * hd) as i32,                 // n
+                ql as i32,                        // k
+                (nh * hd) as i32,                 // out_stride
+                self.cos.unwrap(),                // rope cos
+                self.sin.unwrap(),                // rope sin
+                self.pos_rows_ptr(),              // pos_rows[r] = rope_pos + r
+                cfg.rope_head_dim as i32,         // rope_rd
+                hd as i32,                        // rope_hd
+                false,                            // forward
             )?;
         }
-        // the pre-RoPE projection — the unit-diff isolator between the
-        // projection chain (wq_a/q_norm/wq_b) and the RoPE.
-        self.dump_unit_idx("q_pre_rope", s, self.q.ptr as *const f32, &[bs, nh, hd]);
-        // S1: `rope_pos` (NOT `pos`) — the shared base that keeps q/o in lockstep
-        // with kv under the SEED_POS arm (see the definition above).
-        self.rope_queries(self.q.ptr as *mut f32, rope_pos)?;
+        if !q_fused {
+            self.dev.rmsnorm(
+                self.qr.ptr as *const f32,
+                q_norm.as_f32(),
+                self.qr.ptr as *mut f32,
+                bs as i32,
+                ql as i32,
+                cfg.norm_eps,
+            )?;
+            self.quant1(self.qr.ptr as *const f32, bs * ql)?;
+            // wq_b is [nh * hd, ql]; one fp8 GEMM covers all bs draft rows.
+            // Same program choice as `wq_a` above: `DSV41_ATTN_PROJ_ALIGN` puts this
+            // on the verify's `gemm_fp8_mrows` (the `m == 1` GEMV program, the
+            // verify's `proj_mrows` for wq_b), OFF keeps the `m = bs` TILE launch.
+            if !(attn_proj_align()
+                && self.proj_attn_mrows(
+                    wq_b.as_u8(),
+                    wq_b_s.as_u8(),
+                    self.q.ptr as *mut f32,
+                    bs,
+                    (nh * hd) as i32,
+                    ql as i32,
+                    (nh * hd) as i32,
+                )?)
+            {
+                self.dev.gemm_fp8_mx(
+                    self.xq.as_u8(),
+                    self.xsc.as_f32(),
+                    wq_b.as_u8(),
+                    wq_b_s.as_u8(),
+                    std::ptr::null(),
+                    self.q.ptr as *mut f32,
+                    bs as i32,
+                    (nh * hd) as i32,
+                    ql as i32,
+                )?;
+            }
+            // the pre-RoPE projection — the unit-diff isolator between the
+            // projection chain (wq_a/q_norm/wq_b) and the RoPE.
+            self.dump_unit_idx("q_pre_rope", s, self.q.ptr as *const f32, &[bs, nh, hd]);
+            // S1: `rope_pos` (NOT `pos`) — the shared base that keeps q/o in lockstep
+            // with kv under the SEED_POS arm (see the definition above).
+            self.rope_queries(self.q.ptr as *mut f32, rope_pos)?;
+        }
 
         // ---- kv = wkv(x), normed and roped like the backbone's window KV ----
         // D1 fix (audit-ffi-args): quantise ALL bs rows — one row left rows 1..bs-1
