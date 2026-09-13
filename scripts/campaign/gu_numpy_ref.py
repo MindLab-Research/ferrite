@@ -61,6 +61,8 @@ def main():
     ap.add_argument("--layer", type=int, default=0)
     ap.add_argument("--kmax", type=int, default=DIM,
                     help="limit K to this many elements (pair with DSV41_MOE_BS_STAGE1=1)")
+    ap.add_argument("--row", type=int, default=0,
+                    help="which row of a multi-row dump to use (0 = first; -1 = last)")
     ap.add_argument("--out", default="/tmp/gu_numpy.f32")
     a = ap.parse_args()
 
@@ -71,8 +73,14 @@ def main():
     xsc4 = np.fromfile(f"{d}/xsc4.f32", dtype="<f4")
     print(f"in-dir {d}: x={x.size} ids={ids.size} xq4={xq4.size} xsc4={xsc4.size}")
     rows = x.size // DIM
-    ids = ids[: rows * TOPK]
-    print(f"rows(m)={rows} ids={ids.tolist()}")
+    row = max(0, min(a.row, rows - 1))
+    if row != 0:
+        x = x[row * DIM:(row + 1) * DIM]
+        xq4 = xq4[row * DIM:(row + 1) * DIM]
+        xsc4 = xsc4[row * (DIM // 32):(row + 1) * (DIM // 32)]
+        ids = ids[row * TOPK:(row + 1) * TOPK]
+    ids = ids[: rows * TOPK] if row == 0 else ids
+    print(f"rows(m)={rows} using row {row} ids={ids.tolist()}")
 
     # ---- (1) our activation quantisation vs the official act_quant rules on the same x --------
     xb = x[: DIM].astype(np.float32)
