@@ -4972,6 +4972,11 @@ fn hc_tail_split() -> bool {
                             self.gt_dump_vec(&xdp, 10, self.s.ex_act.ptr, 64)?;
                         }
                     }
+                    if slot == 1 && layer == 0 {
+                        if let Ok(xdp) = std::env::var("DSV41_GT_XDUMP") {
+                            self.gt_dump_vec(&xdp, 11, self.s.ex_act.ptr, 64)?;
+                        }
+                    }
                     self.dev.expert_down_fp4_indirect(
                         self.s.ex_act.ptr as *const f32,
                         self.s.o.ptr as *mut f32,
