@@ -1719,3 +1719,34 @@ C[(int64_t)(seg * HW_BM + c) * HW_NUP + n_tile * HW_BN + r] = C_sh[r * HW_BN + c
 **转正流程**（已完成脚本化：`~/promote_precision.sh "<GATE=1> [DBG=1]"`）：
 ① DBG 五点回读与主机参考**逐元素差 0** → ② `wq_check.py` 文本红线 PASS → ③ 快速臂无回归 →
 ④ 加进出货脚本 → ⑤ 全 gate 回归（`push400_hw_test.sh`）。**逐项转正、一次一个变量。**
+
+## §65 【定谳】bs-wiring-audit：两个确定性缺陷（其中一个是**我自己造成的回归**）+ 六项映射 OK
+
+### M1 —— ⚠️ 我的仪器化回归（**已彻底回退**）
+上一轮为定位 `[NC]` 而加的 `[NC-TRACE]` 仪器化，把**独立的 `return X;` 行**改写成
+"打印块 + `return X;`"两行 ⇒ 原先是 `if (条件)\n return 2;` 的结构，变成
+`if (条件)\n {打印}\n return 2;` ⇒ **`return` 掉到 `if` 外面、变成无条件返回**（9 处守卫全废）。
+后果：**dev 入口在第一个守卫就无条件 `return 2`** ⇒ **BS 臂整体失效**，任何 e2e 都**静默回落到老路径**
+——正是本项目 #1 测量偏置陷阱（"跑的不是你以为的那条路"）。
+⇒ **推论（重要）**：**F / P / U / E 各回合的文本判据全部建立在"BS 臂已生效"的假设上，该假设不成立** ⇒
+那些文本结论（如"包打包后文本变得更像计数"）**必须作废重判**。
+⇒ **教训（已回退）**：**仪器化只能"加"，绝不能重写控制流**；且改完**必须验证语义**（编译通过 ≠ 行为不变）。
+
+### M2 —— `goto` 跳过探针（**已修**）
+`HANDWRITTEN=1` 分支在 `moe_bs_shim.cu` 用 `goto scatter_launch;` 直达 scatter，
+**跨过**了 MMA-DIAG 与 NUMCHECK 两个探针块 ⇒ 手写路径上 `[NC]` **结构上不可能打印**
+（不是"某个提前 return"，而是 `goto` 直接跳过）。我 §56 的"(d) NUMCHECK 位于主路径上"**前提是错的**。
+⇒ 已在该 `goto` **之前**接上同一套（带非捕获守卫 + 同样 D2H 拷贝的）NUMCHECK 探针，并加一次性入口标记。
+⇒ **教训**：判断"可达性"必须**沿控制流走**（尤其 `goto`），不能只看代码位置。
+
+### 六项映射审计结论：**全部 OK**
+入口实参（`xq4/xsc4/out/w1/w3/sfw1/sfw3/eid/order/counts/nseg/w_stride/rows/dim/inter/topk`）
+**ABI 同序同型、常量与冻结几何逐项对齐**（SEG_CAP36/BM128/BK128/NH64/NP320/N_UP640/DIM5120/K_ITER40/sf_words40/smem166912）；
+A 行距 = `dim`（e4m3 1 B/value）、W 行距 = `K/2 = 2560`（§59 已验）；SF/eid/order/epilogue/act_slot 逐条 OK。
+
+### 审计点名的两处代码质量项（本轮一并修）
+1. **注释陷阱**：`moe_bs_shim.cu:746/885`、`device.rs:8127/887` 把 `xq4` 写成 `[rows*topk][dim]`，
+   而**代码与生产者都是 `[rows][dim]`**（激活按**行**量化）。这种误导性注释会诱导人"按注释改代码"⇒ 必须改对。
+2. **跨语言不对称契约**：shim **不检查** `topk*rows ≤ SEG_CAP`（只在 Rust 侧
+   `chain_dev.rs:16732` 的 `n_assign > TILELANG_SEG_CAP → Ok(false)` 把关）⇒ 建议 shim 加一条断言
+   （当前生产形状 (6,6)=36 恰取等，不触发）。
