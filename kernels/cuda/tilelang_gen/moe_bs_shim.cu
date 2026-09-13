@@ -572,7 +572,10 @@ __global__ void tl_moe_bs_scatter_kernel(const float* __restrict__ c, float* __r
     const int seg = blockIdx.y;
     if (seg >= *nseg) return;
     const int r = blockIdx.x;
-    const int live = counts[seg];
+    // D3 (audit): clamp exactly like the gather does. Without this, a corrupted counts[seg]
+    // (> kBm) makes r walk past this segment's C rows into the next segment — an
+    // out-of-bounds read/write rather than a crash, i.e. silently wrong output.
+    const int live = counts[seg] < kBm ? counts[seg] : kBm;
     const int idx = (r < live) ? order[seg * kBm + r] : -1;
     if (idx < 0) return;
     // up 的 out_pitch = topk*2*inter，分页 = (row*topk + slot)*2*inter；dn 直接 idx*dim。
@@ -1327,8 +1330,16 @@ extern "C" int dsv41_moe_bs_debug_gather(
     cudaStream_t s) {
     if (!tl_bs_init()) return 2;
     // Run the gather
+    // D4 (audit): up-sync the caller's nseg into the device scratch the kernel's `nseg`
+    // parameter expects — it used to be handed `eid`, so `seg >= *nseg` filtered on an
+    // expert id and only filled the first that many segments, making every conclusion
+    // drawn from this debug entry either falsely pass or falsely fail. Same pattern as the
+    // host-table entry (see the cudaMemcpyAsync into g_nseg above).
+    if (g_nseg == nullptr) return 2;
+    if (cudaMemcpyAsync(g_nseg, &nseg, sizeof(int), cudaMemcpyHostToDevice, s) != cudaSuccess)
+        return (int)cudaGetLastError();
     tl_moe_bs_gather_kernel<<<dim3((unsigned)kBm, (unsigned)kSegCap), kMovThreads, 0, s>>>(
-        xq4, xsc4, g_a, g_sfa, order, counts, kDim, kDim / 32, kSfWords, (int)topk, eid);
+        xq4, xsc4, g_a, g_sfa, order, counts, kDim, kDim / 32, kSfWords, (int)topk, g_nseg);
     cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) return (int)e;
     // Dump the requested segment+row

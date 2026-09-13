@@ -17083,7 +17083,14 @@ impl<'a> DevChain<'a> {
                 w_stride, u_stride, s_stride, sf_expect, t_stride, sf_expect
             );
         });
-        if sf_expect == 0 || w_stride <= 0 || s_stride != sf_expect || t_stride != sf_expect {
+        // D5 (audit): `u_stride` (the W3 plane's expert distance) was measured and then
+        // DISCARDED while the kernel reuses `w_stride` for W3 as well. That holds today
+        // because the loader lays all six planes out with the same per-expert spacing, but
+        // it is an implicit contract: a future loader that pads or reorders W3 alone would
+        // silently fetch the wrong expert. Make the contract an assertion.
+        if sf_expect == 0 || w_stride <= 0 || u_stride != w_stride
+            || s_stride != sf_expect || t_stride != sf_expect
+        {
             return None;
         }
         Some((w1, u1, s1.ptr(), t1.ptr(), w_stride as u64))
