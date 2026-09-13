@@ -3823,6 +3823,39 @@ SGLang 侧的实现路径（供性能/精度对照）：DeepGEMM `fp8_fp4_gemm_n
 - `DSV41_MOE_BS_SFDUMP_K=k`：内容快照可指定 stage（默认 0）⇒ `sfdump_check.py` 终于看得见任意 stage 的
   W/SF 内容 ✓。
 
+## §145 【头号假设 + 候选修复】mbarrier 协议失步（每 stage 一次 commit 的相位记账）
+
+### 证据（可复算）
+
+1. **`defect-synthesis` 的 E4（类别级反证）**：把 BS 臂对**全部 24 个 word 内字节置换 × 320 个源 row ×
+   ±3 stage 位移 × A-SF-only 位移 × 组合**逐一扫过（其重建机器先经 E3 证明：对**旧路径** 12/12
+   slot×plane 的残差 = 0）⇒ **全部不拟合**（每个 π 的 self-row `medrel≈1.0–1.4`，最好 corr ≤ 0.16）
+   ⇒ **"标度归属/静态置换"整类被数据杀掉** ✓ ⇒ 只剩"改变 partial product 本身（K 轴配对）"的机制。
+2. **E6（关键）**：`armrun_GD4_BS.log` / `armrun_GD4_LDOLD.log` 均被 watchdog 以
+   **"§92 unbounded mbar spin"** 杀掉 ⇒ **MMA 完成到达会缺失**（不是 bounded-wait 引入的）。
+3. **由此推出的机制完全命中指纹**：无界等待 ⇒ **hang**；有界等待 ⇒ **带着未完成的 MMA 继续** ⇒
+   操作数 smem 被下一 stage 的 loader 覆写而**异步 MMA 仍在读** ⇒ 输出 = 多个 K-stage 的**混合**
+   = 量级对（同 row 邻接字节）+ 逐元素不相关 + **非置换** ✓✓；且**单 stage 仪器结构性免疫**
+   （只 commit/wait 一次、phase 恒 0）✓✓。
+
+### 候选修复（已实现，默认 OFF，与官方同构）
+
+`DSV41_MOE_BS_MBAR_RING=1`：把"**40 次到达共用一个 mbarrier**（相位靠 `k&1` 交替）"换成
+**2 项轮转 ring**（官方 DeepGEMM 用 `consumed[k%3]` ✓）：commit → `mma_bar[k&1]`，等待 →
+`mma_bar[k&1]` 且 `phase = (k>>1)&1` ⇒ 每个 barrier 每轮恰好一次到达、相位每轮翻一次 ✓
+⇒ 单次丢失/多余到达**不再污染整条相位序列** ✓。
+（`mbar-protocol-audit` 正在做独立复核：到达计数、发射者/等待者身份、所有提前退出路径、
+`tcgen05.cp` 是否计入 commit、以及"超时后不写 C"之类的兜底。）
+
+### 验证顺序（一个变量）
+
+1. `batch9`（已含）：`KS_RING`（`MBAR_RING=1`）vs **已有的全 K 官方 oracle**（`/tmp/gu_bs_new.f32`）
+   ⇒ 若 `corr≈1 / medrel≈0` ⇒ **协议就是缺陷且已修** ✓✓；
+2. 同时 `KS_CPA`（cp.async 双缓冲）与 `KS_DET_A/B`（确定性）给旁证；
+3. `KS_WDBG`（`BOUNDED_WAIT=1 WAITDBG=1`）读 `[moe-bs-wait-dbg]` 的
+   `other_parity_ready=1` / both-not-ready 计数 ⇒ **直接量出失步** ✓；
+4. `KEEP_STAGE=0/1/17/39` × oracle 40 段偏积 ⇒ 定位"哪一 stage 的数据被用错"（若仍有残余错）。
+
 ⇒ 误差**只在算术内部**：K 元素配对 / 标度归属 / 逐元素映射中有一处不对，且它必须同时解释
 "量级对 + 逐元素不相关 + 非置换 + 非换 expert"。**下一判据 = `DSV41_MOE_BS_SFDUMP` 内容校验（`sfdump_check.py`）
 + 去假设 replay（`sfdump_replay.py`：输出是否等于"它自己 staged 的数据"的积）** ⇒ 分流"内容错" vs "使用错" ✓。
