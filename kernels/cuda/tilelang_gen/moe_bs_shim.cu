@@ -894,6 +894,7 @@ extern "C" int dsv41_moe_tilelang_gate_up_bs_dev(
     const int* counts_dev,   // [SEG_CAP] i32 —— **DEVICE**
     const int* nseg_dev,     // [1] i32 —— **DEVICE**（dsv41_moe_align_from_group 的输出）
     int rows, int dim, int inter, int topk, int64_t w_stride, cudaStream_t s) {
+    { static bool _m1=false; if(!_m1){_m1=true; fprintf(stderr, "[NC-TRACE] dev entry ENTERED (NUMCHECK env=%s)\n", getenv("DSV41_MOE_BS_NUMCHECK")?"1":"0");} }
     if (xq4 == nullptr || xsc4 == nullptr || out == nullptr || w1 == nullptr || w3 == nullptr ||
         sfw1 == nullptr || sfw3 == nullptr || eid_dev == nullptr || order_dev == nullptr ||
         counts_dev == nullptr || nseg_dev == nullptr)
