@@ -238,6 +238,15 @@ struct Scratch {
     /// reads `qr_r` (a layer without an indexer leaves it set; the next layer's
     /// `attention_rows` overwrites it, so it cannot leak across a layer).
     qr_raw_r: std::cell::Cell<bool>,
+    /// P3 MEGAKERNEL: set by [`ChainDev::hc_mixes_auto`] when the PREFUSED front
+    /// end (`dsv41_verify_hc_front_prefused`) actually ran on this block, i.e. the
+    /// T1 fp8 staging of the block's `xn` in `s.xq_r`/`s.xsc_r` is ALREADY the
+    /// `quant_rows(xn)` output (same bytes, same row pitch). Consumed once by the
+    /// first `quant_rows(xn)` site downstream — the attention block's and the MoE
+    /// block's — each of which then skips its launch. Cleared on consume and
+    /// overwritten by the next front end, so it cannot leak across a block.
+    /// Cell because the `shared_expert_mrows` chain takes `&self`.
+    p3_xq_staged: std::cell::Cell<bool>,
     /// L2+L3: set by `attention()` when the wq_b + idx_wq_b pair was computed
     /// in ONE mx2 launch (`DSV41_IDX_FUSE`), so `indexer()` skips its own
     /// `lin(idx_wq_b)`. Cleared after the indexer consumes it (and whenever the
@@ -1812,6 +1821,54 @@ fn norm_mrows() -> bool {
     })
 }
 
+/// P3 MEGAKERNEL master gate (`DSV41_P3_MEGAKERNEL=1`, default OFF) — the Rust
+/// arm of `docs/agent/p3-megakernel-verify-design.md`.
+///
+/// ONE switch for the whole verify-side family the design budgets at −2.7 ms:
+///
+///  * **F1** (`dsv41_verify_hc_front_prefused`) — the hc front end as ONE launch
+///    with the row-based T1 fp8 emit, which also removes the trailing
+///    `quant_rows(xn)`. See [`ChainDev::hc_mixes_auto`].
+///  * **F2** (`DSV41_ATTN_MROWS_ROPE_NORM`) — `norm(qr) + quant(qr) + wq_b +
+///    rope` as ONE `gemm_fp8_mrows_rope_norm` (kernel already in the tree).
+///  * **F3** (`DSV41_RMSNORM_ROPE_MROWS`) — kv `norm + rope` as ONE
+///    `dsv41_rmsnorm_rope_mrows` (kernel already in the tree).
+///  * **F4** (`DSV41_HC_VERIFY_FUSE`) — `hc_post` + the `h2_r` copy as ONE
+///    `hc_post_inplace_rows`, and the collapse+norm pair as ONE
+///    `hc_collapse_norm` (both already in the tree).
+///
+/// Each arm keeps its OWN gate, and an EXPLICIT value of that gate always wins
+/// (`DSV41_ATTN_MROWS_ROPE_NORM=0` still forces F2 off under the master gate).
+/// The master gate only supplies the DEFAULT: without it every one of the four
+/// keeps the value it has today (F2/F3/F4 OFF), so the behaviour of an unset
+/// environment is unchanged — this is a new opt-in, not a default flip.
+///
+/// WHY ONE SWITCH. The four are only interesting together: F1 alone still pays
+/// the q/kv tails and both `hc_post`s, and F2/F3/F4 alone cannot see the fp8
+/// staging F1 removes. Arming them from one place is also what makes the A/B
+/// honest — "P3 on vs P3 off" is one environment variable, so no mixed state can
+/// be mistaken for the fusion's effect.
+///
+/// DESIGN-DOC ALIAS. The design document's §2.3 names this gate
+/// `DSV41_VERIFY_HC_PREFUSED`; both spellings are accepted (the task's
+/// `DSV41_P3_MEGAKERNEL` wins when both are set), so a script written against
+/// either document arms the same arm.
+///
+/// MODULE LEVEL, not an associated function: the two F2/F3 gates below are free
+/// functions and must reach it too. Read ONCE and cached — the arm is entered
+/// ~80x/step inside graph capture.
+fn p3_megakernel() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        if let Ok(v) = std::env::var("DSV41_P3_MEGAKERNEL") {
+            return v == "1";
+        }
+        std::env::var("DSV41_VERIFY_HC_PREFUSED")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
+}
+
 /// B4 (`DSV41_RMSNORM_ROPE_MROWS=1`, DEFAULT OFF): the verify block's kv half —
 /// `norm_rows(kv_r)` + `apply_rope(kv_r)` — as ONE launch
 /// (`Device::rmsnorm_rope_mrows`), where `attention_rows` issued two.
@@ -1833,8 +1890,12 @@ fn norm_mrows() -> bool {
 /// it replaces are the fork's side-stream (`*_on`) entries.
 fn rmsnorm_rope_mrows() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *F.get_or_init(|| {
-        std::env::var("DSV41_RMSNORM_ROPE_MROWS").map(|v| v == "1").unwrap_or(false)
+    // P3 (F3): an UNEXPLICIT value under the master gate is ON; an explicit
+    // `DSV41_RMSNORM_ROPE_MROWS` (either value) always wins, so `=0` is the A/B
+    // arm. Unset without the master gate is today's OFF, unchanged.
+    *F.get_or_init(|| match std::env::var("DSV41_RMSNORM_ROPE_MROWS") {
+        Ok(v) => v == "1",
+        Err(_) => p3_megakernel(),
     })
 }
 
@@ -3213,10 +3274,12 @@ impl AttnLinFuse {
 /// construction — so OFF and ON-but-declined are the same code path.
 fn attn_mrows_rope_norm() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *F.get_or_init(|| {
-        std::env::var("DSV41_ATTN_MROWS_ROPE_NORM")
-            .map(|v| v == "1")
-            .unwrap_or(false)
+    // P3 (F2): an UNEXPLICIT value under the master gate is ON; an explicit
+    // `DSV41_ATTN_MROWS_ROPE_NORM` (either value) always wins, so `=0` is the
+    // A/B arm. Unset without the master gate is today's OFF, unchanged.
+    *F.get_or_init(|| match std::env::var("DSV41_ATTN_MROWS_ROPE_NORM") {
+        Ok(v) => v == "1",
+        Err(_) => p3_megakernel(),
     })
 }
 
@@ -4610,6 +4673,7 @@ impl<'a> DevChain<'a> {
             xq_of_qr_valid: std::cell::Cell::new(false),
             qr_raw: std::cell::Cell::new(false),
             qr_raw_r: std::cell::Cell::new(false),
+            p3_xq_staged: std::cell::Cell::new(false),
             idx_q_ready: std::cell::Cell::new(false),
             idx_q_rope: std::cell::Cell::new(false),
             pre: dev.alloc(fb(hc))?,
@@ -5880,6 +5944,30 @@ impl<'a> DevChain<'a> {
             32,
             true,
         )
+    }
+
+    /// P3 MEGAKERNEL: consume the "the prefused front end already staged this
+    /// block's fp8 activation" flag. Returns `true` exactly ONCE per staging (the
+    /// setter is [`ChainDev::hc_mixes_auto`]'s prefused arm), so the caller can
+    /// skip its `quant_rows(xn)` launch and read `s.xq_r`/`s.xsc_r` directly.
+    ///
+    /// WHY IT IS A CONSUME AND NOT A READ. The two consumers (the attention
+    /// block's `mrows` staging and the MoE block's `shared_expert_mrows`) sit at
+    /// different depths of the layer and there is exactly one staging per block,
+    /// so a plain read would let the second consumer re-use a staging the first
+    /// one already consumed — correct today, but only because both happen to
+    /// want the same bytes. Clearing makes the invariant explicit and keeps the
+    /// flag from surviving into the next layer.
+    ///
+    /// The staging is `quant_rows(xn_r, m, dim)`'s output: same source, same
+    /// `cols = dim`, same row pitch, same per-32 arithmetic (`quant_kernel<0>`
+    /// at `block = 32`), which is what the design's §5.1 fp8 item argues. A
+    /// `false` return means the caller runs its own `quant_rows`, exactly as
+    /// before.
+    fn take_xq_staged(&self) -> bool {
+        let staged = self.s.p3_xq_staged.get();
+        self.s.p3_xq_staged.set(false);
+        staged
     }
 
     /// ONE `gemm_fp8_mrows` launch for a projection whose activation is already
@@ -12745,8 +12833,13 @@ impl<'a> DevChain<'a> {
                 hc_pc,
                 hc_out,
                 cfg.norm_eps,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
+                // P3: the ROW-BASED fp8 staging (`[VERIFY_ROWS, xq_row]`), so the
+                // prefused arm can emit the T1 pair itself. The older arms never
+                // see these pointers — `hc_mixes_auto` nulls them for `rows > 1`,
+                // because their emit is single-row (the hazard these two nulls
+                // documented).
+                self.s.xq_r.ptr as *mut u8,
+                self.s.xsc_r.ptr as *mut f32,
                 m,
                 // A2 verify arm: `false` on purpose, exactly as A1-a's
                 // `collapse_norm_rows` — the m-row chain must keep the raw pair's
@@ -12755,6 +12848,10 @@ impl<'a> DevChain<'a> {
                 // first time and broke the zero-Latin baseline; only `layer()`
                 // reads the gate.
                 false,
+                // P3 MegaKernel (`DSV41_P3_MEGAKERNEL=1`): the prefused arm is
+                // legal on THIS call site only (its fp8 buffers are the m-row
+                // staging above); `false` is the in-code A/B arm.
+                true,
             )?
         } else {
             Self::hc_front_note("hc_front_rows() off -> raw hc_mixes (gate)", m);
@@ -12823,12 +12920,16 @@ impl<'a> DevChain<'a> {
                 ffn_pc,
                 ffn_out,
                 cfg.norm_eps,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
+                // Same P3 staging as the attention block above (both blocks
+                // collapse `xn_r` through the same `[VERIFY_ROWS, dim]` buffers).
+                self.s.xq_r.ptr as *mut u8,
+                self.s.xsc_r.ptr as *mut f32,
                 m,
                 // Same A2 verify arm as the attention block above: no
                 // `BF16_TRUNCATE` on the m-row chain.
                 false,
+                // Same P3 arm as the attention block above.
+                true,
             )?
         } else {
             Self::hc_front_note("hc_front_rows() off -> raw hc_mixes (gate)", m);
@@ -13017,7 +13118,15 @@ impl<'a> DevChain<'a> {
         // the extra launch in the config where K1 and R2's `lin2` are both on is
         // harmless, and the OFF path issues it in the same place it always did.
         if mrows2 || mrows {
-            self.quant_rows(self.s.xn_r.ptr as *const f32, m, dim as i32)?;
+            // P3: the prefused front end already emitted this block's fp8 in the
+            // `quant_rows` layout (row base, the same `cols = dim` pitch, the same
+            // per-32 arithmetic), so staging it again is a redundant launch.
+            // `take_xq_staged` CONSUMES the flag, so the FFN block later in this
+            // layer still runs its own `quant_rows` unless its own front end
+            // staged it too.
+            if !self.take_xq_staged() {
+                self.quant_rows(self.s.xn_r.ptr as *const f32, m, dim as i32)?;
+            }
         }
         let m2_ok = if mrows2 {
             // K1: ONE two-family launch for wq_a + wkv. The activation is the
@@ -17472,7 +17581,10 @@ impl<'a> DevChain<'a> {
         {
             // 1) ONE fp8 quantisation of the block -- the same launch the arms
             //    below start with, so the activation is staged once either way.
-            self.quant_rows(self.s.xn_r.ptr as *const f32, m, dim as i32)?;
+            //    P3: skipped when the prefused FFN front end already emitted it.
+            if !self.take_xq_staged() {
+                self.quant_rows(self.s.xn_r.ptr as *const f32, m, dim as i32)?;
+            }
             // The row pitch of that staging is the `cols` it was quantised with
             // (`dim` bytes / `dim/32` f32, see `quant_rows`), NOT the wider
             // `xq_r` allocation.
@@ -17555,7 +17667,10 @@ impl<'a> DevChain<'a> {
         {
             // 1) ONE fp8 quantisation of the block — the same launch the pass
             //    below starts with, so the activation is staged once either way.
-            self.quant_rows(self.s.xn_r.ptr as *const f32, m, dim as i32)?;
+            //    P3: skipped when the prefused FFN front end already emitted it.
+            if !self.take_xq_staged() {
+                self.quant_rows(self.s.xn_r.ptr as *const f32, m, dim as i32)?;
+            }
             // The row pitch of that staging is the `cols` it was quantised with
             // (`dim` bytes / `dim/32` f32, see `quant_rows` (#5)), NOT the wider
             // `xq_r` allocation.
@@ -17625,8 +17740,11 @@ impl<'a> DevChain<'a> {
             sh_exp_mrows_note(false, "stale .so (no dsv41_gemm_fp8_mrows symbol)");
             return Ok(false);
         }
-        // 1) ONE fp8 quantisation for the whole block.
-        self.quant_rows(self.s.xn_r.ptr as *const f32, m, dim as i32)?;
+        // 1) ONE fp8 quantisation for the whole block. P3: skipped when the
+        // prefused FFN front end already emitted the same bytes into `xq_r`.
+        if !self.take_xq_staged() {
+            self.quant_rows(self.s.xn_r.ptr as *const f32, m, dim as i32)?;
+        }
         // 2) w1 | w3: one weight-stationary GEMV each, over the same activation.
         let stride = (2 * sh_il) as i32;
         let ok1 = self.dev.gemm_fp8_mrows(
@@ -17772,7 +17890,90 @@ impl<'a> DevChain<'a> {
         xsc: *mut f32,
         rows: usize,
         truncate: bool,
+        // P3 MEGAKERNEL only (design §2.1): this call site's `xq`/`xsc` are the
+        // ROW-BASED fp8 staging (`s.xq_r`/`s.xsc_r` from `layer_rows`), so the
+        // PREFUSED arm below may write them. `false` — the single-row `layer()` —
+        // keeps every arm on the arguments it has always been handed.
+        prefused: bool,
     ) -> Result<bool> {
+        // ---- F1: P3 MEGAKERNEL (docs/agent/p3-megakernel-verify-design.md §2.1)
+        // The hc front end as ONE launch at `rows = m`: the dots spread over
+        // `mix * split` blocks, the collapse/rmsnorm on its OWN block running in
+        // PARALLEL with them, the tail (ss/sigmoid/sinkhorn/comb) ELECTED to the
+        // last-finishing dot block (no ticket, no spin), and — the design's new
+        // mathematics — the T1 fp8 emitted with a ROW BASE (`xq[r*pitch + c]`),
+        // which is what lets this arm drop the caller's `quant_rows(xn)`.
+        //
+        // TRIED FIRST because it strictly subsumes the split below: same three
+        // programs, same operands, no side stream and no event pair, and one
+        // launch fewer downstream. Bit-exact at the default `split = 1` (design
+        // §5.1); `DSV41_P3_MK_SPLIT > 1` is deterministic but not bit-exact and
+        // exists only for the throughput A/B.
+        //
+        // A DECLINE IS FREE: the C entry returns before any block starts, so
+        // `pre/post/comb/out/xq/xsc` are untouched and the chain below runs
+        // exactly as if this arm did not exist. That is why it is a pre-check
+        // rather than a branch of the fallback chain.
+        //
+        // `dim % 32 == 0` is the fp8 grouping condition (`quant_kernel`'s block
+        // is 32 and a warp's 32 lanes must cover exactly one of them — design
+        // §7). The launcher declines it too; checking here keeps a shape this
+        // rank cannot emit for from costing a launch.
+        let pf_pitch = dim as i32; // == the `cols` `quant_rows(xn)` would use (#5)
+        let staged = if prefused
+            && p3_megakernel()
+            && self.dev.supports_verify_hc_front_prefused()
+            && rows >= 1
+            && rows <= VERIFY_ROWS
+            && (dim % 32) == 0
+            && !norm_w.is_null()
+            && !pre_collapse.is_null()
+            && !out.is_null()
+            && !xq.is_null()
+            && !xsc.is_null()
+        {
+            self.dev.verify_hc_front_prefused(
+                x,
+                hc_fn,
+                hc_scale,
+                hc_base,
+                norm_w,
+                pre_collapse,
+                pre_out,
+                post_out,
+                comb_out,
+                out,
+                xq,
+                xsc,
+                pf_pitch,
+                rows as i32,
+                hc as i32,
+                dim as i32,
+                sinkhorn_iters,
+                eps,
+                eps_norm,
+                truncate,
+            )?
+        } else {
+            false
+        };
+        // Published for the first `quant_rows(xn)` downstream (the attention
+        // block's and the MoE block's — see `take_xq_staged`). Written on EVERY
+        // path so it cannot leak from the previous block.
+        self.s.p3_xq_staged.set(staged);
+        if staged {
+            return Ok(true);
+        }
+        // The T1 emit of every arm BELOW is single-row (`hc_mixes_tail_kernel`'s
+        // `xq[c]` / `xsc[c >> 5]` carry no row base), so a multi-row block must
+        // hand them nulls — the hazard the call site's two nulls documented. At
+        // `rows == 1` this is a pass-through, so the single-row decode path keeps
+        // its arguments byte for byte.
+        let (xq, xsc) = if rows == 1 {
+            (xq, xsc)
+        } else {
+            (std::ptr::null_mut(), std::ptr::null_mut())
+        };
         // Stage-C persistent forms, both default OFF and both selected only when
         // the .so carries the symbol. `_MB` (multi-block) is tried first: same
         // one-launch phase structure, but the dots are spread instead of pinned
@@ -18030,10 +18231,17 @@ fn hc_verify_fuse() -> bool {
     // 1ddff9c): HC_VERIFY_FUSE=0 restores zero Latin at HEAD. The default is
     // now OFF (=0 semantics: the historical 10-launch chain); set
     // DSV41_HC_VERIFY_FUSE=1 to re-arm after the interaction is understood.
-    *F.get_or_init(|| {
-        std::env::var("DSV41_HC_VERIFY_FUSE")
-            .map(|v| v == "1")
-            .unwrap_or(false)
+    //
+    // P3 (2026-09-13): the P3 master gate arms F4 — an UNEXPLICIT value under
+    // `DSV41_P3_MEGAKERNEL=1` is ON, and an explicit `DSV41_HC_VERIFY_FUSE`
+    // (either value) still wins, so `=0` remains the A/B arm. The zero-Latin
+    // interaction above is older code than this kernel (the fused collapse is
+    // entered with `truncate = false`, the same discipline `collapse_norm_rows`
+    // already carries), but it must be re-validated by the receipt the design
+    // requires before F4 can be called done — see the delivery notes.
+    *F.get_or_init(|| match std::env::var("DSV41_HC_VERIFY_FUSE") {
+        Ok(v) => v == "1",
+        Err(_) => p3_megakernel(),
     })
 }
 
@@ -18392,6 +18600,12 @@ fn oracle_tap() -> bool {
             // validated on, so `layer()` keeps reading the gate. Only the m-row
             // verify arm passes `false` (see `hc_mixes_auto`).
             bf16_truncate(),
+            // P3 (`DSV41_P3_MEGAKERNEL`) does NOT arm the prefused arm here: its
+            // fp8 emit is wired for the m-row staging (`s.xq_r`/`s.xsc_r`) and
+            // this path already has its own single-row staging flag
+            // (`xq_of_xn_valid` below). The decode chain is untouched by P3, so
+            // "P3 on vs off" is a verify-only A/B.
+            false,
         )?;
         // T1: when the fused front ran the collapse, it also emitted the fp8
         // quantisation of `xn` (s.xq/s.xsc), so the next quant1(xn) - lin2's, in
@@ -18511,6 +18725,9 @@ fn oracle_tap() -> bool {
             // Same as the attention block above: the single-row decode form keeps
             // the `DSV41_BF16_TRUNCATE` gate.
             bf16_truncate(),
+            // Same P3 rationale as the attention block above: the prefused arm is
+            // verify-only, so the decode FFN chain is untouched.
+            false,
         )?;
         // T1 (ffn side): the tail emitted the fp8 of the ffn-norm output, so the
         // MoE's quant1(xn) - its first xq consumer - is redundant and skips.

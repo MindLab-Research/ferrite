@@ -1830,6 +1830,25 @@ struct Kernels {
             c_int, c_int, c_int, c_int, f32, f32, *mut u8, *mut f32, c_int, CuStream,
         ) -> c_int,
     >,
+    /// P3 MEGAKERNEL (docs/agent/p3-megakernel-verify-design.md §2.1; gate
+    /// `DSV41_P3_MEGAKERNEL=1`, default OFF): the verify block's hc front end —
+    /// the dots spread over `mix*split` blocks, the collapse/rmsnorm on its own
+    /// PARALLEL block, and the tail (ss/sigmoid/sinkhorn/comb) ELECTED to the
+    /// last-finishing dot block — in ONE launch, PLUS the row-based T1 fp8 emit
+    /// (`xq[r*pitch + c]`, `xsc[r*pitch/32 + c/32]`). Same shape as
+    /// `hc_front_persist_mb`; the row base in the emit is what lets a multi-row
+    /// block drop its trailing `quant_rows(xn)` launch. Bit-exact at `split == 1`
+    /// (the `< 1 ulp` caveat for `split > 1` is `hc_front_persist_mb`'s). Returns
+    /// false on any decline so the caller keeps the older chain.
+    verify_hc_front_prefused: Option<
+        unsafe extern "C" fn(
+            *const f32, *const f32, *const f32, *const f32,
+            *const f32, *const f32,
+            *mut f32, *mut f32, *mut f32, *mut f32,
+            *mut u8, *mut f32, c_int,
+            c_int, c_int, c_int, c_int, f32, f32, c_int, CuStream,
+        ) -> c_int,
+    >,
     /// hc TAIL SPLIT (`DSV41_HC_TAIL_SPLIT`, default ON): same front end as
     /// `hc_front`, but the DOTS and the LATE half (ss/sigmoid/sinkhorn/comb)
     /// leave `main` and run in that order on the side stream, between `fork_ev`
@@ -2252,6 +2271,7 @@ impl Device {
             hc_front: km!(rt, "dsv41_hc_front"),
             hc_front_persist: ko!(rt, "dsv41_hc_front_persist"),
             hc_front_persist_mb: ko!(rt, "dsv41_hc_front_persist_mb"),
+            verify_hc_front_prefused: ko!(rt, "dsv41_verify_hc_front_prefused"),
             hc_front_split: ko!(rt, "dsv41_hc_front_split"),
             embed_expand_dev: km!(rt, "ferrite_embed_expand_dev"),
             f32_to_bf16: km!(rt, "ferrite_f32_to_bf16"),
@@ -9242,6 +9262,98 @@ impl Device {
             return Ok(false);
         }
         self.kerr(rc, "dsv41_hc_front_persist_mb")?;
+        Ok(true)
+    }
+
+    /// True when the loaded `.so` carries the P3 megakernel entry
+    /// (`dsv41_verify_hc_front_prefused`). A stale `.so` reports false and the
+    /// caller keeps the split / two-launch front end plus its `quant_rows`.
+    pub fn supports_verify_hc_front_prefused(&self) -> bool {
+        self.kernels.verify_hc_front_prefused.is_some()
+    }
+
+    /// P3 MEGAKERNEL (`DSV41_P3_MEGAKERNEL=1`, default OFF; design
+    /// `docs/agent/p3-megakernel-verify-design.md` §2.1): [`Self::hc_front_persist_mb`]'s
+    /// one-launch phase structure — dots spread over `mix*split` blocks, collapse
+    /// on its own parallel block, tail elected to the last-finishing dot block —
+    /// plus the ROW-BASED T1 fp8 emit.
+    ///
+    /// `xq`/`xsc` are the caller's `[rows, xq_pitch]` (fp8 e4m3 bytes) and
+    /// `[rows, xq_pitch/32]` (f32) staging in the layout `quant_rows` writes and
+    /// `gemm_fp8_mrows_kernel` reads back (`a + r*k`, `a_scale + r*(k/32)`), so
+    /// the same `xq_pitch = cols` the caller would have passed to `quant_rows`
+    /// makes the emitted pair byte-identical to that launch. A null pair (or
+    /// `xq_pitch <= 0`) disables the emit — the older kernel's path exactly.
+    /// The kernel is only entered when `xq != nullptr`, so a caller that wants
+    /// the collapse WITHOUT the fp8 can pass nulls and use
+    /// [`Self::hc_front_persist_mb`] semantics.
+    ///
+    /// Returns `Ok(false)` on ANY decline (stale `.so`, a shape the C entry does
+    /// not specialise — `rows > DSV41_HC_SPREAD_MAXR`, `dim % 32 != 0` for an
+    /// emit request, an unusable chunk — or a `cudaFuncSetAttribute` refusal):
+    /// the caller then runs its older chain, which is the bit-exact reference at
+    /// `split == 1`. ⚠️ `split > 1` (`DSV41_P3_MK_SPLIT`) is deterministic but
+    /// NOT bit-exact (the K partials recombine in `ck` order); `split == 1` is
+    /// the default and the parity target.
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify_hc_front_prefused(
+        &self,
+        x: *const f32,
+        hc_fn: *const f32,
+        hc_scale: *const f32,
+        hc_base: *const f32,
+        w_norm: *const f32,
+        pre_collapse: *const f32,
+        pre: *mut f32,
+        post: *mut f32,
+        comb: *mut f32,
+        out: *mut f32,
+        xq: *mut u8,
+        xsc: *mut f32,
+        xq_pitch: i32,
+        rows: i32,
+        hc: i32,
+        dim: i32,
+        sinkhorn_iters: i32,
+        eps: f32,
+        eps_norm: f32,
+        truncate: bool,
+    ) -> Result<bool> {
+        let f = self.need(
+            self.kernels.verify_hc_front_prefused,
+            "dsv41_verify_hc_front_prefused",
+        )?;
+        let rc = unsafe {
+            f(
+                x,
+                hc_fn,
+                hc_scale,
+                hc_base,
+                w_norm,
+                pre_collapse,
+                pre,
+                post,
+                comb,
+                out,
+                xq,
+                xsc,
+                xq_pitch,
+                rows,
+                hc,
+                dim,
+                sinkhorn_iters,
+                eps,
+                eps_norm,
+                truncate as c_int,
+                self.stream,
+            )
+        };
+        // The C entry's decline contract: 1 (InvalidValue) and 2 (shape) both
+        // mean "fall back", exactly as the sibling `hc_front*` entries do.
+        if rc == 1 || rc == 2 {
+            return Ok(false);
+        }
+        self.kerr(rc, "dsv41_verify_hc_front_prefused")?;
         Ok(true)
     }
 
