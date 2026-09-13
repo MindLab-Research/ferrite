@@ -225,6 +225,7 @@ def moe_bs_up(NSEG, BM, NP_, K, E_, BN, BK, NH, threads=THREADS, stages=STAGES_D
     M = NSEG * BM
     GRID_X = 2 * NP_ // BN
 
+    @tilelang.jit(pass_configs={"tl::disable_tma_lower": False})
     @T.prim_func
     def main(A: T.Tensor((M, K), T.float4_e2m1fn),
              W1: T.Tensor((E_, NP_, K), T.float4_e2m1fn),

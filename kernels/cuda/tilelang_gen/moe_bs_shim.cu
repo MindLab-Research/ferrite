@@ -595,15 +595,16 @@ extern "C" int dsv41_moe_tilelang_gate_up_bs(
         (((uintptr_t)w3 & 0xF) != 0) || (((uintptr_t)out & 0x1F) != 0))
         return 2;
 
-    // P0-2 (graph-capture audit): NEVER run cudaMalloc inside a capture — it
-    // invalidates the caller's capture BEFORE we could decline. Decline here.
-    // moe_bs is the EAGER arm (host route-table readback + a CPU-computed
-    // tensormap), so it can never be a legal capture node anyway; this guard
-    // keeps tl_bs_init()'s cudaMalloc/TMA setup out of the capture.
+    // P0-2 (graph-capture audit, v2 state-gated — matching the bf16 shim's pattern):
+    // decline ONLY when INIT hasn't completed (g_a == nullptr — can't cudaMalloc
+    // inside capture); once scratch is allocated, launches are capture-safe and
+    // SHOULD enter the verify graph (the device-side moe_align from 0818d78
+    // eliminated the host D2H that made this arm EAGER-only).
     cudaStreamCaptureStatus cap_st = cudaStreamCaptureStatusNone;
     if (s && cudaStreamIsCapturing(s, &cap_st) == cudaSuccess
-        && cap_st != cudaStreamCaptureStatusNone) {
-        return 2;  // decline without touching capture
+        && cap_st != cudaStreamCaptureStatusNone
+        && g_a == nullptr) {
+        return 2;  // INIT hasn't run yet — decline without touching capture
     }
 
     if (!tl_bs_init()) {
