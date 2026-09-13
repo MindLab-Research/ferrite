@@ -537,10 +537,10 @@ __global__ void tl_moe_bs_gather_kernel(const uint8_t* __restrict__ xq4,
             // SF BYTE ORDER TEST: swap byte positions (s[0]→MSB, s[3]→LSB)
             // Hypothesis: tcgen05's sf_id=0 might select MSB not LSB
             // Synthetic data (all 0x7F) masked this — real data has varying scales
-            w = ((uint32_t)tl_bs_f_pow2_to_ue8m0(s[0]) << 24) |
-                ((uint32_t)tl_bs_f_pow2_to_ue8m0(s[1]) << 16) |
-                ((uint32_t)tl_bs_f_pow2_to_ue8m0(s[2]) << 8) |
-                (uint32_t)tl_bs_f_pow2_to_ue8m0(s[3]);
+            w = (uint32_t)tl_bs_f_pow2_to_ue8m0(s[0]) |
+                ((uint32_t)tl_bs_f_pow2_to_ue8m0(s[1]) << 8) |
+                ((uint32_t)tl_bs_f_pow2_to_ue8m0(s[2]) << 16) |
+                ((uint32_t)tl_bs_f_pow2_to_ue8m0(s[3]) << 24);
         }
         sfa[(int64_t)g * m + row] = w;
     }
