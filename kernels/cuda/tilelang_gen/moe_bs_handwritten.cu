@@ -552,10 +552,16 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
             const int r = i >> 7;   // swapAB: r = weight row (output channel); else token row
             const int c = i & 127;  // swapAB: c = token; else output column
             if (g_swapab) {
-                // C[m][n] with m = output channel, n = token -> transpose on store.
-                const int col = (r < HW_NH) ? (n_tile * HW_NH + r)
-                                            : (HW_NP + n_tile * HW_NH + (r - HW_NH));
-                C[(int64_t)(seg * HW_BM + c) * HW_NUP + col] = C_sh[r * HW_BN + c];
+                // C[m][n] with m = the WEIGHT row (gate rows [0,64) = W1, up rows
+                // [64,128) = W3) and n = the token -> transpose the row/column roles.
+                // The scratch layout the scatter READS must be kept exactly as in the
+                // non-swapAB branch: 128 columns per n_tile, gate in the first 64 and up
+                // in the second 64 (see the scatter's
+                //   bx = col/128, n = (j<64) ? bx*64+j : 320 + bx*64 + (j-64)
+                // in moe_bs_shim.cu). The previous formula packed all gates into [0,320)
+                // and all ups into [320,640), which the scatter mis-reads — a real
+                // wiring defect found by re-deriving the mapping (see docs §61).
+                C[(int64_t)(seg * HW_BM + c) * HW_NUP + n_tile * HW_BN + r] = C_sh[r * HW_BN + c];
             } else {
                 C[(int64_t)(seg * HW_BM + r) * HW_NUP + n_tile * HW_BN + c] = C_sh[r * HW_BN + c];
             }
