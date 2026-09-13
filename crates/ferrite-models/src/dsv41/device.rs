@@ -429,7 +429,7 @@ struct Kernels {
         unsafe extern "C" fn(
             *const u8, *const f32, *mut f32, c_int, c_int, c_int, f32,
             *const u8, i64, *const u8, i64, *const u8, i64, *const u8, i64,
-            *const c_int, c_int, CuStream,
+            *const c_int, c_int, c_int, CuStream,
         ) -> c_int,
     >,
     expert_down_fp4_indirect: Option<
@@ -3337,6 +3337,7 @@ impl Device {
         w3s_stride: i64,
         ids: *const i32,
         slot: i32,
+        act_e4m3: i32,
     ) -> Result<()> {
         let f = self.need(
             self.kernels.expert_gate_up_fp4_indirect,
@@ -3345,7 +3346,7 @@ impl Device {
         let rc = unsafe {
             f(
                 a, a_scale, out, rows, dim, inter, limit, w1_base, w1_stride, w1s_base, w1s_stride,
-                w3_base, w3_stride, w3s_base, w3s_stride, ids, slot, self.stream,
+                w3_base, w3_stride, w3s_base, w3s_stride, ids, slot, act_e4m3, self.stream,
             )
         };
         self.kerr(rc, "dsv41_expert_gate_up_fp4_indirect")

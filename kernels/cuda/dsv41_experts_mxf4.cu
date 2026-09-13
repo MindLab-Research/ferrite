@@ -571,6 +571,22 @@ __device__ __forceinline__ float dsv41_e2m1_to_f(uint8_t n) {
     return (n & 8u) ? -m : m;
 }
 
+// e4m3: 1 sign, 4 exp (bias 7), 3 mantissa; no inf, 0x7F/0xFF = NaN. The
+// OFFICIAL's routed experts consume act_quant's e4m3 activations (model.py
+// linear(): fp4-weight Linears quantize the activation to FP8, block 32 with
+// power-of-two f32 scales — exactly quant1's output format).
+__device__ __forceinline__ float dsv41_e4m3_to_f(uint8_t b) {
+    const uint32_t s = (uint32_t)(b & 0x80u) << 24;
+    const uint32_t be = (b >> 3) & 0xFu;
+    const uint32_t m = (uint32_t)(b & 0x7u);
+    if (be == 0u) {
+        const float v = (float)m * (1.0f / 512.0f);  // subnormal: m * 2^-9
+        return (b & 0x80u) ? -v : v;
+    }
+    if (be == 0xFu && m == 0x7u) return __uint_as_float(0x7fffffffu);  // NaN
+    return __uint_as_float(s | ((be + 120u) << 23) | (m << 20));
+}
+
 __global__ void expert_gemv_fp4_kernel(const float* __restrict__ a_f32,
                                        const uint8_t* __restrict__ a,
                                        const float* __restrict__ a_scale,
@@ -584,7 +600,7 @@ __global__ void expert_gemv_fp4_kernel(const float* __restrict__ a_f32,
                                        const uint8_t* __restrict__ bs_base, long bs_stride,
                                        const uint8_t* __restrict__ bh_base, long bh_stride,
                                        const uint8_t* __restrict__ bhs_base, long bhs_stride,
-                                       const int* __restrict__ ids, int slot) {
+                                       const int* __restrict__ ids, int slot, int act_e4m3) {
     const uint8_t* b_use = b;
     const uint8_t* bsc_use = b_scale;
     const uint8_t* bhi_use = b_hi;
@@ -606,6 +622,10 @@ __global__ void expert_gemv_fp4_kernel(const float* __restrict__ a_f32,
     for (int j = threadIdx.x; j < k; j += blockDim.x) {
         if (a_f32 != nullptr) {
             s_act[j] = a_f32[j];
+        } else if (act_e4m3) {
+            // The official's activation format: e4m3 bytes (1/elem) with f32
+            // power-of-two scales per 32 — quant1's output, passed verbatim.
+            s_act[j] = dsv41_e4m3_to_f(a[j]) * a_scale[j >> 5];
         } else {
             const uint8_t ab = a[j >> 1];
             const float asc = a_scale[j >> 5];
@@ -2123,7 +2143,7 @@ inline cudaError_t launch_mxf4(const uint8_t* a, const float* a_scale, const flo
         const int blocks = (n_total + warps - 1) / warps;
         expert_gemv_fp4_kernel<<<blocks, cta, (size_t)k * sizeof(float), s>>>(
             a_f32, a, a_scale, b, b_scale, b_hi, b_hi_scale, out, n_total, k, b_split, epi_mode,
-            limit, row_weight, nullptr, 0, nullptr, 0, nullptr, 0, nullptr, 0, nullptr, 0);
+            limit, row_weight, nullptr, 0, nullptr, 0, nullptr, 0, nullptr, 0, nullptr, 0, 0);
         return cudaGetLastError();
     }
     const dim3 grid((unsigned)((n_total + kNTile - 1) / kNTile),
@@ -2226,7 +2246,7 @@ inline cudaError_t launch_mxf4_indirect(const uint8_t* a, const float* a_scale, 
                                         const uint8_t* bs_base, long bs_stride,
                                         const uint8_t* bh_base, long bh_stride,
                                         const uint8_t* bhs_base, long bhs_stride,
-                                        const int* ids, int slot, cudaStream_t s) {
+                                        const int* ids, int slot, int act_e4m3, cudaStream_t s) {
     if (rows <= 0 || n_total <= 0 || k <= 0) return cudaSuccess;
     if (k % kAtomK != 0) return cudaErrorInvalidValue;
     // M=1 (decode): the tcgen05 tile is M=128 by hardware, so the tensor-core path
@@ -2242,7 +2262,7 @@ inline cudaError_t launch_mxf4_indirect(const uint8_t* a, const float* a_scale, 
         expert_gemv_fp4_kernel<<<blocks, warps * 32, (size_t)k * sizeof(float), s>>>(
             a_f32, a, a_scale, nullptr, nullptr, nullptr, nullptr, out, n_total, k, b_split,
             epi_mode, limit, row_weight, b_base, b_stride, bs_base, bs_stride, bh_base, bh_stride,
-            bhs_base, bhs_stride, ids, slot);
+            bhs_base, bhs_stride, ids, slot, act_e4m3);
         return cudaGetLastError();
     }
     const dim3 grid((unsigned)((n_total + kNTile - 1) / kNTile),
@@ -2265,10 +2285,11 @@ extern "C" int dsv41_expert_gate_up_fp4_indirect(
     const uint8_t* a, const float* a_scale, float* out, int rows, int dim, int inter, float limit,
     const uint8_t* w1_base, long w1_stride, const uint8_t* w1s_base, long w1s_stride,
     const uint8_t* w3_base, long w3_stride, const uint8_t* w3s_base, long w3s_stride,
-    const int* ids, int slot, cudaStream_t stream) {
+    const int* ids, int slot, int act_e4m3, cudaStream_t stream) {
     return (int)launch_mxf4_indirect(a, a_scale, nullptr, out, rows, 2 * inter, dim, inter, 1, limit,
                                      nullptr, false, w1_base, w1_stride, w1s_base, w1s_stride,
-                                     w3_base, w3_stride, w3s_base, w3s_stride, ids, slot, stream);
+                                     w3_base, w3_stride, w3s_base, w3s_stride, ids, slot, act_e4m3,
+                                     stream);
 }
 
 // down, indirect, accumulating into `out` (epi_mode 3).
@@ -2278,7 +2299,7 @@ extern "C" int dsv41_expert_down_fp4_indirect(
     const int* ids, int slot, cudaStream_t stream) {
     return (int)launch_mxf4_indirect(nullptr, nullptr, act, out, rows, dim, inter, -1, 3, 0.f,
                                      row_weight, true, w2_base, w2_stride, w2s_base, w2s_stride,
-                                     w2_base, w2_stride, w2s_base, w2s_stride, ids, slot, stream);
+                                     w2_base, w2_stride, w2s_base, w2s_stride, ids, slot, 0, stream);
 }
 
 extern "C" int dsv41_expert_down_fp4(const float* act, const uint8_t* w2,

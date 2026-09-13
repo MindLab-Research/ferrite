@@ -792,6 +792,19 @@ fn bf16_q() -> bool {
     *F.get_or_init(|| std::env::var("DSV41_BF16_Q").map(|v| v != "0").unwrap_or(true))
 }
 
+/// The official's routed experts consume act_quant's FP8 e4m3 activations
+/// (model.py linear(): fp4-weight Linears quantize the activation to FP8,
+/// block 32 with power-of-two f32 scales — exactly quant1's output format).
+/// Our routed experts used e2m1 nibbles (4-bit, 8x coarser) — the moe_o
+/// 4.7-10.9% divergence's dominant source. DEFAULT ON;
+/// `DSV41_EXPERT_ACT_E4M3=0` reverts to the e2m1 path for A/B. (The batched
+/// MoE path's fused kernel does not support the e4m3 format yet and is
+/// disabled while this is on.)
+fn expert_act_e4m3() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_EXPERT_ACT_E4M3").map(|v| v != "0").unwrap_or(true))
+}
+
 /// The official's gate domain: the reference computes the gate scores in FULL
 /// F32 (`linear(x.float(), weight.float()) / gate_temp` — model.py Gate.forward);
 /// our old bf16/fp8 gate paths differ by ~1-2%, which flipped near-tie expert
@@ -4706,15 +4719,34 @@ fn hc_tail_split() -> bool {
             // re-packing the same 5120-element row for each of the ~6 selected
             // experts, i.e. 6x the quant_fp4 + fp4_pack launches (two of the
             // per-expert small kernels nsys counts ~850 times).
-            self.dev.quant_fp4(
-                self.s.xn.ptr as *const f32,
-                self.s.xq4.ptr as *mut u8,
-                self.s.xsc4.ptr as *mut f32,
-                1,
-                dim as i32,
-                32,
-                true,
-            )?;
+            // The official's activation format for fp4-weight Linears: FP8 e4m3
+            // with power-of-two f32 scales per 32 (act_quant) — quant1's format,
+            // written into the routed half's OWN buffers (xq4 is dim bytes, the
+            // e4m3 row fits; the shared half's s.xq is untouched, so the MoE
+            // dual stream stays disjoint). DSV41_EXPERT_ACT_E4M3=0 reverts to
+            // the e2m1 nibbles.
+            if expert_act_e4m3() {
+                self.dev.quant_fp8_on(
+                    self.s.xn.ptr as *const f32,
+                    self.s.xq4.ptr as *mut u8,
+                    self.s.xsc4.ptr as *mut f32,
+                    1,
+                    dim as i32,
+                    32,
+                    true,
+                    self.dev.stream(),
+                )?;
+            } else {
+                self.dev.quant_fp4(
+                    self.s.xn.ptr as *const f32,
+                    self.s.xq4.ptr as *mut u8,
+                    self.s.xsc4.ptr as *mut f32,
+                    1,
+                    dim as i32,
+                    32,
+                    true,
+                )?;
+            }
             // Fixed 6-slot device-driven loop: the expert id comes from
             // route_idx on the device and the weights from route_w, so there is
             // no host round trip and the launch arguments are static.
@@ -4728,6 +4760,10 @@ fn hc_tail_split() -> bool {
             let batched = moe_batch()
                 && topk > 0
                 && ne >= 2
+                // The batched path's fused gateup kernel still consumes the
+                // e2m1 nibble layout; it has no e4m3 arm yet, so the official
+                // activation domain forces the sequential (default) path.
+                && !expert_act_e4m3()
                 && self.dev.supports_moe_batch();
             if batched {
                 // Per-slot strides. `ex_act_b` holds [topk][?] where ? is
@@ -4910,6 +4946,7 @@ fn hc_tail_split() -> bool {
                         w3s_stride,
                         ids,
                         slot as i32,
+                        expert_act_e4m3() as i32,
                     )?;
                     self.dev.swiglu_limit(
                         self.s.ex_act.ptr as *mut f32,
