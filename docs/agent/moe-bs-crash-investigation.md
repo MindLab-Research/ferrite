@@ -2123,3 +2123,16 @@ dsv41_glue.cu(3281): error: function "<unnamed>::glue_e2m1_encode" has already b
 （`dsv41_glue.cu` / `dsv41_kernels.cu` / `tilelang_gen/moe_bs_shim.cu` / `tilelang_gen/moe_bs_handwritten.cu`
 里所有 `__device__`/`__global__`/`static` 函数定义名）：
 **共 73 个定义、重复名 0** ⇒ `glue_e2m1_encode` 是**唯一**的合并碰撞，已被清除 ✓。
+
+## §84 合并后"集成卫生"三项普查（主 agent 亲自做，全部通过）
+
+多次把 subagent 的改动合进同一批大文件后，除"数值正确性"外还有三类**与语义无关但会静默毁掉一轮**的风险。
+本轮逐项普查结论：
+
+| 普查项 | 方法 | 结果 |
+|---|---|---|
+| **重复函数定义**（本次真出过事，§83） | 扫四个被合并 TU 里所有 `__device__`/`__global__`/`static` 定义名 | 73 个定义、**重复名 0** ✓（`glue_e2m1_encode` 是唯一一处，已清） |
+| **env 名冲突**（一个门误开另一个门） | 扫全仓 `DSV41_[A-Z0-9_]+` 引用 | 222 个引用；**新增五门名字唯一** ✓；仅 4 个 env 被多处读取，均为"定义点 + 使用点"的正常分离 ✓ |
+| **launcher 越界守卫**（新内核的 grid/block 与传入尺寸不匹配 ⇒ 静默越界） | 逐门读 `extern "C"` 入口的前置校验 | A2 `dsv41_win_kv_quant_rt`：校验 `kv/cols>0/block∈(0,256]且%32==0/cols%block==0` ✓；A3 `dsv41_compress_latent_fp4`：校验 `x/rows/hd>0且%16==0/ld` ✓；A4 `dsv41_indexer_fp4_rt`：校验 `x/rows,cols>0/cols%32==0` ✓；I3 的门判定与 `ops.rs` 镜像一致（`[0]=='1'` ≡ `starts_with('1')`）✓ |
+
+⇒ 三类风险**均已排除**。**纪律**：每次多线合并后都应跑这三项普查（成本几分钟，能避免整轮 GPU 窗口作废）。
