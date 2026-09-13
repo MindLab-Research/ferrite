@@ -4664,12 +4664,16 @@ impl<'a> DevChain<'a> {
             // is <= that). Sized unconditionally: a few hundred KB, and a static
             // allocation graph is worth more than the bytes.
             xq_r: dev.alloc((VERIFY_ROWS * dim.max(nh * hd)).max(8))?,
-            // ⚠️ TILELANG ABI (eager-scale-abi-audit): same MPAD=16 padding floor
-            // as xsc above — the current VERIFY_ROWS*32768/32 = 6144 f32 covers
-            // MPAD*160 = 2560 only by ACCIDENT (the audit's "capacity dividend");
-            // narrow the activation width and verify would OOB the same way.
+            // ⚠️ TILELANG ABI (eager-scale-abi-audit + tl-garbage-diagnosis D1):
+            // same MPAD=16 padding floor as xsc above — but the floor's BASIS must
+            // cover the largest ASTRIDE any shape can present (wo_a G8 = 32768 =>
+            // ASC row pitch 1024 f32 => 16 rows need 16384 f32, not 16*dim/32=2560).
+            // The c43c078 fix used `16 * dim / 32` which under-allocates for wo_a G8
+            // (deterministic 40928B OOB READ — padding rows x0 are numerically
+            // harmless but the read can cross into unmapped territory => sticky
+            // illegal access, the 2f6422c precedent).
             xsc_r: dev.alloc(fb((VERIFY_ROWS * dim.max(nh * hd))
-                .max(16 * dim / 32)
+                .max(16 * dim.max(nh * hd) / 32)
                 / 32 + 8))?,
             moe_out_r: dev.alloc(fb(VERIFY_ROWS * dim))?,
             ids_r: dev.alloc(VERIFY_ROWS * 4)?,
