@@ -3208,14 +3208,23 @@ static void gg_declined_note(int rows, int dim, int inter, int slots, size_t sme
 
 // DSV41_EXPERT_GROUPED_GATEUP — the expert-union gate/up arm. Read ONCE per
 // process, strict first-char '1', default OFF (a per-call getenv is a CUDA-graph
-// capture hazard, the same rule every gate in this file follows). ANDed with
-// DSV41_EXPERT_GROUPED on purpose, exactly like its down twin: the arm is defined
-// as part of the grouped stack, so arming it alone would silently measure a mixed
-// configuration that no A/B arm is specified for.
+// capture hazard, the same rule every gate in this file follows).
+//
+// ⚠️ DELIBERATELY NOT ANDed WITH DSV41_EXPERT_GROUPED (which is where this arm
+// departs from its down twin). The down twin consumes the grouped stack's
+// semantics and is defined as part of it; this kernel does not: its election runs
+// in-kernel over `ids`, so it needs NO grouped layout, NO route_group/gather/
+// scatter launch and NO host-side table. Arming DSV41_EXPERT_GROUPED just to arm
+// this arm would also arm those PURE-OVERHEAD launches (they build a layout no
+// consumer reads while this arm answers the stage) — the measured cost of the
+// layout stack is exactly what killed the tcgen05 grouped arm on 2026-09-13
+// (verify 40.43 vs 24.5 ms). The two arms stay independent: GROUPED arms the
+// layout (and the e4x/down consumers of it), GROUPED_GATEUP arms this kernel.
+// Arming BOTH is legal and costs the layout build (the layout is then live for
+// the other two consumers); arming this one ALONE is the clean A/B.
 static const int g_grouped_gateup = [] {
     const char* g = getenv("DSV41_EXPERT_GROUPED_GATEUP");
-    const char* h = getenv("DSV41_EXPERT_GROUPED");
-    return (g != nullptr && g[0] == '1' && h != nullptr && h[0] == '1') ? 1 : 0;
+    return (g != nullptr && g[0] == '1') ? 1 : 0;
 }();
 
 // One-shot notice for an armed-but-declined grouped down arm. The repo's first
