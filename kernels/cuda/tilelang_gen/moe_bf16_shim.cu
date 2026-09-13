@@ -135,6 +135,10 @@ thread_local float* g_c_dn = nullptr;          // 36*16*5120 f32  = 11.80 MiB
 thread_local int* g_eid = nullptr;             // [SEG_CAP]
 thread_local int* g_order = nullptr;           // [SEG_CAP*BM]
 thread_local int* g_counts = nullptr;          // [SEG_CAP]
+// `nseg` 的 device 副本：host-table 入口每调用上行一次（4 字节），
+// device-table 入口不用它（直接传调用方的 `tl_nseg`）。mover kernel 的 `nseg`
+// 形参因此统一成指针 —— 两条臂共用同一 launch 序列。
+thread_local int* g_nseg = nullptr;            // [1]
 
 bool tl_moe_init() {
     // thread_local：每个 rank 线程各自 SetAttribute + 7 次 cudaMalloc 一次。state 线程本地 ⇒
@@ -171,7 +175,8 @@ bool tl_moe_init() {
                     cudaMalloc(&g_c_dn, c_dn) == cudaSuccess &&
                     cudaMalloc(&g_eid, kTLSegCap * sizeof(int)) == cudaSuccess &&
                     cudaMalloc(&g_order, kTLSegCap * kTLBM * sizeof(int)) == cudaSuccess &&
-                    cudaMalloc(&g_counts, kTLSegCap * sizeof(int)) == cudaSuccess;
+                    cudaMalloc(&g_counts, kTLSegCap * sizeof(int)) == cudaSuccess &&
+                    cudaMalloc(&g_nseg, sizeof(int)) == cudaSuccess;
     if (!alloc_ok) {
         (void)cudaGetLastError();
         // P1 (no-latch-death): same permanent-latch rationale as the SetAttribute
@@ -200,12 +205,16 @@ void init_failed_note(int rows, int dim, int inter) {
 // up 的 rpitch = dim，src_row = order[...] / topk（激活按 token 行索引）；
 // dn 的 rpitch = inter，src_row = order[...]（激活已按 (row,slot) 展平）。
 // pad 行写 0 —— 生成物对 A 的读没有 mask，pad 段必须真的是 0（否则脏数据进 MMA）。
+//
+// `nseg` 是**指针**：host-table 入口传常驻 scratch `g_nseg`（上行一次），
+// device-table 入口直接传调用方由 `dsv41_moe_align_from_group` 写出的
+// `tl_nseg`。两条臂因此共用同一个 kernel，只有表的来源不同（A/B 基线）。
 // ---------------------------------------------------------------------------
 __global__ void tl_moe_gather_kernel(const float* __restrict__ act, __nv_bfloat16* __restrict__ a,
                                      const int* __restrict__ order, const int* __restrict__ counts,
-                                     int K, int rpitch, int row_div, int nseg) {
+                                     int K, int rpitch, int row_div, const int* nseg) {
     const int seg = blockIdx.y;
-    if (seg >= nseg) return;
+    if (seg >= *nseg) return;
     const int r = blockIdx.x;
     __nv_bfloat16* dst = a + ((size_t)seg * kTLBM + r) * K;
     const int live = counts[seg];
@@ -223,15 +232,16 @@ __global__ void tl_moe_gather_kernel(const float* __restrict__ act, __nv_bfloat1
 // up：out[(row*topk + slot)*2*inter + n]（(row,slot) = order[...] 的分解）——RAW gate‖up，
 //     swiglu 仍由既有 `dsv41_swiglu_limit_batched` 做（最小改动：本臂只换 gate/up 那一步）。
 // dn：out[order[...] * dim + n]（激活已按 (row,slot) 展平，直接是 per-slot partial）。
+// `nseg` 是指针，与 gather 同约定（见上）。
 // ---------------------------------------------------------------------------
 __global__ void tl_moe_scatter_kernel(const float* __restrict__ c, float* __restrict__ out,
                                       const int* __restrict__ order, const int* __restrict__ counts,
-                                      int N, int out_pitch, int split, int nseg) {
+                                      int N, int out_pitch, int split, const int* nseg) {
     const int seg = blockIdx.y;
-    if (seg >= nseg) return;
+    if (seg >= *nseg) return;
     const int r = blockIdx.x;
     const int live = counts[seg];
-    const int idx = (seg < nseg) ? order[seg * kTLBM + r] : -1;
+    const int idx = order[seg * kTLBM + r];
     if (r >= live || idx < 0) return;
     // up 的 out_pitch = topk*2*inter，分页 = (row*topk + slot)*2*inter；dn 直接 idx*dim。
     const long dst = (split > 0) ? ((long)(idx / split) * out_pitch + (long)(idx % split) * N)
@@ -342,7 +352,9 @@ extern "C" int dsv41_moe_tilelang_gate_up_bf16(
                     (int)kTLUpN);
     }
 
-    // (0) 元数据上行（小数组；见文件头「EAGER 臂」）。
+    // (0) 元数据上行（小数组；见文件头「EAGER 臂」）。⚠️ H2D 上行在 CUDA-graph
+    // capture 内非法 —— 这正是本入口只能走 eager 的原因，也是 device-table 入口
+    // （`*_dev`，表已在 device 上）存在的理由。本入口保留为 A/B 基线。
     cudaError_t e = cudaMemcpyAsync(g_eid, eid, (size_t)nseg * sizeof(int), cudaMemcpyHostToDevice, s);
     if (e != cudaSuccess) return (int)e;
     e = cudaMemcpyAsync(g_order, order, (size_t)kTLSegCap * kTLBM * sizeof(int),
@@ -350,10 +362,12 @@ extern "C" int dsv41_moe_tilelang_gate_up_bf16(
     if (e != cudaSuccess) return (int)e;
     e = cudaMemcpyAsync(g_counts, counts, (size_t)nseg * sizeof(int), cudaMemcpyHostToDevice, s);
     if (e != cudaSuccess) return (int)e;
+    e = cudaMemcpyAsync(g_nseg, &nseg, sizeof(int), cudaMemcpyHostToDevice, s);
+    if (e != cudaSuccess) return (int)e;
 
     // (1) gather：f32 激活 -> bf16 [SEG_CAP*BM, dim]，每段 pad 到 16 行。
     tl_moe_gather_kernel<<<dim3((unsigned)kTLBM, (unsigned)kTLSegCap), kMovThreads, 0, s>>>(
-        act, g_a_up, g_order, g_counts, kTLDim, kTLDim, topk, nseg);
+        act, g_a_up, g_order, g_counts, kTLDim, kTLDim, topk, g_nseg);
     e = cudaGetLastError();
     if (e != cudaSuccess) return (int)e;
 
@@ -366,7 +380,7 @@ extern "C" int dsv41_moe_tilelang_gate_up_bf16(
 
     // (3) scatter：RAW gate‖up 写回 out[row][slot][2*inter]（swiglu 由既有 kernel 做）。
     tl_moe_scatter_kernel<<<dim3((unsigned)kTLBM, (unsigned)kTLSegCap), kMovThreads, 0, s>>>(
-        g_c_up, out, g_order, g_counts, kTLUpN, topk * kTLUpN, topk, nseg);
+        g_c_up, out, g_order, g_counts, kTLUpN, topk * kTLUpN, topk, g_nseg);
     e = cudaGetLastError();
     return (int)e;
 }
@@ -432,6 +446,7 @@ extern "C" int dsv41_moe_tilelang_down_bf16(
                     (int)rows, (int)topk, (int)dim, (int)kTLDim);
     }
 
+    // 元数据上行（见 up 入口 / 文件头「EAGER 臂」；本入口同样只能走 eager）。
     cudaError_t e = cudaMemcpyAsync(g_eid, eid, (size_t)nseg * sizeof(int), cudaMemcpyHostToDevice, s);
     if (e != cudaSuccess) return (int)e;
     e = cudaMemcpyAsync(g_order, order, (size_t)kTLSegCap * kTLBM * sizeof(int),
@@ -439,10 +454,12 @@ extern "C" int dsv41_moe_tilelang_down_bf16(
     if (e != cudaSuccess) return (int)e;
     e = cudaMemcpyAsync(g_counts, counts, (size_t)nseg * sizeof(int), cudaMemcpyHostToDevice, s);
     if (e != cudaSuccess) return (int)e;
+    e = cudaMemcpyAsync(g_nseg, &nseg, sizeof(int), cudaMemcpyHostToDevice, s);
+    if (e != cudaSuccess) return (int)e;
 
     // gather：激活按 assignment 展平（row_div = 1），槽距 = act_pitch。
     tl_moe_gather_kernel<<<dim3((unsigned)kTLBM, (unsigned)kTLSegCap), kMovThreads, 0, s>>>(
-        act, g_a_dn, g_order, g_counts, kTLInter, act_pitch, 1, nseg);
+        act, g_a_dn, g_order, g_counts, kTLInter, act_pitch, 1, g_nseg);
     e = cudaGetLastError();
     if (e != cudaSuccess) return (int)e;
 
@@ -454,7 +471,169 @@ extern "C" int dsv41_moe_tilelang_down_bf16(
 
     // scatter：split == 0 ⇒ dst = idx * dim（assignment 直接索引 per-slot partial）。
     tl_moe_scatter_kernel<<<dim3((unsigned)kTLBM, (unsigned)kTLSegCap), kMovThreads, 0, s>>>(
-        g_c_dn, out, g_order, g_counts, kTLDim, kTLDim, 0, nseg);
+        g_c_dn, out, g_order, g_counts, kTLDim, kTLDim, 0, g_nseg);
+    e = cudaGetLastError();
+    return (int)e;
+}
+
+// ===========================================================================
+//  DEVICE-TABLE 入口（up / down）—— 让本臂进 CUDA-graph capture
+// ===========================================================================
+// 与上面两个 host-table 入口**逐行相同**，只有一个本质区别：三张表 + nseg
+// **已经在 device 上**，由 `dsv41_moe_align_from_group`（kernels/cuda/
+// dsv41_moe_align.cu）从 `dsv41_route_group` 的输出投影出来 —— 与 host 侧
+// `moe_align_host` 的表逐位相同（等价性论证见该文件的头注释）。因此：
+//   * **没有 D2H 回读、没有 H2D 上行**：整条链在 capture 内合法，这正是本入口
+//     存在的理由（host-table 入口的 `cudaMemcpyAsync(..., HostToDevice, s)` 是
+//     capture 里的非法操作，所以它被 `moe_tilelang_ready()` 的 `!capturing()`
+//     挡在 graph 外 —— 那 −7.1ms 就压在这一点上）；
+//   * `nseg` 是 DEVICE 指针：没有 host 形状检查（设备上的值 host 读不到），
+//     边界由 `dsv41_moe_align_from_group` 的 `min(n_active, SEG_CAP)` 和两个
+//     mover 的 `seg >= *nseg` 守卫保证；`grid.y = SEG_CAP` 恒定。
+// 旧入口保留为 A/B 基线：同一 `ARMED` 回执格式，便于逐行对比两条臂。
+// ===========================================================================
+extern "C" int dsv41_moe_tilelang_gate_up_bf16_dev(
+    const float* act,        // [rows, dim] f32（已 rmsnorm 的激活，一行一 token）
+    float* out,              // [rows][topk][2*inter] f32（row pitch = topk*2*inter）
+    const void* w_up,        // bf16 [E=384, 2*inter, dim]（N 前半 gate / 后半 up）
+    const int* eid,          // [SEG_CAP] i32 —— **DEVICE**
+    const int* order,        // [SEG_CAP*BM] i32 —— **DEVICE**（pad = -1）
+    const int* counts,       // [SEG_CAP] i32 —— **DEVICE**
+    const int* nseg_dev,     // [1] i32 —— **DEVICE**（dsv41_moe_align_from_group 的输出）
+    int rows, int dim, int inter, int topk, cudaStream_t s) {
+    if (act == nullptr || out == nullptr || w_up == nullptr || eid == nullptr || order == nullptr ||
+        counts == nullptr || nseg_dev == nullptr)
+        return 2;
+    if (dim != kTLDim || inter != kTLInter) return 2;
+    if (topk < 1 || topk > kTLTopkMax) return 2;
+    if (rows < 1 || rows > kTLRowsMax) return 2;
+    // nseg 的形状检查在这里**不存在**（device 上的值 host 读不到）——见上方文件头。
+    if ((((uintptr_t)act & 0xF) != 0) || (((uintptr_t)w_up & 0xF) != 0) ||
+        (((uintptr_t)out & 0x1F) != 0))
+        return 2;
+
+    // P0-2 (graph-capture audit, v2 state-gated): only decline when INIT hasn't
+    // completed — once scratch is allocated, launches are capture-safe and SHOULD
+    // enter the verify graph (the head_bf16 pattern). This is the guard that makes
+    // `cudaMalloc` unreachable from inside a capture.
+    cudaStreamCaptureStatus cap_st = cudaStreamCaptureStatusNone;
+    if (s && cudaStreamIsCapturing(s, &cap_st) == cudaSuccess
+        && cap_st != cudaStreamCaptureStatusNone
+        && g_a_up == nullptr) {
+        return 2;  // INIT hasn't run yet — decline without touching capture
+    }
+
+    if (!tl_moe_init()) {
+        init_failed_note(rows, dim, inter);
+        return 2;
+    }
+
+    {
+        static int reported = 0;
+        if (reported++ == 0)
+            fprintf(stderr,
+                    "[moe-tilelang] ARMED gate_up (device tables) rows=%d dim=%d inter=%d topk=%d "
+                    "nseg_dev=<device> -> grid=(%d,%d)x%d smem=%zu + gather/scatter\n",
+                    rows, dim, inter, topk, kUpGridX, kTLSegCap, kUpThreads, kUpSmem);
+    }
+
+    // 一次性回执（与 host-table 入口同一行距契约，见那里的长注释）。
+    {
+        static int reported = 0;
+        if (reported++ == 0)
+            fprintf(stderr,
+                    "[proj-tilelang:moe_up_dev] FIRST CALL rows=%d topk=%d n=%d inter=%d — caller "
+                    "MUST verify out token pitch == topk*2*inter=%d and slot pitch == 2*inter=%d\n",
+                    (int)rows, (int)topk, (int)kTLUpN, (int)inter, (int)(topk * kTLUpN),
+                    (int)kTLUpN);
+    }
+
+    // 表已在 device 上 ⇒ 没有 (0) 元数据上行这一步。
+
+    // (1) gather：f32 激活 -> bf16 [SEG_CAP*BM, dim]，每段 pad 到 16 行。
+    tl_moe_gather_kernel<<<dim3((unsigned)kTLBM, (unsigned)kTLSegCap), kMovThreads, 0, s>>>(
+        act, g_a_up, order, counts, kTLDim, kTLDim, topk, nseg_dev);
+    cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) return (int)e;
+
+    // (2) grouped GEMM（生成物；参数序 = dump 的 (A, C, Eid, W)）。
+    moe_up_tl_kernel<<<dim3((unsigned)kUpGridX, (unsigned)kTLSegCap), kUpThreads, kUpSmem, s>>>(
+        reinterpret_cast<const bfloat16_t*>(g_a_up), g_c_up, eid,
+        reinterpret_cast<const bfloat16_t*>(w_up));
+    e = cudaGetLastError();
+    if (e != cudaSuccess) return (int)e;
+
+    // (3) scatter：RAW gate‖up 写回 out[row][slot][2*inter]（swiglu 由既有 kernel 做）。
+    tl_moe_scatter_kernel<<<dim3((unsigned)kTLBM, (unsigned)kTLSegCap), kMovThreads, 0, s>>>(
+        g_c_up, out, order, counts, kTLUpN, topk * kTLUpN, topk, nseg_dev);
+    e = cudaGetLastError();
+    return (int)e;
+}
+
+// down 的 device-table 孪生体（语义见上）。
+extern "C" int dsv41_moe_tilelang_down_bf16_dev(
+    const float* act,        // [rows*topk][inter] f32，**按 (row,slot) 展平且槽距 = act_pitch**
+    float* out,              // [rows*topk][dim] f32（per-slot partial）
+    const void* w_dn,        // bf16 [E=384, dim, inter]
+    const int* eid, const int* order, const int* counts, const int* nseg_dev,
+    int rows, int dim, int inter, int topk, int act_pitch, cudaStream_t s) {
+    if (act == nullptr || out == nullptr || w_dn == nullptr || eid == nullptr || order == nullptr ||
+        counts == nullptr || nseg_dev == nullptr)
+        return 2;
+    if (dim != kTLDim || inter != kTLInter) return 2;
+    if (act_pitch < kTLInter) return 2;
+    if (topk < 1 || topk > kTLTopkMax) return 2;
+    if (rows < 1 || rows > kTLRowsMax) return 2;
+    if ((((uintptr_t)act & 0xF) != 0) || (((uintptr_t)w_dn & 0xF) != 0) ||
+        (((uintptr_t)out & 0x1F) != 0))
+        return 2;
+
+    // P0-2（见 up 的 device-table 入口）。
+    cudaStreamCaptureStatus cap_st = cudaStreamCaptureStatusNone;
+    if (s && cudaStreamIsCapturing(s, &cap_st) == cudaSuccess
+        && cap_st != cudaStreamCaptureStatusNone
+        && g_a_up == nullptr) {
+        return 2;
+    }
+
+    if (!tl_moe_init()) {
+        init_failed_note(rows, dim, inter);
+        return 2;
+    }
+
+    {
+        static int reported = 0;
+        if (reported++ == 0)
+            fprintf(stderr,
+                    "[moe-tilelang] ARMED down (device tables) rows=%d dim=%d inter=%d topk=%d "
+                    "nseg_dev=<device> -> grid=(%d,%d)x%d smem=%zu + gather/scatter\n",
+                    rows, dim, inter, topk, kDnGridX, kTLSegCap, kDnThreads, kDnSmem);
+    }
+
+    {
+        static int reported = 0;
+        if (reported++ == 0)
+            fprintf(stderr,
+                    "[proj-tilelang:moe_dn_dev] FIRST CALL rows=%d topk=%d n=%d — caller MUST "
+                    "verify out per-slot pitch == dim=%d\n",
+                    (int)rows, (int)topk, (int)dim, (int)kTLDim);
+    }
+
+    // gather：激活按 assignment 展平（row_div = 1），槽距 = act_pitch。
+    tl_moe_gather_kernel<<<dim3((unsigned)kTLBM, (unsigned)kTLSegCap), kMovThreads, 0, s>>>(
+        act, g_a_dn, order, counts, kTLInter, act_pitch, 1, nseg_dev);
+    cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) return (int)e;
+
+    moe_dn_tl_kernel<<<dim3((unsigned)kDnGridX, (unsigned)kTLSegCap), kDnThreads, kDnSmem, s>>>(
+        reinterpret_cast<const bfloat16_t*>(g_a_dn), g_c_dn, eid,
+        reinterpret_cast<const bfloat16_t*>(w_dn));
+    e = cudaGetLastError();
+    if (e != cudaSuccess) return (int)e;
+
+    // scatter：split == 0 ⇒ dst = idx * dim（assignment 直接索引 per-slot partial）。
+    tl_moe_scatter_kernel<<<dim3((unsigned)kTLBM, (unsigned)kTLSegCap), kMovThreads, 0, s>>>(
+        g_c_dn, out, order, counts, kTLDim, kTLDim, 0, nseg_dev);
     e = cudaGetLastError();
     return (int)e;
 }

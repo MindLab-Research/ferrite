@@ -26,7 +26,18 @@ SRCS=("$DIR/ferrite_kernels.cu")
 # (docs/agent/tensorcore-proj-design.md §3.3/§7). The build-vs-runtime split is
 # the same contract the tcgen05 blocks below carry — a build that omitted the
 # TU would make a `DSV41_PROJ_MMA=1` A/B silently measure the OLD path.
-for f in "$DIR"/dsv41_kernels.cu "$DIR"/dsv41_experts_mxf4.cu "$DIR"/dsv41_vision.cu "$DIR"/dsv41_glue.cu "$DIR"/dsv41_route.cu "$DIR"/dsv41_proj_mma_skel.cu; do
+#
+# MOE-ALIGN (`dsv41_moe_align.cu`, 2026-09-13): the DEVICE-side projection of the
+# TileLang MoE arm's segment tables out of `dsv41_route_group`'s output
+# (`dsv41_moe_align_from_group`). It rides here as its OWN TU because it needs no
+# shared memory at all while `dsv41_route.cu` owns the TU-local anonymous
+# `extern __shared__` alias — a second dynamic-smem declaration in that TU is a
+# redeclaration error. Same build-vs-runtime split as the blocks above: the
+# symbol is COMPILED IN unconditionally, and the runtime gate
+# (`DSV41_MOE_TILELANG` + `moe_tilelang_ready`'s probe) is the only way in. A
+# build that omitted this TU would make the device-table arm silently measure the
+# HOST-table path — the project's #1 measurement-bias trap.
+for f in "$DIR"/dsv41_kernels.cu "$DIR"/dsv41_experts_mxf4.cu "$DIR"/dsv41_vision.cu "$DIR"/dsv41_glue.cu "$DIR"/dsv41_route.cu "$DIR"/dsv41_moe_align.cu "$DIR"/dsv41_proj_mma_skel.cu; do
     [ -f "$f" ] && SRCS+=("$f")
 done
 

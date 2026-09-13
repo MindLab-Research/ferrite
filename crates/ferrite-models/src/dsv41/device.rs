@@ -1377,6 +1377,34 @@ struct Kernels {
         unsafe extern "C" fn(*const c_void, *const c_void, *mut c_void, c_int, c_int, c_int, c_int, CuStream)
             -> c_int,
     >,
+    /// DEVICE-SIDE `moe_align` (`dsv41_moe_align_from_group`,
+    /// `dsv41_moe_align.cu`): projects the TileLang arm's `order`/`counts`/`eid`
+    /// tables out of `dsv41_route_group`'s output ON THE DEVICE.
+    ///
+    /// This is the half that lets the TileLang MoE arm enter the verify graph:
+    /// the host `moe_align` needs a D2H read of `route_idx_r` (a full sync and an
+    /// illegal capture op), which is exactly why the arm used to be eager-only.
+    /// Args (all DEVICE pointers, caller runs `route_group` on the same stream
+    /// first): `(active, n_active, counts_by_e, starts, gather_src, order,
+    /// counts_seg, eid, nseg_out, seg_cap, bm, stream)`. The output semantics are
+    /// bit-for-bit `moe_align_host` (see the kernel's header comment).
+    moe_align_from_group: Option<
+        unsafe extern "C" fn(*const c_int, *const c_int, *const c_int, *const c_int, *const c_int, *mut c_int, *mut c_int, *mut c_int, *mut c_int, c_int, c_int, CuStream) -> c_int,
+    >,
+    /// The TileLang up arm's DEVICE-TABLE twin
+    /// (`dsv41_moe_tilelang_gate_up_bf16_dev`, `tilelang_gen/moe_bf16_shim.cu`).
+    /// Same three launches as `moe_tilelang_gate_up_bf16`, but `eid`/`order`/
+    /// `counts`/`nseg` are DEVICE buffers (`nseg` is a pointer, not a value), so
+    /// there is no H2D upload — i.e. the whole sequence is legal inside a
+    /// CUDA-graph capture. The host-table entry is kept as the A/B baseline.
+    moe_tilelang_gate_up_bf16_dev: Option<
+        unsafe extern "C" fn(*const f32, *mut f32, *const c_void, *const c_int, *const c_int, *const c_int, *const c_int, c_int, c_int, c_int, c_int, CuStream) -> c_int,
+    >,
+    /// The TileLang down arm's device-table twin (see the up field above; the
+    /// extra `c_int` before the stream is `act_pitch`).
+    moe_tilelang_down_bf16_dev: Option<
+        unsafe extern "C" fn(*const f32, *mut f32, *const c_void, *const c_int, *const c_int, *const c_int, *const c_int, c_int, c_int, c_int, c_int, c_int, CuStream) -> c_int,
+    >,
     /// TILELANG MoE block-scaled arm — the **native fp4** up (gate‖up) grouped GEMM
     /// (`DSV41_MOE_TILELANG_BS`, default OFF; mutually exclusive with
     /// `DSV41_MOE_TILELANG`). Unlike the bf16 arm this one reads the loader's fp4
@@ -2060,6 +2088,9 @@ impl Device {
             expert_down_reduce_fp4_batched: ko!(rt, "dsv41_expert_down_reduce_fp4_batched"),
             moe_tilelang_gate_up_bf16: ko!(rt, "dsv41_moe_tilelang_gate_up_bf16"),
             moe_tilelang_down_bf16: ko!(rt, "dsv41_moe_tilelang_down_bf16"),
+            moe_tilelang_gate_up_bf16_dev: ko!(rt, "dsv41_moe_tilelang_gate_up_bf16_dev"),
+            moe_tilelang_down_bf16_dev: ko!(rt, "dsv41_moe_tilelang_down_bf16_dev"),
+            moe_align_from_group: ko!(rt, "dsv41_moe_align_from_group"),
             moe_fp4_to_bf16: ko!(rt, "dsv41_moe_fp4_to_bf16"),
             moe_tilelang_gate_up_bs: ko!(rt, "dsv41_moe_tilelang_gate_up_bs"),
             moe_bs_pack_wsf: ko!(rt, "dsv41_moe_bs_pack_wsf"),
@@ -4314,6 +4345,51 @@ impl Device {
             )
         };
         self.kerr(rc, "dsv41_route_group")?;
+        Ok(true)
+    }
+
+    /// DEVICE-SIDE `moe_align` (`dsv41_moe_align_from_group`): project the
+    /// TileLang MoE arm's three segment tables (`order` / `counts_seg` / `eid`)
+    /// out of [`Self::route_group`]'s device output.
+    ///
+    /// Every pointer is a DEVICE buffer and `route_group` must have run on the
+    /// same stream first; `n_active` is `grp_nactive` (the `[1]` i32 live length),
+    /// `counts_by_e`/`starts`/`gather_src` are the group tables, and `nseg_out`
+    /// receives `min(*n_active, seg_cap)`. The tables are **bit-for-bit
+    /// `moe_align_host`** (the kernel's header comment carries the equivalence
+    /// argument), which is what makes this a drop-in replacement for the host
+    /// version — minus the D2H read that made the arm eager-only.
+    ///
+    /// Returns `Ok(false)` on `rc == 2` (declined: a contract break in
+    /// `seg_cap`/`bm`), an `Err` on any other non-zero rc — the shim rc contract.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_align_from_group(
+        &self,
+        active: *const i32,
+        n_active: *const i32,
+        counts_by_e: *const i32,
+        starts: *const i32,
+        gather_src: *const i32,
+        order: *mut i32,
+        counts_seg: *mut i32,
+        eid: *mut i32,
+        nseg_out: *mut i32,
+        seg_cap: i32,
+        bm: i32,
+    ) -> Result<bool> {
+        let Some(f) = self.kernels.moe_align_from_group else {
+            return Ok(false);
+        };
+        let rc = unsafe {
+            f(
+                active, n_active, counts_by_e, starts, gather_src, order, counts_seg, eid,
+                nseg_out, seg_cap, bm, self.stream,
+            )
+        };
+        if rc == 2 {
+            return Ok(false);
+        }
+        self.kerr(rc, "dsv41_moe_align_from_group")?;
         Ok(true)
     }
 
@@ -7280,6 +7356,86 @@ impl Device {
         Ok(true)
     }
 
+    /// TILELANG MoE grouped GEMM — up, the **DEVICE-TABLE** bf16 arm
+    /// (`dsv41_moe_tilelang_gate_up_bf16_dev`, same `DSV41_MOE_TILELANG` gate).
+    ///
+    /// The twin of [`Self::moe_tilelang_gate_up_bf16`] that can run INSIDE a
+    /// CUDA-graph capture: `eid`/`order`/`counts` are DEVICE buffers (the
+    /// `tl_eid`/`tl_order`/`tl_counts` scratch filled by
+    /// [`Self::moe_align_from_group`]) and `nseg` is a DEVICE pointer
+    /// (`tl_nseg`) instead of a value, so the shim performs no H2D upload and no
+    /// D2H read at all. Everything else — the frozen shape gate, the `grid.y =
+    /// SEG_CAP` launches and the raw gate‖up output layout — is identical, which
+    /// is what makes the host-table entry a valid A/B baseline.
+    ///
+    /// `Ok(false)` on `rc == 2` (declined: shape/alignment, or INIT not done);
+    /// `Err` on any other rc.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_tilelang_gate_up_bf16_dev(
+        &self,
+        act: *const f32,
+        out: *mut f32,
+        w_up: *const c_void,
+        eid: *const c_int,
+        order: *const c_int,
+        counts: *const c_int,
+        nseg: *const c_int,
+        rows: i32,
+        dim: i32,
+        inter: i32,
+        topk: i32,
+    ) -> Result<bool> {
+        let f = self.need(
+            self.kernels.moe_tilelang_gate_up_bf16_dev,
+            "dsv41_moe_tilelang_gate_up_bf16_dev",
+        )?;
+        let rc = unsafe {
+            f(act, out, w_up, eid, order, counts, nseg, rows, dim, inter, topk, self.stream)
+        };
+        if rc == 2 {
+            return Ok(false);
+        }
+        self.kerr(rc, "dsv41_moe_tilelang_gate_up_bf16_dev")?;
+        Ok(true)
+    }
+
+    /// TILELANG MoE grouped GEMM — down, the device-table bf16 arm
+    /// (`dsv41_moe_tilelang_down_bf16_dev`). Same contract as the up twin above;
+    /// `act_pitch` is the raw `2*inter` slot stride the up arm's RAW gate‖up
+    /// output leaves in `ex_act_r`/`ex_act_b`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_tilelang_down_bf16_dev(
+        &self,
+        act: *const f32,
+        out: *mut f32,
+        w_dn: *const c_void,
+        eid: *const c_int,
+        order: *const c_int,
+        counts: *const c_int,
+        nseg: *const c_int,
+        rows: i32,
+        dim: i32,
+        inter: i32,
+        topk: i32,
+        act_pitch: i32,
+    ) -> Result<bool> {
+        let f = self.need(
+            self.kernels.moe_tilelang_down_bf16_dev,
+            "dsv41_moe_tilelang_down_bf16_dev",
+        )?;
+        let rc = unsafe {
+            f(
+                act, out, w_dn, eid, order, counts, nseg, rows, dim, inter, topk, act_pitch,
+                self.stream,
+            )
+        };
+        if rc == 2 {
+            return Ok(false);
+        }
+        self.kerr(rc, "dsv41_moe_tilelang_down_bf16_dev")?;
+        Ok(true)
+    }
+
     /// Load-time fp4(e2m1 + ue8m0) → bf16 expand (`DSV41_MOE_BF16_DEQUANT`).
     /// `wq` is `[n, k/2]` packed e2m1 (low nibble = even k), `ws` is `[n, k/32]`
     /// ue8m0 (`scale = 2^(byte-127)`) and `out_bf16` is `[n, k]` bf16.
@@ -7389,6 +7545,20 @@ impl Device {
     pub fn supports_moe_tilelang(&self) -> bool {
         self.kernels.moe_tilelang_gate_up_bf16.is_some()
             && self.kernels.moe_tilelang_down_bf16.is_some()
+    }
+
+    /// True when the loaded `.so` carries the whole DEVICE-TABLE MoE path: the
+    /// device-side `moe_align` (`dsv41_moe_align_from_group`) **and** both
+    /// `*_dev` shim entries. Probed as a SET on purpose: arming `DSV41_MOE_TILELANG`
+    /// on a `.so` that has only part of it would fall back to the host tables (or
+    /// to the SIMT path) while the operator believes the graph arm ran — the
+    /// project's #1 measurement-bias trap. `supports_route_group` covers the
+    /// `dsv41_route_group` half of the chain and is checked separately by the
+    /// caller; both probes are required for the in-graph arm.
+    pub fn supports_moe_align_from_group(&self) -> bool {
+        self.kernels.moe_align_from_group.is_some()
+            && self.kernels.moe_tilelang_gate_up_bf16_dev.is_some()
+            && self.kernels.moe_tilelang_down_bf16_dev.is_some()
     }
 
     /// True when the `.so` carries the block-scaled (native fp4) MoE arm AND its

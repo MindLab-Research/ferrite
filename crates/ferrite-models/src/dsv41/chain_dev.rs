@@ -566,6 +566,28 @@ struct Scratch {
     /// everything downstream (swiglu, the down GEMV, the reduce) is untouched by
     /// the grouped path.
     grp_out: DevBuf,
+    // ---- device-side moe_align for the TileLang MoE arm (DSV41_MOE_TILELANG) ----
+    //
+    // The three tables the TileLang shim consumes, in the EXACT form
+    // `moe_align_host` produces (see `kernels/cuda/dsv41_moe_align.cu` for the
+    // layout contract), plus the device-side segment count. Filled by
+    // `dsv41_moe_align_from_group` from the `grp_*` tables above — on the DEVICE,
+    // so the arm needs no D2H read of `route_idx_r` and is therefore legal inside
+    // the verify graph capture (that D2H read is the arm's only former
+    // limitation). Allocated unconditionally, like the `grp_*` block: the
+    // allocation graph stays static and the buffers cost 2.6 KB.
+    /// `[TILELANG_SEG_CAP * TILELANG_BM]` i32 — segment `seg`'s row `r` holds the
+    /// flat assignment `row*topk + slot`; pad rows and the whole tail past `nseg`
+    /// are `-1`.
+    tl_order: DevBuf,
+    /// `[TILELANG_SEG_CAP]` i32 — live rows per segment; pad segments are `0`.
+    tl_counts: DevBuf,
+    /// `[TILELANG_SEG_CAP]` i32 — the segment's expert id; pad segments are `0`.
+    tl_eid: DevBuf,
+    /// `[1]` i32 — `min(n_active, TILELANG_SEG_CAP)`, i.e. the number of live
+    /// segments. A DEVICE pointer is what the shim's movers take (`seg >= *nseg`),
+    /// which is what removes the host round trip.
+    tl_nseg: DevBuf,
     xq4_r: DevBuf,       // [m, dim] fp4 nibbles (dim/2 bytes/row) or e4m3 (dim)
     xsc4_r: DevBuf,      // [m, dim/32 + 8] f32 scales (either format)
     /// [m, topk, 2*inter] routed gate|up output. The batched expert launchers
@@ -749,6 +771,21 @@ pub(crate) fn moe_batch() -> bool {
 pub(crate) fn moe_tilelang() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *F.get_or_init(|| std::env::var("DSV41_MOE_TILELANG").map(|v| v != "0").unwrap_or(false))
+}
+
+/// `DSV41_MOE_TL_HOST_ALIGN=1` (default OFF): a DIAGNOSTIC that additionally
+/// rebuilds the TileLang MoE arm's three segment tables with the HOST
+/// `moe_align` ([`moe_align_host`], over a D2H read of `route_idx_r`) and
+/// memcmp's them against the DEVICE ones the arm actually consumes. A mismatch
+/// is reported as an ERROR, not silently resolved — the two must be bit-identical
+/// (see `kernels/cuda/dsv41_moe_align.cu` for the equivalence argument).
+///
+/// ⚠️ It is NOT an alternative code path: the arm always runs the device tables.
+/// This only says whether the two agree. The D2H read it costs is why it is a
+/// pure diagnostic and refused while a capture is in flight.
+pub(crate) fn moe_tl_host_align() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_MOE_TL_HOST_ALIGN").map(|v| v != "0").unwrap_or(false))
 }
 
 /// `DSV41_MOE_BF16_DEQUANT=1` (default OFF) expands the routed experts'
@@ -4730,6 +4767,17 @@ impl<'a> DevChain<'a> {
             // Same capacity as `ex_act_r` below (one row per assignment, `2*inter`
             // wide): the grouped gate/up output is the pre-scatter twin of it.
             grp_out: dev.alloc(fb(VERIFY_ROWS * grp_topk_max(cfg) * 2 * inter.max(dim)))?,
+            // ---- device-side moe_align tables for the TileLang MoE arm ----------
+            // Filled by `dsv41_moe_align_from_group` from the `grp_*` block above
+            // (see the struct docs). The shapes are the generated kernels' FROZEN
+            // geometry (`TILELANG_SEG_CAP` / `TILELANG_BM`), not a config value:
+            // the dumps bake `grid.y = SEG_CAP` and the `BM = 16` M-tile, so a
+            // buffer sized from anything else would be read out of bounds inside
+            // the graph. 2.6 KB total.
+            tl_order: dev.alloc(4 * TILELANG_SEG_CAP * TILELANG_BM)?,
+            tl_counts: dev.alloc(4 * TILELANG_SEG_CAP)?,
+            tl_eid: dev.alloc(4 * TILELANG_SEG_CAP)?,
+            tl_nseg: dev.alloc(4)?,
             // `dim` bytes per row covers both activation formats: the packed fp4
             // arm uses `dim/2`, the DSV41_EXPERT_ACT_E4M3 arm exactly `dim`.
             xq4_r: dev.alloc((VERIFY_ROWS * dim).max(8))?,
@@ -15603,15 +15651,15 @@ impl<'a> DevChain<'a> {
     /// The TileLang MoE grouped-GEMM arm's HOST half: read `route_idx_r` back and
     /// run the port of the prototype's `moe_align` on it.
     ///
-    /// ⚠️ `download_u8` is a FULL device sync, which is exactly why the arm is
-    /// eager-only: see [`Self::moe_tilelang_ready`] (`!capturing()`). The device
-    /// side moe_align is the documented follow-up (prototype §8-3); until then an
-    /// armed `DSV41_MOE_TILELANG` inside a graph would be an illegal capture op, so
-    /// the gate declines there rather than failing the step.
+    /// ⚠️ `download_u8` is a FULL device sync, which is why this is NO LONGER on
+    /// the arm's path: the arm consumes the device tables
+    /// ([`Self::moe_tilelang_tables_dev`]) and this function survives only as the
+    /// `DSV41_MOE_TL_HOST_ALIGN=1` parity diagnostic (see
+    /// [`moe_tl_host_align`]). It must never be called from inside a capture.
     ///
     /// Returns `Ok(None)` when the routing cannot be expressed as segments (see
     /// [`moe_align_host`]) — the caller then keeps the proven launches.
-    fn moe_tilelang_tables(
+    fn moe_tilelang_tables_host(
         &self,
         m: usize,
         topk: usize,
@@ -15629,13 +15677,178 @@ impl<'a> DevChain<'a> {
         Ok(moe_align_host(&idx, topk))
     }
 
+    /// The TileLang MoE arm's DEVICE half: build the three segment tables
+    /// (`tl_order` / `tl_counts` / `tl_eid` + `tl_nseg`) from
+    /// `dsv41_route_group`'s device output — **no D2H read, no H2D upload**.
+    ///
+    /// This is what lets the arm enter the verify graph. Two launches on the
+    /// engine stream:
+    ///
+    ///  1. `dsv41_route_group` (`grp_*` scratch, the same call
+    ///     [`Self::moe_route_grouped`] makes): experts ASCENDING, and within one
+    ///     expert the assignments in ascending flat index — the very order the
+    ///     host `moe_align`'s STABLE sort produces;
+    ///  2. `dsv41_moe_align_from_group`: that layout re-indexed by SEGMENT
+    ///     (`active` with the gaps removed), with the pad tail zero-filled
+    ///     (`order = -1`, `counts = eid = 0`).
+    ///
+    /// The result is bit-for-bit [`moe_align_host`] (equivalence argument in
+    /// `kernels/cuda/dsv41_moe_align.cu`), so the shim cannot tell the two apart.
+    ///
+    /// `route_group_kernel` writes every pointer it is given (`grp_rows` /
+    /// `grp_slots` / `grp_perm` unconditionally, `active` / `n_active` behind
+    /// null checks) — all of them are real scratch here, never null.
+    ///
+    /// Returns `Ok(false)` when the routing cannot be expressed as segments or the
+    /// `.so` lacks either half: the caller keeps the proven launches (one-shot
+    /// notice). `DSV41_MOE_TL_HOST_ALIGN=1` additionally memcmp's the device
+    /// tables against the host ones and FAILS the step on any difference.
+    fn moe_tilelang_tables_dev(&mut self, m: usize, topk: usize, n_routed: usize) -> Result<bool> {
+        let n_assign = m * topk;
+        if n_assign == 0
+            || n_assign > TILELANG_SEG_CAP
+            || n_assign * 4 > self.s.grp_src.bytes
+            || TILELANG_SEG_CAP * 4 > self.s.grp_counts.bytes
+        {
+            return Ok(false); // the tables could not be expressed anyway
+        }
+        let built = self.dev.route_group(
+            self.s.route_idx_r.ptr as *const i32,
+            self.s.grp_counts.ptr as *mut i32,
+            self.s.grp_starts.ptr as *mut i32,
+            self.s.grp_rows.ptr as *mut i32,
+            self.s.grp_slots.ptr as *mut i32,
+            self.s.grp_perm.ptr as *mut i32,
+            self.s.grp_src.ptr as *mut i32,
+            self.s.grp_active.ptr as *mut i32,
+            self.s.grp_nactive.ptr as *mut i32,
+            m as i32,
+            topk as i32,
+            n_routed as i32,
+            grp_m_cap(self.cfg) as i32,
+        )?;
+        if !built {
+            return Ok(false);
+        }
+        let aligned = self.dev.moe_align_from_group(
+            self.s.grp_active.ptr as *const i32,
+            self.s.grp_nactive.ptr as *const i32,
+            self.s.grp_counts.ptr as *const i32,
+            self.s.grp_starts.ptr as *const i32,
+            self.s.grp_src.ptr as *const i32,
+            self.s.tl_order.ptr as *mut i32,
+            self.s.tl_counts.ptr as *mut i32,
+            self.s.tl_eid.ptr as *mut i32,
+            self.s.tl_nseg.ptr as *mut i32,
+            TILELANG_SEG_CAP as i32,
+            TILELANG_BM as i32,
+        )?;
+        if !aligned {
+            return Ok(false);
+        }
+        if moe_tl_host_align() {
+            self.moe_tilelang_tables_parity(m, topk)?;
+        }
+        Ok(true)
+    }
+
+    /// `DSV41_MOE_TL_HOST_ALIGN=1` diagnostic: rebuild the tables on the host and
+    /// memcmp them against the device ones. A difference is an ERROR — the whole
+    /// device arm rests on the two being bit-identical, so reporting one and
+    /// carrying on would be a silent numeric change.
+    ///
+    /// Refused (with a notice) while a capture is in flight: `download_u8` is
+    /// illegal there, and this is a diagnostic, not a path.
+    fn moe_tilelang_tables_parity(&self, m: usize, topk: usize) -> Result<()> {
+        if self.dev.capturing() {
+            static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            if ONCE.set(()).is_ok() {
+                eprintln!(
+                    "[moe-tilelang] DSV41_MOE_TL_HOST_ALIGN is set but a capture is in flight — \
+                     the host/device table parity check was skipped"
+                );
+            }
+            return Ok(());
+        }
+        let Some((h_order, h_counts, h_eid, h_nseg)) = self.moe_tilelang_tables_host(m, topk)?
+        else {
+            static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            if ONCE.set(()).is_ok() {
+                eprintln!(
+                    "[moe-tilelang] host-align: the HOST moe_align declines this routing table — \
+                     nothing to compare (the device tables are the arm's, and the host refuses \
+                     the shape it would have to serve)"
+                );
+            }
+            return Ok(());
+        };
+        let d_order = self.download_i32(&self.s.tl_order, TILELANG_SEG_CAP * TILELANG_BM)?;
+        let d_counts = self.download_i32(&self.s.tl_counts, TILELANG_SEG_CAP)?;
+        let d_eid = self.download_i32(&self.s.tl_eid, TILELANG_SEG_CAP)?;
+        let d_nseg = self.download_i32(&self.s.tl_nseg, 1)?;
+        let mut differ = Vec::new();
+        if d_nseg[0] as usize != h_nseg {
+            differ.push(format!("nseg device={} host={}", d_nseg[0], h_nseg));
+        }
+        if d_order != h_order {
+            differ.push("order".to_string());
+        }
+        if d_counts != h_counts {
+            differ.push("counts".to_string());
+        }
+        if d_eid != h_eid {
+            differ.push("eid".to_string());
+        }
+        static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        if differ.is_empty() {
+            if ONCE.set(()).is_ok() {
+                eprintln!(
+                    "[moe-tilelang] host-align: DEVICE moe_align == HOST moe_align (order/counts/\
+                     eid/nseg, {n_assign} assignments, {h_nseg} segments) — the graph arm's tables \
+                     are the host tables",
+                    n_assign = m * topk
+                );
+            }
+            return Ok(());
+        }
+        Err(FerriteError::Config(format!(
+            "DSV41_MOE_TL_HOST_ALIGN: the device moe_align tables differ from the host ones \
+             ({}) — the TileLang MoE arm would compute different rows than the host path",
+            differ.join(", ")
+        )))
+    }
+
+    /// `n` i32 from a device buffer (the `download_u8` pattern, typed).
+    fn download_i32(&self, buf: &DevBuf, n: usize) -> Result<Vec<i32>> {
+        if n * 4 > buf.bytes {
+            return Err(ferrite_types::FerriteError::Config(format!(
+                "download_i32: {} elements do not fit the {} byte buffer",
+                n, buf.bytes
+            )));
+        }
+        let mut bytes = vec![0u8; n * 4];
+        self.dev.download_u8(buf, &mut bytes)?;
+        Ok(bytes
+            .chunks_exact(4)
+            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect())
+    }
+
+
     /// Whether the TileLang arm can serve THIS step (§"接线" — every refusal is a
     /// decline into the proven launch, and the caller reports the ones that matter).
     ///
     /// The terms are, in order:
     ///   * `DSV41_MOE_TILELANG` armed, `.so` carries both shim symbols;
-    ///   * NOT inside a CUDA-graph capture (the host moe_align needs a D2H read —
-    ///     the arm's single real limitation, prototype §8-3);
+    ///   * the `.so` carries the whole DEVICE-TABLE chain: `dsv41_route_group`
+    ///     (`supports_route_group`) plus the device-side `moe_align` and both
+    ///     `*_dev` shim entries (`supports_moe_align_from_group`). Those are what
+    ///     removed the arm's former `!capturing()` term: with the tables built on
+    ///     the device there is no D2H read and no H2D upload, so the arm is legal
+    ///     inside a CUDA-graph capture — which is where its ~7.1ms lives
+    ///     (docs/agent/moe-graph-design.md, verdict 1a'). The probe is a SET: a
+    ///     `.so` carrying only part of it would silently measure the host-table or
+    ///     SIMT path, so the gate must stay OFF and say so;
     ///   * the generated kernels' FROZEN shapes: `n_routed == 384` (the `e < 384`
     ///     guard is baked into the dump), `dim == 5120`, `inter_local == 320`,
     ///     `topk ∈ [1,6]`, `m ∈ [1,6]`;
@@ -15652,8 +15865,9 @@ impl<'a> DevChain<'a> {
         n_routed: usize,
     ) -> bool {
         moe_tilelang()
-            && !self.dev.capturing()
             && self.dev.supports_moe_tilelang()
+            && self.dev.supports_route_group()
+            && self.dev.supports_moe_align_from_group()
             && n_routed == 384
             && dim == 5120
             && inter_local == 320
@@ -16077,27 +16291,29 @@ impl<'a> DevChain<'a> {
             // notice): an armed gate must never silently measure the OLD path.
             let tl_ready = self.moe_tilelang_ready(ld, m, topk, dim, inter_local, n_routed);
             let mut tl_gu = false;
-            let mut tl_tables: Option<(Vec<i32>, Vec<i32>, Vec<i32>, usize)> = None;
+            let mut tl_tbl = false;
             let mut tl_w: Option<(*const std::ffi::c_void, *const std::ffi::c_void)> = None;
             if moe_tilelang() && !tl_ready {
                 Self::moe_tilelang_skipped_note(
-                    "the step is outside the arm's domain (a CUDA-graph capture, a frozen-shape \
-                     mismatch, or the .so lacks the shim symbols)",
+                    "the step is outside the arm's domain (a frozen-shape mismatch, a .so without \
+                     the device moe_align / `*_dev` shim set, or the bf16 expert copies missing)",
                     true,
                 );
             } else if tl_ready && !grp_gu {
-                tl_tables = self.moe_tilelang_tables(m, topk)?;
+                // The tables come from the DEVICE (`dsv41_route_group` +
+                // `dsv41_moe_align_from_group`), so this works inside a capture:
+                // no D2H read, no H2D upload. See `moe_tilelang_tables_dev`.
+                tl_tbl = self.moe_tilelang_tables_dev(m, topk, n_routed)?;
                 tl_w = Self::moe_tilelang_weights(ld, dim, inter_local);
-                if let Some(tables) = tl_tables.as_ref() {
-                    let (order, counts, eid, nseg) = tables;
-                    tl_gu = self.dev.moe_tilelang_gate_up_bf16(
+                if tl_tbl && tl_w.is_some() {
+                    tl_gu = self.dev.moe_tilelang_gate_up_bf16_dev(
                         self.s.xn_r.ptr as *const f32,
                         self.s.ex_act_r.ptr as *mut f32,
                         tl_w.map(|w| w.0).unwrap_or(std::ptr::null()),
-                        eid.as_ptr(),
-                        order.as_ptr(),
-                        counts.as_ptr(),
-                        *nseg as i32,
+                        self.s.tl_eid.ptr as *const i32,
+                        self.s.tl_order.ptr as *const i32,
+                        self.s.tl_counts.ptr as *const i32,
+                        self.s.tl_nseg.ptr as *const i32,
                         m as i32,
                         dim as i32,
                         inter_local as i32,
@@ -16110,10 +16326,15 @@ impl<'a> DevChain<'a> {
                          [E, N, K] pool (build with DSV41_MOE_BF16_DEQUANT=1 and rebuild the .so)",
                         true,
                     );
+                } else if !tl_tbl {
+                    Self::moe_tilelang_skipped_note(
+                        "the routing table could not be expressed as <= 36 expert segments of \
+                         <= 16 rows, or the .so lacks the device moe_align / `*_dev` shim set",
+                        false,
+                    );
                 } else if !tl_gu && !grp_gu {
                     Self::moe_tilelang_skipped_note(
-                        "the shim declined the up shape (see its shape gate) or the routing table \
-                         could not be expressed as <= 36 expert segments of <= 16 rows",
+                        "the shim declined the up shape (see its shape gate)",
                         false,
                     );
                 }
@@ -16249,16 +16470,15 @@ impl<'a> DevChain<'a> {
             // branches (one-shot notice inside the arm).
             let mut tl_dn_done = false;
             if tl_gu {
-                if let (Some(tables), Some(w)) = (tl_tables.as_ref(), tl_w) {
-                    let (order, counts, eid, nseg) = tables;
-                    tl_dn_done = self.dev.moe_tilelang_down_bf16(
+                if let (true, Some(w)) = (tl_tbl, tl_w) {
+                    tl_dn_done = self.dev.moe_tilelang_down_bf16_dev(
                         self.s.ex_act_r.ptr as *const f32,
                         self.s.ex_down_r.ptr as *mut f32,
                         w.1,
-                        eid.as_ptr(),
-                        order.as_ptr(),
-                        counts.as_ptr(),
-                        *nseg as i32,
+                        self.s.tl_eid.ptr as *const i32,
+                        self.s.tl_order.ptr as *const i32,
+                        self.s.tl_counts.ptr as *const i32,
+                        self.s.tl_nseg.ptr as *const i32,
                         m as i32,
                         dim as i32,
                         inter_local as i32,
@@ -19604,32 +19824,34 @@ fn tap_input() -> bool {
                 // multi-row layouts, so the two call sites pass identical shapes and
                 // the double-sided swap is bit-for-bit the same computation.
                 //
-                // ⚠️ `route_idx` (the eager router's output) lives on the DEVICE, so
-                // `moe_tilelang_tables` performs a D2H read — eager-only, like the
-                // verify side (see `moe_tilelang_ready`).
+                // ⚠️ `route_idx` (the eager router's output) lives on the DEVICE, and
+                // so do the tables now: the arm uses the same DEVICE-side
+                // `dsv41_route_group` + `dsv41_moe_align_from_group` chain as the
+                // verify side (`moe_tilelang_tables_dev`), with no round trip. The
+                // eager and graph arms are therefore the SAME computation.
                 let tl_ready = self.moe_tilelang_ready(ld, 1, topk, dim, inter_local, ne);
                 let mut tl_gu = false;
-                let mut tl_tables: Option<(Vec<i32>, Vec<i32>, Vec<i32>, usize)> = None;
+                let mut tl_tbl = false;
                 let mut tl_w: Option<(*const std::ffi::c_void, *const std::ffi::c_void)> = None;
                 if moe_tilelang() && !tl_ready {
                     Self::moe_tilelang_skipped_note(
-                        "the step is outside the arm's domain (a CUDA-graph capture, a frozen-shape \
-                         mismatch, or the .so lacks the shim symbols)",
+                        "the step is outside the arm's domain (a frozen-shape mismatch, a .so \
+                         without the device moe_align / `*_dev` shim set, or the bf16 expert \
+                         copies missing)",
                         true,
                     );
                 } else if tl_ready {
-                    tl_tables = self.moe_tilelang_tables(1, topk)?;
+                    tl_tbl = self.moe_tilelang_tables_dev(1, topk, ne)?;
                     tl_w = Self::moe_tilelang_weights(ld, dim, inter_local);
-                    if let Some(tables) = tl_tables.as_ref() {
-                        let (order, counts, eid, nseg) = tables;
-                        tl_gu = self.dev.moe_tilelang_gate_up_bf16(
+                    if tl_tbl && tl_w.is_some() {
+                        tl_gu = self.dev.moe_tilelang_gate_up_bf16_dev(
                             self.s.xn.ptr as *const f32,
                             self.s.ex_act_b.ptr as *mut f32,
                             tl_w.map(|w| w.0).unwrap_or(std::ptr::null()),
-                            eid.as_ptr(),
-                            order.as_ptr(),
-                            counts.as_ptr(),
-                            *nseg as i32,
+                            self.s.tl_eid.ptr as *const i32,
+                            self.s.tl_order.ptr as *const i32,
+                            self.s.tl_counts.ptr as *const i32,
+                            self.s.tl_nseg.ptr as *const i32,
                             1,
                             dim as i32,
                             inter_local as i32,
@@ -19642,10 +19864,15 @@ fn tap_input() -> bool {
                              [E, N, K] pool (build with DSV41_MOE_BF16_DEQUANT=1 and rebuild the .so)",
                             true,
                         );
+                    } else if !tl_tbl {
+                        Self::moe_tilelang_skipped_note(
+                            "the routing table could not be expressed as <= 36 expert segments of \
+                             <= 16 rows, or the .so lacks the device moe_align / `*_dev` shim set",
+                            false,
+                        );
                     } else if !tl_gu {
                         Self::moe_tilelang_skipped_note(
-                            "the shim declined the up shape (see its shape gate) or the routing table \
-                             could not be expressed as <= 36 expert segments of <= 16 rows",
+                            "the shim declined the up shape (see its shape gate)",
                             false,
                         );
                     }
@@ -19776,16 +20003,15 @@ fn tap_input() -> bool {
                 // carrier included: the sum is still `s.o`'s last writer here).
                 let mut tl_dn_done = false;
                 if tl_gu {
-                    if let (Some(tables), Some(w)) = (tl_tables.as_ref(), tl_w) {
-                        let (order, counts, eid, nseg) = tables;
-                        tl_dn_done = self.dev.moe_tilelang_down_bf16(
+                    if let (true, Some(w)) = (tl_tbl, tl_w) {
+                        tl_dn_done = self.dev.moe_tilelang_down_bf16_dev(
                             self.s.ex_act_b.ptr as *const f32,
                             self.s.ex_down_b.ptr as *mut f32,
                             w.1,
-                            eid.as_ptr(),
-                            order.as_ptr(),
-                            counts.as_ptr(),
-                            *nseg as i32,
+                            self.s.tl_eid.ptr as *const i32,
+                            self.s.tl_order.ptr as *const i32,
+                            self.s.tl_counts.ptr as *const i32,
+                            self.s.tl_nseg.ptr as *const i32,
                             1,
                             dim as i32,
                             inter_local as i32,
