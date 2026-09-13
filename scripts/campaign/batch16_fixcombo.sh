@@ -34,6 +34,13 @@ run F1_DC2   DSV41_GATEUP_DUMP=/tmp/f1   DSV41_MOE_BS_SFDUMP=/tmp/sfdf1 DSV41_MO
 run F2_DRAIN DSV41_GATEUP_DUMP=/tmp/f2   DSV41_MOE_BS_DRAIN=1
 run F3_PS    DSV41_GATEUP_DUMP=/tmp/f3   DSV41_MOE_BS_MBAR_PERSTAGE=1
 run F4_ALL   DSV41_GATEUP_DUMP=/tmp/f4   DSV41_MOE_BS_DCLEAR=2 DSV41_MOE_BS_DRAIN=1 DSV41_MOE_BS_MBAR_PERSTAGE=1
+# THE localisation pair for the barrier bug batch15 exposed: MBAR_PERSTAGE spins out on every
+# wait (step 153 ms vs 13 ms, log frozen, watchdog kill) while the DEFAULT single barrier works —
+# so arrivals are not landing on slots k>=1. The ring uses slots 0/1 and the drain uses slot 40:
+#   ring hangs too  => anything past slot 0 fails  => addressing/instruction form
+#   ring works     => multi-slot arrivals are fine => my per-stage loop/init logic is at fault
+run F7_RING  DSV41_GATEUP_DUMP=/tmp/f7  DSV41_MOE_BS_MBAR_RING=1
+run F8_DRAIN DSV41_GATEUP_DUMP=/tmp/f8  DSV41_MOE_BS_DRAIN=1 DSV41_MOE_BS_BOUNDED_WAIT=1
 run F4_ALL_B DSV41_GATEUP_DUMP=/tmp/f4b  DSV41_MOE_BS_DCLEAR=2 DSV41_MOE_BS_DRAIN=1 DSV41_MOE_BS_MBAR_PERSTAGE=1
 run F1_DC2ZA DSV41_GATEUP_DUMP=/tmp/f1za DSV41_MOE_BS_DCLEAR=2 DSV41_MOE_BS_ZERO_A=1
 # The ZERO probes contradict each other on the *old* data: ZERO_ALL gives ~0 (1.2e-36) while ZERO_A
@@ -47,7 +54,16 @@ run F5_SF_GC DSV41_GATEUP_DUMP=/tmp/f5s DSV41_MOE_BS_SFDUMP=/tmp/sfdf5s DSV41_MO
 # the scatter actually runs. A zero product must therefore give an exactly-zero output; anything
 # non-zero means the MMA is not reading the operands we staged.
 run F6_ASF   DSV41_GATEUP_DUMP=/tmp/f6  DSV41_MOE_BS_SFDUMP=/tmp/sfdf6 DSV41_MOE_BS_ZERO_ASF=1
+# The decisive pair: a zero product with the tables intact, once bare and once with an explicit D
+# clear. If the bare arm is non-zero but the cleared one is exactly zero, the accumulator/stale-TMEM
+# path is confirmed as the source; if BOTH are non-zero, the MMA is reading neither of our buffers.
+run F6_ASFDC DSV41_GATEUP_DUMP=/tmp/f6dc DSV41_MOE_BS_ZERO_ASF=1 DSV41_MOE_BS_DCLEAR=2
 
+echo "=== F7/F8: did the multi-slot arrivals land? (step time is the tell) ==="
+for a in F7_RING F8_DRAIN; do
+  echo "--- $a"; grep -a "step pos" ~/armrun_$a.log 2>/dev/null | tail -2
+  echo "    steps=$(grep -ac 'step pos' ~/armrun_$a.log 2>/dev/null) frozen/watchdog=$(grep -ac WATCHDOG ~/armrun_$a.log 2>/dev/null) timeouts=$(grep -ac 'TIMEOUT' ~/armrun_$a.log 2>/dev/null)"
+done
 echo "=== verdicts ==="
 python3 - <<'PY'
 import os, numpy as np
