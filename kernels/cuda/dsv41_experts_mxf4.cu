@@ -2331,6 +2331,9 @@ __global__ void expert_gemv_fp4_down_reduce_kernel(
     __syncthreads();
     const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
+    // restore: the SF-pitch diff (70377ae) accidentally deleted this line while
+    // editing the neighboring ksc comment — the row grid-stride loop below uses it.
+    const int nwarps = (int)((blockDim.x + 31) >> 5);
 
     for (int row = blockIdx.x * nwarps + warp; row < n_total; row += gridDim.x * nwarps) {
         float tot = 0.f;
