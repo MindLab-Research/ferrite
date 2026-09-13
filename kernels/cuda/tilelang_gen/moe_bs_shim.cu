@@ -1108,3 +1108,22 @@ extern "C" int dsv41_moe_bs_act_e4m3_cap(void) {
     return 1;  // A operand = e4m3 激活（1 B/value）
 }
 #endif
+
+// Debug dump: compare gather output with direct xq4 read
+extern "C" int dsv41_moe_bs_debug_gather(
+    const uint8_t* xq4, const float* xsc4,
+    const int* eid, const int* order, const int* counts,
+    int nseg, int rows, int dim, int inter, int topk,
+    uint8_t* dbg_a_out, uint32_t* dbg_sfa_out, int dump_seg, int dump_row,
+    cudaStream_t s) {
+    if (!tl_bs_init()) return 2;
+    // Run the gather
+    tl_moe_bs_gather_kernel<<<dim3((unsigned)kBm, (unsigned)kSegCap), kMovThreads, 0, s>>>(
+        xq4, xsc4, g_a, g_sfa, order, counts, kDim, kDim / 32, kSfWords, (int)topk, eid);
+    cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) return (int)e;
+    // Dump the requested segment+row
+    cudaMemcpyAsync(dbg_a_out, g_a + (size_t)(dump_seg * kBm + dump_row) * kDim, kDim, cudaMemcpyDeviceToDevice, s);
+    cudaMemcpyAsync(dbg_sfa_out, g_sfa, 4, cudaMemcpyDeviceToDevice, s);
+    return 0;
+}
