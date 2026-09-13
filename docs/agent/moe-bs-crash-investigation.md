@@ -2666,3 +2666,22 @@ compressor 投影 mrows、`ATTN_PROJ_ALIGN` 等**代码已在**，出货脚本�
 ⇒ **行动**：两者都在**出货脚本里为 0**（`DSV41_SPEC=1`/`DSV41_DSPARK=1` 已开 ✓，与此二者无关）⇒
    都属于"零新代码、只差一个开关"的收益，且**都作用在 spec 路径**（博客最大单步杠杆所在）✓
    ⇒ 上机验证时**先各测一条**（一次一个变量）：`ATTN_PROJ_ALIGN` 看 accept/红线；`DRAFT_MOE_MROWS` 看 p50 与逐位一致。
+
+## §105 spec 侧两门的 A/B 实验已脚本化（`~/spec_gates_test.sh`）+ **一条关键隔离设计**
+
+`~/spec_gates_test.sh` 三臂、**一次一个变量**（同会话背靠背）：
+`SG0_base`（`DSV41_SPEC=1 DSPARK=1` + `DSV41_ACC_HISTOGRAM=1`）→ `SG1_align`（+`DSV41_ATTN_PROJ_ALIGN=1`）
+→ `SG2_mrows`（+`DSV41_DRAFT_MOE_MROWS=1`）；每臂报 accept/`[acc-hist-summary]`、p50、`wq_check` 红线。
+
+### ⚠️ 关键隔离设计（没有它，判据会被污染）
+**每一臂都显式关闭 fp4 MoE BS 臂**（`DSV41_MOE_TILELANG_BS=0 DSV41_MOE_DOWN_BS=0`）
+⇒ MoE 走**已知正确的旧 per-slot GEMV 路径**。
+**理由**：本轮同时在进行"BS 臂是否正确"的另一条战线。若 spec 门实验带着 BS 臂跑，
+一旦文本异常，就**无法区分**"这个 spec 门有害"与"BS 臂还没对"——两个变量混在一起，
+结论不可用（本战役已多次踩到"半挂/混挂"的坑）。
+（`arm_run` 是 `env $BASE $COMMON "$@"` ⇒ **后面的 `$@` 覆盖 COMMON** ⇒ 该覆盖可行 ✓。）
+
+**判读**：
+- `SG1` vs `SG0`：accept 若上升且红线不破 ⇒ **draft/verify 程序不一致确实是 accept 被压在 ~2.2 的成因之一**
+  ⇒ 按 §87 的**精度门**规则转正；
+- `SG2` vs `SG0`：必须**逐位一致**（同 kernel 同实参，只是发射形状不同）⇒ 若一致且 p50 改善 ⇒ 按**性能门**规则转正。
