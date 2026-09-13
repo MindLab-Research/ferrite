@@ -4555,15 +4555,16 @@ impl<'a> DevChain<'a> {
             // (the attention output has n_heads*head_dim elements, well past
             // `dim` — sizing these by `dim` overflowed on the output projection)
             xq: dev.alloc(dim.max(nh * hd).max(cfg.o_lora_rank).max(inter))?,
-            // ⚠️ TILELANG ABI (eager-scale-abi-audit): the generated wkv kernel
-            // reads a_scale as [MPAD=16, k/32] with NO m predicate (only A staging
-            // and reduce-store are predicated) — 16 rows × 160 f32 = 10240B. The
-            // old single-row formula (32768/32+8 = 1032 f32 = 4128B) under-allocated
-            // by 6104B => deterministic OOB read on every armed eager launch (the
-            // T-arm hang root cause). Pad to cover MPAD rows.
-            xsc: dev.alloc(fb((dim.max(nh * hd).max(cfg.o_lora_rank).max(inter))
+            // ⚠️ TILELANG ABI (tl-parity-vs-old defect #1 + tl-garbage D1): the
+            // generated kernel reads ASC as [MPAD=16, pitch/32] with NO m predicate.
+            // The `.max(16*dim/32)` must be in the ELEMENT-COUNT domain (AFTER
+            // /32) — placing it before makes it a no-op (32768>2560 wins, then /32
+            // gives 1032 while the kernel reads up to index 2559). Same fix needed
+            // on xsc_r below. Verified formula: max(X/32, 16*dim/32) + 8 where
+            // X covers the largest ASTRIDE any shape presents.
+            xsc: dev.alloc(fb((dim.max(nh * hd).max(cfg.o_lora_rank).max(inter) / 32)
                 .max(16 * dim / 32)
-                / 32 + 8))?,
+                + 8))?,
             // One activation row: `dim/2` packed fp4 bytes, or `dim` e4m3 bytes
             // under DSV41_EXPERT_ACT_E4M3 (1 byte/value). `dim` covers both.
             xq4: dev.alloc(dim.max(8))?,
@@ -4664,17 +4665,14 @@ impl<'a> DevChain<'a> {
             // is <= that). Sized unconditionally: a few hundred KB, and a static
             // allocation graph is worth more than the bytes.
             xq_r: dev.alloc((VERIFY_ROWS * dim.max(nh * hd)).max(8))?,
-            // ⚠️ TILELANG ABI (eager-scale-abi-audit + tl-garbage-diagnosis D1):
-            // same MPAD=16 padding floor as xsc above — but the floor's BASIS must
-            // cover the largest ASTRIDE any shape can present (wo_a G8 = 32768 =>
-            // ASC row pitch 1024 f32 => 16 rows need 16384 f32, not 16*dim/32=2560).
-            // The c43c078 fix used `16 * dim / 32` which under-allocates for wo_a G8
-            // (deterministic 40928B OOB READ — padding rows x0 are numerically
-            // harmless but the read can cross into unmapped territory => sticky
-            // illegal access, the 2f6422c precedent).
-            xsc_r: dev.alloc(fb((VERIFY_ROWS * dim.max(nh * hd))
+            // ⚠️ TILELANG ABI (tl-parity-vs-old #1 + tl-garbage D1): same element-
+            // count domain fix as xsc above. The worst case is wo_a G8 (ASTRIDE
+            // =32768 => pitch 1024 f32/row => 16 rows need 16384). Formula:
+            // max(VERIFY_ROWS * max_dim / 32, 16 * max_dim / 32) + 8 — the .max()
+            // AFTER /32 (element domain), not before (the old code's no-op).
+            xsc_r: dev.alloc(fb((VERIFY_ROWS * dim.max(nh * hd) / 32)
                 .max(16 * dim.max(nh * hd) / 32)
-                / 32 + 8))?,
+                + 8))?,
             moe_out_r: dev.alloc(fb(VERIFY_ROWS * dim))?,
             ids_r: dev.alloc(VERIFY_ROWS * 4)?,
             argmax_r: dev.alloc(VERIFY_ROWS * 4)?,
