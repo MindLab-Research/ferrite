@@ -857,6 +857,21 @@ bool tl_bs_init() {
         (void)cudaGetLastError();
         fprintf(stderr, "[moe-bs] SF delivery via tcgen05.st = %d\n", fs);
     }
+    // The staged-operand dump needs BOTH the scratch AND the switch: the kernel's dump block tests
+    // `g_sfdump != nullptr && g_sfdump_on && k == g_sfdump_k`, and nothing in the repo ever set the
+    // first two. That made DSV41_MOE_BS_SFDUMP a DEAD instrument — its buffer stayed zero, and a
+    // consumer (sfdump_check.py) reads zeros, which is indistinguishable from "content is wrong"
+    // unless someone notices. Wiring both here revives it.
+    if (ok) {
+        (void)cudaMemcpyToSymbol(g_sfdump, &g_sfdump_buf, sizeof(void*));
+        int dump_on = 0;
+        const char* de = getenv("DSV41_MOE_BS_SFDUMP");
+        if (de != nullptr && de[0] != '\0' && de[0] != '0') dump_on = 1;
+        (void)cudaMemcpyToSymbol(g_sfdump_on, &dump_on, sizeof(int));
+        (void)cudaGetLastError();
+        fprintf(stderr, "[moe-bs] staged-operand dump armed = %d (scratch %p, %d bytes, k=%d)\n",
+                dump_on, (void*)g_sfdump_buf, (int)kSfDumpBytes, 0);
+    }
     // g_swapab: operand orientation (0 = A=activation/B=weight, 1 = A=weight/B=activation)
     if (ok) {
         int sw = 0;
