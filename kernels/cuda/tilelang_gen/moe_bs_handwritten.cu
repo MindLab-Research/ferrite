@@ -376,10 +376,20 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
     // Thread t reads from lane (t % 32) + warp offset, columns 0-127
     {
         float C_reg[128];
+        // TileLang brackets every TMEM operation with the tcgen05 thread-sync fences
+        // (tcgen05_before_thread_sync / __syncthreads / tcgen05_after_thread_sync).
+        // `tcgen05.fence::before_thread_sync` must precede a thread sync that orders
+        // tcgen05 async results with other threads; our kernel was missing them.
+        asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
+        __syncthreads();
+        asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
         // TileLang's verified TMEM read (replaces custom hw_tc_ld<128> that caused ICE)
         tl::tcgen05_ld_32dp32bNx<128, false>(C_tmem, 0, C_reg);
 
-        __syncthreads();  // ensure all threads have read TMEM before writing C_sh
+        // ensure all threads have read TMEM before writing C_sh (fenced pattern)
+        asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
+        __syncthreads();
+        asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
         // Write to C_sh (swizzled for coalesced global store)
         // Simple layout: C_sh[row * 128 + col] where row = warp * 32 + lane
