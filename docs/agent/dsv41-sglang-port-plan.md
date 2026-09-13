@@ -12,6 +12,15 @@
 5. **漂移猎杀工具链（已就绪）**：官方 MP8 分片在 `/opt/dlami/nvme/dsv41_mp8`（WORLD_SIZE=8 NCCL 可跑官方 model.py）；`~/ref_count.py`（官方贪心数数=能力金标）、`~/ref_diff.py`（teacher-forced 逐步 logits dump）、`~/compare_logits.py`（按"预测位置"对齐，报首个 argmax 分歧 + 幅度形态）、我们侧 `DSV41_GT_LOGITS_DUMP` 探针（rank0 逐步全量 logits append，诊断专用）。
 6. **S3a（真值 spec）已实现**（`spec_step_gt`：verify=6 串行 golden 步 + 每行快照 premix/state_kv/state_score/clen/compress_len + commit 恢复 snap[k+2]；draft 模式 noise/self/cycle）——金标准 = **spec 流 ≡ eager 流**。
 
+## ⚠️ 战况修订二（2026-09-13 深夜二，S0 + spec_gt 实测）
+
+1. **S0 同口径参考落袋：908.9 tok/s 中位**（sglang TP8、模拟 acc 5.49、random 4k/1k、cuda graph ✓、`--disable-flashinfer-autotune`——首启 autotune 在 TP8 死锁 17 分钟 GPU 全闲，禁用后 6 分钟起服务）。**这是同条件要击败的数字**。
+2. **sglang 数数金标 = 完美 1..100**（101 行、first-61 干净、尾部 86..100；9 个"重复形态"恰为 11/22/.../99 正常值）⇒ 模型会数数，**我们的 52 行腐蚀确凿是我们的 bug**（与官方数值的发散）。
+3. **sglang 自己的背诵输出也乱序**（静夜思"疑是地上疑霜"、出师表串词）= 重度量化 checkpoint 的背诵天花板，与数数红线无关。
+4. **spec_gt 金标准 = 部分通过**：忠实复现 eager 流到第 58 行（含其腐蚀形态，字节级），第 59 行起发散——发生在模型漂移开始（52 行）之后的 marginal logits 区。**待漂移修复后复测才是干净判据**（漂移让 top-2 贴近时，任何合法微差都会放大）。p50=65.7ms/spec 步（cycle 模式 ~11 次 forward）与 eager ~6ms/步（无图）自洽。
+5. **ref 工具链的 encode bug 已修**：transformers 5.17 的 `encode(text, False)` 第二位置参是 `text_pair` 而非 `add_special_tokens` → 改关键字传参。hunt.sh 步骤 1/1b 因旧码崩（模型加载后崩于 encode），需在队列后重跑；步骤 3+ 用修好的 ref_diff.py。
+6. **parity 内核源码已提取备好**（HEAD 的 `win_kv_quant_rt_kernel`（含 G3 bf16 写回修）与 `glue_latent_fp4_block16`（e4m3 标度 + e2m1 码 + bf16 写回））——NO-FP4 判别一旦证实量化域假设即开干移植。
+
 ## 0. 基座决策（已定）
 
 - **基座 = tag `dsv41-6.15ms-162toks`（8a5a952，09-12 02:16）**：纯 eager 基座，chain_dev.rs 仅 4668 行，无任何 dspark/mrows 机器；eager 正确（用户锚点）、step 6.15ms。
