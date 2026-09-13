@@ -508,6 +508,16 @@ __device__ __forceinline__ uint8_t tl_bs_f_pow2_to_ue8m0(float s) {
 // device-table 入口直接传调用方由 `dsv41_moe_align_from_group` 写出的 `tl_nseg`。
 // 两条臂因此共用同一个 kernel，只有表的来源不同（A/B 基线）。
 // ---------------------------------------------------------------------------
+// D1 (audit) VISIBILITY FIX: ue8m0 can only express POWERS OF TWO. quant_fp8 with
+// round_scale=true always emits a power of two EXCEPT for its all-zero-block floor
+// (fmaxf(scale, 1e-30)); a non-power-of-two activation scale would therefore be silently
+// rounded here. That is numerically inert for an all-zero block (every product is 0), but
+// the whole bs arm silently depends on round_scale staying true, so make it visible.
+__device__ int g_nonpow2_sf_seen = 0;
+__device__ __forceinline__ bool tl_bs_sf_not_pow2(float v) {
+    return v > 0.f && ((__float_as_uint(v) & 0x7FFFFFu) != 0u);   // a power of two has a zero mantissa
+}
+
 __global__ void tl_moe_bs_gather_kernel(const uint8_t* __restrict__ xq4,
                                         const float* __restrict__ xsc4,
                                         uint8_t* __restrict__ a, uint32_t* __restrict__ sfa,
@@ -559,16 +569,6 @@ __global__ void tl_moe_bs_gather_kernel(const uint8_t* __restrict__ xq4,
         }
         sfa[(int64_t)g * m + row] = w;
     }
-}
-
-// D1 (audit) VISIBILITY FIX: ue8m0 can only express POWERS OF TWO. quant_fp8 with
-// round_scale=true always emits a power of two EXCEPT for its all-zero-block floor
-// (fmaxf(scale, 1e-30)); a non-power-of-two activation scale would therefore be silently
-// rounded here. That is numerically inert for an all-zero block (every product is 0), but
-// the whole bs arm silently depends on round_scale staying true, so make it visible.
-__device__ int g_nonpow2_sf_seen = 0;
-__device__ __forceinline__ bool tl_bs_sf_not_pow2(float v) {
-    return v > 0.f && ((__float_as_uint(v) & 0x7FFFFFu) != 0u);   // a power of two has a zero mantissa
 }
 
 // ---------------------------------------------------------------------------
