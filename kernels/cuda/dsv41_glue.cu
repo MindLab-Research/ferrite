@@ -3274,25 +3274,13 @@ __device__ __forceinline__ float glue_e2m1_to_f(uint8_t code) {
     return glue_kFp4Table[code & 0x0Fu];
 }
 
-// Nearest e2m1 code == the loop `quant_kernel<1>` / `quant_fp4_fused_kernel`
-// run (dsv41_kernels.cu:168-174 and :251-257) and `quant.rs:40-55`
-// `e2m1_encode`: first minimum-distance slot wins, i.e. a tie goes to the
-// SMALLER magnitude. The caller has already clamped to +-6.
-__device__ __forceinline__ uint8_t glue_e2m1_encode(float v) {
-    const float a = fabsf(v);
-    const float mags[8] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
-    uint8_t best = 0;
-    float bd = 1e30f;
-    #pragma unroll
-    for (int c = 0; c < 8; c++) {
-        const float d = fabsf(a - mags[c]);
-        if (d < bd) {
-            bd = d;
-            best = (uint8_t)c;
-        }
-    }
-    return (uint8_t)(best | (v < 0.f ? 8u : 0u));
-}
+// MERGE COLLISION FIX (2026-09-14): this file briefly carried TWO definitions of
+// `glue_e2m1_encode` after the A2/A3 precision merges — the build failed with
+// "function glue_e2m1_encode has already been defined" (the earlier one at ~:3001
+// clamps to +-6 internally, this one assumed the caller had). The clamping version
+// is kept because it matches the official semantics exactly (`kernel.py`'s
+// `T.clamp(x / s, -fp4_max, fp4_max)` with fp4_max = 6 before the cast), and this
+// non-clamping duplicate is deleted; its callers now use the clamping one.
 
 // The probe's seven 32-wide groups, written by the ONE warp that owns
 // (row 0, block 0). `dbg` is nullptr in production and the kernel is
