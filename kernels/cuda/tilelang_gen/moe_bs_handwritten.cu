@@ -253,8 +253,20 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
         }
         // SFW1/SFW3: [384, 40*320] — SFW[e][k*320 + n_tile*64 + i] for i in [0, 64)
         for (int i = tid; i < HW_NH; i += 128) {
-            SFB_sh[i] = SFW1[(int64_t)e * (40 * HW_NP) + k * HW_NP + n_tile * HW_NH + i];
-            SFB_sh[HW_NH + i] = SFW3[(int64_t)e * (40 * HW_NP) + k * HW_NP + n_tile * HW_NH + i];
+            // Weight SF byte swap (matching activation SF swap for consistency)
+            // pack_wsf stores p[0] in LSB — we need it in MSB to match the
+            // swapped activation SF byte order (sf_id=0 → MSB hypothesis)
+            {
+                uint32_t w1sf = SFW1[(int64_t)e * (40 * HW_NP) + k * HW_NP + n_tile * HW_NH + i];
+                uint32_t w3sf = SFW3[(int64_t)e * (40 * HW_NP) + k * HW_NP + n_tile * HW_NH + i];
+                // Byte-swap: reverse the 4 bytes
+                w1sf = ((w1sf & 0xFF000000) >> 24) | ((w1sf & 0x00FF0000) >> 8) |
+                       ((w1sf & 0x0000FF00) << 8) | ((w1sf & 0x000000FF) << 24);
+                w3sf = ((w3sf & 0xFF000000) >> 24) | ((w3sf & 0x00FF0000) >> 8) |
+                       ((w3sf & 0x0000FF00) << 8) | ((w3sf & 0x000000FF) << 24);
+                SFB_sh[i] = w1sf;
+                SFB_sh[HW_NH + i] = w3sf;
+            }
         }
 
         __syncthreads();
