@@ -3083,6 +3083,8 @@ impl<'a> DsparkDev<'a> {
                         strides.10,
                         strides.11,
                         ids_r,
+                        // DSV41_SEQ_ALIGN (#5): same gate as the main chain.
+                        if crate::dsv41::chain_dev::seq_align() { 1 } else { 0 },
                     )?;
                 }
             } else {
