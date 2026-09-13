@@ -4694,6 +4694,20 @@ fn hc_tail_split() -> bool {
         } else {
             (std::ptr::null(), 0, std::ptr::null(), 0)
         };
+        // op-level diagnostic: the w2 row 0 of the FIRST selected expert
+        // (160 bytes as 40 f32) — kind 20 — and its e8m0 scale row (16 bytes
+        // as 4 f32) — kind 21. The e4m3's s.o is 40x the e2m1's from
+        // comparable dumped activations — the weight norms decide which
+        // side's dump mismatches its down's actual input.
+        if let Ok(xdp) = std::env::var("DSV41_GT_XDUMP") {
+            if layer == 0 && !idx.is_empty() && ne >= 2 {
+                let e0 = idx[0] as i64;
+                let w2r = unsafe { w2_base.offset((e0 * w2_stride) as isize) };
+                let w2sr = unsafe { w2s_base.offset((e0 * w2s_stride) as isize) };
+                self.gt_dump_vec(&xdp, 20, w2r as *mut std::ffi::c_void, 40)?;
+                self.gt_dump_vec(&xdp, 21, w2sr as *mut std::ffi::c_void, 4)?;
+            }
+        }
         if moe_dbg() {
             let n_active = wsum.iter().filter(|w| **w != 0.0).count();
             eprintln!(
