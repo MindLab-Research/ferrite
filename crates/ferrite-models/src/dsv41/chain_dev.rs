@@ -769,6 +769,19 @@ fn win_kv_quant() -> bool {
     *F.get_or_init(|| std::env::var("DSV41_WIN_KV_QUANT").map(|v| v != "0").unwrap_or(true))
 }
 
+/// The official's KV chain carries THREE bf16 boundaries (model.py
+/// Attention._window_kv): the wkv GEMM's output is bf16, the kv_norm's output
+/// is bf16 (`.to(dtype)`), and the rope operates in-place on that bf16 tensor
+//    before act_quant. Our chain stays f32 until the RT. Measured: post-GEMM
+/// kv matches to 0.474% (the gemm's own bf16 boundary) but post-norm+rope
+/// diverges ~1.4-2.2% — the missing boundaries are the residual. This gate
+/// rounds the kv row at the two chain points (post-GEMM, post-norm+rope) to
+/// the official's bf16 domain. DEFAULT ON; `DSV41_BF16_KV=0` opts out.
+fn bf16_kv() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_BF16_KV").map(|v| v != "0").unwrap_or(true))
+}
+
 /// The official's gate domain: the reference computes the gate scores in FULL
 /// F32 (`linear(x.float(), weight.float()) / gate_temp` — model.py Gate.forward);
 /// our old bf16/fp8 gate paths differ by ~1-2%, which flipped near-tie expert
@@ -3144,6 +3157,11 @@ fn hc_tail_split() -> bool {
                 self.s.qr.ptr as *mut f32,
             )?;
         }
+        // The official's wkv GEMM outputs bf16; round ours to the same domain
+        // before the norm reads it.
+        if bf16_kv() {
+            self.dev.bf16_round_inplace(self.s.kv.ptr as *mut f32, hd as i32)?;
+        }
         // op-level diagnostic: the post-GEMM kv (pre-norm, pre-rope, pre-RT)
         // at layer 0 — kind 6 — splits the fp8 GEMM {quant + codes + weight
         // scales} from the fused norm+rope. Runs on the MAIN stream before the
@@ -3461,6 +3479,12 @@ fn hc_tail_split() -> bool {
         // before its cache write. Runs after the join so the side stream's rope
         // is visible, and before `ring_win_fuse`/`ring_append` — the ring's
         // first and only writer of this row.
+        // The official's rope operates in-place on the bf16 norm output, so
+        // the row entering act_quant is bf16-valued; round ours to the same
+        // domain before the RT quantizes it.
+        if bf16_kv() {
+            self.dev.bf16_round_inplace(self.s.kv.ptr as *mut f32, hd as i32)?;
+        }
         if win_kv_quant() {
             self.dev.win_kv_quant_rt(self.s.kv.ptr as *mut f32, hd as i32, 32)?;
         }
