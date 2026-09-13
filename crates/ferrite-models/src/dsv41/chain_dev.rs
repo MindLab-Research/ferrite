@@ -779,6 +779,18 @@ fn gate_f32() -> bool {
     *F.get_or_init(|| std::env::var("DSV41_GATE_F32").map(|v| v != "0").unwrap_or(true))
 }
 
+/// The official's hc_pre output is bf16 (`.to(x.dtype)` — model.py Block.forward:
+/// `x = self.hc_pre(x, pre_mix)` where hc_pre ends with `.to(x.dtype)`): every
+/// downstream consumer — the attention projections, the gate GEMV, the MoE —
+/// reads bf16-VALUED xn. Our collapse chain stays f32, so our xn carries ~0.18%
+/// more precision than the official's, which propagates ~1% mixed-sign noise
+/// into the gate scores and flips near-tie expert selections. DEFAULT ON.
+/// `DSV41_BF16_XN=0` opts out for A/B.
+fn bf16_xn() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_BF16_XN").map(|v| v != "0").unwrap_or(true))
+}
+
 /// B3 (DSV41_COMP_PLACEHOLDER_FUSE, default ON): the recency-placeholder launch
 /// (30/step, ~1.0us each) writes `idxs[win, win+take)` into the SAME buffer the
 /// `ring_win_fuse` epilogue already writes `idxs[0, win)` into, and `sparse_attn`
@@ -2855,6 +2867,12 @@ fn hc_tail_split() -> bool {
             cfg.norm_eps,
         )?;
         }
+        // The official's collapse output is bf16: round xn to that domain
+        // BEFORE any consumer reads it (the dump below then captures the
+        // bf16'd value — the same thing the ref's hook reports).
+        if bf16_xn() {
+            self.dev.bf16_round_inplace(self.s.xn.ptr as *mut f32, dim as i32)?;
+        }
         // op-level diagnostic dumps for the layer-0 bisection: the collapse
         // output (xn, kind 0) before attention, and the attention output
         // (o, kind 1) after it. Format [u64 step][u64 kind][f32*n], rank 0.
@@ -2970,6 +2988,11 @@ fn hc_tail_split() -> bool {
             dim as i32,
             cfg.norm_eps,
         )?;
+        }
+        // The official's ffn-side collapse output is bf16 too: round before the
+        // MoE's consumers (the gate GEMV, quant1, the experts) read it.
+        if bf16_xn() {
+            self.dev.bf16_round_inplace(self.s.xn.ptr as *mut f32, dim as i32)?;
         }
         let _t_moeonly = std::time::Instant::now();
         // DSV41_GRAPH_MOE=1 captures the host-free part of the MoE (everything up

@@ -590,6 +590,24 @@ extern "C" int dsv41_win_kv_quant_rt(float* kv, int cols, int block, cudaStream_
     return (int)cudaGetLastError();
 }
 
+// The official's hc_pre output is bf16 (`.to(x.dtype)`): every downstream
+// consumer — the attention projections, the gate GEMV, the MoE — reads
+// bf16-VALUED xn. This rounds our f32 collapse output to that domain, in
+// place, with round-to-nearest-even (the torch `.to(bfloat16)` semantics).
+__global__ void bf16_round_inplace_kernel(float* __restrict__ x, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    uint32_t u = __float_as_uint(x[i]);
+    u += 0x7fffu + ((u >> 16) & 1u);
+    x[i] = __uint_as_float((uint32_t)((uint16_t)(u >> 16)) << 16);
+}
+
+extern "C" int dsv41_bf16_round_inplace(float* x, int n, cudaStream_t s) {
+    if (n <= 0) return (int)cudaSuccess;
+    bf16_round_inplace_kernel<<<(unsigned)((n + 255) / 256), 256, 0, s>>>(x, n);
+    return (int)cudaGetLastError();
+}
+
 // The decode-step n-gram hash on the device: removes the LAST per-step H2D on
 // the decode path (the host used to run NgramHashState::forward_row and upload
 // the ids) and makes the whole step graph-capturable. Faithful port of

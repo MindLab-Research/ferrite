@@ -362,6 +362,7 @@ struct Kernels {
     gate_gemv_f32: Option<
         unsafe extern "C" fn(*const f32, *const c_void, *mut f32, c_int, c_int, f32, CuStream) -> c_int,
     >,
+    bf16_round_inplace: Option<unsafe extern "C" fn(*mut f32, c_int, CuStream) -> c_int>,
     comp_placeholder:
         Option<unsafe extern "C" fn(*mut i32, *const c_int, c_int, c_int, CuStream) -> c_int>,
     ring_append:
@@ -819,6 +820,7 @@ impl Device {
             window_idxs: ko!(rt, "dsv41_window_idxs"),
             win_kv_quant_rt: ko!(rt, "dsv41_win_kv_quant_rt"),
             gate_gemv_f32: ko!(rt, "dsv41_gate_gemv_f32"),
+            bf16_round_inplace: ko!(rt, "dsv41_bf16_round_inplace"),
             comp_placeholder: ko!(rt, "dsv41_comp_placeholder"),
             compress_commit: ko!(rt, "dsv41_compress_commit"),
             ring_append: ko!(rt, "dsv41_ring_append"),
@@ -3069,6 +3071,14 @@ impl Device {
         let f = self.need(self.kernels.gate_gemv_f32, "dsv41_gate_gemv_f32")?;
         let rc = unsafe { f(x, w, scores, n_out, dim, gate_temp, self.stream) };
         self.kerr(rc, "dsv41_gate_gemv_f32")
+    }
+
+    /// Round a buffer to the bf16 value domain, in place (RN semantics —
+    /// the torch `.to(bfloat16)` boundary).
+    pub fn bf16_round_inplace(&self, x: *mut f32, n: i32) -> Result<()> {
+        let f = self.need(self.kernels.bf16_round_inplace, "dsv41_bf16_round_inplace")?;
+        let rc = unsafe { f(x, n, self.stream) };
+        self.kerr(rc, "dsv41_bf16_round_inplace")
     }
 
     /// Publish the roped index key into the owner's group slot, with the slot
