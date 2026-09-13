@@ -258,3 +258,117 @@ gate 平面读——**静默错值**。⇒ 两者互斥，`load.rs::ilv_ok` 在 
 | `cargo check -p ferrite-models` / `--workspace` | **EXIT=0** |
 | GPU e2e + parity | ⏳ 见 `docs/agent/tilelang-moe-wiring.md` §5（主 agent 职责）|
 
+---
+
+## 8. 第三阶段：五形状投影批量接线（wq_a / wq_b / wo_b + wo_a 分组）
+
+> 前置：`docs/agent/tilelang-proj-phase2.md`（五形状原型的全部 GPU 数字，M6/M1 = 0.99–1.01）。
+> 接线验证手册：`docs/agent/tilelang-proj-phase2-wiring.md`。
+
+在 §5 的扩展路径上，把**剩余四个形状**全部接进生产链（wkv 不动，逐位保持第一阶段的产物）。
+
+### 8.1 生成（唯一合法路径）
+
+```bash
+scp kernels/tilelang/gen_proj_shapes_aot.py ubuntu@43.202.208.136:~/tl_proj/
+ssh ubuntu@43.202.208.136 \
+  'cd ~/tl_proj && mkdir -p proj_gen && /opt/dlami/nvme/dsv41_venv/bin/python gen_proj_shapes_aot.py proj_gen'
+scp ubuntu@43.202.208.136:'~/tl_proj/proj_gen/*' kernels/cuda/tilelang_gen/
+# 再给 10 份 .cu 加 banner（banner 是唯一的、可复现的本地改动）
+```
+
+| 项 | 值 |
+|---|---|
+| 形状（稠密） | `wq_a (n=1280,k=5120)`、`wq_b (n=4096,k=1280)`、`wo_b (n=5120,k=1024)` |
+| 形状（分组） | `wo_a`：`G∈{1,8}`、`n=1024`、`k=4096`、`a_stride∈{4096,32768}`、`OS=8192` |
+| 几何 | `bN=128, ks=8, threads=128, ns=3`；reduce `bN=256, threads=256`（同第一阶段） |
+| 数值路线 | route A（原生 fp8 mma + per-32 scale，与原型/第一阶段逐行一致） |
+| ABI | 裸指针（`TL_DISABLE_TMA_LOWER:1, TL_DISABLE_WARP_SPECIALIZED:1`）|
+| 产物 | `{wq_a,wq_b,wo_b}_{partial,reduce}_tl.cu` + `wo_a_g{1,8}_{partial,reduce}_tl.cu` + `proj_shapes_tl_config.txt` |
+
+**与第一阶段唯一的生成差异：输出行 stride 由 `OS` 烘进来，不是 `n`。**
+ferrite 的 `out_stride` 是本形状调用点真实的行距，且**不总等于 n**：
+
+| 形状 | 调用点 | `OS`（= out_stride） | `n` | OS == n? |
+|---|---|---|---|---|
+| wkv | verify/eager | 512 | 512 | ✅ |
+| wq_a | verify/eager | 1280 | 1280 | ✅ |
+| **wq_b** | **verify / eager `lin`** | **nh·hd = 32768** | nlh·hd = 4096 | ❌（ColumnParallel：只填整行的前 nlh·hd 列）|
+| wq_b | indexer（idx_wq_b） | idx_nh·idx_hd = 4096 | 4096 | ✅ —— 但 OS 已烘成 32768 ⇒ **decline** |
+| wo_b | verify/eager | 5120 | 5120 | ✅ |
+| **wo_a** | verify（`wo_a_grouped_fp8` 站点） | **ol_total = 8192** | 1024（每组宽）| ❌（ColumnParallel：nlg 组写进全局宽行）|
+
+生成物把 OS 作为编译期常量写进归约声明 `C: T.Tensor((MPAD, OS))`，**store 仍是
+`tl::store_global_256`（256-bit 向量化）**，且不需要第三发 launch 做 strided copy。
+shim 的形状门据 OS 做判定（见 8.2 的 m==1 放宽）。
+
+### 8.2 shim（四个新导出符号）
+
+`tilelang_gen/{wq_a,wq_b,wo_b,wo_a}_shim.cu`，全部照 `wkv_shim.cu` 的契约（rc `0`/`2`、
+三条硬约束、INIT 懒初始化、ARMED 一次性回执、两次 launch + 常驻 scratch、K-split）。
+
+| 符号 | 形状门 | scratch |
+|---|---|---|
+| `dsv41_gemm_fp8_tilelang_wq_a` | `m∈[1,8] && n==1280 && k==5120 && out_stride==1280` | `P[8][16][1280]` = 640 KiB |
+| `dsv41_gemm_fp8_tilelang_wq_b` | `m∈[1,8] && n==4096 && k==1280 && out_stride==32768` | 2 MiB |
+| `dsv41_gemm_fp8_tilelang_wo_b` | `m∈[1,8] && n==5120 && k==1024 && out_stride==5120` | 2.5 MiB |
+| `dsv41_gemm_fp8_tilelang_wo_a` | `rows∈[1,8] && n==1024 && k==4096 && out_stride==8192 && (groups,a_stride)∈{(1,4096),(8,32768)}` | `P[8][8][16][1024]` = 4 MiB（G=8 上界，两变体复用）|
+
+公共门（四个都有）：`bias` 必须 null（生成物无 bias 通路，绝不静默丢 bias）；`a/a_scale/
+w/w_scale` 16B 对齐、`out` 32B 对齐；INIT 失败 ⇒ decline（不半发射）。
+
+**m==1（rows==1）时 `out_stride` 放宽**（四形状都有）：行 stride 只在 `m>1` 参与归约 store
+的地址计算（第 0 行恒在 offset 0）⇒ `m==1` 时 `out_stride` 不参与计算。这条放宽是为了
+eager 单行站点：`lin`/`lin2` 按 `n_out` 约定传 stride，而 wq_b 的真 OS 是 `nh*hd`；单行下
+两者等价。`m>1` 仍严格要求 `out_stride == OS`。
+
+### 8.3 接线
+
+| 侧 | 点位 | 形状 | gate |
+|---|---|---|---|
+| verify | `proj_mrows`（⓪ wkv 臂**之后**新增一块）| wq_a / wq_b / wo_b | `DSV41_GEMM_TILELANG` |
+| verify | `attention_rows` 的 `wo_a_grouped_fp8` 调用点 | wo_a | `DSV41_GEMM_TILELANG` |
+| eager | `lin`（⓪ wkv 臂之后）| wq_a / wq_b / wo_b | `DSV41_GEMM_TILELANG && DSV41_GEMM_TILELANG_EAGER` |
+| eager | `lin2`（`tilelang_dense_pick`）| wq_a / wq_b / wo_b | 同上 |
+| eager | `layer()` 的 wo_a per-group 循环前 | wo_a | 同上 |
+
+- **eager 侧统一二级 gate**（`DSV41_GEMM_TILELANG_EAGER=1`，默认 OFF）：T 臂挂起分诊的
+  结论 —— eager `lin` 站点喂的是 `quant1` 的单行 `s.xq/s.xsc`，其 scale 布局审计未完成。
+  verify 侧 parity 已证，`DSV41_GEMM_TILELANG` 单独即上线。
+- **`out_stride` 的 decline 是设计内的**：wq_b 的 indexer 站点（`out_stride == n`）、
+  wo_a 的变体不匹配，都静默回退到老 kernel（一个形状一个 dump，OS/几何是编译期常量）。
+- **phantom-gate 回执**：新增 `proj_tilelang_skipped_note_phase2()` —— gate armed 但 `.so`
+  一个 phase-2 符号都没有时，一次性提示（区别于"形状 decline 是正常的、静默的"）。
+
+### 8.4 验收证据（本阶段）
+
+| 检查 | 结果 |
+|---|---|
+| 10 份生成物 dump + `proj_shapes_tl_config.txt` | ✅ 见 8.1；OS 烘入已在 dump 中核对（wq_b reduce store `C + i*262144 + row*32768`）|
+| `nvcc -O3 -std=c++17 -c -arch=sm_103a -I tilelang_inc -I tilelang_gen`（五个 shim）| ✅ **全 EXIT=0** |
+| `cargo check -p ferrite-models` / `--workspace` | ✅ **EXIT=0** |
+| GPU e2e + parity | ⏳ `kernels/cuda/tests_tilelang_proj_parity.cu`（五形状台架，主 agent 执行）|
+
+⚠️ 本阶段**未跑 GPU**（用户指令：GPU 测量是主 agent 专属职责）。生成已在远端 B300 完成
+（dump 落仓），CPU 侧 compile-only 全绿；GPU parity 台架已交付，见 §8.5。
+
+### 8.5 GPU 验证手册（主 agent 执行）
+
+```bash
+# 编译（CPU compile-only，约 2–2.5 min；dsv41_kernels.cu 14.8k 行）
+nvcc -arch=sm_103a -O3 -std=c++17 -I kernels/cuda -I kernels/cuda/tilelang_inc \
+     -I kernels/cuda/tilelang_gen -o /tmp/tl_proj_parity \
+     kernels/cuda/tests_tilelang_proj_parity.cu
+# 运行（GPU）
+/tmp/tl_proj_parity
+```
+
+判据（与第一阶段 wkv 台架同口径）：
+1. 每形状 `shim rc` 必须为 **0**（2 = decline，说明接线或 OS 不对）；
+2. **门 1**：`repeatability` 与 `m=6 row0 == m=1 row0` 必须 `BIT-IDENTICAL`；
+3. **门 2**：`maxrel ≲ 1e-6`（原型 §5.2 实测 ≤7.6e-7），`argmax` 一致；**禁止 byte-compare**；
+4. wo_a 的 `g=0..G-1` 每组 `maxrel` 同量级（分组形态不引入额外数值退化）。
+
+接线侧的活性证据：`[proj-tilelang] ARMED {wq_a,wq_b,wo_b,wo_a} ...` 一次性回执（stderr）。
+
+

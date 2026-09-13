@@ -134,7 +134,7 @@ def moe_align(topk_ids):
 # ---------------------------------------------------------------- kernel
 @tilelang.jit(out_idx=[-1])
 def k_up_bs(NSEG, N, K, BM=128, BN=128, BK=128, threads=128, stages=4, gran=GRAN,
-            repeat=1, diag="none"):
+            repeat=1, diag="none", store_bn=0, packed=False):
     """Grouped block-scaled fp4 (e2m1+ue8m0) up-GEMM, tcgen05 1-CTA, explicit async.
 
     A  : [NSEG*BM, K]  float4_e2m1fn   (segment rows gathered + BM-padded)
@@ -163,8 +163,9 @@ def k_up_bs(NSEG, N, K, BM=128, BN=128, BK=128, threads=128, stages=4, gran=GRAN
              SFW: T.Tensor((sf_words * NSEG * N,), T.uint32),
              C: T.Tensor((M, N), "float32")):
         with T.Kernel(N // BN, NSEG, threads=threads) as (bx, by):
-            A_sh = T.alloc_shared((stages, BM, BK), T.float4_e2m1_unpacked)
-            B_sh = T.alloc_shared((stages, BN, BK), T.float4_e2m1_unpacked)
+            _sm = T.float4_e2m1fn if packed else T.float4_e2m1_unpacked
+            A_sh = T.alloc_shared((stages, BM, BK), _sm)
+            B_sh = T.alloc_shared((stages, BN, BK), _sm)
             SFA_sh = T.alloc_shared((stages, BM), "uint32")
             SFW_sh = T.alloc_shared((stages, BN), "uint32")
 
@@ -173,7 +174,8 @@ def k_up_bs(NSEG, N, K, BM=128, BN=128, BK=128, threads=128, stages=4, gran=GRAN
             SFW_tmem = T.alloc_tmem([BM, BN // 128 * 4], "uint32")
 
             C_l = T.alloc_fragment((BM, BN), "float32")
-            C_sh = T.alloc_shared((BM, BN), "float32")
+            sbn = store_bn if store_bn else BN
+            C_sh = T.alloc_shared((BM, sbn), "float32")
 
             loaded = T.alloc_barrier([32] * stages)      # TMA completion
             sf_full = T.alloc_barrier([32] * stages)     # SF transposed + fenced
@@ -213,7 +215,25 @@ def k_up_bs(NSEG, N, K, BM=128, BN=128, BK=128, threads=128, stages=4, gran=GRAN
                         T.tcgen05_cp_warpx4(SFW_sh[st, :], SFW_tmem)
                     if diag == "tma":
                         # ablation: no UMMA at all -- pure TMA+SF throughput floor
-                        T.tcgen05_mma_arrive(consumed[st])
+                        if k == k_iters - 1:
+                            T.tcgen05_gemm_blockscaled(
+                                A_sh[st, :, :], B_sh[st, :, :], C_tmem, SFA_tmem, SFW_tmem,
+                                transpose_B=True, mbar=consumed[st], clear_accum=True,
+                                k_start=k * BK,
+                                sf_a_granularity_k=gran, sf_b_granularity_k=gran,
+                            )
+                        else:
+                            T.tcgen05_mma_arrive(consumed[st])
+                    elif diag == "nosf":
+                        # ablation: SF hoisted out of the loop (numerics INVALID)
+                        for rep in T.serial(repeat):
+                            T.tcgen05_gemm_blockscaled(
+                                A_sh[st, :, :], B_sh[st, :, :], C_tmem, SFA_tmem, SFW_tmem,
+                                transpose_B=True, mbar=consumed[st],
+                                clear_accum=(k == 0) and (rep == 0),
+                                k_start=k * BK,
+                                sf_a_granularity_k=gran, sf_b_granularity_k=gran,
+                            )
                     else:
                         for rep in T.serial(repeat):
                             T.tcgen05_gemm_blockscaled(
@@ -243,8 +263,13 @@ def k_up_bs(NSEG, N, K, BM=128, BN=128, BK=128, threads=128, stages=4, gran=GRAN
             T.mbarrier_wait_parity(tmem_full, 0)
             T.sync_threads()
             T.copy(C_tmem, C_l)
-            T.copy(C_l, C_sh)
-            T.copy(C_sh, C[by * BM, bx * BN])
+            if sbn == BN:
+                T.copy(C_l, C_sh)
+                T.copy(C_sh, C[by * BM, bx * BN])
+            else:
+                for i in T.serial(BN // sbn):
+                    T.copy(C_l[:, i * sbn:(i + 1) * sbn], C_sh)
+                    T.copy(C_sh, C[by * BM, bx * BN + i * sbn])
 
     return main
 
@@ -290,7 +315,8 @@ def run_case(nseg, counts, BM, K, N, cfg, seed=7, ref_rows=None):
 
     ker = k_up_bs(nseg, N, K, BM=BM, BN=cfg["bn"], BK=cfg["bk"],
                   threads=cfg["threads"], stages=cfg["stages"], gran=gran,
-                  repeat=cfg.get("repeat", 1), diag=cfg.get("diag", "none"))
+                  repeat=cfg.get("repeat", 1), diag=cfg.get("diag", "none"),
+                  store_bn=cfg.get("store_bn", 0), packed=cfg.get("packed", False))
     C = ker(as_fp4(Aq), as_fp4(Wq), sfa, sfw)
 
     Adq = dequant_fp4(Aq, Asf, K, gran)
