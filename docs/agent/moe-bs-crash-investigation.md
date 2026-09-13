@@ -3917,6 +3917,33 @@ wait ⇒ **到达数不可能超过等待数** ⇒ **smem 被提前覆写的竞�
 **产物纪律**：每次测量前必跑 `check_artifacts.sh`（`ensure_built.sh` 已内置）——它已两次拦下陈旧 `.so` ✓；
 **构建**：`ensure_built.sh` 按 `.cu` 内容哈希门控 ⇒ 源码未变时**零构建**（一轮 ~2.5 分钟 = 臂本身）✓。
 
+## §149 【头号机制】外来 TMEM 残留（`tcgen05.alloc` 不清零 + 等待可能少一相）
+
+`output-stale-audit` §5 给出**同时解释全部实测异常**的机制，其余候选都已按判据排除：
+
+1. `tcgen05.alloc` **不清零** TMEM；生产用**单个 mbarrier**（`count=1`）吸收 40 次到达，等待相位纯靠 `k&1`，
+   **无任何到达计数断言** ⇒ 若某次到达丢失/超前，`try_wait.parity` 的 **1-bit 观察窗口**可能"少一相"
+   ⇒ **epilogue 读到的 128 列里有一部分是本次 launch 从未写过的**（= 该 SM 上一批 kernel/CTA 的残留）；
+2. 这同时给出两条实测异常的解释：**同输入两次输出不同**（残留随 SM 调度变化 ✓）与
+   **把 A 整块置 0 后输出仍非零**（外来 TMEM 与 A 无关 ✓）；而**单 stage 仪器必然 PASS**（它只 commit/wait
+   一次且读自己刚写的区 ✓）。
+
+**数值闭环（不可绕开）**：A≡0 ⇒ 对任意 SF/W，`(k=0,ki=0)` 的 `enable_d=0` MMA 覆写整个 128×128 D tile
+⇒ 本内核写出的 C tile **必然逐位为 0**；实测 3456/3840 非零 ⇒ **该值不是本轮 MMA 算出来的** ✓。
+
+**修复候选（按代价/强度排序）**：
+
+| # | 方案 | 状态 | 判据 |
+|---|---|---|---|
+| 1 | `DSV41_MOE_BS_MBAR_PERSTAGE=1`：**每 K-stage 一个专用 barrier**（每个只被到达一次 ⇒ 相位恒 0 ⇒ **不依赖相位记账**） | **已实现** ✓（`batch10_fixconfirm.sh MBAR_PERSTAGE` 可跑） | 臂与官方 oracle 对齐 + `ZERO_A` 输出**精确为 0** + 同配置两次**逐位相同** |
+| 2 | `DSV41_MOE_BS_MBAR_RING=1`：2 项 ring（官方 `consumed[k%3]` 同构）——**只改变故障落点**，不改变正确性（`mbar-ring-verify` 证明） | 已实现 ✓ | 同上；若两者都不生效 ⇒ 机制不在相位记账 |
+| 3 | `tcgen05.alloc` 结果校验（base≠0 且 lane 字段=0） | **已实现** ✓（`printf` 报警） | 日志里出现该行 ⇒ 分配异常成立 |
+| 4 | 超时**不得静默写错值**（abort 路径把输出打成哨兵/NaN + 计数） | 已有 `safe-abort-diff` 的 diff 草案 ✓ | `BOUNDED_WAIT=1` 超时后 e2e 一眼可见（而不是搬走上一次的 `g_c`） |
+| 5 | 读 TMEM 前加**保守的最终同步**（最后一个 commit 之后、epilogue 之前） | 待评估（`perstage-verify` 在查是否已足够） | 与 #1 联用 |
+
+**下一动作**：batch14（判别 (a)/(b)/(c) + 读原始 `g_c`）⇒ 若指向 (a) 则立刻跑
+`batch10_fixconfirm.sh MBAR_PERSTAGE`（#1）与 `=MBAR_RING`（#2）两条臂对照 ✓。
+
 ⇒ 误差**只在算术内部**：K 元素配对 / 标度归属 / 逐元素映射中有一处不对，且它必须同时解释
 "量级对 + 逐元素不相关 + 非置换 + 非换 expert"。**下一判据 = `DSV41_MOE_BS_SFDUMP` 内容校验（`sfdump_check.py`）
 + 去假设 replay（`sfdump_replay.py`：输出是否等于"它自己 staged 的数据"的积）** ⇒ 分流"内容错" vs "使用错" ✓。
