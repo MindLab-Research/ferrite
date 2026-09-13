@@ -57,7 +57,9 @@ __device__ int g_sfrev = 0;
 // 16 smem bytes; the descriptor that the vendor's own W operand uses is
 // lbo=1 (16 B) / sbo=64 (1024 B) / layout_type=2 (SWIZZLE_128B). See
 // docs/agent/moe-bs-crash-investigation.md §29-§31.
-__device__ int g_packed = 0;
+__device__ int g_packed = 1;   // DEFAULT ON: the MEASURED-correct layout (hw_pack_sw128)
+// Escape hatch for reference only: DSV41_MOE_BS_UNPACKED=1 restores the measured-WRONG
+// unpacked staging (relerr 1.491) that this whole investigation started from.
 
 // Address inside the PACKED fp4 operand tile (K packed into K/2 bytes = 64 B per row at
 // K=128). PREDICTION (§30): the 128-byte swizzle span holds two 64-byte rows, so the row's

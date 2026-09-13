@@ -663,9 +663,14 @@ bool tl_bs_init() {
     // g_packed: stage the fp4 operand PACKED (two K elements per byte, the way the
     // hardware reads it) instead of unpacked
     if (ok) {
-        int pk = 0;
+        // DEFAULT ON since 2026-09-14: the packed-container layout is the MEASURED-correct
+        // one (hw_pack_sw128 reaches exact parity, relerr = 0). The unpacked staging is kept
+        // only as a reference escape hatch and measures relerr 1.491.
+        int pk = 1;
         const char* e = getenv("DSV41_MOE_BS_PACKED");
-        if (e != nullptr && e[0] == '1') pk = 1;
+        if (e != nullptr && e[0] == '0') pk = 0;
+        const char* u = getenv("DSV41_MOE_BS_UNPACKED");
+        if (u != nullptr && u[0] == '1') pk = 0;
         (void)cudaMemcpyToSymbol(g_packed, &pk, sizeof(int));
         (void)cudaGetLastError();
         fprintf(stderr, "[moe-bs] packed fp4 staging = %d\n", pk);
