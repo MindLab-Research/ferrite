@@ -3222,3 +3222,20 @@ SH_PAIR_MROWS=false INDEXER_MROWS=false COMPRESSOR_MROWS=false SH_EXP_TILELANG=f
 
 **教训（与 §110/§111 同源）**：报错的**形态**比报错的**文字**更信息丰富——"类型落到错误的形参上"
 指向**声明可见性/版本**问题，而不是实参个数问题 ✓。
+
+## §127 cp.async 门的**最后一项**预验证：C staging 别名在两种配置下都安全 ✓
+
+§86 曾点名"C staging 的别名区间必须在实现里重新确认"✓。实读 kernel 的 smem 布局注释（`moe_bs_handwritten.cu:655-685`）：
+
+```
+//   A: [0, 16384) e4m3 tile            B: [16384, 32768) packed fp4 tile
+//   SFA: [32768, 33280) activation SF  SFB: [33280, 33792) weight SF
+//   mbar: [33792, 33800) MMA completion barrier
+//   C staging: [0, 65536) f32 output (overlaps A/B/SF/mbar — written after all MMAs)   ← 关键
+```
+⇒ **C staging 与 A/B/SF 重叠，但只在"所有 MMA 完成之后"写入** ✓ ⇒ 别名安全 ✓。
+⇒ **cp.async（NS=2）下**：A/B 的 stage 用法扩到 `2 × 16384 = 32768 B` ⊂ `[0, 65536)` ✓ ⇒
+C 写入时 A/B 已不再被读 ✓ ⇒ **依然安全** ✓ ✓（无需迁移 C staging，也无需改地址）。
+
+**cp.async 门的预验证至此完成**（§116 的逐位一致性 + 本节的内存安全）⇒ 只剩 **GPU 两件**：
+① 门开/门关**数值逐位一致**；② **p50 改善**（`staged_verify.sh cpasync` 已实现该 A/B ✓）。
