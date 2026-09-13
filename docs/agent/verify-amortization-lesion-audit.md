@@ -82,7 +82,27 @@ B1 系三臂的断崖都在 line 52（1..51 正确然后跳 62）+ mean-k 0.64-0
 
 注意：line 52/62 是模型退化边界的漂移（near-tie argmax 对 1ULP 敏感）——找到元凶 gate 后需评估"数值合法性"（逐位承诺 vs 实际）。
 
-## 8. 修复交付后的 GPU 验证序列（双门禁纪律）
+## 9. nsys 对比表实测（2026-09-13 01:00，v6 配方，swallow A0 栈 vs eager，AR_SAFE 模式）
+
+**病灶倍数实锤**（instRatio = swallow 实例数 / eager 实例数；健康应该 ≈1-2×）：
+
+| kernel | sw% | instRatio | 判定 | 修复载体 |
+|---|---|---|---|---|
+| apply_rope | 0.8 | **40.1×** | q/kv rope per-row 🔴 | VERIFY_ROPE_MROWS（弃用四 gate 之一——需查它为什么改 accept） |
+| rmsnorm | 1.2 | **24.9×** | per-row norm 🔴 | 同上（B4 族） |
+| compressor_pool/commit | 0.2+0.1 | **11.6×** | compressor per-row 🔴 | ✅ comp-engram-v2 已交付（COMPRESSOR_PROJ_MROWS） |
+| quant_kernel | 2.1 | **9.3×** | per-row quant 🔴 | WOB_MROWS_F32（弃用）+ 折叠设计 |
+| sparse_attn_split/merge | 2.8+2.3 | **3.2×** | sparse attn per-row 🔴 | ✅ attn-mrows-tp8 收尾中（TP8 row_pitch） |
+| gemm_fp8_gemv | 15.4(#1) | 1.7× | draft 侧逐行 gemv + verify 并存 | draft-p3-lite-v2（段融合） |
+| gemm_fp8_mrows<5> | 15.2(#2) | — | 52µs avg，M-in-register | ✅ MPAR 已交付（符号未定→NCU 判读） |
+| hc_mixes | 8.0(#4) | swallow-only | 30272 发×51.4µs | hc 链待查 |
+| wo_a_grouped<5> | 4.5 | swallow-only | 57.9µs | WO_PAIR 方向 |
+| gemv_bf16_v1_mrows<5> | 2.5 | swallow-only | **1.36ms/发**×352（head） | head 侧 |
+| AR（reduce/store/stamp） | 8.4 | 1.2× | 正常 ✓（A0 判决一致） | — |
+
+**NCU 补充（m5.ncu-rep，mrows_bench 微基准）**：gemm_fp8_mrows<5/6> 的 **DRAM 0.67-0.79%、Compute 12.8-13%、L1 14.1-14.6%、Occupancy 13.4%、40 regs**——kernel 完全没跑满（latency-bound 特征）⇒ **MPAR（warp 并行 M）符号利好**；m=1 gemv（m4）DRAM 9.1%/L1 44.2% 同样 latency-bound。
+
+**遗留问题**：弃用的四 gate（VERIFY_ROPE/GATE_ROUTE/1b/P3B）覆盖的正是 40×/25× 病灶区——它们"逐位承诺"却改了 accept，**需要找出四者中哪个真的破位**（第五刀单拆），否则 rope/norm 的 per-row 折叠无法安全启用。
 
 **双门禁**：每个优化臂必须同时报告 `step_ms`（[dspark] 分解）**AND** `mean-k`（A0 基线 1.34；掉了 = 数值回归，立即弃用该 gate）。
 
