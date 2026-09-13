@@ -365,7 +365,12 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
                 "@!P bra WAIT;\n\t}"
                 :: "r"((uint32_t)__cvta_generic_to_shared(mma_bar)), "r"(phase));
         }
+        // tcgen05 thread-sync fences (TileLang's pattern): the MMA is an async tcgen05
+        // operation, so ordering its completion with the barrier that lets other threads
+        // overwrite the operand smem requires both fences around the sync.
+        asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
         __syncthreads();
+        asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
         // (7) 下一轮 k-iteration 会覆盖 smem——MMA 已完成，安全
     }
