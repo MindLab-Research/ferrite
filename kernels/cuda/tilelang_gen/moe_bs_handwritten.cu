@@ -198,34 +198,46 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
 
     // ---- K-loop (sequential, no pipeline) ----
     for (int k = 0; k < HW_KITER; ++k) {
-        // (1) 所有线程协同加载 A tile
-        // A[seg*128 + row][k*128 + col] for row,col in [0,128)
+        // (1) 所有线程协同加载 A tile — **CORE MATRIX 布局**（不是 row-major！）
+        // UMMA smem descriptor 期望 core matrix 布局:
+        //   addr(m, k) = (m/8)*1024 + (k/16)*128 + (m%8)*16 + (k%16)
+        // 这是 8行×16B 的 core matrix 顺序排列（m_block 外层，k_block 内层）
         for (int i = tid; i < HW_BM * HW_BK; i += 128) {
-            const int row = i >> 7;
-            const int col = i & 127;
-            A_sh[i] = A[(int64_t)(seg * HW_BM + row) * HW_K + k * HW_BK + col];
+            const int m = i >> 7;  // row [0,128)
+            const int k = i & 127; // col [0,128) — byte index for e4m3
+            const uint8_t val = A[(int64_t)(seg * HW_BM + m) * HW_K + kb * HW_BK + k];
+            // Core matrix layout: (m/8)*1024 + (k/16)*128 + (m%8)*16 + (k%16)
+            A_sh[(m >> 3) * 1024 + (k >> 4) * 128 + (m & 7) * 16 + (k & 15)] = val;
         }
 
         // (2) 所有线程协同加载 B tile (W1 前 64 行 + W3 后 64 行)
         // W1[e][n_tile*64 + row][k*128..k*128+127) — packed fp4，需要 unpack
         // packed: [384, 320, 2560] — expert e 的 W1 面
         // row r 的第 k*128..k*128+127 列 = packed bytes [r*2560 + k*64 .. +64)
+        // (2) 所有线程协同加载 B tile — **CORE MATRIX 布局**（同 A）
+        // B = W1 前 64 行 + W3 后 64 行，unpacked fp4 (1 byte/element)
+        // Core matrix: addr(m, k) = (m/8)*1024 + (k/16)*128 + (m%8)*16 + (k%16)
         for (int i = tid; i < HW_NH * 64; i += 128) {
-            const int row = i >> 6;   // 0-63
+            const int row = i >> 6;   // 0-63 (W1 row)
             const int col = i & 63;   // 0-63 (packed column)
             const uint8_t packed =
                 W1[(int64_t)e * w_stride + (int64_t)(n_tile * HW_NH + row) * 2560 + k * 64 + col];
-            // unpack: low nibble = even element, high nibble = odd element
-            B_sh[row * HW_BK + col * 2]     = packed & 0xF;
-            B_sh[row * HW_BK + col * 2 + 1] = packed >> 4;
+            // unpack to 2 elements, write in core matrix layout
+            const int k0 = col * 2;      // even element K index
+            const int k1 = col * 2 + 1;  // odd element K index
+            B_sh[(row >> 3) * 1024 + (k0 >> 4) * 128 + (row & 7) * 16 + (k0 & 15)] = packed & 0xF;
+            B_sh[(row >> 3) * 1024 + (k1 >> 4) * 128 + (row & 7) * 16 + (k1 & 15)] = packed >> 4;
         }
         for (int i = tid; i < HW_NH * 64; i += 128) {
             const int row = i >> 6;
             const int col = i & 63;
             const uint8_t packed =
                 W3[(int64_t)e * w_stride + (int64_t)(n_tile * HW_NH + row) * 2560 + k * 64 + col];
-            B_sh[(HW_NH + row) * HW_BK + col * 2]     = packed & 0xF;
-            B_sh[(HW_NH + row) * HW_BK + col * 2 + 1] = packed >> 4;
+            const int m = HW_NH + row;  // W3 rows are after W1
+            const int k0 = col * 2;
+            const int k1 = col * 2 + 1;
+            B_sh[(m >> 3) * 1024 + (k0 >> 4) * 128 + (m & 7) * 16 + (k0 & 15)] = packed & 0xF;
+            B_sh[(m >> 3) * 1024 + (k1 >> 4) * 128 + (m & 7) * 16 + (k1 & 15)] = packed >> 4;
         }
 
         // (3) 加载 SF
@@ -259,10 +271,10 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
 
             // MMA: 4 sub-MMAs (ki=0-3, each covers 32 K elements)
             // smem descriptors for A and B tiles
-            // layout=2 (64B swizzle), LBO=1 (16B), SBO=64 (16B units = 1024B)
-            // (与 TileLang kernel 的 initialize_tcgen05_descriptor 参数一致)
-            const uint64_t a_desc_base = hw_make_desc(A_sh, 1, 64, 2);
-            const uint64_t b_desc_base = hw_make_desc(B_sh, 1, 64, 2);
+            // layout=0 (no swizzle), LBO=1 (16B = core matrix row stride), SBO=64 (1024B = 8-row atom stride)
+            // (数据已按 core matrix 布局写入，无需 swizzle)
+            const uint64_t a_desc_base = hw_make_desc(A_sh, 1, 64, 0);  // layout=0 (no swizzle)
+            const uint64_t b_desc_base = hw_make_desc(B_sh, 1, 64, 0);  // layout=0 (no swizzle)
 
             for (int ki = 0; ki < 4; ++ki) {
                 // idesc: M=128, N=128, a_fmt=0 (E4M3), b_fmt=5 (E2M1), sf_id=ki
