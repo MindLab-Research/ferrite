@@ -72,3 +72,17 @@ if [ -f "$HOME/sfdump_check.py" ]; then
 else
   echo "(sfdump_check.py missing)"
 fi
+
+echo "=== assumption-free replay: does the arm's output equal its own staged operands' product? ==="
+if [ -f "$HOME/sfdump_replay.py" ]; then
+  for d in /tmp/sfd_LV_REF; do
+    [ -d "$d" ] || continue
+    for e in "$d/eager" "$d/rows"; do
+      [ -d "$e" ] || continue
+      echo "--- $e"
+      timeout 900 python3 "$HOME/sfdump_replay.py" --sfdump "$d" --gu "$e" 2>&1 | tail -6
+    done
+  done
+else
+  echo "(sfdump_replay.py missing)"
+fi

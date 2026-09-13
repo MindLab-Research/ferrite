@@ -112,13 +112,27 @@ def main():
 
     codes_off = np.zeros(xq4[: DIM].shape, dtype=np.uint8)
     qq = np.clip(xr / s_off[:, None], -448.0, 448.0)
-    flat = e4m3_encode(qq.ravel()).reshape(qq.shape)
-    codes_off[:] = flat.reshape(-1)
+    # Use the OFFICIAL conversion, not a hand-rolled encoder: torch's float8_e4m3fn cast is what
+    # `kernel.py`'s `Cast(float8_e4m3fn, ..)` lowers to. (A hand-rolled RNE encoder here was wrong
+    # in the mantissa field and produced a bogus 51% mismatch — measure with the reference, always.)
+    import torch
+
+    codes_off = (
+        torch.from_numpy(qq.astype(np.float32))
+        .to(torch.float8_e4m3fn)
+        .view(torch.uint8)
+        .numpy()
+        .reshape(xq4[: DIM].shape)
+    )
     our_codes = xq4[: DIM]
     our_s = xsc4[: DIM // 32]
     n_diff_code = int((codes_off != our_codes).sum())
     assert np.all(our_s > 0)
     print(f"[act] official-rule codes vs ferrite xq4: differing bytes = {n_diff_code}/{DIM}")
+    if n_diff_code:
+        idx = np.nonzero(codes_off != our_codes)[0][:8]
+        print("[act] first differing (k, official, ferrite, x):",
+              [(int(i), int(codes_off[i]), int(our_codes[i]), float(xb[i])) for i in idx])
     print(f"[act] official scales (2^n) vs ferrite xsc4: max rel diff = "
           f"{float(np.abs(s_off - our_s).max() / np.abs(our_s).max()):.3g}")
 
