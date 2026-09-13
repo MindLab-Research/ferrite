@@ -1265,3 +1265,18 @@ hw_tc_cp(hw_make_sf_desc(SFB_sh), SF_tmem + 4);   // B 操作数的 SF
 
 ⇒ §44 的候选 ② 里"W3 行错位"这一支也被排除，剩余集中在
 ①A/B tile 的**内容装配**（激活行 / W 行距 / `w_stride` 的实际取值）与 ③朝向/M-N 角色（U 回合在测）。
+
+## §46 排除：MMA 完成的 mbarrier parity（正确）
+
+`moe_bs_handwritten.cu:286-293, 472-481` 实测：
+- init：`mbarrier.init.shared::cta.b64 [mbar], 1`（1 次到达）+ `fence.mbarrier_init.release.cluster` ✓（且在第一道 barrier **之前** ✓）
+- 每轮 k：`if (warp==1) hw_tc_commit(mma_bar)`（一次 commit = 一次到达 ✓）
+- 全体线程：`phase = k & 1` + `mbar_wait(mma_bar, phase)` ✓
+⇒ 每轮翻转一次相位、与到达次数**一一对应** ⇒ **parity 语义正确** ✓（不是"瞬过"型竞态）。
+
+**至此 §44–§46 已排除**：参数面（布局/描述符/idesc/K 递进/enable_d/SF 投递/字节序/词组/粒度）、
+**SF 行对应与角色**、**mbarrier parity**。剩余最可疑的三处（全部在"我们自己的装配细节"）：
+① **A/B tile 的内容装配**（激活行取自哪张表、W 行距 2560 与 `w_stride` 的**实际取值来源**、
+`n_tile*64` 与 W1/W3 半区的对应）；
+② **K 组 `k` 与逐迭代重写 tile 的同步**（我们 k = 0..39，每轮原地重写；SF 的 `k` 必须与 tile 的 `k` 同源）；
+③ **朝向**（U 回合在测；但注意官方 a8b4/a4b8 **两朝向都 PASS** ⇒ 朝向差异必然来自我们自己的 swapAB 实现）。
