@@ -690,11 +690,12 @@ TL_DEVICE void tcgen05mma_blockscaled_ss(uint64_t const & /*desc_a*/,
 }
 
 // FP8 E4M3 block-scaled
-// FIX (2026-09-14): match the VERIFIED hand-written pattern from
-// tests_tcgen05_mxf8f6f4_1x.cu:781-797 — (1) add the .scale_vec::1X suffix
-// (without it the hardware may use a different SF layout → TMEM OOB read →
-// illegal memory access), (2) add the "memory" clobber (without it the
-// compiler may reorder memory ops around the asm, racing with TMA loads).
+// REVERTED (2026-09-14): the .scale_vec::1X + "memory" clobber experiment BROKE
+// the previously-working eager path (all MMAs → illegal instruction). The
+// verified hand-written code's .scale_vec::1X works for ITS data layout, but
+// our production layout (from TileLang codegen) is different. Reverting to the
+// original TileLang template form. The "memory" clobber alone might be safe
+// but reverting both to isolate variables.
 template <>
 TL_DEVICE void tcgen05mma_blockscaled_ss<DataType::kFloat8_e4m3, false>(
     uint64_t const &desc_a, uint64_t const &desc_b, uint32_t const &tmem_c,
@@ -705,13 +706,12 @@ TL_DEVICE void tcgen05mma_blockscaled_ss<DataType::kFloat8_e4m3, false>(
         "{\n\t"
         ".reg .pred p;\n\t"
         "setp.ne.b32 p, %4, 0;\n\t"
-        "tcgen05.mma.cta_group::1.kind::mxf8f6f4.block_scale.scale_vec::1X "
-        "[%0], %1, %2, %3, [%5], [%6], p; \n\t"
+        "tcgen05.mma.cta_group::1.kind::mxf8f6f4.block_scale [%0], %1, %2, "
+        "%3, [%5], [%6], p; \n\t"
         "}\n"
         :
         : "r"(tmem_c), "l"(desc_a), "l"(desc_b), "r"(desc_val), "r"(scalec),
-          "r"(tmem_sfa), "r"(tmem_sfb)
-        : "memory");
+          "r"(tmem_sfa), "r"(tmem_sfb));
   }
 }
 
