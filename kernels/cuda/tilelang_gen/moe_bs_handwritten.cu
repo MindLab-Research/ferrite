@@ -79,6 +79,9 @@ __device__ int g_mbar_ring = 0;
 // arrived exactly once per launch, so its phase is always 0 and the wait needs no parity
 // accounting at all — the most robust option when the shared-barrier accounting desynchronises.
 __device__ int g_mbar_perstage = 0;
+// 1 = zero the D tile via tcgen05.st before the K loop (DSV41_MOE_BS_DCLEAR=1), so a lost/inverted
+// first-MMA accumulator clear can no longer leave foreign TMEM residue in the output.
+__device__ int g_dclear = 0;
 __device__ uint8_t* g_sfdump = nullptr;
 constexpr size_t kSfDumpA = 0;                                  // [36][128][128] u8
 constexpr size_t kSfDumpB = kSfDumpA + 36 * 128 * 128;          // [36][5][128][64] u8
@@ -829,6 +832,20 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
                       ((C_tmem >> 16) & 0x1FFu) != 0u || ((SF_tmem >> 16) & 0x1FFu) != 0u)) {
         printf("[moe-bs-handwritten] BAD TMEM ALLOC C=%08x SF=%08x — D would not be this launch's\n",
                C_tmem, SF_tmem);
+    }
+
+    // DSV41_MOE_BS_DCLEAR=1: zero the D tile through TMEM stores BEFORE the K loop, so "the first
+    // MMA's enable_d=0 clears the accumulator" stops being load-bearing. tcgen05.alloc does NOT zero
+    // TMEM, so if that single clearing MMA is lost (or its predicate inverted), every later MMA
+    // accumulates onto foreign residue — which is exactly a non-zero result with ALL operands zeroed,
+    // plus run-to-run variation (whose residue it is depends on which CTA had the columns before).
+    // Same primitive the isolated instrument uses (tcgen05.st.32x32b.x4), so it is exercised code.
+    if (g_dclear) {
+        for (int i = 0; i < 32; ++i) {
+            hw_tc_st_x4(((uint32_t)(warp * 32) << 16) | (C_tmem + 4 * i), 0u, 0u, 0u, 0u);
+        }
+        hw_tc_wait_st();
+        __syncthreads();
     }
 
     // ---- init mbarrier (1 arrival from tcgen05.commit) ----

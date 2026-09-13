@@ -15,7 +15,7 @@
 set -uo pipefail
 cd "$HOME/ferrite"
 echo "=== build (hash-gated: skips when the .cu content is unchanged) ==="
-bash "$HOME/ensure_built.sh"
+bash "$HOME/ensure_built.sh" || { echo "=== BUILD/ARTEFACT GATE FAILED — aborting before any measurement ==="; exit 1; }
 echo "=== tree ==="; git log --oneline -1
 stat -c "%y %n" kernels/cuda/libferrite_kernels.so target/release/ferrite-serve
 

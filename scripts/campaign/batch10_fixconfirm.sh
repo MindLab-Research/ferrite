@@ -16,7 +16,7 @@ for m in ${MODE//+/ }; do GATE="$GATE DSV41_MOE_BS_$m=1"; done
 echo "=== mode: $MODE  (gate:$GATE) label: $LABEL ==="
 
 echo "=== build (hash-gated: skips when the .cu content is unchanged) ==="
-bash "$HOME/ensure_built.sh"
+bash "$HOME/ensure_built.sh" || { echo "=== BUILD/ARTEFACT GATE FAILED — aborting before any measurement ==="; exit 1; }
 git log --oneline -1
 
 run () {

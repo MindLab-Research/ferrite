@@ -840,6 +840,16 @@ bool tl_bs_init() {
         (void)cudaGetLastError();
         fprintf(stderr, "[moe-bs] per-warp TMEM lane address = %d\n", lw);
     }
+    // g_dclear: zero the D tile via tcgen05.st before the K loop (DSV41_MOE_BS_DCLEAR=1), so a lost
+    // or inverted first-MMA accumulator clear cannot leave foreign TMEM residue in the output.
+    if (ok) {
+        int dc = 0;
+        const char* e = getenv("DSV41_MOE_BS_DCLEAR");
+        if (e != nullptr && e[0] == '1') dc = 1;
+        (void)cudaMemcpyToSymbol(g_dclear, &dc, sizeof(int));
+        (void)cudaGetLastError();
+        fprintf(stderr, "[moe-bs] explicit D clear = %d\n", dc);
+    }
     // g_mbar_ring: 2-entry mbarrier ring for the MMA-completion waits (the official structure)
     // instead of one barrier absorbing all 40 arrivals. DSV41_MOE_BS_MBAR_RING=1.
     if (ok) {

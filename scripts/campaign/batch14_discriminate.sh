@@ -13,7 +13,7 @@
 set -uo pipefail
 cd "$HOME/ferrite"
 echo "=== build (hash-gated) ==="
-bash "$HOME/ensure_built.sh"
+bash "$HOME/ensure_built.sh" || { echo "=== BUILD/ARTEFACT GATE FAILED — aborting before any measurement ==="; exit 1; }
 git log --oneline -1
 nm -D kernels/cuda/libferrite_kernels.so | grep -c "dsv41_moe_bs_gc_ptr" || true
 

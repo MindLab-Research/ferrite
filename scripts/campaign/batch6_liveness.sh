@@ -17,7 +17,7 @@ set -uo pipefail
 cd "$HOME/ferrite"
 
 echo "=== build (hash-gated: skips when the .cu content is unchanged) ==="
-bash "$HOME/ensure_built.sh"
+bash "$HOME/ensure_built.sh" || { echo "=== BUILD/ARTEFACT GATE FAILED — aborting before any measurement ==="; exit 1; }
 
 run () {
   local name="$1"; shift
