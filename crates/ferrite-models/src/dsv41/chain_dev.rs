@@ -17130,6 +17130,14 @@ impl<'a> DevChain<'a> {
             // quantisers); the single gate/up call then reads each row's bytes at
             // arow*dim (e4m3, 1 byte/value) or arow*(dim/2) (fp4) inside the
             // kernel, with the scales at arow*(dim/32) either way.
+            // D1 精度修复（用户裁决 2026-09-14：latent 必须 bf16 不能 fp32）：
+            // 官方 PyTorch 的 FFN 输入是 bf16。eager 路径的 `xn` 有 bf16_snap
+            // （:19102 等 3 处），但 verify 路径的 `xn_r` 从来没有——导致
+            // verify 的激活量化输入精度比官方高（f32 vs bf16），产生不同的
+            // e4m3 值。这就是 m>1 输出乱码的根因。
+            if bf16_truncate() {
+                self.bf16_snap(self.s.xn_r.ptr as *mut f32, m * dim)?;
+            }
             if e4m3 {
                 self.dev.quant_fp8(
                     self.s.xn_r.ptr as *const f32,
