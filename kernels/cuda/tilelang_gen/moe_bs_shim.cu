@@ -277,6 +277,13 @@ uint8_t* g_sfdump_buf = nullptr;   // kSfDumpBytes
 bool g_sfdump_armed = false;
 extern "C" void* dsv41_moe_bs_sfdump_ptr() { return g_sfdump_buf; }
 extern "C" int dsv41_moe_bs_sfdump_bytes() { return (int)kSfDumpBytes; }
+// The MMA's RAW output tile (before the scatter). The caller copies it back exactly like the SFDUMP
+// scratch — deliberately NOT here, because a stream sync inside the shim's decode path is the §119
+// lockstep deadlock class. It splits "the MMA/epilogue produced this" from "the scatter or a stale
+// buffer produced this", which is the one question the ZERO_A anomaly (zeroing the staged A leaves a
+// non-zero output) opened.
+extern "C" void* dsv41_moe_bs_gc_ptr() { return g_c; }
+extern "C" int dsv41_moe_bs_gc_bytes() { return (int)((size_t)kSegCap * kBm * kNup * 4); }
 
 // DSV41_MOE_BS_KEEP_STAGE=<s> (default -1): zero the gathered A bytes outside K in
 // [128s, 128s+128) so the arm's output is that stage's partial. Paired with the oracle's matching

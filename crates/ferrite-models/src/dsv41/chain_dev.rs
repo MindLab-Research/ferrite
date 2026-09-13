@@ -24031,6 +24031,33 @@ fn oracle_tap() -> bool {
                                 eprintln!("[bs-sfdump] {e}");
                             }
                         }
+                        // The MMA's RAW output tile, same run, same policy: this is the value BEFORE
+                        // the scatter, so with the operands zeroed it must be exactly 0 — the probe
+                        // that tells "the MMA produced this" from "the scatter/stale buffer did".
+                        if sfdump_dir().is_some() {
+                            if let Some((ptr, bytes)) = self.dev.moe_bs_gc() {
+                                // segment 0's tile is enough for the zero/non-zero question
+                                let want = (128 * 640 * 4).min(bytes);
+                                let view = Device::view(ptr, want);
+                                let mut buf = vec![0u8; want];
+                                match self.dev.download_u8(&view, &mut buf) {
+                                    Ok(()) => {
+                                        let base = sfdump_dir().unwrap_or_default();
+                                        let p = format!("{base}/eager/gc_seg0.f32");
+                                        match std::fs::write(&p, &buf) {
+                                            Ok(()) => eprintln!(
+                                                "[bs-gc] wrote {want} B to {p} (MMA raw output, \
+                                                 segment 0 tile, before the scatter)"
+                                            ),
+                                            Err(e) => eprintln!("[bs-gc] write {p}: {e}"),
+                                        }
+                                    }
+                                    Err(e) => eprintln!("[bs-gc] read failed: {e}"),
+                                }
+                            } else {
+                                eprintln!("[bs-gc] the .so has no dsv41_moe_bs_gc_ptr/_bytes");
+                            }
+                        }
                     }
                 }
                 self.bf16_snap(

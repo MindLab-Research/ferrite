@@ -1682,6 +1682,10 @@ struct Kernels {
     /// all-reduce), so the shim only allocates and hands out the pointer.
     moe_bs_sfdump_ptr: Option<unsafe extern "C" fn() -> *mut c_void>,
     moe_bs_sfdump_bytes: Option<unsafe extern "C" fn() -> c_int>,
+    /// The MMA's raw output tile accessors (`dsv41_moe_bs_gc_ptr/_bytes`). Same copy-back policy as
+    /// the SFDUMP scratch: Rust-side only, never a sync inside the shim.
+    moe_bs_gc_ptr: Option<unsafe extern "C" fn() -> *mut c_void>,
+    moe_bs_gc_bytes: Option<unsafe extern "C" fn() -> c_int>,
     moe_down_reduce: Option<unsafe extern "C" fn(*const f32, *mut f32, c_int, c_int, CuStream) -> c_int>,
     /// `dsv41_moe_down_reduce_seq` (DSV41_SEQ_ALIGN #5): the same fixed-order sum,
     /// plus the ascending-EXPERT-ID slot permutation when `seq_align != 0`.
@@ -2406,6 +2410,8 @@ impl Device {
             moe_bs_act_e4m3_cap: ko!(rt, "dsv41_moe_bs_act_e4m3_cap"),
             moe_bs_sfdump_ptr: ko!(rt, "dsv41_moe_bs_sfdump_ptr"),
             moe_bs_sfdump_bytes: ko!(rt, "dsv41_moe_bs_sfdump_bytes"),
+            moe_bs_gc_ptr: ko!(rt, "dsv41_moe_bs_gc_ptr"),
+            moe_bs_gc_bytes: ko!(rt, "dsv41_moe_bs_gc_bytes"),
             w2_l2_prewarm: ko!(rt, "dsv41_w2_l2_prewarm"),
             attn_p_dbg_read: ko!(rt, "dsv41_attn_p_dbg_read"),
             swiglu_limit_batched: ko!(rt, "dsv41_swiglu_limit_batched"),
@@ -8445,6 +8451,24 @@ impl Device {
     pub fn moe_bs_sfdump(&self) -> Option<(*mut c_void, usize)> {
         let p = self.kernels.moe_bs_sfdump_ptr?;
         let b = self.kernels.moe_bs_sfdump_bytes?;
+        let ptr = unsafe { p() };
+        let bytes = unsafe { b() } as usize;
+        if ptr.is_null() || bytes == 0 {
+            None
+        } else {
+            Some((ptr, bytes))
+        }
+    }
+
+    /// The MMA's raw output tile (`dsv41_moe_bs_gc_ptr/_bytes`) as `(device ptr, bytes)`, or `None`
+    /// when the `.so` predates the accessors. The CALLER copies it back — a stream sync inside the
+    /// shim's decode path is the §119 lockstep deadlock class.
+    ///
+    /// This is the probe that splits "the MMA/epilogue produced this value" from "the scatter or a
+    /// stale buffer produced it": with every operand zeroed the tile must be exactly zero.
+    pub fn moe_bs_gc(&self) -> Option<(*mut c_void, usize)> {
+        let p = self.kernels.moe_bs_gc_ptr?;
+        let b = self.kernels.moe_bs_gc_bytes?;
         let ptr = unsafe { p() };
         let bytes = unsafe { b() } as usize;
         if ptr.is_null() || bytes == 0 {
