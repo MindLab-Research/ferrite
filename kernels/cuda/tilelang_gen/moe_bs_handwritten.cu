@@ -77,7 +77,7 @@ __device__ __forceinline__ uint32_t hw_make_idesc(int m, int n,
                                                    int a_fmt, int b_fmt,
                                                    int sf_id) {
     uint32_t d = 0;
-    d |= (uint32_t)(sf_id & 3);                        // b_sf_id [4,6)
+    d |= (uint32_t)(sf_id & 3) << 4;                   // b_sf_id [4,6)  ← FIX: was missing <<4
     d |= (uint32_t)(a_fmt & 7) << 7;                   // a_format [7,10) — 0=E4M3
     d |= (uint32_t)(b_fmt & 7) << 10;                  // b_format [10,13) — 5=E2M1
     d |= (uint32_t)((n >> 3) & 63) << 17;              // n_dim [17,23) — N/8
@@ -287,14 +287,9 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
             for (int ki = 0; ki < 4; ++ki) {
                 // idesc: M=128, N=128, a_fmt=0 (E4M3), b_fmt=5 (E2M1), sf_id=ki
                 const uint32_t idesc = hw_make_idesc(HW_BM, HW_BN, 0, 5, ki);
-                // A/B descriptor advance: ki * 32 (raw descriptor units = 16B each → 512B offset)
-                // Descriptor advance per K-block: 256 bytes = 16 units (NOT 32!)
-                // Core matrix layout: each K-block (32 elements) spans 2 K-atoms
-                // = 2 × 128 bytes = 256 bytes = 16 start_address units (16B each).
-                // TileLang uses ki*32 for its TMA+swizzle layout — WRONG for our
-                // core matrix + layout=0. With synthetic data (all same bytes),
-                // this 2× error was invisible. With real data, it reads the
-                // WRONG K-block's data → garbage output.
+                // K-block descriptor advance: TileLang's `desc_a + (ki*32)` where
+                // Tcgen05SMemDescriptor::operator+ does `reg32_[0] += offset >> 4`
+                // (offset in BYTES). So the advance is ki*32 bytes = ki*2 units.
                 const uint64_t a_desc = a_desc_base + (uint64_t)(ki * 2);
                 const uint64_t b_desc = b_desc_base + (uint64_t)(ki * 2);
                 // enable_d: 0 for first MMA (clear accumulator), 1 for rest
