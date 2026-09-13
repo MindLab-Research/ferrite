@@ -3098,3 +3098,27 @@ bash ~/bisect_probe.sh origin/main --restore   # 用完恢复
    只用它跑**单臂诊断**，并观察是否出现 `ar5-hang` 刷屏 + 0 step ✓；
 3. 判据：若某探针开启后出现"**0 个 step + ar5-hang 刷屏**"，**先怀疑探针本身**（§119 的教训），
    而不是先怀疑模型/kernel ✓。
+
+## §121 【配置保真】`arm_run` 的 COMMON 已与"能跑出 48 step 的时代"逐字一致（只少那个探针）
+
+用三个最老备份做**权威核对**（它们是在改动之前生成的 ✓）：
+
+| 文件 | COMMON（截断） |
+|---|---|
+| `/tmp/arm_run.bak`（最老） | `DSV41_EXPERT_ACT_E4M3=1 DSV41_BF16_TRUNCATE=1 DSV41_EXPERT_ILV=0 DSV41_MOE_TILELANG_BS=1 DSV41_MOE_BS_HANDWRITTEN=1 **DSV41_MOE_BS_NUMCHECK=1** $GRAPH_OFF` |
+| `/tmp/arm_run.bak2` | 同上（逐字相同） |
+| `/tmp/arm_run.bak3` | 同上（逐字相同） |
+| **当前 `arm_run.sh`** | 同上，但 **无 `DSV41_MOE_BS_NUMCHECK=1`** ✓ |
+
+⇒ **当前配置 = 已知可跑形态 − 回归嫌疑项（探针）** ✓ —— 这是**最强的保真度**：
+- ✅ 我此前加进去、与老配置不同的两项（`NCCL_NVLS_ENABLE=0`、两个 DSpark 图门钉死）**都已撤掉** ✓
+  （图门钉死本身与"未设置"语义等价 ✓——`verify_graph_want()` 是 `env != "0"` ✓；但撤掉后**零差异**更干净 ✓）
+- ✅ 唯一剩余的差异就是**我已判定为嫌疑的那一个探针** ✓
+⇒ 因此下一轮的结果**具备可解释性**：
+- **若通过** ⇒ 回归确认由该探针造成（§119 定案）✓，且**验证通路首次打通** ✓；
+- **若仍卡** ⇒ 嫌疑转向**代码合并**（SEQ_ALIGN / cpasync / down TU）⇒ 按 §118 实验 B 用
+  `~/bisect_probe.sh 7e54fd25` 二分 ✓。
+
+**另附（F1/P1 时代的 startup 佐证）**：`~/armrun_F1.log` 里 `[sh-gate] startup: SH_EXP_MROWS=false
+SH_PAIR_MROWS=false INDEXER_MROWS=false COMPRESSOR_MROWS=false SH_EXP_TILELANG=false` ⇒
+那一轮确实是"几乎全关"的纯净形态 ✓，与 §§108/117 的结论一致 ✓。
