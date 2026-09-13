@@ -635,6 +635,15 @@ bool tl_bs_init() {
         (void)cudaGetLastError();
         fprintf(stderr, "[moe-bs] scale_vec::1X = %d\n", sv1x);
     }
+    // g_canon: smem layout family (0 = TileLang SW128, 1 = repo canonical interleave)
+    if (ok) {
+        int canon = 0;
+        const char* e = getenv("DSV41_MOE_BS_CANON");
+        if (e != nullptr && e[0] == '1') canon = 1;
+        (void)cudaMemcpyToSymbol(g_canon, &canon, sizeof(int));
+        (void)cudaGetLastError();
+        fprintf(stderr, "[moe-bs] canon layout = %d\n", canon);
+    }
 
     // (b) 常驻 scratch
     if (ok) {
@@ -816,6 +825,11 @@ extern "C" int dsv41_moe_tilelang_gate_up_bs(
 //     capture 内合法），A/SFA/C 的 map 在 INIT 后建一次。
 // 旧入口保留为 A/B 基线：同一 `ARMED` 回执格式，便于逐行对比两条臂。
 // ===========================================================================
+// forward declaration (definition is appended at the end of this file)
+static void tl_bs_numcheck(const uint8_t* xq4, const float* xsc4, const uint8_t* w1,
+                           const uint32_t* sfw1, int e, int token, int64_t w_stride,
+                           const float* g_c, cudaStream_t s);
+
 extern "C" int dsv41_moe_tilelang_gate_up_bs_dev(
     const uint8_t* xq4,      // [rows*topk][dim] u8 —— routed 的 **e4m3** 激活（行距 dim）
     const float* xsc4,       // [rows*topk][dim/32] f32 —— routed 的 per-(row,32) 标度
@@ -1125,6 +1139,28 @@ extern "C" int dsv41_moe_tilelang_gate_up_bs_dev(
             fprintf(stderr, "\n");
         }
     }
+    // NUMCHECK (env DSV41_MOE_BS_NUMCHECK=1, one-shot): compute gate[0..15] for the
+    // first assignment on the HOST with explicit e4m3/e2m1/ue8m0 decoders and compare
+    // against the MMA's g_c[0..15]. This is the decisive numeric probe: it bypasses
+    // the model entirely and answers "is the MMA computing the right numbers given
+    // the right inputs?" with a self-contained reference.
+    {
+        static bool g_nc_done = false;
+        if (!g_nc_done && getenv("DSV41_MOE_BS_NUMCHECK") != nullptr) {
+            cudaStreamCaptureStatus nc_cap = cudaStreamCaptureStatusNone;
+            cudaStreamIsCapturing(s, &nc_cap);
+            if (nc_cap == cudaStreamCaptureStatusNone) {
+                g_nc_done = true;
+                int e0 = 0, o0 = 0;
+                if (cudaMemcpyAsync(&e0, eid_dev, sizeof(int), cudaMemcpyDeviceToHost, s) == cudaSuccess &&
+                    cudaMemcpyAsync(&o0, order_dev, sizeof(int), cudaMemcpyDeviceToHost, s) == cudaSuccess &&
+                    cudaStreamSynchronize(s) == cudaSuccess) {
+                    tl_bs_numcheck(xq4, xsc4, (const uint8_t*)w1, (const uint32_t*)sfw1,
+                                   e0, o0 / (topk > 0 ? topk : 1), w_stride, g_c, s);
+                }
+            }
+        }
+    }
 scatter_launch:
     tl_moe_bs_scatter_kernel<<<dim3((unsigned)kBm, (unsigned)kSegCap), kMovThreads, 0, s>>>(
         g_c, out, order_dev, counts_dev, kNup, topk * kNup, topk, nseg_dev);
@@ -1193,4 +1229,71 @@ extern "C" int dsv41_moe_bs_debug_gather(
     cudaMemcpyAsync(dbg_a_out, g_a + (size_t)(dump_seg * kBm + dump_row) * kDim, kDim, cudaMemcpyDeviceToDevice, s);
     cudaMemcpyAsync(dbg_sfa_out, g_sfa, 4, cudaMemcpyDeviceToDevice, s);
     return 0;
+}
+
+
+// ===========================================================================
+// §9 NUMCHECK — host-side reference for gate[0..15] of the first assignment.
+// Bypasses the model: decodes the SAME bytes the kernel sees (e4m3 activation,
+// e2m1 packed weights, f32 activation scales, ue8m0 weight scales) and compares
+// with the MMA's g_c. Declared before use at the scatter site.
+// ===========================================================================
+static float tl_h_e2m1(unsigned n) {
+    static const float mag[8] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
+    float v = mag[n & 7u];
+    return (n & 8u) ? -v : v;
+}
+static float tl_h_e4m3(unsigned b) {
+    unsigned sgn = (b >> 7) & 1u, ex = (b >> 3) & 0xFu, mn = b & 7u;
+    float v = (ex == 0) ? ldexpf((float)mn, -9) : ldexpf(1.0f + (float)mn / 8.0f, (int)ex - 7);
+    return sgn ? -v : v;
+}
+static double tl_h_ue8m0(unsigned b) { return (b == 0) ? 0.0 : ldexp(1.0, (int)b - 127); }
+
+static void tl_bs_numcheck(const uint8_t* xq4, const float* xsc4, const uint8_t* w1,
+                           const uint32_t* sfw1, int e, int token, int64_t w_stride,
+                           const float* g_c, cudaStream_t s) {
+    static uint8_t h_act[5120];
+    static float h_asc[160];
+    static uint8_t h_w1[16 * 2560];
+    static uint32_t h_sf[40 * 16];
+    static float h_gc[16];
+    if (e < 0 || token < 0) { fprintf(stderr, "[moe-bs][NUMCHECK] bad e/token\n"); return; }
+    if (cudaMemcpy(h_act, xq4 + (size_t)token * 5120, 5120, cudaMemcpyDeviceToHost) != cudaSuccess) return;
+    if (cudaMemcpy(h_asc, xsc4 + (size_t)token * 160, 160 * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) return;
+    if (cudaMemcpy(h_w1, w1 + (size_t)e * (size_t)w_stride, 16 * 2560, cudaMemcpyDeviceToHost) != cudaSuccess) return;
+    for (int k = 0; k < 40; ++k) {
+        if (cudaMemcpy(h_sf + k * 16, sfw1 + (size_t)e * 40 * 320 + (size_t)k * 320,
+                       16 * sizeof(uint32_t), cudaMemcpyDeviceToHost) != cudaSuccess) return;
+    }
+    if (cudaMemcpy(h_gc, g_c, 16 * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) return;
+
+    double ref[16];
+    for (int n = 0; n < 16; ++n) {
+        double acc = 0.0;
+        for (int k = 0; k < 5120; ++k) {
+            const unsigned byte = h_w1[(size_t)n * 2560 + (k >> 1)];
+            const unsigned nib = (k & 1) ? ((byte >> 4) & 0xFu) : (byte & 0xFu);
+            const double a = (double)tl_h_e4m3(h_act[k]);
+            const double sa = (double)h_asc[k / 32];
+            const double w = (double)tl_h_e2m1(nib);
+            const unsigned sfbyte = (h_sf[(k / 128) * 16 + n] >> (((k / 32) & 3) * 8)) & 0xFFu;
+            acc += a * sa * w * tl_h_ue8m0(sfbyte);
+        }
+        ref[n] = acc;
+    }
+    fprintf(stderr, "[moe-bs][NUMCHECK] e=%d token=%d\n", e, token);
+    fprintf(stderr, "[moe-bs][NUMCHECK] ref :");
+    for (int n = 0; n < 8; ++n) fprintf(stderr, " %.4f", ref[n]);
+    fprintf(stderr, "\n[moe-bs][NUMCHECK] mma :");
+    for (int n = 0; n < 8; ++n) fprintf(stderr, " %.4f", (double)h_gc[n]);
+    double worst = 0.0; int wi = -1;
+    for (int n = 0; n < 16; ++n) {
+        double d = fabs(ref[n] - (double)h_gc[n]);
+        double den = fabs(ref[n]) > 1e-6 ? fabs(ref[n]) : 1e-6;
+        double rel = d / den;
+        if (rel > worst) { worst = rel; wi = n; }
+    }
+    fprintf(stderr, "[moe-bs][NUMCHECK] worst rel=%.4g at n=%d  %s\n", worst, wi,
+            worst < 1e-3 ? "MATCH (mma == host reference)" : "MISMATCH (mma != reference)");
 }
