@@ -1873,3 +1873,22 @@ cargo test -p ferrite-models --lib routed_down_prep → 6 passed; 0 failed
   `bf16_rn_is_round_to_nearest_even` ✓、`cpu_reference_uses_the_reference_amax_floor` ✓。
 
 ⇒ 这两门的**语义正确性**在 CPU 上已被独立参考背书；剩下的是 GPU 上的**端到端**对拍（§58 的 DBG 五点回读 + 文本红线）。
+
+## §72 关闭审计的两处 UNKNOWN + 明确剩余的最后一项
+
+### (a) engram 数值路径 —— **关闭**
+官方 `ref_inference/engram.py` 全文**没有任何量化调用**（对 `act_quant|fp4_act_quant|quant|float()|bf16|half()`
+的 grep 零命中）⇒ engram 的数值只经过**常规量化线性层**（`model.py:181-207` 的 `linear()`，即 A1）
+与 n-gram 查表/加和 ⇒ **A1 已对齐即 engram 对齐** ✓（我方 `engram_proj_mrows`/`engram_gather` 用的是同一套
+`dsv41_quant_fp8(block32, round_scale)` ✓）。
+
+### (b) vision —— **不适用（N/A）**
+本战役是**纯文本推理**，不加载 visual 分支 ⇒ vision 的精度面不在范围（`vision_rope_theta` 等仅存在于 config）✓。
+
+### (c) 剩余最后一项：**累加序（≤ulp 级）**
+审计里若干项标为"ALIGNED（乘法结合顺序不同 ⇒ ≤ulp）"或"MISALIGNED（累加序）"——
+即数值**顺序**差异（torch 的归约树 vs 我们的 warp/分块归约）。这类差异是 **≤1 ulp × 项数**量级，
+要"完全对齐"必须复刻官方逐位归约顺序（代价高）。
+**处理**：按用户"完全对齐"的要求，这类项**必须由 GPU 量化其实际影响**（属 NEEDS-GPU N3），
+在逐门转正时用 `wq_check.py` + `[NC]`/DBG 对拍观察是否出现可观测漂移；若只是 ≤ulp 抖动则记录为
+"顺序差、量级 ≤ulp"并保留（不强求逐位）。
