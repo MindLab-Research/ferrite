@@ -562,3 +562,32 @@ shim 的 capture 期 decline 注释记载：tcgen05 路径在 **CUDA graph repla
 "illegal instruction"（直接 launch 同 kernel 却正常）。根因未定。已修的两个内存模型栅栏
 （`fence.proxy.async`、`tcgen05.fence::before/after_thread_sync`）**正是** replay 与直接 launch
 行为差异的常见来源 ⇒ 下一次带 graph 的 e2e 若不再出现该 decline，即为此前的栅栏缺失所致。
+
+## §18 ⚠️ 两个 harness 自身的可信度问题（重大更正）
+
+### (a) 16 组合微基准的 FAIL **不作数**
+它报出：**换 smem 布局（canonical ↔ SW128，写公式与 descriptor 成对换）、换 SF 通道（`tcgen05.cp` ↔ `tcgen05.st`）、
+换 A/B 朝向（`A=E4M3/B=E2M1` ↔ swapAB），D 的误差**逐位相同**（`max|diff|=2.2651e+03`、`relerr=9.2376e+01`、`bad=16384/16384`）。
+**这在物理上不可能**：两套写公式给 smem 的内容必然不同，配套 descriptor 也不同，MMA 读到的地址则必然不同 ⇒ D 必须不同。
+最简解释：**harness 自己的 D 读回/累加器复位在 case 之间没有真正生效**（例如 case 2 读到的仍是 case 1 的 TMEM），
+于是"全 16 组合 FAIL 且逐位一致"只是同一个陈旧 D 被比了 16 次。
+⚠️ 因此 §13 基于该 harness 得出的"非 swapAB 朝向算不出正确乘积"**不能作为定论**（它可能只是同一份陈旧输出）。
+⇒ 判据必须换成**独立于该 harness** 的证据：a) e2e 文本（swapAB 近正确 vs 非 swapAB 乱码，见下）；
+b) 全新、最小化的**冲激响应**探针（`kernels/cuda/tests_bs_impulse.cu`，由 subagent `bs-impulse-probe` 编写并实跑）。
+
+### (b) `e2e` 的信号**仍然有效**（与 harness 无关）
+同一台机器、同一份模型，仅改朝向开关：
+- 非 swapAB（A1/A2/B1/B2）：随机乱码（"3600 720 探头…"、"7 8 9 10 11 12 17 18 24 27…"）
+- **swapAB + canonical：`5 4 3 2 1 6 5 4`（递减连续数字）**；swapAB + SW128：`1 (0) 2 (0kie) 3 (0va)…`
+⇒ 朝向确实改变了 MoE 数值（近正确 vs 随机），**swapAB 明显更接近正确**。
+
+### (c) in-tree "已验证原语"的前提需要重新验证
+`kernels/cuda/tests_tcgen05_mxf8f6f4_1x.cu`（Phase-0 探针，文件注释自称 round-trip VERIFIED）
+在**本机也跑不过它自己的金标准**（subagent official-numeric-parity 实测）。而全树其余实现都是抄它的原语。
+⇒ 要么注释过期、要么环境（nvcc 13.2 / ptxas / driver / sm_103a）变了。
+**它是全树最省时的锚点**：先让它在本机通过，再谈其它。另：官方 TileLang 路径在同一台卡上能复现
+float64 金标准到 bf16 精度（3.8e-3）⇒ 硬件与官方路径没有问题，问题只在我们的 block-scale 取数/SF 部件。
+
+### 已确认为**无需改动**的一项
+激活量化的输出与官方**逐字节一致**（Q2 对拍）；唯一可讨论的是全零块标度的下限语义：
+官方 `max(amax, 1e-4)`（`kernel.py:76`）vs 我们 `max(scale, 1e-30)`（`dsv41_kernels.cu:156`）——仅在字面要求时才需对齐。
