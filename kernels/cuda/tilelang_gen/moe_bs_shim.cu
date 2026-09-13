@@ -1184,6 +1184,9 @@ extern "C" int dsv41_moe_tilelang_gate_up_bs_dev(
     {
         static bool g_nc_done = false;
         if (!g_nc_done && getenv("DSV41_MOE_BS_NUMCHECK") != nullptr) {
+            // entry marker: distinguishes "the block was never reached" from "it was
+            // reached and then returned silently" (e.g. a failed memcpy). One line only.
+            fprintf(stderr, "[NC] entered (capture/guard check next; stream=%p)\n", (void*)s);
             cudaStreamCaptureStatus nc_cap = cudaStreamCaptureStatusNone;
             cudaStreamIsCapturing(s, &nc_cap);
             if (nc_cap == cudaStreamCaptureStatusNone) {
