@@ -190,3 +190,19 @@ W = **原生 fp4 nibble + ue8m0 标度面**（与官方 `fp4_gemm` 完全同格�
 | 3 | **同格式 grouped MoE** | `DSV41_EXPERT_GROUPED=1 DSV41_EXPERT_TCGEN05_E4M3=1` | 6 行共享专家权重的重复读（shared 10.4ms + routed 8.3ms） |
 | 4 | draft 图化 | `DSV41_DRAFT_GRAPH=1` | 草稿段的发射 |
 | 5 | 整步图 | `DSV41_GRAPH_STEP=1`（默认 ON，但 runner 的 `GRAPH_OFF` 会关掉 ⇒ 必须显式覆盖） | decode 侧单行步 |
+
+## 10. 「数字跳跃」的层级判决（`skip-provenance`）与下一步
+
+- 观测来源锁定：`/v1/chat/completions` **无 `stream` 字段** ⇒ 走**非流式**分支 ⇒ 文本是
+  **`decode(all_ids)` 一次性解码**的产物（`api.rs:239-245`）⇒ **不是**增量反分词吞字 ✗。
+- `temperature=0` **是纯 argmax，全仓库无采样代码**（`temperature` 在 HTTP 层只被反序列化、从不读取）✓。
+- **该观测根本没走 spec**（未设 `DSV41_SPEC`）⇒ 所以跳跃**与 spec emit 无关** ✓。
+- ⇒ **判决：最可能的层 = 模型前向数值 / argmax** ⇒ 即在**我那个 eager 配置**下，本该"永远对"的路也跳了 ✗。
+- ⇒ 两个可能：**(a) 我的配置与"old 路"不同**；(b) **当前树里 eager 也坏了（回归）**。
+  而审计指出的**确切差别**是：**`arm_run.sh` 的 `GRAPH_OFF` 关掉了默认 ON 的 `GRAPH_STEP`，并顺带关掉 `ar_v5`** ✗
+  ⇒ **正在跑的 P0（两图显式 ON，`ar_v5` 回正常）就是判定它的臂** ✓（P0 文本若 1..61 干净 ⇒ 跳跃是 `GRAPH_OFF` 造成的 ✓）。
+
+**定位 verify 取值缺陷的原生工具**（用户明确只有 verify 路对 MTP 有意义）：
+- `DSV41_DIFF_EAGER=1`：逐轮重放并报**第一个 mismatch 的 index 与绝对位置**（AGENTS 原文称"定位利器"）✓
+- `DSV41_TOKTRACE=1`：非 spec 路径每步打 `[toktr] ds= pos= tok=`（**直接看 argmax 写下的 id**，零改动）✓
+- 二者已封装进 `scripts/campaign/verify_value_probe.sh`（带 `DSV41_SPEC=1`）✓
