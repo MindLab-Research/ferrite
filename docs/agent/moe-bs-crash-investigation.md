@@ -1518,3 +1518,39 @@ python3 wq_check.py --selftest
 
 ⇒ 这条把文档里"**退化与 EAGER 一致 = 干净**"的判读规则**做成了机械判据**，不再靠人眼判断 ✓。
 **验收流程**（§51 第 2 步）改为：`arm_run` → `wq_check.py --log ... [--eager-file ...]` → `VERDICT` 决定是否继续。
+
+## §56 F 回合结论（修复后 e2e 仍不正确）+ `[NC]` 仪器的分级探针
+
+### F 回合实测（同一构建、5 图门全关、`swapAB` 两朝向）
+| 臂 | 配置 | 输出 | 判读 |
+|---|---|---|---|
+| F1 | `PACKED=1 SWAPAB=1`（canon=0 ⇒ SW128） | `'\n-\t-\t\t\t----------------------------- .\t\t-'` | **仍不正确**（短线/制表符混合） |
+| F2 | `PACKED=1`（canon=0） | `'\n\t\t\t\n\t\t…'` | **仍不正确**（纯制表符） |
+
+**两条关键事实**：
+1. **kernel 语义已精确**（§47 的 relerr=0 是实测）但 **e2e 仍错** ⇒ 缺陷在**接线/取数**，
+   不在 MMA 的 smem 语义里。（且注意：修复**确实改变了输出**——从修复前的"引号+中文混合"
+   变成现在的"短线混合"，说明改动生效了，只是还有第二个缺陷。）
+2. **`[NC]` 仍然 not-entered** ——即便：(a) 5 个图门全关；(b) launcher 确认
+   `env $BASE $COMMON "$@" … ferrite-serve` 把 `DSV41_MOE_BS_NUMCHECK=1` 传进了进程；
+   (c) `ARMED gate_up_bs (**device tables**)` 证明走的是含 NUMCHECK 的那个入口；
+   (d) NUMCHECK 块位于主路径上、在 sync/mma diag 之后。
+   ⇒ **必然有某个提前 `return` 在它之前命中。**
+
+### 本轮的仪器化（一次构建即可定位）
+- `[NC-TRACE] dev entry ENTERED (NUMCHECK env=?/1)`：放在 dev 入口函数体**第一行** ⇒
+  区分"入口根本没被调用"与"调用了但提前返回"。
+- dev 入口内**全部 9 处提前 `return`** 都被包上一次性打印
+  `[NC-TRACE] dev EARLY-RETURN at shim line <L> -><expr>;` ⇒ 无论命中哪个守卫都能直接报出行号。
+- 编译检查通过（`PK9_RC=0`）。
+
+### 已排除（本轮静态核查，勿重查）
+- `w_stride` **不是**硬编码：Rust 从实际指针测量（`w3 - w1`，注释明写 "block layout, not NP*K/2"）
+  并有断言校验（`chain_dev.rs:17029-17089`）✓
+- **W 的 nibble 序**：官方 fp4 打包用 torch 的 sub-byte 约定（`convert.py:181` 的
+  `.view(torch.float4_e2m1fn_x2)`）+ `kernel.py:131-181` 的 `fp4_quant_kernel`（`fp4_max=6.0`，
+  `T.clamp(x/s, ±6)` → `T.Cast(FP4, …)`）⇒ **低 nibble = 偶元素**，与我们"源字节原样写入"一致 ✓
+- **A 侧取数**：`GATHER-DIAG` 证实 `g_a[0..15] == xq4[0..15]` ✓（至少首 16 元素）
+- **容器与 K-block 的一致性**（自洽推演）：一个 16 B 容器 = 8 packed 字节 = **16 个元素** ⇒
+  32 元素的 K-block = **2 个容器** = 32 B ⇒ 与描述符 `ki*32 B` 递进**完全自洽** ✓；
+  一行 64 packed 字节 = 8 容器 = 128 元素 ✓ ⇒ footprint 128 B ✓（与 §47/§48 一致 ✓）
