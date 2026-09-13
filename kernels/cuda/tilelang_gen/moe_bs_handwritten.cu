@@ -297,9 +297,10 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
         // W1[e][n_tile*64 + row][k*128..k*128+127) — packed fp4，需要 unpack
         // packed: [384, 320, 2560] — expert e 的 W1 面
         // row r 的第 k*128..k*128+127 列 = packed bytes [r*2560 + k*64 .. +64)
-        // (2) 所有线程协同加载 B tile — **CORE MATRIX 布局**（同 A）
-        // B = W1 前 64 行 + W3 后 64 行，unpacked fp4 (1 byte/element)
-        // Core matrix: addr(m, k) = (m/8)*1024 + (k/16)*128 + (m%8)*16 + (k%16)
+        // (2) 所有线程协同加载 fp4 操作数（= W1 前 64 行 + W3 后 64 行）
+        //     门控 OFF：unpacked 1 字节/元素（**实测是错的**——硬件按 packed 读，见 §29），
+        //     门控 DSV41_MOE_BS_PACKED=1：整字节写入（2 元素/字节），几何见 hw_pack_idx
+        // B = W1 前 64 行 + W3 后 64 行
         for (int i = tid; i < HW_NH * 64; i += 128) {
             const int row = i >> 6;   // 0-63 (W1 row)
             const int col = i & 63;   // 0-63 (packed column)
