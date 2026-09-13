@@ -58,10 +58,6 @@ __device__ int g_sfrev = 0;
 // lbo=1 (16 B) / sbo=64 (1024 B) / layout_type=2 (SWIZZLE_128B). See
 // docs/agent/moe-bs-crash-investigation.md §29-§31.
 __device__ int g_sfst = 0;     // 1 = deliver the SF with tcgen05.st (isolated-instrument path)
-// 1 = keep the TileLang copy's `^ (lane>>3)` XOR in the pre-UTCCP transpose. DEFAULT 0 (no XOR),
-// which is DeepGEMM's shape (`out[lane*4+j] = in[j*32+lane]`) — the only external, production
-// implementation of this exact chain on this hardware. Escape hatch: DSV41_MOE_BS_SFXOR=1.
-__device__ int g_sfxor = 0;
 __device__ int g_ldw = 1;      // 1 (DEFAULT) = read D with the per-warp TMEM lane address, which
                                // PTX ISA 9.7.18.1.1 + CUTLASS + Triton all require (the address's
                                // lane field is an ABSOLUTE lane coordinate and a warp may only
@@ -248,6 +244,13 @@ __device__ __forceinline__ uint32_t hw_make_idesc(int m, int n,
 }
 
 // SF 转置（从 TileLang tcgen05_sf_warp_transpose 复制——4×32 uint32 块内转置）
+//
+// ⚠️ 这里的 `^ (lane >> 3)` 出现**两次**（读一次、写一次）⇒ 两次抵消：
+//     post[lane*4 + (i^(l>>3))] = pre[(i^(l>>3))*32 + lane]
+//   ⇒ 令 j = i^(l>>3)，即 post[lane*4 + j] = pre[j*32 + lane]
+//   ⇒ **与 DeepGEMM 的 `utccp_required_smem_warp_transpose`（无 XOR）逐点等价** ✓
+//     （DeepGEMM = SGLang 在 SM100/103 跑同款模型的生产实现，`sm100_fp8_fp4_gemm_1d1d.cuh`。）
+//   ⇒ 曾经据"抄来的多了一个 XOR"判它是缺陷是**误读**：只删一处 XOR 才会破坏对称 ✗。本条已排除。
 __device__ __forceinline__ void hw_sf_transpose(uint32_t *smem_ptr) {
     const uint32_t lane = threadIdx.x % 32;
     uint32_t values[4];

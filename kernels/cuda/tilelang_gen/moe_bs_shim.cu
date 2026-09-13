@@ -758,18 +758,6 @@ bool tl_bs_init() {
         (void)cudaGetLastError();
         fprintf(stderr, "[moe-bs] per-warp TMEM lane address = %d\n", lw);
     }
-    // g_sfxor: keep the TileLang copy's `^ (lane>>3)` XOR in the pre-UTCCP SF transpose.
-    // DEFAULT 0 = DeepGEMM's shape (`out[lane*4+j] = in[j*32+lane]`), the only external production
-    // implementation of this chain on this hardware; the XOR moved the 4 K-block scales of 3/4 of
-    // the rows onto each other.
-    if (ok) {
-        int sx = 0;
-        const char* e = getenv("DSV41_MOE_BS_SFXOR");
-        if (e != nullptr && e[0] == '1') sx = 1;
-        (void)cudaMemcpyToSymbol(g_sfxor, &sx, sizeof(int));
-        (void)cudaGetLastError();
-        fprintf(stderr, "[moe-bs] SF transpose XOR = %d (0 = DeepGEMM shape)\n", sx);
-    }
     // g_sfst: SF→TMEM delivery path (0 = production transpose+tcgen05.cp, 1 = the isolated
     // instrument's tcgen05.st register path). The production chain has never been validated
     // on its own; this gate decides whether it is the defect.
