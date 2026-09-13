@@ -1432,3 +1432,29 @@ F 回合 = 修复落地后的两条 e2e 臂（`~/arm_run.sh`，5 图门全关）
 2. **正确性验收**：`~/verify_correct.sh`（1..100 前 61 行 + 拉丁探针 + step p50）+ EAGER 对照 + 无重复/无乱码
    （新脚本 `~/wq_check.py` 由 subagent `wq-accept-checker` 交付后接入）。
 3. **全 gate 回归 + push400**：`~/push400_hw_test.sh`（真实 p50 与红线）。
+
+## §52 性能路线图（subagent `perf-roadmap-400`）的三条关键结论 + 一条口径裁决
+
+### (1) 【主 agent 裁决】`step ≈ 8.87ms / ~112 tok/s` 是 **plain m=1 decode 步时**，不是 MTP 步时 ✓
+证据：本次会话所有 e2e 臂都**没有**开 `DSV41_SPEC`（spec/MTP 路径未激活），而 `[dsv41] step pos=` 行
+正是 plain decode 的步时口径。roadmap 独立地做了同一判断（它指出"MTP step 的现有口径是 28.5–31.3ms"，
+而 8.87ms 与 `roadmap-200-tokps.md §2` 的"9.0ms → ~112 tok/s"完全吻合）。
+⇒ **因此 8.87ms 就是性能模型里的 `eager(1)` 项**（即用户口中的 "eager 6.3ms" 的当前值）。
+
+### (2) 【最重要量化发现】440/400 的算术**是紧的**：只"照抄 eager 优化 + 摊薄"**不够**
+按 `mtp-verify-amortization-model §1`：`step ≈ verify(m) + draft + commit ≈ eager(1)+ε + 1.5~2 + 0.4`。
+取 `eager(1) = 8.87ms` ⇒ **即使摊薄 100% 兑现，step ≈ 10.8ms > 9.8ms 门槛**。
+⇒ **必须靠 tilelang/mma 把 `verify` 压到 *低于* "自私单行"的水平**（或把 draft 折进 verify 的第 0 行）。
+这正说明 **MoE BS（fp4 blockscaled / tcgen05）臂是 400 的必经之路**——它把 routed experts 的 8.30ms 压下去，
+而 routed 族是 breakdown 里第二大项（§52 表 A：8.30ms / 22.2%，且字节不可压、只能靠核效率）。
+
+### (3) 三个正确性阻塞项互相独立（都是 400 的头部杠杆）
+① **MoE BS fp4 blockscaled 臂**（本文件）② **TileLang 投影臂**（`tl-garbage-verdict`：5 条根因已定位，
+修复 `98f50e8` 已推，**双挂 e2e 未重编**）③ **MoE grouped SIMT A′**（`g1-moe-expert-union-verdict §3`：
+零布局、逐位等价、**未上机**）。⇒ 正确性一解决，这三条可并行推进。
+
+### 附带纪律（roadmap 提醒，与本文件 §42 同类）
+**票面必须用 nsys 占比算，不能用"每层节省 × 40"这类代数**：实测五 gate 只兑现 −0.6ms，
+而票面远高于此（best1 −1.14 / best2 −2.98 / MPAR 二连败）。已判死清单见 roadmap（MPAR、⑤a L2 直读、
+proj-mma、p3lite+ALIGN、GROUPED 系列、launch 税、M-tile 调参、bf16 dequant 显存、MROWS_FOLD_R/AR_STORE_FUSE/AR_SINGLE_POLL）
+——**勿再投入**。
