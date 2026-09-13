@@ -223,10 +223,14 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
             const uint8_t packed =
                 W1[(int64_t)e * w_stride + (int64_t)(n_tile * HW_NH + row) * 2560 + k * 64 + col];
             // unpack to 2 elements, write in core matrix layout
-            const int k0 = col * 2;      // even element K index
-            const int k1 = col * 2 + 1;  // odd element K index
-            B_sh[(row >> 3) * 1024 + (k0 >> 4) * 128 + (row & 7) * 16 + (k0 & 15)] = packed & 0xF;
-            B_sh[(row >> 3) * 1024 + (k1 >> 4) * 128 + (row & 7) * 16 + (k1 & 15)] = packed >> 4;
+            // NIBBLE ORDER FIX (2026-09-14): PyTorch float4_e2m1fn_x2 convention is
+            // HIGH nibble = FIRST element (lower K index), LOW nibble = SECOND.
+            // Our previous unpacking had them SWAPPED (low=first), which caused
+            // every pair of FP4 weight values to be reversed → garbage output.
+            const int k0 = col * 2;      // first element K index
+            const int k1 = col * 2 + 1;  // second element K index
+            B_sh[(row >> 3) * 1024 + (k0 >> 4) * 128 + (row & 7) * 16 + (k0 & 15)] = packed >> 4;
+            B_sh[(row >> 3) * 1024 + (k1 >> 4) * 128 + (row & 7) * 16 + (k1 & 15)] = packed & 0xF;
         }
         for (int i = tid; i < HW_NH * 64; i += 128) {
             const int row = i >> 6;
