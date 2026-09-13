@@ -792,6 +792,17 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
     const uint32_t C_tmem = hw_C_tmem;
     const uint32_t SF_tmem = hw_SF_tmem;
+    // `tcgen05.alloc` leaves TMEM UNINITIALISED and its result was never inspected. A failed or
+    // unexpected allocation therefore makes the epilogue read columns THIS LAUNCH NEVER WROTE — i.e.
+    // the residue of whatever previously ran on this SM — which explains the two live anomalies
+    // better than any other mechanism (identical inputs but different outputs; and a NON-zero result
+    // with every operand zeroed, since zeroing the operands cannot change foreign TMEM). A fresh
+    // allocation must have lane field 0 and a non-zero column base.
+    if (warp == 0 && (C_tmem == 0u || SF_tmem == 0u ||
+                      ((C_tmem >> 16) & 0x1FFu) != 0u || ((SF_tmem >> 16) & 0x1FFu) != 0u)) {
+        printf("[moe-bs-handwritten] BAD TMEM ALLOC C=%08x SF=%08x — D would not be this launch's\n",
+               C_tmem, SF_tmem);
+    }
 
     // ---- init mbarrier (1 arrival from tcgen05.commit) ----
     if (tid == 0) {
