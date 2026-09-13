@@ -1382,9 +1382,10 @@ pub(crate) fn routed_down_quant() -> bool {
     })
 }
 
-/// `DSV41_GATEUP_DUMP=<path>` (default unset) dumps the routed gate/up arm's RAW output
-/// (`[topk][act_slot]` f32, little-endian) once, at the first `moe()` call of the eager
-/// path — the A/B numeric comparator for the block-scaled arm (see the dump site).
+/// `DSV41_GATEUP_DUMP=<dir>` (default unset) arms the one-shot routed gate/up dump: the raw arm
+/// output plus the inputs that produced it, written as `<dir>/{gateup.f32,x.f32,xq4.u8,xsc4.f32,
+/// ids.i32,w.f32}`, all little-endian and headerless. Diagnostic only (a blocking D2H on the
+/// decode path), so it must never be set in a performance or capture arm.
 pub(crate) fn gateup_dump_path() -> Option<String> {
     static P: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     P.get_or_init(|| {
@@ -17903,6 +17904,64 @@ impl<'a> DevChain<'a> {
             .collect())
     }
 
+    /// `DSV41_GATEUP_DUMP=<dir>` (opt-in, one-shot): write the routed gate/up arm's RAW output
+    /// plus the inputs that produced it — `gateup.f32` (`[m][topk][act_slot]` f32), `x.f32`
+    /// (`[m][dim]` f32), `xq4.u8`, `xsc4.f32`, `ids.i32`, `w.f32` — all little-endian, headerless.
+    ///
+    /// Called from BOTH the single-row ([`Self::moe`]) and the multi-row ([`Self::moe_rows`]) arm
+    /// with THAT path's buffers, behind ONE process-wide latch, so the FIRST MoE call of a run
+    /// wins. That is deliberate and load-bearing: the first call is layer 0 of the first step,
+    /// whose input is derived from the embedding alone, so two different arms are guaranteed to
+    /// see byte-identical inputs there. Dumping at the first *decode* call instead is unsound if
+    /// the arm under test also runs during prefill — the two runs' hidden states would already
+    /// differ by then, and the A/B would silently compare different inputs (the "same magnitude,
+    /// uncorrelated" signature looks identical either way).
+    ///
+    /// Diagnostic only: a blocking D2H on the decode path, same hazard class as
+    /// `DSV41_MOE_BS_TABLE_DUMP`, so never set it in a performance or capture arm.
+    #[allow(clippy::too_many_arguments)]
+    fn gateup_dump_once(
+        &self,
+        act: *mut f32,
+        m: usize,
+        topk: usize,
+        act_slot: i64,
+        x: *mut f32,
+        xq4: *mut u8,
+        xsc4: *mut f32,
+        ids: *mut i32,
+        rw: *mut f32,
+        dim: usize,
+    ) {
+        let Some(dir) = gateup_dump_path() else {
+            return;
+        };
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            eprintln!("[gateup-dump] mkdir {dir}: {e}");
+        }
+        let jobs: [(&str, *mut c_void, usize, usize); 6] = [
+            ("gateup.f32", act as *mut c_void, m * topk * act_slot as usize, 4),
+            ("x.f32", x as *mut c_void, m * dim, 4),
+            ("xq4.u8", xq4 as *mut c_void, m * dim, 1),
+            ("xsc4.f32", xsc4 as *mut c_void, m * (dim / 32) + 8, 4),
+            ("ids.i32", ids as *mut c_void, m * topk, 4),
+            ("w.f32", rw as *mut c_void, m * topk, 4),
+        ];
+        for (name, ptr, count, esz) in jobs {
+            let path = format!("{dir}/{name}");
+            let view = Device::view(ptr, count * esz);
+            let mut bytes = vec![0u8; count * esz];
+            match self.dev.download_u8(&view, &mut bytes) {
+                Ok(()) => match std::fs::write(&path, &bytes) {
+                    Ok(()) => eprintln!("[gateup-dump] {path}: {count} x {esz}B"),
+                    Err(e) => eprintln!("[gateup-dump] write {path}: {e}"),
+                },
+                Err(e) => eprintln!("[gateup-dump] read {name}: {e}"),
+            }
+        }
+        eprintln!("[gateup-dump] done (m={m} topk={topk} act_slot={act_slot} dim={dim})");
+    }
+
     /// `DSV41_MOE_TL_HOST_ALIGN=1` diagnostic: rebuild the tables on the host and
     /// memcmp them against the device ones. A difference is an ERROR — the whole
     /// device arm rests on the two being bit-identical, so reporting one and
@@ -18859,7 +18918,27 @@ impl<'a> DevChain<'a> {
                     e4m3 as i32,
                 )?;
             }
-            // The separate swiglu pass is element-wise and row-local, and its
+            // `DSV41_GATEUP_DUMP` (opt-in, one-shot): same instrument as the single-row arm,
+            // same process-wide latch, called with THIS path's buffers. The first MoE call of a
+            // run is layer 0 of the first step, whose input is embed-derived — the only point
+            // where two different arms are guaranteed to see byte-identical inputs.
+            {
+                static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                if ONCE.set(()).is_ok() {
+                    self.gateup_dump_once(
+                        self.s.ex_act_r.ptr as *mut f32,
+                        m,
+                        topk,
+                        act_slot as i64,
+                        self.s.xn_r.ptr as *mut f32,
+                        self.s.xq4_r.ptr as *mut u8,
+                        self.s.xsc4_r.ptr as *mut f32,
+                        self.s.route_idx_r.ptr as *mut i32,
+                        self.s.route_w_r.ptr as *mut f32,
+                        dim,
+                    );
+                }
+            }            // The separate swiglu pass is element-wise and row-local, and its
             // kernel walks the SAME [rows][slot][slot_stride] layout
             // (`base + (blockIdx.z*gridDim.y + blockIdx.y)*slot_stride`), so the
             // m-row loop collapses into one rows=m launch with no order
@@ -23840,64 +23919,18 @@ fn oracle_tap() -> bool {
                 {
                     static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
                     if ONCE.set(()).is_ok() {
-                        if let Some(dir) = gateup_dump_path() {
-                            let n = topk * act_slot as usize;
-                            let mut sets: Vec<(&str, usize, usize)> = vec![
-                                // (file, element count, element size in bytes)
-                                ("gateup.f32", n, 4),
-                                ("x.f32", dim, 4),
-                                ("xq4.u8", dim, 1),
-                                ("xsc4.f32", dim / 32 + 8, 4),
-                            ];
-                            if let Ok(d) = std::fs::create_dir_all(&dir) {
-                                let _ = d;
-                            }
-                            for (name, count, esz) in sets.drain(..) {
-                                let path = format!("{dir}/{name}");
-                                let view = Device::view(
-                                    match name {
-                                        "gateup.f32" => self.s.ex_act_b.ptr,
-                                        "x.f32" => self.s.xn.ptr,
-                                        "xq4.u8" => self.s.xq4.ptr,
-                                        _ => self.s.xsc4.ptr,
-                                    },
-                                    count * esz,
-                                );
-                                let mut bytes = vec![0u8; count * esz];
-                                match self.dev.download_u8(&view, &mut bytes) {
-                                    Ok(()) => match std::fs::write(&path, &bytes) {
-                                        Ok(()) => eprintln!(
-                                            "[gateup-dump] {path}: {count} x {esz}B"
-                                        ),
-                                        Err(e) => eprintln!("[gateup-dump] write {path}: {e}"),
-                                    },
-                                    Err(e) => eprintln!("[gateup-dump] read {name}: {e}"),
-                                }
-                            }
-                            for (name, count, esz) in [
-                                ("ids.i32", topk, 4usize),
-                                ("w.f32", topk, 4usize),
-                            ] {
-                                let path = format!("{dir}/{name}");
-                                let ptr = if name == "ids.i32" {
-                                    self.s.route_idx.ptr
-                                } else {
-                                    self.s.route_w.ptr
-                                };
-                                let view = Device::view(ptr, count * esz);
-                                let mut bytes = vec![0u8; count * esz];
-                                match self.dev.download_u8(&view, &mut bytes) {
-                                    Ok(()) => {
-                                        let _ = std::fs::write(&path, &bytes);
-                                        eprintln!("[gateup-dump] {path}: {count} x {esz}B");
-                                    }
-                                    Err(e) => eprintln!("[gateup-dump] read {name}: {e}"),
-                                }
-                            }
-                            eprintln!(
-                                "[gateup-dump] done (topk={topk} act_slot={act_slot} dim={dim})"
-                            );
-                        }
+                        self.gateup_dump_once(
+                            self.s.ex_act_b.ptr as *mut f32,
+                            1,
+                            topk,
+                            act_slot,
+                            self.s.xn.ptr as *mut f32,
+                            self.s.xq4.ptr as *mut u8,
+                            self.s.xsc4.ptr as *mut f32,
+                            self.s.route_idx.ptr as *mut i32,
+                            self.s.route_w.ptr as *mut f32,
+                            dim,
+                        );
                     }
                 }
                 self.bf16_snap(
