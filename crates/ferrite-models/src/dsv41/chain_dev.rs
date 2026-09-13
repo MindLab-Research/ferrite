@@ -4995,6 +4995,14 @@ fn hc_tail_split() -> bool {
                         ids,
                         slot as i32,
                     )?;
+                    // op-level diagnostic: s.o after THIS slot's down — kind
+                    // 14+slot — locating the first exploding slot in the
+                    // e4m3-vs-e2m1 bisection.
+                    if layer == 0 {
+                        if let Ok(xdp) = std::env::var("DSV41_GT_XDUMP") {
+                            self.gt_dump_vec(&xdp, (14 + slot) as u64, self.s.o.ptr, 32)?;
+                        }
+                    }
                 }
             }
         }
