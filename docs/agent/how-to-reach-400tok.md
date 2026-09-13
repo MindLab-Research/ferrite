@@ -311,3 +311,26 @@ curl -sS --noproxy '*' https://mint-alpha.macaron.xin/v1/chat/completions \
 `N=30/40`（pos_max ≈ 35+80=115 < 128）**干净** ⇒ 边界坐实 ✓；**照样有缺口** ⇒ 边界不是病因 ✗，
 改走确定性二分 `~/gap_bisect.sh`（已备，单次运行即可判 ✓）。
 
+## 16. ⚠️ 「陈旧产物」类陷阱——第三次发作，且它可能**颠倒**了整条回归结论
+
+**这次的形态**：被停掉的 bisect 只做 `git checkout <commit> -- kernels crates`（**部分检出** ✗）。
+把它恢复成 `origin/main` 之后，`~/ensure_built.sh` 依据自己的 **`.cu` 内容哈希戳**判断"内核源码未变 ⇒
+跳过 `build.sh`" ✓，但 **`.so` 仍是那个中间提交编出来的** ✗ ⇒ `cargo build` 直接失败：
+`error: failed to run custom build command for ferrite-kernel`（`CARGO_RC=101`）——
+**`build.rs` 门禁发现不同源并拒绝** ✓（门禁是对的；`ensure_built.sh` 的判断是错的 ✗）。
+
+**前两次同族**：① 我误加 `touch` 强制全量重编；② `build.sh` 曾静默跳过变了的 shim；③ 中断构建留下
+"只重编了 `.so`、cargo 没跑" ⇒ 引擎 `kernel build-id mismatch — REFUSING TO START`。
+
+**⇒ 关键含义（可能颠倒结论）**：如果**今天那几次"对不上金标准"的臂**用到了**不同源**的产物 ✗，
+那么"gate|up 回归"就**不是代码回归**，而是**测量被污染** ✗✗ —— 用户问的"之前正常是不是幻觉"，
+答案很可能是**反过来**：**今天显得"坏"才是幻觉** ✓。
+
+**⇒ 根治（三条，缺一不可）**：
+1. `ensure_built.sh` 在**跳过** `build.sh` 之前，必须跑 `check_artifacts.sh`（**三源 build-id 比对**：
+   `.so` / 二进制 / `kernels/cuda/.build_id`）⇒ 不一致就**强制** `build.sh`（而不是只信自己的戳 ✗）。
+2. 任何 `git checkout <rev> -- kernels crates` 之后**强制** `build.sh`（bisect 脚本里做 ✓）。
+3. `build.sh` 判断单个 TU 是否需重编时，一律用**内容哈希**，不用 mtime。
+
+**⇒ 判据（廉价）**：故意把 `.so` 换成旧的 ⇒ `ensure_built.sh` 必须**响亮失败并重编**，而不是报 "unchanged, skipping"。
+
