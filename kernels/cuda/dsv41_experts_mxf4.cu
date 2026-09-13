@@ -3655,8 +3655,12 @@ extern "C" int dsv41_expert_gate_up_fp4_batched(
             const dim3 ggrid((unsigned)(n_total + kGtRows - 1) / kGtRows, 1u,
                              (unsigned)n_assign_l);
             const cudaError_t gle = dsv41_experts_pdl_or_plain(
-                expert_gemv_fp4_gate_up_grouped_kernel, ggrid, dim3(256), gt_smem, stream, nullptr,
-                0, a, a_scale, out, out_slot_stride, n_total, dim, dsv41_sf_pitch(dim), inter, 1,
+                expert_gemv_fp4_gate_up_grouped_kernel, ggrid, dim3(256), gt_smem, stream,
+                // NOTE the full argument list: cudaLaunchKernelEx does not apply
+                // the kernel's declared parameter types, so every slot is spelled
+                // out. This kernel (unlike the batched one) has no leading
+                // (a_f32, act_stride) pair: its A side is always the quantised row.
+                a, a_scale, out, out_slot_stride, n_total, dim, dsv41_sf_pitch(dim), inter, 1,
                 limit, w1_base, w1_stride, w1s_base, w1s_stride, w3_base, w3_stride, w3s_base,
                 w3s_stride, ids, slots, g_expert_fp4_mode, act_e4m3);
             if (gle != cudaSuccess) {
