@@ -3856,6 +3856,24 @@ SGLang 侧的实现路径（供性能/精度对照）：DeepGEMM `fp8_fp4_gemm_n
    `other_parity_ready=1` / both-not-ready 计数 ⇒ **直接量出失步** ✓；
 4. `KEEP_STAGE=0/1/17/39` × oracle 40 段偏积 ⇒ 定位"哪一 stage 的数据被用错"（若仍有残余错）。
 
+## §146 🏁【机制确证】BS 臂存在**竞争**（两条独立测量，CPU 可复算）
+
+| 测量 | 方法与结果 | 含义 |
+|---|---|---|
+| **① 非确定性** | 同配置（同为 BS 臂默认、含 LDW 修复）两次运行：`/tmp/gu_in_GD4_BS/gateup.f32` vs `/tmp/lv_REF/eager/gateup.f32` ⇒ `identical=False, max\|d\|=8.54`；而**两次运行的输入**（`x.f32`/`ids.i32`/`xq4.u8`/`xsc4.f32`）**逐字节完全相同** ✓ | **输入无随机性 ⇒ 非确定性来自 kernel 本身 = 存在竞争** ✓✓ |
+| **② ZERO_A 活性** | `DSV41_MOE_BS_ZERO_A=1`（把 **gather 写入的 `g_a`**——device 路径 A 操作数的真实缓冲（`moe_bs_shim.cu:977-978` ⇒ `tl_moe_bs_gather_kernel(..., g_a, ...)`）——整块置 0）⇒ 输出 **`max\|.\|=0.248`、3456/3840 非零** ✗ | **MMA 没有在消费"刚 staged 的 A"** ⇒ 它在读**上一 stage 残留的 smem** ✓✓（若 A 真被消费，输出必须恒为 0） |
+
+⇒ 两条证据同指：**异步 MMA 仍在读操作数 smem 时，loader 已把它覆写 ⇒ mbarrier 保护失效** ⇒
+输出 = **跨 stage 混合**（量级对 ✓ + 逐元素不相关 ✓ + 非置换 ✓）⇒ 与 §145 的指纹推导**逐项吻合** ✓✓，
+也与 E6（到达缺失导致 hang）相容 ✓。
+
+**判据链**：oracle 判"确定性偏离官方"（corr 0.04）→ 输入同一而输出不同（竞争）→ ZERO_A 非零（竞争确实发生在
+**操作数 smem** 上）⇒ **不必再找别的类别** ✓。
+
+**修复与验证**：`DSV41_MOE_BS_MBAR_RING=1`（§145，官方 DeepSeek/DeepGEMM 的 `consumed[k%3]` 同构）——
+若 `KS_RING` 臂与官方 oracle `corr≈1 / medrel≈0` ⇒ **修好** ✓；若仍不对，按 `mbar-protocol-audit` 的
+兜底方案（3 项 ring / 每 stage 专用 barrier / 超时后不写 C）继续 ✓。
+
 ⇒ 误差**只在算术内部**：K 元素配对 / 标度归属 / 逐元素映射中有一处不对，且它必须同时解释
 "量级对 + 逐元素不相关 + 非置换 + 非换 expert"。**下一判据 = `DSV41_MOE_BS_SFDUMP` 内容校验（`sfdump_check.py`）
 + 去假设 replay（`sfdump_replay.py`：输出是否等于"它自己 staged 的数据"的积）** ⇒ 分流"内容错" vs "使用错" ✓。
