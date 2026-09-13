@@ -98,18 +98,18 @@ template <typename T> struct PrintTraits<T *> {
   }
 };
 
-template <typename T> __device__ void debug_print_var(const char *msg, T var) {
+template <typename T> inline __device__ void debug_print_var(const char *msg, T var) {
   PrintTraits<T>::print_var(msg, var);
 }
 
 template <typename T>
-__device__ void debug_print_buffer_value(const char *msg, const char *buf_name,
+inline __device__ void debug_print_buffer_value(const char *msg, const char *buf_name,
                                          int index, T var) {
   PrintTraits<T>::print_buffer(msg, buf_name, index, var);
 }
 
 template <>
-__device__ void debug_print_buffer_value<uint16_t>(const char *msg,
+inline __device__ void debug_print_buffer_value<uint16_t>(const char *msg,
                                                    const char *buf_name,
                                                    int index, uint16_t var) {
   printf("msg='%s' BlockIdx=(%d, %d, %d), ThreadIdx=(%d, %d, %d): buffer=%s, "

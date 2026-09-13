@@ -1682,6 +1682,28 @@ fn proj_tilelang_skipped_note() {
     });
 }
 
+/// One-shot receipt for the PHASE-2 projection arms (wq_a / wq_b / wo_b / wo_a),
+/// same trap and same discipline as [`proj_tilelang_skipped_note`]: the gate is
+/// armed but NONE of the phase-2 shims is present in the `.so`, so those sites
+/// silently measure the OLD programs.
+///
+/// A shape the C entry DECLINES is NORMAL and silent (each dump bakes one shape):
+/// the wq_b indexer site (`out_stride == n`, but the dump's OS is `nh*hd`), the
+/// wo_a variant mismatch, or any other n/k decline gets no line. Only "the symbol
+/// is absent from this build" is the phantom worth one line per process.
+fn proj_tilelang_skipped_note_phase2() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        eprintln!(
+            "[proj-tilelang] DSV41_GEMM_TILELANG=1 is ARMED but the loaded .so has NONE of \
+             the phase-2 projection shims (dsv41_gemm_fp8_tilelang_wq_a / _wq_b / _wo_b / \
+             _wo_a): those projection sites keep their existing kernels. Do NOT read this \
+             run as a phase-2 TILELANG measurement (the arm is inert). Rebuild with \
+             kernels/cuda/build.sh so kernels/cuda/tilelang_gen/*_shim.cu are linked in."
+        );
+    });
+}
+
 /// ENGRAM-GATHER-MROWS (`DSV41_ENGRAM_GATHER_MROWS=1`, DEFAULT OFF): the
 /// multi-row engram gather runs as ONE `dsv41_engram_gather_rows` launch for all
 /// `m` rows, instead of `m` one-row gathers (12 launches per verify block at
@@ -4466,7 +4488,15 @@ impl<'a> DevChain<'a> {
             // (the attention output has n_heads*head_dim elements, well past
             // `dim` — sizing these by `dim` overflowed on the output projection)
             xq: dev.alloc(dim.max(nh * hd).max(cfg.o_lora_rank).max(inter))?,
-            xsc: dev.alloc(fb(dim.max(nh * hd).max(cfg.o_lora_rank).max(inter) / 32 + 8))?,
+            // ⚠️ TILELANG ABI (eager-scale-abi-audit): the generated wkv kernel
+            // reads a_scale as [MPAD=16, k/32] with NO m predicate (only A staging
+            // and reduce-store are predicated) — 16 rows × 160 f32 = 10240B. The
+            // old single-row formula (32768/32+8 = 1032 f32 = 4128B) under-allocated
+            // by 6104B => deterministic OOB read on every armed eager launch (the
+            // T-arm hang root cause). Pad to cover MPAD rows.
+            xsc: dev.alloc(fb((dim.max(nh * hd).max(cfg.o_lora_rank).max(inter))
+                .max(16 * dim / 32)
+                / 32 + 8))?,
             // One activation row: `dim/2` packed fp4 bytes, or `dim` e4m3 bytes
             // under DSV41_EXPERT_ACT_E4M3 (1 byte/value). `dim` covers both.
             xq4: dev.alloc(dim.max(8))?,
@@ -4567,7 +4597,13 @@ impl<'a> DevChain<'a> {
             // is <= that). Sized unconditionally: a few hundred KB, and a static
             // allocation graph is worth more than the bytes.
             xq_r: dev.alloc((VERIFY_ROWS * dim.max(nh * hd)).max(8))?,
-            xsc_r: dev.alloc(fb(VERIFY_ROWS * dim.max(nh * hd) / 32 + 8))?,
+            // ⚠️ TILELANG ABI (eager-scale-abi-audit): same MPAD=16 padding floor
+            // as xsc above — the current VERIFY_ROWS*32768/32 = 6144 f32 covers
+            // MPAD*160 = 2560 only by ACCIDENT (the audit's "capacity dividend");
+            // narrow the activation width and verify would OOB the same way.
+            xsc_r: dev.alloc(fb((VERIFY_ROWS * dim.max(nh * hd))
+                .max(16 * dim / 32)
+                / 32 + 8))?,
             moe_out_r: dev.alloc(fb(VERIFY_ROWS * dim))?,
             ids_r: dev.alloc(VERIFY_ROWS * 4)?,
             argmax_r: dev.alloc(VERIFY_ROWS * 4)?,
@@ -5558,6 +5594,74 @@ impl<'a> DevChain<'a> {
                 proj_tilelang_skipped_note();
             }
         }
+        // TILELANG PHASE 2 (the remaining DENSE shapes on the EAGER half): wq_a /
+        // wq_b / wo_b, each with its own frozen geometry and its own real
+        // `out_stride` (wq_b's is nh*hd, NOT n). Same double-swap contract as ⓪:
+        // the verify half (`proj_mrows`) carries the matching arms, so an arm taken
+        // here is taken there too.
+        //
+        // ⚠️ SAME separate EAGER gate as ⓪ (`DSV41_GEMM_TILELANG_EAGER=1`, default
+        // OFF): the eager `lin` site feeds `quant1`'s single-row `s.xq`/`s.xsc`,
+        // whose scale layout is NOT the verify path's staged block — that ABI audit
+        // is still open (the T-arm's first request died on a sticky illegal access).
+        // Verify-only is the default; the eager half arms only with the second flag.
+        if Self::gemm_tilelang_wkv() && Self::gemm_tilelang_eager() {
+            let mut any = false;
+            if self.dev.supports_gemm_fp8_tilelang_wq_a() {
+                any = true;
+                if self.dev.gemm_fp8_tilelang_wq_a(
+                    self.s.xq.as_u8(),
+                    self.s.xsc.as_f32(),
+                    w.as_u8(),
+                    ws.as_u8(),
+                    std::ptr::null(),
+                    out,
+                    1,
+                    n_out,
+                    k,
+                    n_out,
+                )? {
+                    return Ok(());
+                }
+            }
+            if self.dev.supports_gemm_fp8_tilelang_wq_b() {
+                any = true;
+                if self.dev.gemm_fp8_tilelang_wq_b(
+                    self.s.xq.as_u8(),
+                    self.s.xsc.as_f32(),
+                    w.as_u8(),
+                    ws.as_u8(),
+                    std::ptr::null(),
+                    out,
+                    1,
+                    n_out,
+                    k,
+                    n_out,
+                )? {
+                    return Ok(());
+                }
+            }
+            if self.dev.supports_gemm_fp8_tilelang_wo_b() {
+                any = true;
+                if self.dev.gemm_fp8_tilelang_wo_b(
+                    self.s.xq.as_u8(),
+                    self.s.xsc.as_f32(),
+                    w.as_u8(),
+                    ws.as_u8(),
+                    std::ptr::null(),
+                    out,
+                    1,
+                    n_out,
+                    k,
+                    n_out,
+                )? {
+                    return Ok(());
+                }
+            }
+            if !any {
+                proj_tilelang_skipped_note_phase2();
+            }
+        }
         self.gemm_fp8_mx_or_swap(
             self.s.xq.as_u8(),
             self.s.xsc.as_f32(),
@@ -5739,7 +5843,76 @@ impl<'a> DevChain<'a> {
                 proj_tilelang_skipped_note();
             }
         }
-        // ① PROJ_MMA (numerics-changing): checked FIRST, and BEFORE the swapAB
+        // ⓠ TILELANG PHASE 2 (the remaining DENSE projection shapes): the SAME
+        // double-swap arm, three more shapes — wq_a (n=1280,k=5120), wq_b
+        // (n=4096,k=1280, out_stride=nh*hd) and wo_b (n=5120,k=1024), each from its
+        // own frozen dump in kernels/cuda/tilelang_gen/. Same activation staging
+        // (`s.xq_r`/`s.xsc_r`) and same fallback as ⓪ — a declined shape costs a
+        // host-side compare and NO launch, so trying them in turn is free. The
+        // wq_b INDEXER site (out_stride == idx_nh*idx_hd == n, not nh*hd) declines
+        // by design and keeps its kernel.
+        //
+        // ⚠️ EAGER GATE: the phase-2 dense arms live under the SAME
+        // `DSV41_GEMM_TILELANG` family gate on the verify side, but the eager half
+        // (`lin`/`lin2`) additionally requires `DSV41_GEMM_TILELANG_EAGER=1` — see
+        // the lin-site comment for the eager ABI audit. This site is verify-only.
+        if Self::gemm_tilelang_wkv() {
+            let mut any = false;
+            if self.dev.supports_gemm_fp8_tilelang_wq_a() {
+                any = true;
+                if self.dev.gemm_fp8_tilelang_wq_a(
+                    self.s.xq_r.ptr as *const u8,
+                    self.s.xsc_r.ptr as *const f32,
+                    w,
+                    ws,
+                    std::ptr::null(),
+                    out,
+                    rows as i32,
+                    n,
+                    k,
+                    out_stride,
+                )? {
+                    return Ok(true);
+                }
+            }
+            if self.dev.supports_gemm_fp8_tilelang_wq_b() {
+                any = true;
+                if self.dev.gemm_fp8_tilelang_wq_b(
+                    self.s.xq_r.ptr as *const u8,
+                    self.s.xsc_r.ptr as *const f32,
+                    w,
+                    ws,
+                    std::ptr::null(),
+                    out,
+                    rows as i32,
+                    n,
+                    k,
+                    out_stride,
+                )? {
+                    return Ok(true);
+                }
+            }
+            if self.dev.supports_gemm_fp8_tilelang_wo_b() {
+                any = true;
+                if self.dev.gemm_fp8_tilelang_wo_b(
+                    self.s.xq_r.ptr as *const u8,
+                    self.s.xsc_r.ptr as *const f32,
+                    w,
+                    ws,
+                    std::ptr::null(),
+                    out,
+                    rows as i32,
+                    n,
+                    k,
+                    out_stride,
+                )? {
+                    return Ok(true);
+                }
+            }
+            if !any {
+                proj_tilelang_skipped_note_phase2();
+            }
+        }
         // refusal below. Switch order ① MMA > ② MPAR > ③ SIMT legacy; ②/③ both
         // live inside the C entry `dsv41_gemm_fp8_mrows`, so from here the choice
         // is simply "mma program or the C entry". The ORDER matters: the (b′)
@@ -6205,6 +6378,73 @@ impl<'a> DevChain<'a> {
     /// bit-identical to two `lin` calls. Ok(false) means the fused kernel
     /// declined the shape and the caller runs the two lins.
     #[allow(clippy::too_many_arguments)]
+    /// TILELANG PHASE 2: try the three new DENSE shapes for ONE family of a fused
+    /// eager site. `Ok(true)` = one of them took this family (the caller must NOT
+    /// run the OLD program for it — that would put the two families on different
+    /// programs); `Ok(false)` = all declined (wrong shape / stale .so), keep the
+    /// caller's fallback. The shapes are distinct in `(n, k)`, so exactly one can
+    /// take and the rest decline without a launch. Used by `lin2`; the single-family
+    /// `lin` carries the same three arms inline (it has no second family to pair).
+    #[allow(clippy::too_many_arguments)]
+    fn tilelang_dense_pick(
+        &self,
+        w: &crate::dsv41::load::DevTensor,
+        ws: &crate::dsv41::load::DevTensor,
+        out: *mut f32,
+        n_out: i32,
+        k: i32,
+    ) -> Result<bool> {
+        if self.dev.supports_gemm_fp8_tilelang_wq_a()
+            && self.dev.gemm_fp8_tilelang_wq_a(
+                self.s.xq.as_u8(),
+                self.s.xsc.as_f32(),
+                w.as_u8(),
+                ws.as_u8(),
+                std::ptr::null(),
+                out,
+                1,
+                n_out,
+                k,
+                n_out,
+            )?
+        {
+            return Ok(true);
+        }
+        if self.dev.supports_gemm_fp8_tilelang_wq_b()
+            && self.dev.gemm_fp8_tilelang_wq_b(
+                self.s.xq.as_u8(),
+                self.s.xsc.as_f32(),
+                w.as_u8(),
+                ws.as_u8(),
+                std::ptr::null(),
+                out,
+                1,
+                n_out,
+                k,
+                n_out,
+            )?
+        {
+            return Ok(true);
+        }
+        if self.dev.supports_gemm_fp8_tilelang_wo_b()
+            && self.dev.gemm_fp8_tilelang_wo_b(
+                self.s.xq.as_u8(),
+                self.s.xsc.as_f32(),
+                w.as_u8(),
+                ws.as_u8(),
+                std::ptr::null(),
+                out,
+                1,
+                n_out,
+                k,
+                n_out,
+            )?
+        {
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     fn lin2(
         &self,
         a: *const f32,
@@ -6232,7 +6472,7 @@ impl<'a> DevChain<'a> {
         // ⚠️ The (wq_b, idx_wq_b) site declines BOTH families (neither is the
         // generated shape), so it falls through to the fused launch verbatim —
         // zero behaviour change there.
-        if Self::gemm_tilelang_wkv() {
+        if Self::gemm_tilelang_wkv() && Self::gemm_tilelang_eager() {
             if self.dev.supports_gemm_fp8_tilelang_wkv() {
                 let tl1 = self.dev.gemm_fp8_tilelang_wkv(
                     self.s.xq.as_u8(),
@@ -6291,6 +6531,50 @@ impl<'a> DevChain<'a> {
                 }
             } else {
                 proj_tilelang_skipped_note();
+            }
+        }
+        // TILELANG PHASE 2 on the FUSED eager site (see the wkv block above): the
+        // three new DENSE shapes, with the SAME per-family discipline — a family
+        // that took is NOT run again by the fused launch (that would put the two
+        // families on different programs), so the fused launch is skipped and the
+        // other family runs as its own single-row launch. See
+        // [`Self::tilelang_dense_pick`].
+        if Self::gemm_tilelang_wkv() && Self::gemm_tilelang_eager() {
+            if !self.dev.supports_gemm_fp8_tilelang_wq_a()
+                && !self.dev.supports_gemm_fp8_tilelang_wq_b()
+                && !self.dev.supports_gemm_fp8_tilelang_wo_b()
+            {
+                proj_tilelang_skipped_note_phase2();
+            } else {
+                let tl1 = self.tilelang_dense_pick(w1, ws1, out1, n1, k)?;
+                let tl2 = self.tilelang_dense_pick(w2, ws2, out2, n2, k)?;
+                if tl1 || tl2 {
+                    if !tl1 {
+                        self.gemm_fp8_mx_or_swap(
+                            self.s.xq.as_u8(),
+                            self.s.xsc.as_f32(),
+                            w1.as_u8(),
+                            ws1.as_u8(),
+                            std::ptr::null(),
+                            out1,
+                            n1,
+                            k,
+                        )?;
+                    }
+                    if !tl2 {
+                        self.gemm_fp8_mx_or_swap(
+                            self.s.xq.as_u8(),
+                            self.s.xsc.as_f32(),
+                            w2.as_u8(),
+                            ws2.as_u8(),
+                            std::ptr::null(),
+                            out2,
+                            n2,
+                            k,
+                        )?;
+                    }
+                    return Ok(true);
+                }
             }
         }
         self.dev.gemm_fp8_mx2(
@@ -13620,20 +13904,50 @@ impl<'a> DevChain<'a> {
                     true,
                 )?;
             }
-            self.dev.wo_a_grouped_fp8(
-                self.s.xq_r.ptr as *const u8,
-                self.s.xsc_r.ptr as *const f32,
-                ld.wo_a.as_ref().unwrap().as_u8(),
-                ld.wo_a_scale.as_ref().unwrap().as_u8(),
-                std::ptr::null(),
-                self.s.wo_r.ptr as *mut f32,
-                nlg as i32,
-                m as i32,
-                olg as i32,
-                k as i32,
-                (nlh * hd) as i32,
-                ol_total as i32,
-            )?
+            // TILELANG (DSV41_GEMM_TILELANG, phase 2): the GROUPED wo_a arm. The
+            // activation is the block-wide fp8 staged just above (`s.xq_r`/
+            // `s.xsc_r`, compact rows of `nlh*hd`), `a_stride` is this rank's
+            // attention-output row pitch and the C entry picks the frozen variant on
+            // (groups, a_stride) — (1, 4096) for verify@TP8, (8, 32768) for TP1.
+            // Quantisation stays OUTSIDE the shim (this site already hands it fp8 +
+            // per-32 scale), which is what makes wo_a the lowest-cost shape to arm
+            // (tilelang-proj-phase2.md §6.1). A decline (variant mismatch / stale
+            // .so) keeps the grouped kernel verbatim — no line, that is the normal case.
+            let mut tl_wo_a = false;
+            if Self::gemm_tilelang_wkv() && self.dev.supports_gemm_fp8_tilelang_wo_a() {
+                tl_wo_a = self.dev.gemm_fp8_tilelang_wo_a(
+                    self.s.xq_r.ptr as *const u8,
+                    self.s.xsc_r.ptr as *const f32,
+                    ld.wo_a.as_ref().unwrap().as_u8(),
+                    ld.wo_a_scale.as_ref().unwrap().as_u8(),
+                    std::ptr::null(),
+                    self.s.wo_r.ptr as *mut f32,
+                    nlg as i32,
+                    m as i32,
+                    olg as i32,
+                    k as i32,
+                    (nlh * hd) as i32,
+                    ol_total as i32,
+                )?;
+            }
+            if tl_wo_a {
+                true
+            } else {
+                self.dev.wo_a_grouped_fp8(
+                    self.s.xq_r.ptr as *const u8,
+                    self.s.xsc_r.ptr as *const f32,
+                    ld.wo_a.as_ref().unwrap().as_u8(),
+                    ld.wo_a_scale.as_ref().unwrap().as_u8(),
+                    std::ptr::null(),
+                    self.s.wo_r.ptr as *mut f32,
+                    nlg as i32,
+                    m as i32,
+                    olg as i32,
+                    k as i32,
+                    (nlh * hd) as i32,
+                    ol_total as i32,
+                )?
+            }
         } else {
             false
         };
@@ -18168,7 +18482,38 @@ fn tap_input() -> bool {
             )?;
         }
         let mut wo_fused = false;
-        if !wo_paired {
+        // TILELANG (DSV41_GEMM_TILELANG, phase 2) — EAGER half of the grouped wo_a
+        // double swap. Single row (`rows = 1`); the activation is the compact `s.xq`
+        // staged just above (row pitch `nlh*hd`); the C entry picks the frozen
+        // variant on (groups, a_stride) — (1, 4096) or (8, 32768). The generated
+        // kernel writes row 0 only, so `out_stride` is unused here. When it takes,
+        // the per-group loop below is skipped and `wo_fused` stays false, so wo_b's
+        // activation falls to its own `quant1(s.wo)`/WOB_F32 path (unchanged).
+        // ⚠️ EAGER gate (`DSV41_GEMM_TILELANG_EAGER`, default OFF) — see the
+        // `lin`-site comment for the open single-row scale-layout audit.
+        let wo_tl = if !wo_paired
+            && Self::gemm_tilelang_wkv()
+            && Self::gemm_tilelang_eager()
+            && self.dev.supports_gemm_fp8_tilelang_wo_a()
+        {
+            self.dev.gemm_fp8_tilelang_wo_a(
+                self.s.xq.as_u8(),
+                self.s.xsc.as_f32(),
+                ld.wo_a.as_ref().unwrap().as_u8(),
+                ld.wo_a_scale.as_ref().unwrap().as_u8(),
+                std::ptr::null(),
+                self.s.wo.ptr as *mut f32,
+                nlg as i32,
+                1,
+                olg as i32,
+                k as i32,
+                (nlh * hd) as i32,
+                ol_total as i32,
+            )?
+        } else {
+            false
+        };
+        if !wo_paired && !wo_tl {
         for g in 0..nlg {
             // The weight tensor is ALREADY the rank's local slice (Shard::Groups
             // cut it at load time), so every offset must be LOCAL: group g of
