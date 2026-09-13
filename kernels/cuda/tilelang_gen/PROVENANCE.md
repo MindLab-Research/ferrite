@@ -133,6 +133,91 @@ wkv 走通后，把第二个形状（建议 `wq_a`：`n=1280, k=5120`，n 大 �
 `pad-16` 形态已实测 M6/M1 = 1.00，没有任何判据要求 swapAB；它是吃算力的后续优化，
 换形态要重生成全部形状 + 重跑门 1/2，独立一轮。
 
+### 5.1 head（H3，bf16 稠密 GEMM）—— `gen_head_aot.py` 的生成 + ABI 复核
+
+`head_bf16_shim.cu` 的 `__has_include` 守卫（`:102-108`）包含的正是本节两份生成物名
+（`head_partial_tl.cu` / `head_reduce_tl.cu`，与生成器落在 `<outdir>/` 的文件名逐字相同
+⇒ **文件名匹配**；缺席时该 TU 编成空单元、`.so` 无 `dsv41_head_bf16_tilelang`、
+`supports_head_tilelang()` false，绝不静默测老路）。
+
+**生成（主 agent，远端 B300 —— GPU/远端 python 操作，接线 agent 只写清单）**：
+
+```bash
+scp kernels/tilelang/gen_head_aot.py ubuntu@43.202.208.136:~/tl_bs/
+ssh ubuntu@43.202.208.136 \
+  'cd ~/tl_bs && mkdir -p aot_gen && /opt/dlami/nvme/dsv41_venv/bin/python gen_head_aot.py aot_gen'
+# ↑ mkdir 是必需的：脚本直接 open(f"{outdir}/…")，目录不存在即 FileNotFoundError。
+scp ubuntu@43.202.208.136:'~/tl_bs/aot_gen/head_partial_tl.cu' \
+    ubuntu@43.202.208.136:'~/tl_bs/aot_gen/head_reduce_tl.cu' \
+    ubuntu@43.202.208.136:'~/tl_bs/aot_gen/head_tl_config.txt' \
+    kernels/cuda/tilelang_gen/
+```
+
+（`gen_head_aot.py` 自含：只 import `hashlib/sys/tilelang/tilelang.language`，**不需要**
+`head_bf16_tilelang.py`；也不依赖 `vendor/apply_tilelang_patch.py`——那是
+tcgen05-blockscaled（e4m3）臂的补丁，head 是普通 bf16 mma。脚本自己给两份 `.cu` 加
+banner（banner 之外逐字节等于 dump），所以回传后**不需要**再手工贴 banner。）
+
+**产出的期望值**（与 `head_bf16_shim.cu` 的冻结几何逐项对齐；任何不符 ⇒ 先停下对齐）：
+
+| 项 | 期望 | 出处 |
+|---|---|---|
+| config 行 | `N=16160 K=5120 NPAD=16256 BN=128 KS=8 BK=64 NS=3 THREADS=128 MPAD=16 RED_BN=256 RED_THREADS=256` | `gen_head_aot.py:67-74` |
+| partial grid / block | `(127, 8)` / `128` | `ceildiv(N,BN)=127`，与 `NPAD/BN=127` 同值 |
+| partial smem | `55296` B | `NS*(MPAD+BN)*BK*2`（> 48 KiB ⇒ shim 的 `SetAttribute` 是必要条件） |
+| reduce grid / block | `64` / `256` | `ceildiv(16160,256)=64`（⚠️ **不是** `NPAD/256=63`） |
+| P / Xb scratch | `8.30 MiB` / `160 KiB` | `KS*MPAD*NPAD*4` / `MPAD*K*2` |
+
+**ABI（形参序）—— 不许猜，且机制已知**。TileLang 在
+`src/transform/split_host_device.cc` 的 `SortDeviceParams()` 里排 device 形参：
+
+```cpp
+sort_key = { !var->dtype.is_handle(),  var->name_hint };   // 指针在前，再按名 ASCII 升序；标量最后
+```
+
+⇒ head 的张量名是 `X` / `W` / `P`（`gen_head_aot.py:93-95`），故
+
+| dump | 形参序 | shim 的调用 |
+|---|---|---|
+| `head_partial_tl.cu` | `(P f32*, W bf16*, X bf16*)` | `(g_part, (const bfloat16_t*)w, (const bfloat16_t*)g_xb)` |
+| `head_reduce_tl.cu` | `(C f32*, P f32*, int m)` | `(out, g_part, m)` |
+
+（旧版 shim 写的 `(X, P, W)` / `(P, C, m)` 是从 wkv 的 `(A, ASC, P, W, WSC)` 外推的
+"P 前移到 W 之前"；wkv 的 `A` 恰好也是字母序最小项，那条证据分不出「原序首位」与
+「按名排序」。依据 §9.3.1：形参序是 lowering 的产物，**只有 dump 说了算**。
+⚠️ reduce 的两个指针都是 `float*`，**错位编译器不报错**：会把 P 当归约输出写回、
+logits 永不更新——所以下面 ① 是硬闸，不是建议。）
+
+**复核命令（生成后、重建前，硬闸）**：
+
+```bash
+# ① 两份签名行与实际 dump 逐字比对（config 的这两段就是生成器从 dump 里抓的）
+sed -n '/--- head_partial_tl.cu signature ---/,/^$/p' kernels/cuda/tilelang_gen/head_tl_config.txt
+sed -n '/--- head_reduce_tl.cu signature ---/,/^$/p'  kernels/cuda/tilelang_gen/head_tl_config.txt
+grep -m1 "__launch_bounds__" kernels/cuda/tilelang_gen/head_partial_tl.cu
+grep -m1 "__launch_bounds__" kernels/cuda/tilelang_gen/head_reduce_tl.cu
+# 判据：partial = main_kernel(float* P, const bfloat16_t* W, const bfloat16_t* X)
+#       reduce  = main_kernel(float* C, const float* P, int m)
+# ② grid / smem（reduce_grid 必须 = 64；shim 的 kTLSmem 必须 == partial_smem_bytes）
+grep -E "^(partial|reduce)_(grid|block|smem)" kernels/cuda/tilelang_gen/head_tl_config.txt
+```
+
+**编译验证（远端 compile-only，无 GPU）**：
+
+```bash
+ssh ubuntu@43.202.208.136 'cd ~/ferrite && nvcc -gencode arch=compute_103a,code=sm_103a \
+  -O3 -std=c++17 --use_fast_math -c -I kernels/cuda/tilelang_inc \
+  kernels/cuda/tilelang_gen/head_bf16_shim.cu -o /tmp/head_shim.o && \
+  nm /tmp/head_shim.o | grep -E "head_tl_(partial|reduce)_kernel|dsv41_head_bf16_tilelang"'
+```
+
+**整编 + 符号三证**（`bash kernels/cuda/build.sh 103a` 之后，见 `c4-head-ab-manual.md` §4.0）：
+
+```bash
+nm -D kernels/cuda/libferrite_kernels.so | grep -c dsv41_head_bf16_tilelang   # ≥ 1（=0 ⇒ Arm 2 无意义）
+```
+
+
 ---
 
 ## 6. 纪律

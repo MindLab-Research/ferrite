@@ -502,8 +502,10 @@ struct DraftP3Lite {
     /// exactly the P3b-class claim rule R1 forbids. With ALIGN on, both sides run
     /// the same program and the fold is a pure launch-count change.
     q_ropenorm: bool,
-    /// **segment A** (the hc front end, `DSV41_P3LITE_HC_FRONT`, alias
-    /// `DSV41_DRAFT_P3LITE_A_SEG`): `hc_mixes` + `hc_collapse_norm` as ONE
+    /// **segment A** (the hc front end, `DSV41_P3LITE_HC_FRONT`, aliases
+    /// `DSV41_DRAFT_P3LITE_A_SEG` and `DSV41_DRAFT_HC_FRONT` -- the P5/H1 name
+    /// for the fold that retires the draft's 6 raw `hc_mixes`):
+    /// `hc_mixes` + `hc_collapse_norm` as ONE
     /// `dsv41_draft_hc_front` launch, at BOTH of the draft block's sub-blocks
     /// (attention and FFN). `pre_collapse` -- the incoming premix the collapse
     /// reads -- is never the `pre` the mixes write, so the two phases share no
@@ -530,7 +532,7 @@ struct DraftP3Lite {
 /// | l2 | `DSV41_P3LITE_KV_NORM_ROPE` | kv: `rmsnorm(kv)` + `apply_rope(kv)` -> `dsv41_rmsnorm_rope` | 1/block |
 /// | l3 | `DSV41_P3LITE_ATTN_OROPE` | `sparse_attn` + `rope_inv(o)` x bs + `quant1(o)` -> `dsv41_sparse_attn_orope` | 6/block |
 /// | l4 | `DSV41_P3LITE_Q_ROPENORM` | q chain: `rmsnorm(qr)` + `quant1(qr)` + `gemm(wq_b)` + `rope(q)` -> `dsv41_gemm_fp8_mrows_rope_norm` (K2) | 7/block |
-/// | A | `DSV41_P3LITE_HC_FRONT` | hc front end: `hc_mixes` + `hc_collapse_norm` -> `dsv41_draft_hc_front` | 1/block x2 |
+/// | A | `DSV41_P3LITE_HC_FRONT` (alias `DSV41_DRAFT_HC_FRONT`, P5/H1) | hc front end: `hc_mixes` + `hc_collapse_norm` -> `dsv41_draft_hc_front` | 1/block x2 |
 ///
 /// A per-item override, when SET, wins over the master (`=0` turns that one fold
 /// off for an A/B that isolates it; any other value turns it on). An unset
@@ -574,11 +576,18 @@ fn draft_p3lite() -> DraftP3Lite {
             kv_norm_rope: item("DSV41_P3LITE_KV_NORM_ROPE"),
             attn_orope: item("DSV41_P3LITE_ATTN_OROPE"),
             q_ropenorm: item("DSV41_P3LITE_Q_ROPENORM"),
-            // Segment A's own env, plus the task-book alias
-            // `DSV41_DRAFT_P3LITE_A_SEG` (an explicit set of either wins).
-            hc_front: match std::env::var("DSV41_DRAFT_P3LITE_A_SEG") {
+            // Segment A's own env, plus the two task-book aliases:
+            // `DSV41_DRAFT_P3LITE_A_SEG` and `DSV41_DRAFT_HC_FRONT` -- the latter
+            // is P5/H1's name for exactly this fold ("draft 侧 6 发 raw
+            // `hc_mixes` 归零", docs/agent/p5-fused-pipeline-fullwave-hc-segment-
+            // design.md §4.2). An explicit set of either alias wins over the
+            // master, so the H1 A/B is ONE env and needs no P3-lite arm.
+            hc_front: match std::env::var("DSV41_DRAFT_HC_FRONT") {
                 Ok(v) => v != "0",
-                Err(_) => item("DSV41_P3LITE_HC_FRONT"),
+                Err(_) => match std::env::var("DSV41_DRAFT_P3LITE_A_SEG") {
+                    Ok(v) => v != "0",
+                    Err(_) => item("DSV41_P3LITE_HC_FRONT"),
+                },
             },
         }
     })

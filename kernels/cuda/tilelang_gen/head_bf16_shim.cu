@@ -135,6 +135,10 @@ constexpr int kTLNS = 3;         // pipelined stages
 constexpr int kTLThreads = 128;  // partial block
 constexpr int kTLRedBN = 256;    // reduce 的 N 向 tile
 constexpr int kTLRedThreads = 256;  // reduce block
+// reduce 的 grid：**按 N 取 ceil，不能按 NPAD 整除**（16256 / 256 = 63.5 ⇒ 整除 = 63 块，
+// 列 16128..16159 永不写出 = 静默错值）。生成物的 grid = ceildiv(N, RED_BN) ⇒ 这里必须
+// 同规：ceildiv(16160, 256) = 64。
+constexpr int kTLRedGrid = (kTLN + kTLRedBN - 1) / kTLRedBN;  // 64
 constexpr int kTLMPad = 16;      // mma m16 的 M（激活的 pad 目标，生成物内部使用）
 constexpr int kTLM = 8;          // 本阶段接受的 m 上界（与 v1_mrows 族一致）
 // P 的 N 向容量：N 不整除 BN 时把最后一个 tile 补齐，使 partial 的 store 永远在界内
@@ -266,7 +270,7 @@ extern "C" int dsv41_head_bf16_tilelang(const void* w, const float* x, float* ou
                     "[head-tilelang] ARMED m=%d n=%d k=%d ks=%d -> cast + partial grid=(%d,%d)x%d "
                     "smem=%zu + reduce grid=%d x %d\n",
                     m, n, k, kTLKS, kTLNPad / kTLBN, kTLKS, kTLThreads, (size_t)kTLSmem,
-                    kTLNPad / kTLRedBN, kTLRedThreads);
+                    kTLRedGrid, kTLRedThreads);
     }
 
     // (0) cast：f32 激活 -> bf16 [MPAD, K]（行 >= m 写 0）。
@@ -275,17 +279,26 @@ extern "C" int dsv41_head_bf16_tilelang(const void* w, const float* x, float* ou
     if (e != cudaSuccess) return (int)e;
 
     // (1) K-split 分片：grid (NPAD/BN, KS)，每块算一段 K 的 partial 写 P[kp]。
-    // 生成物的形参序 = dump 的 (A, P, W)（TileLang 重排，见 head_tl_config.txt 的签名行）。
+    // ⚠️ 形参序 = dump 的 **(P, W, X)** —— TileLang `split_host_device.cc` 的
+    // `SortDeviceParams()`：sort key = (!is_handle, name_hint)，即**指针参数在前、按
+    // 形参名 ASCII 升序**，标量在后。head 的三个张量名是 X/W/P（`gen_head_aot.py`），
+    // 故 P < W < X。旧代码写的 "(A, P, W)" 是从 wkv 的 (A, ASC, P, W, WSC) 外推的
+    // ——wkv 的 A 恰好也是字母序最小项，那条证据分不出「A 只是排头」与「按名排序」。
+    // 生成后**必须**用 head_tl_config.txt 的 `--- head_partial_tl.cu signature ---`
+    // 行复核本调用（见 PROVENANCE.md §5.1 的复核命令）。
     head_tl_partial_kernel<<<dim3((unsigned)(kTLNPad / kTLBN), (unsigned)kTLKS), kTLThreads, kTLSmem,
-                             s>>>(reinterpret_cast<const bfloat16_t*>(g_xb), g_part,
-                                  reinterpret_cast<const bfloat16_t*>(w));
+                             s>>>(g_part, reinterpret_cast<const bfloat16_t*>(w),
+                                  reinterpret_cast<const bfloat16_t*>(g_xb));
     e = cudaGetLastError();
     if (e != cudaSuccess) return (int)e;
 
     // (2) 确定性归约：按 kp 升序求和 ks 个 partial，只写前 m 行（行 stride = n = out 的
     // 行 stride —— verify 的两个臂都是 out_stride == n，见 chain_dev.rs 的 geom）。
-    head_tl_reduce_kernel<<<dim3((unsigned)(kTLNPad / kTLRedBN)), kTLRedThreads, 0, s>>>(g_part, out,
-                                                                                          m);
+    // ⚠️ 形参序同为 dump 序 **(C, P, m)**（`SortDeviceParams`：C < P 按名升序，m 是标量
+    // 排后）—— 生成物里 C 是**先写**的那个。⚠️ 这里两个都是 `float*`，**错位不会编译报错**
+    // 而会静默把 P 当归约输出写回（logits 永不更新）⇒ 只能靠 config 签名行复核。
+    // grid：ceildiv(N, RED_BN) = 64（**不是** NPAD/RED_BN = 63，见 kTLRedGrid）。
+    head_tl_reduce_kernel<<<dim3((unsigned)kTLRedGrid), kTLRedThreads, 0, s>>>(out, g_part, m);
     return (int)cudaGetLastError();
 }
 
