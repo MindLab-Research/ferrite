@@ -16473,6 +16473,21 @@ impl<'a> DevChain<'a> {
         inter_local: usize,
         n_routed: usize,
     ) -> bool {
+        // [DIAG] one-shot: print the runtime values to identify which frozen-shape
+        // condition fails (the REFUSED message doesn't say which one).
+        static DIAG: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        let _ = DIAG.get_or_init(|| {
+            eprintln!(
+                "[moe-bs-diag] n_routed={} (want 384) dim={} (want 5120) inter_local={} (want 320) \
+                 topk={} (want 1-6) m={} (want 1-6) experts_len={} (want >=2) \
+                 wsf1[0]={:?} wsf3[0]={:?} ilv={} e4m3={}",
+                n_routed, dim, inter_local, topk, m, ld.experts.len(),
+                ld.experts.first().map(|e| e.wsf1.is_some()),
+                ld.experts.first().map(|e| e.wsf3.is_some()),
+                ld.experts_ilv,
+                expert_act_e4m3(),
+            );
+        });
         crate::dsv41::weights::moe_tilelang_bs()
             && self.dev.supports_moe_tilelang_bs()
             && self.dev.supports_moe_tilelang_bs_dev()
