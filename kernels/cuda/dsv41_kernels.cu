@@ -3814,7 +3814,12 @@ extern "C" int dsv41_quant_fp8(const float* x, uint8_t* y, float* scale, int row
 extern "C" __attribute__((visibility("default"))) int dsv41_quant_fp8_stride(
     const float* x, uint8_t* y, float* scale, int rows, int cols, int block, int round_scale,
     int src_stride, cudaStream_t s) {
-    return dsv41_quant_fp8(x, y, scale, rows, cols, block, round_scale, s, src_stride);
+    if (src_stride != 0 && src_stride < cols) return (int)cudaErrorInvalidValue;
+    const int nb = cols / block;
+    dim3 grid(rows * nb);
+    dim3 blk(1, (block < 256 ? block : 256));
+    quant_kernel<0><<<grid, blk, 0, s>>>(x, y, scale, rows, cols, block, round_scale, src_stride);
+    return (int)cudaGetLastError();
 }
 
 // Per-device fp4 quantise scratch (see the comment in dsv41_quant_fp4). Only the
@@ -15126,8 +15131,11 @@ verify_hc_front_prefused_kernel(const float* __restrict__ x, const float* __rest
         // byte store and the scale store.
         float* o_r = out + (size_t)r * dim;
         const bool emit = (xq != nullptr) && (xsc != nullptr) && (xq_pitch > 0);
-        uint8_t* xq_r = xq + (size_t)r * (size_t)xq_pitch;
-        float* xsc_r = xsc + (size_t)r * (size_t)(xq_pitch >> 5);
+        // Both bases are only formed when the emit is on: forming a base off a
+        // null pointer is undefined behaviour even when it is never dereferenced,
+        // and `xq_pitch >> 5` is also what makes the scale row pitch == `nb`.
+        uint8_t* xq_r = emit ? (xq + (size_t)r * (size_t)xq_pitch) : nullptr;
+        float* xsc_r = emit ? (xsc + (size_t)r * (size_t)(xq_pitch >> 5)) : nullptr;
         float s2 = 0.f;
 #pragma unroll 4
         for (int c = threadIdx.x; c < dim; c += blockDim.x) {
