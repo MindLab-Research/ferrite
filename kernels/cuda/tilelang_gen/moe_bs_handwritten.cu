@@ -298,8 +298,15 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
                 // idesc: M=128, N=128, a_fmt=0 (E4M3), b_fmt=5 (E2M1), sf_id=ki
                 const uint32_t idesc = hw_make_idesc(HW_BM, HW_BN, 0, 5, ki);
                 // A/B descriptor advance: ki * 32 (raw descriptor units = 16B each → 512B offset)
-                const uint64_t a_desc = a_desc_base + (uint64_t)(ki * 32);
-                const uint64_t b_desc = b_desc_base + (uint64_t)(ki * 32);
+                // Descriptor advance per K-block: 256 bytes = 16 units (NOT 32!)
+                // Core matrix layout: each K-block (32 elements) spans 2 K-atoms
+                // = 2 × 128 bytes = 256 bytes = 16 start_address units (16B each).
+                // TileLang uses ki*32 for its TMA+swizzle layout — WRONG for our
+                // core matrix + layout=0. With synthetic data (all same bytes),
+                // this 2× error was invisible. With real data, it reads the
+                // WRONG K-block's data → garbage output.
+                const uint64_t a_desc = a_desc_base + (uint64_t)(ki * 16);
+                const uint64_t b_desc = b_desc_base + (uint64_t)(ki * 16);
                 // enable_d: 0 for first MMA (clear accumulator), 1 for rest
                 const uint32_t enable_d = (k == 0 && ki == 0) ? 0 : 1;
 
