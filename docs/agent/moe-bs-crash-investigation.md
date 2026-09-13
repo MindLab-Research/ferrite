@@ -3988,6 +3988,17 @@ wait ⇒ **到达数不可能超过等待数** ⇒ **smem 被提前覆写的竞�
 3. **`.cu` 改动攒批**：每次 `.cu` 编辑都会触发 `build.sh`（8 TU ≈3.5 分钟）；**批次在飞时不改 `.cu`** ✓
    （纯 Rust 改动走 mtime 门控 ⇒ 零 kernel 构建 ✓）。
 
+## §152 官方生态对照（`accumulator-pattern` 调研，含一条**接 down 臂前必修**项）
+
+| 事实 | 出处 | 对我们的意义 |
+|---|---|---|
+| **DeepGEMM 只靠首个 MMA 的 `enable-input-d=0` 覆盖整块 D**，零显式清零（`grep tcgen05.st/cp` 在 `deep_gemm/include/deep_gemm/` 除 prenorm 外无命中） | `sm100_fp8_fp4_gemm_1d1d.cuh:437,441`、`ptx/tcgen05.cuh:49-58`（`setp.ne.b32 p, %4, 0` + `tcgen05.mma…block_scale … , p`） | **我们的模式是业界统一的官方模式，不是反模式** ✓ ⇒ "首个 clear MMA 丢失/谓词反了"属于**偏离**，而不是设计缺陷 ✓ |
+| **MegaMoE 路径同构** | `sm100_fp8_fp4_mega_moe.cuh:1178-1180` | 同上 ✓ |
+| **TileLang 的 `enable_d` 与我们同构**：`scale_out = Select(ki != 0, 1, Select(clear_accum, 0, 1))`；除首个 MMA 外无别的初始化 | TileLang GitHub main（`tcgen05_gemm*` 模板） | ✓ |
+| **TileLang 多一个自动 fence pass**（`inject_tcgen05_fence.cc`） | TileLang 源码树 | 🔎 **新线索**：已在派 `fence-pass-audit` 逐位点核对我们是否缺等价 fence |
+| 🔍 **DeepGEMM 的 clear 判据是 `k_block_idx`（"每个 (m,n) 输出 tile 都重新 clear 一次"）** | 同 §1 | **已核对并撤回误读**：我们的 `enable_d` 判据对**每个 CTA 的一块 (m,n) tile** 各清一次 —— gate/up 臂 grid=(5,36) ⇒ 每 CTA 一块 128×128 ✓；down 臂 `DN_SPANS=3` 是 **K-stage**（K=320=128+128+64 ✓）、grid x = `dim/DN_BN` ⇒ **每 CTA 也只覆盖一块 N-tile** ✓ ⇒ 三者（DeepGEMM / gate-up / down）**同粒度** ✓（起初把 `sp` 误读成 N-chunk ✗，已由源码核对更正 ✓） |
+| `tcgen05.mma` **没有 `.init` 变体**；`tcgen05.st` 需 `tcgen05.wait::st`；跨线程可见性靠 `tcgen05.fence::before/after_thread_sync` | PTX ISA 9.x | 与 §149 的加固一致 ✓（`DCLEAR` 用 `st`+`wait::st` ✓；故新派审计专门核对 fence） |
+
 ⇒ 误差**只在算术内部**：K 元素配对 / 标度归属 / 逐元素映射中有一处不对，且它必须同时解释
 "量级对 + 逐元素不相关 + 非置换 + 非换 expert"。**下一判据 = `DSV41_MOE_BS_SFDUMP` 内容校验（`sfdump_check.py`）
 + 去假设 replay（`sfdump_replay.py`：输出是否等于"它自己 staged 的数据"的积）** ⇒ 分流"内容错" vs "使用错" ✓。
