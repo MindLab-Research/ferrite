@@ -759,3 +759,24 @@ for k in T.Pipelined(K_iters, num_stages=2):          # block_K = 32
 ### 共同前提
 - 任何 in-situ 结论都必须带 **`DSV41_GRAPH_STEP=0`**（否则 shim 在捕获期 decline，BS 臂只在非捕获调用里跑）。
 - 我们的 kernel 的 MMA **确实在发射**（e2e 输出随朝向/数据变化）；因此"探针里 MMA 不发射"是**探针侧**问题，不推翻 e2e 结论。
+
+## §25 运维陷阱：build-id 不匹配 ⇒ serve 拒绝启动（开 GPU 窗口前必查）
+
+**现象**：起了 serve 但 18 秒就退出、日志里**一条 `[moe-bs]` 都没有**（健康检查拿不到 200）。
+**日志原文**（`~/armrun_*.log`）：
+```
+[single-flight] engine fault: config error: kernel build-id mismatch — REFUSING TO START
+(so and binary must be the same build): .so build_id=…-dirty+cu5dc9942ebee25707
+vs binary build_id=…-dirty+cuf683f43bb06c66f5. Rebuild both from the same checkout:
+  `cd kernels/cuda && bash build.sh 103a && cd ../.. && cargo build --release`
+```
+**根因**：`.so` 与二进制各自记录的 **kernel 源码哈希不同**，运行期防线（三道 runtime 防线之一）直接拒绝启动。
+本次的具体成因：我在**预编译尚未结束**时就开了 GPU 窗口，而且期间 subagent 往 `kernels/cuda/` **新建了文件**
+（`tests_bs_impulse.cu` 等）⇒ 两次构建看到的树不一致（注意 build_id 里带 `-dirty`，未跟踪文件也算进哈希）。
+
+**纪律（新增）**：
+1. **开 e2e 窗口前先确认 `.so` 与 binary 的 mtime 都已就绪**（`stat -c %y`），别在预编译 in-flight 时开窗口。
+2. **双产物必须背靠背、在同一条命令里产出**，中间**不允许**任何 subagent 往 `kernels/cuda/` 或 `crates/` 写文件；
+   多 subagent 并发时，**先让写代码/写测试的 subagent 收尾**再重编，或把它们的产物放在 `/tmp`/`~/` 而非仓库里。
+3. `arm_run.sh` 的 `SERVE_FAILED` 分支要用 `tail` 显示日志尾部（本次 `tail -26` 恰好截掉了关键行，是靠事后
+   手动 `tail ~/armrun_A_ng.log` 才看到 build-id 那行）——**判读 e2e 失败时永远先看 serve 日志尾部**。
