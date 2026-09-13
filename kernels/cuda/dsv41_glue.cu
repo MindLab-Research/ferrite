@@ -2900,7 +2900,262 @@ __global__ void win_kv_quant_rt_kernel(float* __restrict__ kv, int cols, int blo
     }
 }
 
+// ===========================================================================
+// A3 -- the compressed-KV latent's fp4 roundtrip (DSV41_COMPRESS_LATENT_QUANT)
+// ===========================================================================
+// The official does NOT stop at a bf16 latent. `_compress_kv` (`model.py:758-760`)
+// ropes the latent IN PLACE and then runs
+//
+//     fp4_act_quant(latent, 16, True, scale_dtype=torch.float8_e4m3fn)
+//
+// which rewrites each 16-element block with its own DEQUANTISED value. `fp4_act_quant`
+// -> `fp4_quant_kernel`'s E4M3-scale branch (`kernel.py:159-172`) is, per block:
+//
+//   amax = max(|x|)                       over the block        (kernel.py:158)
+//   amax = max(amax, 6 * 2**-9)                                 (kernel.py:162)
+//   s    = f32( e4m3( amax / 6 ) )                              (kernel.py:163)  <- NOT a pow2
+//   q    = e2m1( clamp(x / s, -6, 6) )                          (kernel.py:171)
+//   x'   = bf16( f32(q) * s )               written back in place(kernel.py:169-171)
+//
+// ferrite had only the pre-rope `bf16_snap` on this boundary, i.e. no fp4 step at
+// all -- MORE precision than the official, which is exactly the misalignment
+// audit item A3 (`docs/agent/moe-bs-crash-investigation.md` §61).
+//
+// The two branches of `fp4_quant_kernel` are NOT interchangeable and the
+// distinction is the whole point of this kernel:
+//   * the scale here is the e4m3 ROUNDING of amax/6 -- three significand bits,
+//     not a power of two. `glue_fast_round_scale` / `quant_kernel<0>`
+//     (dsv41_kernels.cu:136-181) implement the OTHER branch (e8m0 / pow2), so
+//     calling them here would be a silently different quantiser -- the failure
+//     mode this file's callers cannot see.
+//   * the floor is `6 * 2**-9` (the smallest positive e4m3 step, so an all-zero
+//     block still gets a representable NONZERO scale -- the reference says so
+//     explicitly at kernel.py:161), not the routed-down path's `1e-4` and not the
+//     e8m0 branch's `6 * 2**-126`.
+//   * block = 16 (compressed KV), not 32 (indexer) and not 128 (window KV).
+//
+// The trailing bf16 of the write-back is a NO-OP here, and provably so: an e2m1
+// code carries a 1-bit significand and an e4m3 scale a 3-bit one, so `q * s`
+// needs at most 4 significand bits and an exponent in [-9, 8]; bf16 carries 8
+// significand bits and an exponent range of hundreds. It is applied anyway, so
+// the contract is the reference's rather than a coincidence of the table.
+//
+// DETERMINISM. One thread owns one whole 16-element block and the amax is a
+// plain sequential loop, so there is no cross-thread reduction order to pin. The
+// launch is tiny (one committed row per layer per step), so this costs a
+// rounding error next to the launch floor -- see the A3 note in `compress_on`.
+
+#define GLUE_LAT_QBLK 16
+
+// The seven groups the A3 probe prints for the ONE block (row 0 / block 0);
+// `glue_latent_fp4_block16` fills them only when the caller passes a non-null
+// pointer, exactly like GLUE_DBG_* above.
+#define GLUE_LAT_DBG_FLOATS 112   // 7 x 16
+#define GLUE_LAT_DBG_PRE 0        // (1) the value the quantiser sees
+#define GLUE_LAT_DBG_AMAX 16      // (2) the block amax, after the floor
+#define GLUE_LAT_DBG_SBYTE 32     // (3a) the e4m3 scale BYTE
+#define GLUE_LAT_DBG_SF32 48      // (3b) that byte widened to f32
+#define GLUE_LAT_DBG_CODE 64      // (4) the e2m1 code
+#define GLUE_LAT_DBG_DEQ 80       // (5) the dequantised value written back
+#define GLUE_LAT_DBG_MEM 96       // (6) it read BACK from memory (the store landed)
+
+// Nearest e2m1 code, ties to the smaller magnitude slot -- the same selection
+// `quant_kernel<1>` (dsv41_kernels.cu:164-174), `dsv41_experts_mxf4.cu:306-318`
+// and `quant.rs:40-55` (e2m1_encode) make, so every encoder in the tree agrees
+// code for code on the 8 magnitudes {0, .5, 1, 1.5, 2, 3, 4, 6}.
+//
+// ⚠️ THE ONE PLACE WHERE "MATCHES THE TREE" IS NOT YET "MATCHES THE OFFICIAL".
+// The official's cast is `T.Cast(FP4, clamp(x/s, -6, 6))` (`kernel.py:171`), and
+// TileLang's codegen for a scalar cast to `float4_e2m1fn` is a C-style cast to
+// its `fp4_e2_t` wrapper (`tilelang/src/cuda/codegen/codegen_cuda.cc`, the
+// `from_ty.is_scalar() && cast_round.empty()` path) whose float constructor is
+// `__nv_fp4_e2m1 tmp(x)` (`tilelang_inc/tl_templates/cuda/cuda_fp4.h:22`), i.e.
+// NVIDIA's `__nv_cvt_float_to_fp4(x, __NV_E2M1, cudaRoundNearest)` (same header,
+// `__tl_cvt_float_to_fp4`), i.e. PTX `cvt.rn.satfinite.e2m1x2.f32` =
+// ROUND-TO-NEAREST-EVEN, saturating at 6.0.
+//
+// Nearest and round-to-nearest-even differ only at an EXACT midpoint of two
+// e2m1 magnitudes, and e2m1's 1-bit significand makes four of those midpoints
+// degenerate (the two candidates carry the SAME retained bit, because the
+// significand is identical on both sides of an exponent boundary):
+//   ratio   1.25  2.5  5.0  -> the retained bit differs -> RNE picks the even
+//                               (lower) one -> agrees with this loop.
+//   ratio   1.75  3.5       -> reflected exponents (1.1b x 2^k vs 1.0b x 2^k+1):
+//                               RNE-on-the-stored-bit picks the UPPER one, this
+//                               loop picks the lower. A REAL divergence, ~1
+//                               element per row per step (v = 1.75*s exactly is
+//                               bf16-representable), NOT a measure-zero corner.
+//   ratio   0.25  0.75      -> both candidates even -> `cvt.rn` is not
+//                               well-defined from the doc; the header only says
+//                               cudaRoundNearest, and the CUDA toolkit ships no
+//                               software fallback to read.
+// Set GLUE_LAT_Q_TIE_UP=1 to take the "round half away from zero" reading of the
+// last four cases (RNE where it is defined, upper on the degenerate ones); the
+// default keeps the tree's own rule so all four encoders stay identical until
+// the GPU says otherwise. `DSV41_COMPRESS_LATENT_QUANT_DBG`'s tie block is what
+// settles it (see scripts/a3_latent_fp4_reference.py --ties).
+#ifndef GLUE_LAT_Q_TIE_UP
+#define GLUE_LAT_Q_TIE_UP 0
+#endif
+
+__device__ __forceinline__ uint8_t glue_e2m1_encode(float v) {
+    const float a = fminf(fabsf(v), 6.0f);
+    uint8_t best = 0;
+    float bd = 1e30f;
+    const float mags[8] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
+#pragma unroll
+    for (int c = 0; c < 8; c++) {
+        const float d = fabsf(a - mags[c]);
+        if (d < bd) {
+            bd = d;
+            best = (uint8_t)c;
+        }
+    }
+#if GLUE_LAT_Q_TIE_UP
+    // A tie is reachable only when `a` is EXACTLY one of the seven midpoints; the
+    // `d < bd` above already kept the lower slot, so a tie shows up as an equal
+    // distance to the upper slot. RNE keeps the lower (even) slot at the three
+    // midpoints where the retained bit differs; the four degenerate ones
+    // (0.25, 0.75, 1.75, 3.5 -- same magnitude significand on both sides of a
+    // binade boundary) take the upper.
+    if (best + 1 < 8 && fabsf(a - mags[best + 1]) == bd) {
+        if (a == 0.25f || a == 0.75f || a == 1.75f || a == 3.5f) best = (uint8_t)(best + 1);
+    }
+#endif
+    return (uint8_t)(best | ((v < 0.f) ? 0x8u : 0u));
+}
+
+// The e2m1 decode table (`convert.py` FP4_TABLE == dsv41_kernels.cu:104-106
+// kFp4Table == quant.rs:22-25 FP4_TABLE, value for value; the write-back needs
+// the DECODE, not the nibble, so it is spelled out here rather than reaching
+// across translation units).
+__device__ __forceinline__ float glue_e2m1_decode(uint8_t code) {
+    const float mags[8] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
+    const float v = mags[code & 0x07u];
+    return (code & 0x8u) ? -v : v;
+}
+
+// One 16-element block, quantised and DEQUANTISED in place. `bf16_first` applies
+// the reference's own `x.to(dtype)` first -- see the call sites: the official's
+// quantiser input is a bf16 tensor (the rope writes back into one), so an f32 row
+// must be narrowed before the amax/scale are computed or the scale itself can
+// differ.
+__device__ __forceinline__ void glue_latent_fp4_block16(float* __restrict__ p, int bf16_first,
+                                                        float* __restrict__ dbg) {
+    float pre[GLUE_LAT_QBLK];
+#pragma unroll
+    for (int i = 0; i < GLUE_LAT_QBLK; i++) pre[i] = bf16_first ? glue_bf16_round(p[i]) : p[i];
+    float amax = 0.f;
+#pragma unroll
+    for (int i = 0; i < GLUE_LAT_QBLK; i++) amax = fmaxf(amax, fabsf(pre[i]));
+    // kernel.py:162 (e4m3 branch). `6 * 2**-9` is the smallest positive e4m3
+    // value, so the scale below is never zero and an all-zero block dequantises
+    // to zero instead of producing inf/NaN.
+    amax = fmaxf(amax, 6.0f * (1.0f / 512.0f));
+    // kernel.py:163 -- `Cast(f32, Cast(e4m3, amax / fp4_max))`. `__nv_fp8_e4m3`
+    // is round-to-nearest-even, which is the cast the reference performs.
+    const __nv_fp8_e4m3 sb = __nv_fp8_e4m3(amax * (1.0f / 6.0f));
+    const uint8_t sb_byte = *(const uint8_t*)&sb;
+    const float s = glue_e4m3_byte_to_f(sb_byte);
+    const float inv = 1.0f / s;
+    uint8_t codes[GLUE_LAT_QBLK];
+#pragma unroll
+    for (int i = 0; i < GLUE_LAT_QBLK; i++) {
+        const float q = fminf(fmaxf(pre[i] * inv, -6.0f), 6.0f);  // kernel.py:171 clamp
+        codes[i] = glue_e2m1_encode(q);
+        p[i] = glue_bf16_round(glue_e2m1_decode(codes[i]) * s);   // kernel.py:169-171 write-back
+    }
+    if (dbg != nullptr) {
+#pragma unroll
+        for (int i = 0; i < GLUE_LAT_QBLK; i++) {
+            dbg[GLUE_LAT_DBG_PRE + i] = pre[i];
+            dbg[GLUE_LAT_DBG_AMAX + i] = amax;
+            dbg[GLUE_LAT_DBG_SBYTE + i] = (float)sb_byte;
+            dbg[GLUE_LAT_DBG_SF32 + i] = s;
+            dbg[GLUE_LAT_DBG_CODE + i] = (float)codes[i];
+            dbg[GLUE_LAT_DBG_DEQ + i] = p[i];
+        }
+        // Read back AFTER the store: group (6) is the probe's proof that the
+        // in-place write landed in the buffer the caller actually keeps (the ring
+        // slot / the latent), not merely in a register.
+        for (int i = 0; i < GLUE_LAT_QBLK; i++) dbg[GLUE_LAT_DBG_MEM + i] = p[i];
+    }
+}
+
+// The standalone form: an in-place roundtrip of `rows` x `hd` f32 rows (`ld` =
+// source row pitch, 0 means `hd`). The reference asserts `N % block_size == 0`
+// (`kernel.py:194`), so a row length that is not a multiple of 16 is REFUSED by
+// the launcher rather than silently handled.
+__global__ void compress_latent_fp4_kernel(float* __restrict__ x, int rows, int ld, int hd,
+                                           int bf16_first, float* __restrict__ dbg) {
+    const int nb = hd >> 4;
+    const int idx = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;  // one 16-block per thread
+    if (idx >= rows * nb) return;
+    const int r = idx / nb, b = idx - r * nb;
+    glue_latent_fp4_block16(x + (size_t)r * (size_t)ld + (size_t)b * GLUE_LAT_QBLK, bf16_first,
+                            (dbg != nullptr && r == 0 && b == 0) ? dbg : nullptr);
+}
+
+// A3's WIRED form. The commit launch has just roped this layer's latent into its
+// ring slot, so the fp4 step has to land on THAT row -- after the rope, which is
+// where the reference puts it (`model.py:758-760`). Rather than duplicate the
+// commit, this reads the slot the commit itself chose: the commit reads
+// `len = *clen`, writes `ring + (window + len) * hd` and stores `*clen = len + 1`
+// (`dsv41_glue.cu` compress_commit_kernel, and the fused arm's VERBATIM stage 3
+// at `dsv41_kernels.cu:3590-3613`), so after it the committed row is the one at
+// `*clen - 1`. Same stream as the commit => ordered after it; the device counter
+// is authoritative, so the host's mirror cannot drift from it.
+//
+// `row_quant == 0` (production) returns immediately, one predicate per thread,
+// which is what makes the OFF path bit-identical.
+__global__ void compress_ring_quant_kernel(float* __restrict__ ring,
+                                          const int* __restrict__ out_rows,
+                                          const int* __restrict__ clen, int window, int hd,
+                                          int bf16_first, int row_quant, float* __restrict__ dbg) {
+    if (row_quant == 0 || *out_rows <= 0) return;  // no group completed: nothing was written
+    const int len = *clen - 1;
+    float* row = ring + (size_t)(window + len) * (size_t)hd;
+    const int nb = hd >> 4;
+    for (int b = (int)threadIdx.x; b < nb; b += (int)blockDim.x) {
+        glue_latent_fp4_block16(row + (size_t)b * GLUE_LAT_QBLK, bf16_first,
+                                (dbg != nullptr && b == 0) ? dbg : nullptr);
+    }
+}
+
 }  // namespace
+
+// The DBG probe (`DSV41_COMPRESS_LATENT_QUANT_DBG`) writes its seven groups for
+// (row 0, block 0) into a GLUE_LAT_DBG_FLOATS-float buffer; nullptr in production
+// (the probe touches no input or output element, so both forms are bit-identical).
+// `bf16_first` is the reference's own `x.to(dtype)` on the quantiser's input:
+// leave it ON for the official's chain (the latent the reference quantises is a
+// bf16 tensor) and OFF only for an A/B that isolates the roundtrip from it.
+// Returns cudaErrorInvalidValue for a row length that is not a multiple of 16.
+extern "C" int dsv41_compress_latent_fp4(float* x, int rows, int ld, int hd, int bf16_first,
+                                         float* dbg, cudaStream_t s) {
+    if (x == nullptr) return (int)cudaErrorInvalidValue;
+    if (rows <= 0) return (int)cudaSuccess;
+    if (hd <= 0 || (hd & 15) != 0) return (int)cudaErrorInvalidValue;
+    if (ld <= 0) ld = hd;
+    const int nb = hd >> 4;
+    const int total = rows * nb;
+    const int threads = 128;
+    const int blocks = (total + threads - 1) / threads;
+    compress_latent_fp4_kernel<<<blocks, threads, 0, s>>>(x, rows, ld, hd, bf16_first, dbg);
+    return (int)cudaGetLastError();
+}
+
+// ABI: (ring, out_rows, clen, window, hd, bf16_first, row_quant, dbg, s). `ring`
+// is the compressed-KV ring the commit just wrote; `hd` must be a multiple of 16.
+extern "C" int dsv41_compress_ring_quant(float* ring, const int* out_rows, const int* clen,
+                                         int window, int hd, int bf16_first, int row_quant,
+                                         float* dbg, cudaStream_t s) {
+    if (ring == nullptr || out_rows == nullptr || clen == nullptr) return (int)cudaErrorInvalidValue;
+    if (hd <= 0 || (hd & 15) != 0) return (int)cudaErrorInvalidValue;
+    compress_ring_quant_kernel<<<1, 128, 0, s>>>(ring, out_rows, clen, window, hd, bf16_first,
+                                                 row_quant, dbg);
+    return (int)cudaGetLastError();
+}
 
 // `dbg` is OPTIONAL: pass nullptr in production (the probe is a default-OFF
 // diagnostic, and the kernel is bit-identical either way -- the dbg stores touch

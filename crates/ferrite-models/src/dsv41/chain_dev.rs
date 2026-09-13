@@ -1260,6 +1260,50 @@ pub(crate) fn routed_down_quant_dbg() -> bool {
     })
 }
 
+/// `DSV41_COMPRESS_LATENT_QUANT=1` (default OFF) enables A3 — the compressed-KV
+/// latent's fp4 roundtrip, the last quantisation of the official's latent chain
+/// that ferrite was missing (`docs/agent/moe-bs-crash-investigation.md` §61).
+///
+/// The official is NOT "rope then store": `_compress_kv` (`model.py:758-760`)
+/// ropes the latent in place and then runs
+/// `fp4_act_quant(latent, 16, True, scale_dtype=torch.float8_e4m3fn)`, which
+/// rewrites every 16-element block with its own DEQUANTISED value. ferrite
+/// applied only the bf16 boundary (`bf16_snap_on(latent)`, D1) and kept f32
+/// afterwards, i.e. it was MORE precise than the official by one whole
+/// quantiser — the "精度不能高也不能低" half of the user's requirement.
+///
+/// Where the step has to sit: AFTER the rope, so it cannot be a replacement for
+/// `bf16_snap_on(latent)` (that one is BEFORE the rope and is a different
+/// boundary — see `compress_latent_quant_on`).
+///
+/// DEFAULT OFF: `"0"` means OFF even though it is "set", and the history is
+/// cached once (house rule — a per-call getenv is a hot-path slip).
+pub(crate) fn compress_latent_quant() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("DSV41_COMPRESS_LATENT_QUANT")
+            .map(|v| v != "0")
+            .unwrap_or(false)
+    })
+}
+
+/// `DSV41_COMPRESS_LATENT_QUANT_DBG=1` (default OFF, only meaningful with the
+/// gate above) arms the ONE-SHOT A3 probe: the roundtrip kernel additionally
+/// writes the seven groups of its (row 0, block 0) 16-element block into a
+/// 112-float device buffer, the host downloads it, recomputes the same seven on
+/// the CPU from the quantiser's own input (see [`LatentQuantDbg::cpu_reference`])
+/// and prints both plus their per-element difference. Same shape as
+/// `DSV41_ROUTED_DOWN_QUANT_DBG`: two implementations of one formula, on real
+/// data, so "looks right, numbers wrong" cannot survive.
+pub(crate) fn compress_latent_quant_dbg() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("DSV41_COMPRESS_LATENT_QUANT_DBG")
+            .map(|v| v.starts_with('1'))
+            .unwrap_or(false)
+    })
+}
+
 /// One-shot notice for an armed-but-inert routed-down gate — the #1 measurement
 /// trap in this project is "a gate was exported and the OLD path answered the
 /// step", so every state in which the arm cannot do what its name says announces
@@ -1508,6 +1552,196 @@ impl RoutedDownDbg {
              weight-scaled bf16 operand — this is what the reference's fp4_gemm multiplies",
             self.scale_exp[0] as u32
         );
+    }
+}
+
+// ===========================================================================
+// DSV41_COMPRESS_LATENT_QUANT_DBG: the one-shot A3 probe
+// ===========================================================================
+// The roundtrip kernel (`dsv41_glue.cu`, `glue_latent_fp4_block16`) fills these
+// seven groups for its (row 0, block 0) 16-element block; the host recomputes the
+// same seven from group ① and prints both. What the probe must show, element by
+// element — this IS the official's formula (`kernel.py:158-171`, e4m3 branch):
+//   ① the quantiser's input                 (`model.py:758-760` feeds it the roped latent)
+//   ② the block amax, AFTER the floor       `max(amax, 6 * 2**-9)`      kernel.py:162
+//   ③ the e4m3 scale BYTE + its f32 value   `s = f32(e4m3(amax / 6))`   kernel.py:163
+//   ④ the e2m1 code                         `fp4(clamp(x / s, -6, 6))`   kernel.py:171
+//   ⑤ the dequantised value written back    kernel.py:169-171
+//   ⑥ ⑤ read BACK from memory — the store landed (in the ring slot / the latent)
+// Kernel vs CPU must agree EXACTLY on ①②③④ and on ⑤⑥ up to nothing at all: the
+// dequantised value is a bf16 by construction (see `glue_latent_fp4_block16`), so
+// there is no second rounding for the two sides to disagree about. The only
+// open difference is the e2m1 TIE rule (see `e2m1_encode`'s doc) — the printed
+// per-element difference is what makes it visible rather than arguable.
+const LAT_Q_BLOCK: usize = 16;
+const LAT_Q_DBG_FLOATS: usize = 7 * LAT_Q_BLOCK;
+
+/// One 16-element block's seven groups, as either side computes them.
+struct LatentQuantDbg {
+    pre: Vec<f32>,
+    amax: Vec<f32>,
+    sbyte: Vec<f32>,
+    sf32: Vec<f32>,
+    code: Vec<f32>,
+    deq: Vec<f32>,
+    mem: Vec<f32>,
+}
+
+impl LatentQuantDbg {
+    /// The seven groups as the KERNEL wrote them (a flat 112-float buffer).
+    fn from_device(vals: &[f32]) -> Self {
+        let g = |k: usize| vals[k * LAT_Q_BLOCK..(k + 1) * LAT_Q_BLOCK].to_vec();
+        Self {
+            pre: g(0),
+            amax: g(1),
+            sbyte: g(2),
+            sf32: g(3),
+            code: g(4),
+            deq: g(5),
+            mem: g(6),
+        }
+    }
+
+    /// The same seven on the CPU, written from the REFERENCE
+    /// (`ref_inference/kernel.py:155-179`, the `scale_dtype == FP8` branch) and
+    /// NOT from the CUDA kernel — the probe must compare two implementations, not
+    /// one with itself. The codec comes from [`crate::dsv41::quant`] (the crate's
+    /// own reference golden: `e4m3_encode`/`e4m3_decode`/`e2m1_encode`/
+    /// `e2m1_decode`, whose table is `convert.py`'s `FP4_TABLE` value for value).
+    ///
+    /// `pre` is the QUANTISER'S input (group ①), so `bf16_first` must be the same
+    /// flag the launch was given: the reference's quantiser reads a bf16 tensor
+    /// (`model.py:485` + the in-place rope at `model.py:397-405` copy back into
+    /// that same bf16 tensor), so an f32 row has to be narrowed before the amax is
+    /// taken or the SCALE can differ too, not just the codes.
+    fn cpu_reference(pre: &[f32], bf16_first: bool) -> Self {
+        use crate::dsv41::quant::{e2m1_decode, e2m1_encode, e4m3_decode, e4m3_encode, FP4_MAX};
+        let pre: Vec<f32> = pre
+            .iter()
+            .map(|&v| if bf16_first { bf16_rn(v) } else { v })
+            .collect();
+        // kernel.py:162 — `T.max(amax, 6 * 2**-9)`, the e4m3 branch's floor: the
+        // smallest positive e4m3 value, so an all-zero block still gets a scale
+        // that is representable and NONzero (kernel.py:161 says so outright).
+        let amax = pre
+            .iter()
+            .fold(0.0f32, |a, &v| a.max(v.abs()))
+            .max(6.0 * (1.0 / 512.0));
+        // kernel.py:163 — the e4m3 ROUNDING of amax/6, not a power of two.
+        let sbyte = e4m3_encode(amax / FP4_MAX);
+        let s = e4m3_decode(sbyte);
+        debug_assert!(s > 0.0, "the floor must keep the scale nonzero");
+        let mut code = Vec::with_capacity(LAT_Q_BLOCK);
+        let mut deq = Vec::with_capacity(LAT_Q_BLOCK);
+        for &v in &pre {
+            let c = e2m1_encode((v / s).clamp(-FP4_MAX, FP4_MAX));
+            code.push(c as f32);
+            // kernel.py:169-171 — the write-back goes through the input dtype
+            // (bf16), which for these magnitudes is exact (see the kernel's note).
+            //
+            // The SIGN is applied here rather than taken from `e2m1_decode`'s
+            // table: `quant.rs`'s `FP4_TABLE[8]` is `+0.0` (the convention
+            // `convert.py:13-15` uses, and its doc comment says index 8 "is a
+            // negative zero and encodes as 0.0"), while an e2m1 nibble with the
+            // sign bit set and a zero magnitude decodes to `-0.0` — which is what
+            // `glue_e2m1_decode` in the kernel produces and what the reference's
+            // `Cast(f32, fp4)` produces. Numerically inert, not bit-identical: the
+            // ring row's byte pattern is what the probe compares.
+            let mag = e2m1_decode(c & 0x7);
+            let signed = if c & 0x8 != 0 { -mag } else { mag };
+            deq.push(bf16_rn(signed * s));
+        }
+        Self {
+            pre,
+            amax: vec![amax; LAT_Q_BLOCK],
+            sbyte: vec![sbyte as f32; LAT_Q_BLOCK],
+            sf32: vec![s; LAT_Q_BLOCK],
+            code,
+            deq,
+            mem: Vec::new(), // group ⑥ only exists on the device side
+        }
+    }
+
+    fn worst(a: &[f32], b: &[f32]) -> (f32, bool) {
+        let mut worst = 0.0f32;
+        let mut all_zero = true;
+        for i in 0..LAT_Q_BLOCK.min(a.len()).min(b.len()) {
+            let d = (a[i] - b[i]).abs();
+            worst = worst.max(d);
+            if d != 0.0 {
+                all_zero = false;
+            }
+        }
+        (worst, all_zero)
+    }
+
+    /// Kernel vs CPU, group by group, element by element.
+    fn report(&self, cpu: &Self, bf16_first: bool, hd: i32, hd_scale: f32) {
+        eprintln!(
+            "[compress-latent-quant] DSV41_COMPRESS_LATENT_QUANT_DBG probe (ONE-SHOT) — block \
+             (row 0, elements 0..{LAT_Q_BLOCK}) of the committed ring row (hd={hd}, {} blocks/row, \
+             bf16_first={bf16_first}); columns: ① quantiser input, ② block amax, ③ scale byte \
+             (e4m3), ④ scale f32, ⑤ e2m1 code, ⑥ dequantised write-back, ⑦ read back from memory",
+            hd / LAT_Q_BLOCK as i32
+        );
+        for i in 0..LAT_Q_BLOCK {
+            eprintln!(
+                "[compress-latent-quant]  i={i:02}  KERNEL {:>15.9e} {:>15.9e} {:>5.0} \
+                 {:>15.9e} {:>5.0} {:>15.9e} {:>15.9e}  |  CPU {:>15.9e} {:>15.9e} {:>5.0} \
+                 {:>15.9e} {:>5.0} {:>15.9e} {:>15.9e}  |  D {:+.2e} {:+.2e} {:+.0e} {:+.2e} \
+                 {:+.0e} {:+.2e}",
+                self.pre[i],
+                self.amax[i],
+                self.sbyte[i],
+                self.sf32[i],
+                self.code[i],
+                self.deq[i],
+                self.mem[i],
+                cpu.pre[i],
+                cpu.amax[i],
+                cpu.sbyte[i],
+                cpu.sf32[i],
+                cpu.code[i],
+                cpu.deq[i],
+                f32::NAN, // ⑥ has no CPU twin by construction (it is a read-back)
+                self.pre[i] - cpu.pre[i],
+                self.amax[i] - cpu.amax[i],
+                self.sbyte[i] - cpu.sbyte[i],
+                self.sf32[i] - cpu.sf32[i],
+                self.code[i] - cpu.code[i],
+                self.deq[i] - cpu.deq[i],
+            );
+        }
+        for (label, a, b) in [
+            ("① quantiser in ", &self.pre, &cpu.pre),
+            ("② block amax  ", &self.amax, &cpu.amax),
+            ("③ scale byte  ", &self.sbyte, &cpu.sbyte),
+            ("④ scale f32   ", &self.sf32, &cpu.sf32),
+            ("⑤ e2m1 code   ", &self.code, &cpu.code),
+            ("⑥ write-back  ", &self.deq, &cpu.deq),
+        ] {
+            let (worst, all_zero) = Self::worst(a, b);
+            eprintln!(
+                "[compress-latent-quant] {label}: kernel-vs-cpu max|diff| = {worst:e}{}",
+                if all_zero { " (bit-identical)" } else { "" }
+            );
+        }
+        let (store, same) = Self::worst(&self.mem, &self.deq);
+        eprintln!(
+            "[compress-latent-quant] ⑦ memory read-back vs ⑥: max|diff| = {store:e}{} — the \
+             in-place write landed in the ring slot",
+            if same { " (the store holds exactly the dequantised value)" } else { "" }
+        );
+        eprintln!(
+            "[compress-latent-quant] scale = {:e} (byte {}); amax/scale = {:e} (block max sits at \
+             ±6 by construction: {:e} x 6 = {:e})",
+            self.sf32[0],
+            self.sbyte[0] as u32,
+            cpu.amax[0] / self.sf32[0],
+            self.sf32[0],
+            self.sf32[0] * 6.0
+        );
+        let _ = hd_scale;
     }
 }
 
@@ -12481,6 +12715,15 @@ impl<'a> DevChain<'a> {
             ratio as i32,
             st,
         )?;
+        // A3 (`DSV41_COMPRESS_LATENT_QUANT`): the SAME fp4 roundtrip the live path
+        // applies, on the row this replay's commit just wrote. It has to be here
+        // too, or a replay would put a bf16-only row where the live step put a
+        // fp4-roundtripped one and the two rings would disagree INSIDE one run
+        // (the exact class of divergence S2/`DSV41_COMP_PARITY` exists to catch).
+        if compress_latent_quant() {
+            let commits_now = (pos_base + r as i32 + 1) % (ratio as i32) == 0;
+            self.compress_latent_quant_on(layer, commits_now, st)?;
+        }
         // The host MIRROR of the device counter, by the SAME rule the commit
         // kernel applies ((*pos + 1) % ratio == 0).
         let committed = (pos_base + r as i32 + 1) % (ratio as i32) == 0;
@@ -20260,6 +20503,111 @@ fn oracle_tap() -> bool {
         Ok(())
     }
 
+    /// A3 (`DSV41_COMPRESS_LATENT_QUANT`, default OFF): the compressed-KV
+    /// latent's fp4 roundtrip, applied to the ring row the commit just wrote.
+    ///
+    /// WHY THIS CANNOT REPLACE `bf16_snap_on(latent)` — the two are different
+    /// points of the official's chain, not two spellings of one step:
+    ///
+    /// | | `bf16_snap_on(latent)` (D1, the existing one) | A3 (this) |
+    /// |---|---|---|
+    /// | where | BEFORE the rope, on the compressor's pooled latent | AFTER the rope, on the committed row |
+    /// | official | `Compressor.forward` returns `self.norm(kv.to(dtype))`, bf16 (`model.py:485`) | `fp4_act_quant(latent, 16, True, e4m3)` (`model.py:758-760`) |
+    /// | what | one bf16 narrowing | amax + e4m3 scale + e2m1 code + dequant, per 16 |
+    /// | gate | `DSV41_BF16_TRUNCATE` (separate, still OFF by default) | this gate |
+    /// | direction | we are too precise without it | we are too precise without it |
+    ///
+    /// Applying the fp4 roundtrip to the PRE-rope latent instead — the tempting
+    /// "one-line swap" — is wrong twice over: the official never quantises that
+    /// tensor, and the quantiser is not order-invariant (the rope mixes adjacent
+    /// pairs inside every 16-element block, so most codes move). And dropping the
+    /// bf16 snap to "compensate" would remove a boundary the official HAS: the
+    /// reference's latent is bf16 before the rope, and the rope writes back into
+    /// that same bf16 tensor (`model.py:397-405`), which is why `bf16_first = 1`
+    /// below rounds the rope's output before the amax is taken — the scale itself
+    /// depends on that rounding, not just the codes.
+    ///
+    /// Full alignment therefore needs BOTH gates on: `DSV41_BF16_TRUNCATE` for the
+    /// pre-rope bf16 tensor's values, and this one for the quantiser's output.
+    /// With this gate ON and the other OFF we are already exactly the official's
+    /// quantiser applied to a slightly-more-precise input — strictly closer than
+    /// the bf16-only boundary, and still one boundary short.
+    ///
+    /// `dbg_arm` (host mirror: "a group completed on this step") gates the
+    /// one-shot probe, whose D2H readback is illegal inside a capture.
+    fn compress_latent_quant_on(
+        &self,
+        layer: usize,
+        dbg_arm: bool,
+        s: ferrite_kernel::devrt::CuStream,
+    ) -> Result<()> {
+        let cfg = self.cfg;
+        let hd = cfg.head_dim;
+        // The reference asserts `N % block_size == 0` (`kernel.py:194`), so a
+        // head_dim that is not a multiple of 16 has no official semantics to
+        // match and the launcher refuses it. Announce it once instead of leaving
+        // an armed gate silently inert (the project's #1 measurement trap).
+        if hd == 0 || hd % LAT_Q_BLOCK != 0 {
+            static NOTE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            NOTE.get_or_init(|| {
+                eprintln!(
+                    "warning: DSV41_COMPRESS_LATENT_QUANT is set, but head_dim={hd} is not a \
+                     multiple of the official's block ({LAT_Q_BLOCK}), so the fp4 roundtrip is \
+                     SKIPPED and the bf16-only boundary stands (an A/B arm under this state \
+                     would measure the OLD path)"
+                );
+            });
+            return Ok(());
+        }
+        let cache = &self.layers[layer];
+        let ring = cache.ring.ptr as *mut f32;
+        let out_rows = cache.out_rows.ptr as *const std::os::raw::c_int;
+        // The commit bumped this counter at the slot it wrote, so the device side
+        // needs no host mirror: `*clen - 1` IS the committed row's index.
+        let clen = (self.s.clen.ptr as *const std::os::raw::c_int).wrapping_add(layer);
+        let dbg = if dbg_arm && compress_latent_quant_dbg() && !self.dev.capturing() {
+            Some(self.dev.alloc(LAT_Q_DBG_FLOATS * 4)?)
+        } else {
+            None
+        };
+        let dbg_ptr = dbg.as_ref().map_or(std::ptr::null_mut(), |b| b.ptr as *mut f32);
+        // bf16_first = 1: the official's quantiser input is the bf16 rope output
+        // (`model.py:397-405` + `485`). row_quant = 1: the gate itself.
+        let live = self.dev.compress_ring_quant_on(
+            ring,
+            out_rows,
+            clen,
+            cfg.window_size as i32,
+            hd as i32,
+            1,
+            1,
+            dbg_ptr,
+            s,
+        )?;
+        if !live {
+            static NOTE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            NOTE.get_or_init(|| {
+                eprintln!(
+                    "warning: DSV41_COMPRESS_LATENT_QUANT is set, but the loaded kernel .so has no \
+                     `dsv41_compress_ring_quant` entry point, so the compressed-KV latent keeps \
+                     its bf16-only boundary and we stay MORE precise than the official on this \
+                     row (rebuild kernels/cuda: bash build.sh 103a)"
+                );
+            });
+            return Ok(());
+        }
+        if let Some(b) = dbg {
+            static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            if ONCE.set(()).is_ok() {
+                let vals = self.dl(b.ptr as *const f32, LAT_Q_DBG_FLOATS)?;
+                let kern = LatentQuantDbg::from_device(&vals);
+                let cpu = LatentQuantDbg::cpu_reference(&kern.pre, true);
+                kern.report(&cpu, true, hd as i32, 0.0);
+            }
+        }
+        Ok(())
+    }
+
     /// MLA window path + grouped output projection.
     /// Decode attention for one layer. Returns whether the segment-C hc-post was
     /// folded into this layer's attention all-reduce (see
@@ -21709,6 +22057,22 @@ fn oracle_tap() -> bool {
                 ratio as i32,
                 s,
             )?;
+        }
+        // A3 (`DSV41_COMPRESS_LATENT_QUANT`, default OFF): the fp4 roundtrip of the
+        // row the commit just wrote — the official's LAST step on this chain
+        // (`model.py:758-760` -> `kernel.py:159-172`: block 16, e4m3 scale, e2m1
+        // codes, dequantised in place). OFF, a stale `.so`, or the DBG probe
+        // declining issues nothing, so the shipping arm is bit-identical without
+        // the gate. It rides `s`, the same stream the commit rode: the kernel
+        // reads the device counter the commit bumped and rewrites the row the
+        // commit produced, so another stream would both race it and name a
+        // different slot.
+        if compress_latent_quant() {
+            // The mirror below applies the SAME rule to decide that a group
+            // completed; the probe only needs to know whether a row exists to
+            // read back, and the kernel re-checks the device's own verdict.
+            let commits_now = (pos + 1) % ratio == 0;
+            self.compress_latent_quant_on(layer, commits_now, s)?;
         }
         // The host keeps a MIRROR of the device counter using the SAME deterministic
         // rule the kernel applies ((pos + 1) % ratio == 0 commits one latent). The
@@ -23449,3 +23813,100 @@ mod routed_down_prep_tests {
     }
 }
 
+
+#[cfg(test)]
+mod a3_latent_quant_tests {
+    use super::{LatentQuantDbg, LAT_Q_BLOCK};
+
+    /// The A3 host reference against the OFFICIAL formula, pinned with the three
+    /// worked blocks of `scripts/a3_latent_fp4_reference.py` (the same numbers the
+    /// GPU probe must reproduce, and the same file the GPU box can diff the
+    /// official kernel against). If this test and that script ever disagree, the
+    /// two references have drifted — which is the one thing a probe that compares
+    /// "kernel vs host" cannot detect on its own.
+    fn ref_of(blk: &[f32]) -> LatentQuantDbg {
+        assert_eq!(blk.len(), LAT_Q_BLOCK);
+        LatentQuantDbg::cpu_reference(blk, true)
+    }
+
+    fn bits(v: f32) -> u32 {
+        v.to_bits()
+    }
+
+    /// An ALL-ZERO block: `kernel.py:162`'s floor is the load-bearing part. The
+    /// block max is 0, so without `max(amax, 6 * 2**-9)` the scale would be
+    /// `e4m3(0) = 0` and the dequantisation `q * 0 / 0` would be undefined — the
+    /// reference's own comment says the scale must stay nonzero (kernel.py:161).
+    /// The floor is exactly the smallest positive e4m3 value, so the scale IS the
+    /// byte 0x01, and every element dequantises to a signed zero.
+    #[test]
+    fn a3_zero_block_keeps_a_representable_scale() {
+        let r = ref_of(&[0.0f32; 16]);
+        assert_eq!(bits(r.amax[0]), 0x3C40_0000, "amax floor must be 6 * 2**-9");
+        assert_eq!(r.amax[0], 6.0 * (1.0 / 512.0));
+        assert_eq!(r.sbyte[0] as u32, 0x01, "e4m3(2**-9) is the byte 0x01");
+        assert_eq!(r.sf32[0], 2.0f32.powi(-9));
+        assert!(r.code.iter().all(|&c| c == 0.0), "a zero block encodes to code 0");
+        assert!(r.deq.iter().all(|&v| v == 0.0), "and dequantises to zero");
+    }
+
+    /// A block whose amax is exactly 6: the scale lands on 1.0 (byte 0x38) and
+    /// every element maps to its own code, so this pins the e2m1 table AND the
+    /// write-back in one shot. `0.75 -> 0.5` and `1.25 -> 1.0` are the
+    /// nearest-code cases (`1.25` is a midpoint whose retained bit differs, so it
+    /// is ALSO what round-to-nearest-even does — the tie block below is the one
+    /// that genuinely depends on the policy).
+    #[test]
+    fn a3_pow2_scale_maps_every_magnitude() {
+        let blk = [
+            0.0f32, 0.125, -0.25, 0.5, -0.5, 0.75, 1.0, -1.0, 1.25, -2.0, 2.0, -3.0, 4.0, -6.0,
+            3.0, 1.5,
+        ];
+        let r = ref_of(&blk);
+        assert_eq!(bits(r.amax[0]), 0x40C0_0000);
+        assert_eq!(r.sbyte[0] as u32, 0x38, "e4m3(6/6) = 1.0 -> byte 0x38");
+        assert_eq!(r.sf32[0], 1.0);
+        let codes: Vec<u32> = r.code.iter().map(|&c| c as u32).collect();
+        assert_eq!(
+            codes,
+            vec![
+                0x00, 0x00, 0x08, 0x01, 0x09, 0x01, 0x02, 0x0a, 0x02, 0x0c, 0x04, 0x0d, 0x06, 0x0f,
+                0x05, 0x03
+            ]
+        );
+        let deq: Vec<u32> = r.deq.iter().map(|&v| bits(v)).collect();
+        assert_eq!(
+            deq,
+            vec![
+                0x0000_0000, 0x0000_0000, 0x8000_0000, 0x3F00_0000, 0xBF00_0000, 0x3F00_0000,
+                0x3F80_0000, 0xBF80_0000, 0x3F80_0000, 0xC000_0000, 0x4000_0000, 0xC040_0000,
+                0x4080_0000, 0xC0C0_0000, 0x4040_0000, 0x3FC0_0000
+            ]
+        );
+        // Saturation: -6.0 is the format's max magnitude and must survive exactly.
+        assert_eq!(r.deq[13], -6.0);
+    }
+
+    /// A block with a NON-power-of-two amax: the scale is the e4m3 rounding of
+    /// `amax / 6` (0.34375 = e4m3 0x2b), which is the whole reason a
+    /// `fast_round_scale` (pow2) call cannot be substituted here. 0.34375 is not a
+    /// power of two, so a pow2 scale would give 0.25 or 0.5 instead and every
+    /// ratio — hence nearly every code — would move.
+    #[test]
+    fn a3_scale_is_the_e4m3_rounding_not_a_power_of_two() {
+        let blk = [
+            0.0f32, 3.906_25e-3, -7.812_5e-3, 1.171_875e-2, 3.125e-2, -6.25e-2, 0.125, -0.1875,
+            0.234_375, -0.3125, 0.468_75, -0.5, 0.625, 1.0, -1.5, 2.0,
+        ];
+        let r = ref_of(&blk);
+        assert_eq!(bits(r.amax[0]), 0x4000_0000, "amax = 2.0");
+        assert_eq!(r.sbyte[0] as u32, 0x2b);
+        assert_eq!(r.sf32[0], 0.343_75);
+        assert_ne!(r.sf32[0].log2().fract(), 0.0, "the scale must NOT be a power of two");
+        // The block max maps to the top code (6) — that is what `amax/6 <= s`
+        // guarantees after the e4m3 rounding, and it is the sanity check that the
+        // scale and the clamp went in the right direction.
+        assert_eq!(r.code[15], 7.0);
+        assert_eq!(r.deq[15], 2.0625);
+    }
+}

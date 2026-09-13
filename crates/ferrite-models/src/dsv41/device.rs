@@ -753,6 +753,25 @@ struct Kernels {
     /// buffer, aligning the MTP head's input with the official model's bf16
     /// hidden states. Optional so a stale `.so` simply declines.
     bf16_roundtrip: Option<unsafe extern "C" fn(*mut f32, i64, CuStream) -> c_int>,
+    /// A3 (DSV41_COMPRESS_LATENT_QUANT): the compressed-KV latent's fp4 roundtrip
+    /// (`dsv41_compress_ring_quant`, dsv41_glue.cu) — per-16-block amax, an E4M3
+    /// (NOT power-of-two) scale, e2m1 codes, dequantised in place. Optional so a
+    /// stale `.so` declines to the bf16-only boundary with one note instead of
+    /// launching nothing at all. ABI: (ring, out_rows, clen, window, hd,
+    /// bf16_first, row_quant, dbg, s).
+    compress_ring_quant: Option<
+        unsafe extern "C" fn(
+            *mut f32,
+            *const c_int,
+            *const c_int,
+            c_int,
+            c_int,
+            c_int,
+            c_int,
+            *mut f32,
+            CuStream,
+        ) -> c_int,
+    >,
     // Grouped low-rank output projection, from dsv41_kernels.cu
     // (`dsv41_wo_a_grouped_fp8`). The draft's block-diagonal `wo_a` in ONE
     // launch per (group tile x MTP block) instead of one m=1 gemv per
@@ -2304,6 +2323,7 @@ impl Device {
             gemv_bf16_v1_mrows: ko!(rt, "dsv41_gemv_bf16_v1_mrows"),
             head_bf16_tilelang: ko!(rt, "dsv41_head_bf16_tilelang"),
             bf16_roundtrip: ko!(rt, "dsv41_bf16_roundtrip"),
+            compress_ring_quant: ko!(rt, "dsv41_compress_ring_quant"),
             wo_a_grouped_fp8: ko!(rt, "dsv41_wo_a_grouped_fp8"),
             gemm_fp8_mrows: ko!(rt, "dsv41_gemm_fp8_mrows"),
             gemm_fp8_mrows_mma: ko!(rt, "dsv41_gemm_fp8_mrows_mma"),
@@ -2444,6 +2464,48 @@ impl Device {
         };
         let rc = unsafe { f(x, n, s) };
         self.kerr(rc, "dsv41_bf16_roundtrip")?;
+        Ok(true)
+    }
+
+    /// A3 (`DSV41_COMPRESS_LATENT_QUANT`): the fp4 roundtrip of the row the
+    /// compressed-KV commit just wrote. MUST be issued on the SAME stream as the
+    /// commit launch — it reads the device counter the commit bumped, and reads
+    /// and rewrites the ring row the commit produced, so a different stream would
+    /// both race and pick the wrong slot.
+    ///
+    /// `row_quant == 0` is a no-op INSIDE the kernel (one predicate per thread),
+    /// so the gate can be read on the host without a second code path; a stale
+    /// `.so` returns Ok(false) and the caller keeps the bf16-only boundary with
+    /// one note (house rule: an armed-but-inert gate announces itself).
+    pub fn compress_ring_quant_on(
+        &self,
+        ring: *mut f32,
+        out_rows: *const c_int,
+        clen: *const c_int,
+        window: i32,
+        hd: i32,
+        bf16_first: i32,
+        row_quant: i32,
+        dbg: *mut f32,
+        s: CuStream,
+    ) -> Result<bool> {
+        let Some(f) = self.kernels.compress_ring_quant else {
+            return Ok(false);
+        };
+        let rc = unsafe {
+            f(
+                ring,
+                out_rows,
+                clen,
+                window as c_int,
+                hd as c_int,
+                bf16_first as c_int,
+                row_quant as c_int,
+                dbg,
+                s,
+            )
+        };
+        self.kerr(rc, "dsv41_compress_ring_quant")?;
         Ok(true)
     }
 
