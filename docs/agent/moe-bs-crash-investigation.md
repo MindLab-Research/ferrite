@@ -1833,3 +1833,27 @@ else:
 | **D5** | `moe_bs_weights` 测了 `u_stride`（W3 的专家间距）**却丢弃**，kernel 对 W3 复用 `w_stride`（今天成立但属**隐式契约**） | **已修**（arm 条件加 `u_stride != w_stride`）✓ |
 | D1 | 激活标度强制走 ue8m0：`quant_fp8` 在 `amax==0` 时把标度抬成 `1e-30`（非幂次）被折成 `2^-100`；**该 32-K 块内激活全零 ⇒ 数值无害**，但暴露"bs 臂正确性依赖 `round_scale=true` 的幂次输出"这一隐式耦合 | **暂不改**（改 `dsv41_kernels.cu:156` 会动共享量化器数值 ⇒ 必须走转正流程）；已在文档与下面记录 |
 | D2 | 中间态 `ex_act` 旧路径 clamp、新路径不 clamp（**净结果同**，但中间态字节不同）⇒ 任何在 gate/up 与 swiglu 之间读 `ex_act` 的环节会看到未 clamp 值 | **记录**（若要逐位可比需在 scatter 加同一 clamp，代价是 ABI 加形参） |
+
+## §70 精度合入台账（主树现状）+ 合并方法教训
+
+| 门控（env） | 语义 | 默认 | 状态 |
+|---|---|---|---|
+| `DSV41_ROUTED_DOWN_QUANT` | 路由权重时机 + routed-down 输入量化（§14/§21） | OFF | **已在主树** ✓（更早合入） |
+| `DSV41_WINDOW_KV_QUANT` (+`_DBG`) | 窗口 KV 的 fp8(block32, e8m0) 就地量化往返（A2） | OFF | **已合入主树** ✓ |
+| `DSV41_INDEXER_FP4_RT` (+`_DBG`) | indexer q/k 的 fp4(block32, 幂次标度) 往返（A4） | OFF | **已合入主树** ✓ |
+| `DSV41_COMPRESS_LATENT_QUANT` (+`_DBG`) | 压缩 KV latent 的 fp4(**block16** + **e4m3 非幂次**标度) 往返（A3） | OFF | 实现中（`prec-a3-latent-quant`） |
+| `DSV41_ATTN_P_BF16` (+`_DBG`) | attention PV 的**概率操作数 bf16 舍入**（I3） | OFF | 实现中（`prec-i3-pv-bf16-p`） |
+
+### 合并方法（**教训**：不要整文件拷贝 worktree）
+- ❌ **整文件拷贝**：worktree 基于较早提交，且可能与我后续的修改**同文件**（如 A2 与我的 D5 都改 `chain_dev.rs`）
+  ⇒ 会**静默覆盖**我的修复（D5 就差点被覆盖）⇒ **禁止**。
+- ✅ **导出 worktree 的未提交 diff，再平铺应用**（本次成功路径）：
+  1. `cd /tmp/prec-XX && git diff HEAD -- crates kernels > /tmp/xx.patch`（**排除文档**避免与我大量编辑冲突）
+  2. `git apply --check` 预检 → `git apply`（无冲突时）
+  3. 冲突时（本次 A4 与已合入的 A2 在同一文件尾部新增、上下文偏移）改用
+     **`patch -p1 -F3 --no-backup-if-mismatch`**（纯新增函数的偏移可容忍，`fuzz 1` 成功）；并确认**无 `.rej`/`.orig` 残留**。
+  4. **必须双向确认落地**：`grep -c <新符号>`（两侧非 0）+ `git diff --stat`（与 subagent 报告一致）
+     + **检查我此前的修复仍在**（本次专项 `grep -c "u_stride != w_stride"` = 1 ✓）。
+  5. 验收：本地 `cargo check --workspace` + 远端**单文件**编译冒烟（`dsv41_glue.cu`、`moe_bs_shim.cu`）。
+- ⚠️ **注意**：`git merge <worktree-branch>` **无效**——subagent 的改动通常是**未提交**的，
+  分支尖端仍指向基线提交（本次 `git merge prec-a2` 返回 "Already up to date"）。
