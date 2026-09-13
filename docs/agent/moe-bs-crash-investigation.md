@@ -2764,3 +2764,32 @@ compressor 投影 mrows、`ATTN_PROJ_ALIGN` 等**代码已在**，出货脚本�
 | 6 | `[NC]`/DBG 被图录制期捕获挡住 | 延迟到重放期（天然延迟型） | §73/§79 |
 | 7 | `OUT` 为空（`curl -s` 静默吞错 + AR v5 停滞） | HTTP 码 + 有界重试 + 失败原因入日志 + AR 缓解 | §90 |
 | 8 | 挂死会一直占窗口 | `arm_run` 加**后台看门狗**（日志停滞 ~120s 即杀 serve，快速失败） | §. |
+
+## §108 【根因 + 用户的直觉被证实】nsys 专属旗标被我抄进了普通诊断臂 ⇒ 反而制造停滞
+
+用户两次质疑（"只有开 nsys 才会死锁吧"、"卡这么久不正常"）**都指向了真因** ✓。主 agent 用 `ps` + 日志取证后定位：
+
+### 证据链
+1. **X/W 轮从未跑出任何 step**（`grep -c "step pos" ~/armrun_X1.log` = **0**）、日志被
+   `[ar5-hang] rank=… spins>5000000 TIMEOUT -> PARK` 刷屏；
+2. **有界等待一次都没命中**（`grep -c "moe-bs-wait"` = **0**）⇒ **不是我们 kernel 的自旋** ✗；
+3. **而更早能正常跑出 48 个 step 的 F1/P1 轮，env 里完全没有**我后来加的那些旗标 ✓；
+4. 代码注释（`tp.rs:1272-1281`）确认：
+   > `DSV41_AR_V5=0` … **but ONLY together with `DSV41_GRAPH_STEP=0`** …
+   > and it is also the reason a reader must not treat `ar_v5()` as opt-in when auditing a capture gate
+   ⇒ 这套旗标（`DSV41_AR_V5=0` + `env -u FERRITE_P2P`）是 **AGENTS.md 里"nsys 多跑"那一节的死锁规避配方**，
+   **属于 nsys 轮**；我把它抄进了普通诊断臂 ✗。
+
+### 处置（已落地 `~/arm_run.sh`）
+撤掉 `DSV41_AR_V5=0` 与 `env -u FERRITE_P2P`（**其中取消 `FERRITE_P2P` 极可能直接破坏 rank 间交换 ⇒ 停滞**），
+只保留该节点**文档要求必带**的 `NCCL_NVLS_ENABLE=0` 与探针所需的图门 ✓。
+
+### 同时修掉**看门狗的真实缺陷**（本轮发现的工具 bug）
+我加的看门狗靠"日志停止增长"判挂，但 **`ar5-hang` 刷屏让日志持续增长** ⇒ 它 14 分钟都没触发 ✗
+（用户正是从 `ps` 里看出"卡这么久不正常"）。现在改成**刷屏感知**：
+`>200 条 ar5-hang 且 0 个 step` ⇒ 判定硬停滞、立刻杀 serve ✓。
+
+### 通用教训（已写进 AGENTS.md 的纪律）
+**文档里"某场景下必带的旗标"是有适用域的**——把 nsys 轮的规避配方搬到普通轮，等于**改变了被测系统的行为**
+（取消 P2P、改 AR 形态），从而**自己制造故障**并在错误的战场里排查。
+**推论**：任何"抄配方"的动作，都必须先确认**配方所属的场景与当前场景一致**。
