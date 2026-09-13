@@ -3382,3 +3382,22 @@ OUT = '\n-\t\t\t\t\t\t. 7. 1. 0. 1. 0. 1.0.0.0(1.0.0.0'
 2. 用 `wq_check --eager-file` 做**差异判定**（C1 vs OLD）✓ —— 若"退化与 OLD 一致"则是模型行为 ✓（§110 规则），
    不一致 ⇒ 按 §88 上 `DSV41_DIFF_EAGER=1`（给出**第一个 mismatch 的 token 绝对位置**）✓；
 3. `arm2`（默认朝向）✓ —— 与 C1（swapAB）对照，判定朝向 ✓。
+
+## §134 排除：B 侧 W1/W3 → gate/up 的**行映射**自洽（§133 的首要假设不成立）
+
+逐处实读（`moe_bs_handwritten.cu` + `moe_bs_shim.cu`）：
+
+| 环节 | 实测 | 与下游是否一致 |
+|---|---|---|
+| kernel 放 W1 | B 操作数行 `[0, HW_NH)`（`hw_pack_sw128(row, col)`） | ✓ |
+| kernel 放 W3 | B 操作数行 `[HW_NH, 2*HW_NH)`（`hw_pack_sw128(HW_NH + row, col)`，`:515`） | ✓ |
+| 非打包路径对照 | `hw_smem_idx(HW_NH + row, k0, …)`（`:532-533`）**同序** | ✓ 两条路径一致 |
+| SF 侧（§45 已核） | W1 的 SF 在 `[i]`、W3 的 SF 在 `[HW_NH + i]` | ✓ 与权重行对齐 |
+| scatter 期望 | `bx = col/128`；`j<64 ⇒ n = bx*64+j`（gate）；`j≥64 ⇒ n = 320+bx*64+(j-64)`（up） | ✓ |
+| epilogue（§62 已修） | `col = n_tile*HW_BN + r`，r∈[0,64)=gate、[64,128)=up | ✓ **对得上** |
+
+⇒ **行映射与列映射全链自洽** ⇒ §133 的首假设**排除** ✓。
+⇒ 残余嫌疑收窄到：**SF 的"行 ↔ K 组"配对**（`SFA[k*(SEGCAP*BM)+seg*BM+i]` / `SFW1[e*(40*NP)+k*NP+n_tile*NH+i]`
+的 `k` 是否与逐迭代重写的 tile 同源 ✓）、以及 **K 组递进与 4 个 `ki` 的对应** ✓。
+
+**下一步（GPU 臂，1–2 分钟）**：`DSV41_DIFF_EAGER=1`（给出**第一个 mismatch 的 token 绝对位置**）⇒ 比继续静态推断更省时 ✓。
