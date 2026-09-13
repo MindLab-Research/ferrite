@@ -1189,8 +1189,12 @@ extern "C" int dsv41_moe_tilelang_gate_up_bs_dev(
         // non-capture guard and the same host-side copies the block below performs.
         {
             static bool g_nc_hw_done = false;
+            static bool g_nc_hw_entered = false;
             if (!g_nc_hw_done && getenv("DSV41_MOE_BS_NUMCHECK") != nullptr) {
-                fprintf(stderr, "[NC] entered (handwritten path; capture guard next)\n");
+                if (!g_nc_hw_entered) {
+                    g_nc_hw_entered = true;
+                    fprintf(stderr, "[NC] entered (handwritten path; capture guard next)\n");
+                }
                 cudaStreamCaptureStatus nc_cap = cudaStreamCaptureStatusNone;
                 (void)cudaStreamIsCapturing(s, &nc_cap);
                 if (nc_cap == cudaStreamCaptureStatusNone) {
@@ -1213,6 +1217,7 @@ extern "C" int dsv41_moe_tilelang_gate_up_bs_dev(
                                        eid_hw, ord_hw, topk, w_stride, g_c, s);
                     } else {
                         fprintf(stderr, "[NC] ABORT: host copy failed on the handwritten path\n");
+                        g_nc_hw_done = true;   // a real failure: do not retry forever
                     }
                 }
             }
