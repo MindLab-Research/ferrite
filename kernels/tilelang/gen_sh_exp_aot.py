@@ -343,6 +343,27 @@ def sh_exp_gu_reduce(ks, bm=MPAD, bn=BN, threads=THREADS):
 # =============================================================================
 def _dump(kern, path):
     src = kern.get_kernel_source()
+    # POST-PROCESS (2026-09-14): inject tcgen05.relinquish_alloc_permit after the
+    # tmem_allocate calls — same fix as gen_moe_bs_aot.py. TileLang 0.1.14's
+    # codegen omits this, violating the PTX ISA precondition for tcgen05.dealloc.
+    _RELINQUISH = ('    asm volatile('
+                   '"tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;"'
+                   ' ::: "memory");')
+    _NEEDLE = 'tl::tmem_allocate'
+    if _NEEDLE in src and 'relinquish_alloc_permit' not in src:
+        lines = src.split('\n')
+        out = []
+        in_alloc_block = False
+        for ln in lines:
+            out.append(ln)
+            if _NEEDLE in ln:
+                in_alloc_block = True
+            elif in_alloc_block and ln.rstrip() == '  }':
+                out.pop()
+                out.append(_RELINQUISH)
+                out.append('  }')
+                in_alloc_block = False
+        src = '\n'.join(out)
     with open(path, "w") as f:
         f.write(src)
     return src
