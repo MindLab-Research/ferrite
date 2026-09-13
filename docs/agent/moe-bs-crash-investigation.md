@@ -3122,3 +3122,25 @@ bash ~/bisect_probe.sh origin/main --restore   # 用完恢复
 **另附（F1/P1 时代的 startup 佐证）**：`~/armrun_F1.log` 里 `[sh-gate] startup: SH_EXP_MROWS=false
 SH_PAIR_MROWS=false INDEXER_MROWS=false COMPRESSOR_MROWS=false SH_EXP_TILELANG=false` ⇒
 那一轮确实是"几乎全关"的纯净形态 ✓，与 §§108/117 的结论一致 ✓。
+
+## §122 【彻底排查完成】"总是生效/加载期"改动已**穷举**（回归排查范围封闭）
+
+为满足"必须彻底修复"，主 agent 把**所有可能在任何运行中生效**（非默认 OFF、或有加载期副作用）
+的改动逐项查完：
+
+| 改动 | 生效条件 | 结论 |
+|---|---|---|
+| **有界等待**（§92/§101） | 曾**总是生效** | **已门控** ⇒ 默认走原无界等待（§117）✓ |
+| **`[NC]` 探针**（我的 M2 修复让它可达） | 曾由 `arm_run` 默认开启 | **已改 opt-in**（§119）✓ |
+| down blockscaled 两个新 TU（§112） | 需 Rust 分发 | **未接线 ⇒ 惰性** ✓；且已查**无加载期副作用**（无 `__attribute__((constructor))`、命名空间域无静态对象、仅两个 `extern "C"` 入口）✓ |
+| `DSV41_SEQ_ALIGN`（§89） | 默认 OFF | 惰性 ✓（ABI 已穿 C ABI，门关时行为不变 ✓） |
+| `DSV41_MOE_BS_CPASYNC`（§116） | 默认 OFF | 惰性 ✓ |
+| 五道精度门（§71-§80） | 全默认 OFF | 惰性 ✓ |
+| 我加进 `arm_run` 的 env（`NCCL_NVLS_ENABLE=0`、两个 DSpark 图门钉死） | 曾生效 | **已全部撤掉** ⇒ COMMON 与最老备份逐字一致（只少探针）（§121）✓ |
+| `arm_run` 的看门狗/请求加固/OUT 回写 | 总是生效（但只做日志与宿主侧操作） | 无害 ✓（`stat`/`grep`/`curl` ⇒ 不进 CUDA 路径）✓ |
+
+⇒ **回归排查范围至此封闭**：可能的元凶只有两个，**都已处置**（门控 / opt-in）✓。
+⇒ 下一步（结果一到即执行）：
+1. **若 `11e16d24` 通过** ⇒ 探针因果**定案**（§119）+ **验证通路首次打通** ✓ ⇒ 立即进入
+   `staged_verify.sh arm1`（两朝向判据）✓；
+2. **若仍卡** ⇒ 按 §118 实验 B：`bash ~/bisect_probe.sh 7e54fd25`（把代码退回合并波之前）二分 ✓。
