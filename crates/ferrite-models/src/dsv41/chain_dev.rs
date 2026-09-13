@@ -2477,6 +2477,116 @@ fn head_tilelang_note(m: usize, seg: usize) {
     });
 }
 
+/// `DSV41_HEAD_MTILE=1` (DEFAULT OFF) makes the verify head's v1 multi-row fold
+/// dispatch to its **N-tiled** sibling program instead of the v1 body: the same
+/// `dsv41_gemv_bf16_v1_mrows` entry, whose C launcher
+/// (`kernels/cuda/dsv41_glue.cu:1666`) reads this gate itself and, when armed,
+/// launches `gemv_bf16_v1_mtile_kernel<M, bn>` (`dsv41_glue.cu:553`) with
+/// `bn = DSV41_HEAD_MTILE_BN` (1..4, default 2; `dsv41_glue.cu:1691-1704`).
+///
+/// **What it is.** The v1 fold already removes the m-fold WEIGHT re-read, but
+/// every output row is still its OWN warp, so each of the `n` warps re-walks the
+/// whole `M x k` f32 activation slab (`2M x` the weight stream per row): the
+/// proj-head "摊薄失效" lesion (`docs/agent/verify-amortization-lesion-audit.md`
+/// §10.2). The mtile program gives warp `w` a `bn`-wide N tile (`acc[r][nn]`), so
+/// ONE activation decode serves `bn` output rows — the instruction account is
+/// 1.00x (bn = 1, the control) / 0.77x (bn = 2) / 0.65x (bn = 4) per k column,
+/// with the WEIGHT read count UNCHANGED (`docs/agent/mtile-woa-head-design.md`
+/// §1). Honest scope: the head's `n*k*2` = 165 MB weight stream (seg = 16160 at
+/// world = 8) is its DRAM-side dominant term and this arm does NOT move it, so
+/// the ticket is the ISSUE side — if the GPU shows the head is purely
+/// weight-DRAM-bound, this arm is a wash. That is the experiment.
+///
+/// **NO NUMERIC DEBT — bit-identical by construction** (unlike
+/// [`head_tilelang`], which owes the acc gate). Only WHICH warp computes WHICH
+/// element changes; the element program is untouched: v1's VERBATIM
+/// `for (c = lane; c < k; c += 32)` walk (including its deliberate
+/// NO-`#pragma unroll` choice), the same `acc[r][nn] += wv * xv[r]` operand
+/// order, one independent accumulator per element, v1's `__shfl_xor_sync` tree
+/// over the SAME off = 16,8,4,2,1 sequence, the same epilogue, no K-split and no
+/// cross-row recombination. The `xv[r]` hoist re-reads the SAME bytes of the same
+/// `x[r*k + c]` address (the kernel header carries the C1-C6 argument). So this
+/// arm is the C4 ticket's bit-safe backstop the dual gate judges on step_ms
+/// ALONE: an unchanged `mean-k` is EXPECTED here, not a coincidence.
+///
+/// **Why a Rust gate at all, when the .cu reads the env itself.** The arming
+/// vehicle for that entry is the fold's call site below, which is gated by
+/// [`verify_head_mrows`] (`DSV41_VERIFY_HEAD_MROWS`) — so with ONLY
+/// `DSV41_HEAD_MTILE` exported the launcher would never be reached and the run
+/// would silently measure the per-row head (this project's #1 measurement-bias
+/// trap). This gate arms that call site independently, exactly like the
+/// "structural dead gate" fix did for the mrows arm; it is a CALL-SITE arm and
+/// NOT a device entry — the C launcher dispatches internally, so there is no new
+/// extern "C" symbol and no `Kernels` field to register (`mtile-woa-head-design`
+/// §5.1/§6: the .cu delivery already ships the kernel and the launcher).
+///
+/// Strict `== "1"`, the convention `DSV41_VERIFY_HEAD_MROWS` / `DSV41_HEAD_TILELANG`
+/// use — an opt-in A/B arm, so an exported-but-empty or mistyped value must not
+/// arm it. ⚠️ The C launcher reads the same variable as `atoi != 0`, so `"1"` is
+/// the ONE value the two sides agree on; any other non-zero spelling reaches the
+/// mtile kernel only through the OTHER arm's call (`DSV41_VERIFY_HEAD_MROWS` /
+/// `DSV41_VERIFY_HEAD_FOLD`), never through this gate. The A/B contract uses
+/// `=1`. Read once and cached (this branch runs at the verify's head, inside the
+/// graph capture); the .cu gate is a function-local static too, so it is ONE
+/// VALUE PER PROCESS — a `DSV41_HEAD_MTILE_BN` sweep needs one serve per value.
+fn verify_head_mtile() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("DSV41_HEAD_MTILE")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
+}
+
+/// One-shot note for an ARMED [`verify_head_mtile`], mirroring
+/// [`verify_head_mrows_note`]'s discipline: an armed arm may never silently
+/// measure the OLD path. `performed` is what the v1 multi-row entry actually
+/// answered, so the three states are distinguishable:
+///
+/// * SLICED arm, performed — the C launcher's own `[head-mtile] ARMED m=… n=…
+///   k=… bn=… nwarp=… -> grid=…` receipt (`dsv41_glue.cu:1711`) is the evidence;
+///   this note stays silent rather than printing a second line saying the same.
+/// * UNSLICED arm, performed — the gate is ALIVE, just off the sliced geometry:
+///   the same v1 kernel is bit-identical on the full-vocabulary head too
+///   (`n = vocab` is still `>= GEMV_V2_MAX_N`, so the per-row launch it replaces
+///   is v1's program).
+/// * not performed — the entry returned `Ok(false)`: a stale `.so` with no
+///   `dsv41_gemv_bf16_v1_mrows`, or a block whose `m` rows are outside its
+///   `1..=8` dispatch set; the per-row loop answers instead. A non-BF16 head is
+///   the same state with a structural cause (the kernel is bf16-only, and the
+///   unsliced arm also requires `head.dtype == "BF16"`).
+fn head_mtile_note(arm_sliced: bool, head_bf16: bool, performed: bool, m: usize) {
+    static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    ONCE.get_or_init(|| {
+        if performed && arm_sliced {
+            return; // the `[head-mtile] ARMED …` receipt above is the evidence
+        }
+        if performed {
+            eprintln!(
+                "note: DSV41_HEAD_MTILE is set: the v1 N-tiled fold runs on the UNSLICED head (no \
+                 slice geometry), i.e. ONE pass over the full-vocabulary head weight serves all \
+                 {m} verify rows, bit-identical to the per-row gemv_bf16 it replaces."
+            );
+        } else if !head_bf16 {
+            eprintln!(
+                "warning: DSV41_HEAD_MTILE is set, but the verify head is not BF16 and no slice \
+                 geometry is available: the v1 multi-row kernel is bf16-only, so this gate is \
+                 STRUCTURALLY DEAD for this model. The per-row head runs, and any A/B run with \
+                 this gate ON measures the OLD path."
+            );
+        } else {
+            eprintln!(
+                "warning: DSV41_HEAD_MTILE is set, but the v1 multi-row entry did not run on the \
+                 {arm} head: the loaded .so has no `dsv41_gemv_bf16_v1_mrows` (rebuild \
+                 kernels/cuda: bash build.sh 103a), or the block's {m} rows are outside the \
+                 kernel's 1..=8 dispatch set. The per-row head runs, so any A/B run with this \
+                 gate ON measures the OLD path.",
+                arm = if arm_sliced { "sliced" } else { "full-vocabulary" },
+            );
+        }
+    });
+}
+
 /// The verify head's SLICE conditions, evaluated by `DevChain::verify_head_geom`
 /// and carried as ONE value so the DECISION and its one-shot decline report
 /// cannot drift: a second copy of the condition list is exactly how the report
@@ -9015,9 +9125,15 @@ impl<'a> DevChain<'a> {
                     seg as i32,
                     dim as i32,
                 )?;
-            let armed = verify_head_mrows();
+            // The fold's arming vehicles. `DSV41_VERIFY_HEAD_MROWS` is the fold's
+            // own gate; `DSV41_HEAD_MTILE` ([`verify_head_mtile`]) is the N-tile
+            // arm's, read by the .cu launcher itself — it arms this SAME call so
+            // the mtile program can be measured with the mrows gate OFF (the C
+            // launcher dispatches, the Rust side only decides to reach it).
+            let armed_mrows = verify_head_mrows();
+            let armed_mtile = verify_head_mtile();
             let mrows = !tl_ok
-                && armed
+                && (armed_mrows || armed_mtile)
                 && self.dev.head_gemv_bf16_v1_mrows(
                     head_ptr as *const c_void,
                     self.s.xn_r.ptr as *const f32,
@@ -9037,8 +9153,11 @@ impl<'a> DevChain<'a> {
                 // .so without the symbol, or `m > 8`): the per-row loop below
                 // answers, so an A/B with the gate ON would otherwise measure the
                 // OLD path with nothing said. One line, once.
-                if armed {
+                if armed_mrows {
                     verify_head_mrows_note(true, true, false, cfg.vocab_size, m);
+                }
+                if armed_mtile {
+                    head_mtile_note(true, true, false, m);
                 }
                 for r in 0..m {
                     let xnr = (self.s.xn_r.ptr as *const f32).wrapping_add(r * dim);
@@ -9089,9 +9208,10 @@ impl<'a> DevChain<'a> {
                     cfg.vocab_size as i32,
                     dim as i32,
                 )?;
-            let armed = verify_head_mrows();
+            let armed_mrows = verify_head_mrows();
+            let armed_mtile = verify_head_mtile();
             let mrows = !tl_ok
-                && armed
+                && (armed_mrows || armed_mtile)
                 && head.dtype == "BF16"
                 && self.dev.head_gemv_bf16_v1_mrows(
                     head.ptr(),
@@ -9106,8 +9226,11 @@ impl<'a> DevChain<'a> {
             }
             // Say which arm ran (or why none did) once — the whole point of the
             // fix: an armed gate must never be a silent no-op.
-            if armed {
+            if armed_mrows {
                 verify_head_mrows_note(false, head.dtype == "BF16", mrows, cfg.vocab_size, m);
+            }
+            if armed_mtile {
+                head_mtile_note(false, head.dtype == "BF16", mrows, m);
             }
             if !tl_ok && !mrows {
                 for r in 0..m {
