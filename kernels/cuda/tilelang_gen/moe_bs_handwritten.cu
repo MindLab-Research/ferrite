@@ -203,11 +203,11 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
         //   addr(m, k) = (m/8)*1024 + (k/16)*128 + (m%8)*16 + (k%16)
         // 这是 8行×16B 的 core matrix 顺序排列（m_block 外层，k_block 内层）
         for (int i = tid; i < HW_BM * HW_BK; i += 128) {
-            const int m = i >> 7;  // row [0,128)
-            const int k = i & 127; // col [0,128) — byte index for e4m3
-            const uint8_t val = A[(int64_t)(seg * HW_BM + m) * HW_K + kb * HW_BK + k];
+            const int m = i >> 7;   // row [0,128)
+            const int kk = i & 127; // col [0,128) — byte index for e4m3
+            const uint8_t val = A[(int64_t)(seg * HW_BM + m) * HW_K + k * HW_BK + kk];
             // Core matrix layout: (m/8)*1024 + (k/16)*128 + (m%8)*16 + (k%16)
-            A_sh[(m >> 3) * 1024 + (k >> 4) * 128 + (m & 7) * 16 + (k & 15)] = val;
+            A_sh[(m >> 3) * 1024 + (kk >> 4) * 128 + (m & 7) * 16 + (kk & 15)] = val;
         }
 
         // (2) 所有线程协同加载 B tile (W1 前 64 行 + W3 后 64 行)
