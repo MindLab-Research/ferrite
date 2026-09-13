@@ -219,7 +219,7 @@ constexpr int kThreads = 128;    // 3 个工作 warp + 1 空转（原型 §2 的
 //    （196608 fp4 + 6144 sf + 65536 c），268288 B = 262 KiB > sm_100 的 227 KiB/block
 //    上限 ⇒ cudaFuncSetAttribute 直接失败。
 // ⚠️ 不符 ⇒ launch err 1（cudaErrorInvalidValue），这是静默回退老路径的入口。
-constexpr size_t kSmem = 202752;
+constexpr size_t kSmem = 268288;  // e4m3 AOT: ab 196608 + sf 6144 + c 65536
 // 每 expert 的 packed SF 池字节（w1 与 w3 各一份）
 constexpr size_t kSfPlaneBytes = (size_t)kSfWords * kNp * 4;  // 51200 B/面/expert
 
