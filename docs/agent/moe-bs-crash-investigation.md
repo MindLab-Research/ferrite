@@ -3199,3 +3199,26 @@ SH_PAIR_MROWS=false INDEXER_MROWS=false COMPRESSOR_MROWS=false SH_EXP_TILELANG=f
 ⇒ 至此 §117 的"总是生效"层级 + §122 的加载期清单 + 本节的生产调用链，**三处排查全部封闭** ✓：
 剩余的唯一嫌疑就是**已被处置的两个**（有界等待→门控 OFF ✓；NUMCHECK 探针→opt-in ✓）。
 ⇒ 正在跑的 `11e16d24`（构建 + 分阶段探针 + 一臂）即为**判定性验证** ✓。
+
+## §126 down 对拍 harness 的**真因**（可一条命令修）：TU 内可见的声明少一个形参
+
+§113 曾猜"少传参数"，实测**不是** ✓。真因由 harness 的 include 结构 + 报错形态共同指出：
+
+- harness `tests_dn_bs_parity.cu:46/50` **同时 `#include` 了两个 `.cu`**：
+  `"moe_bs_dn_shim.cu"` 与 `"../dsv41_experts_mxf4.cu"` ✓（自包含风格，不链 `.so` ✓）；
+- 报错形态是 **`cudaStream_t` 落到"最后一个 `int` 形参"上 + `too few arguments`** ✓
+  —— 这是"**TU 内可见的声明比调用少一个形参**"的**教科书症状** ✗
+  （若只是"调用少传"，报错会是 'too few arguments' 而**不会**出现类型落到 int 上 ✓）；
+- 两处调用（347/359）**实参确实是 16 个、含 `st`、含 `seq_align=0`** ✓ 与 `dsv41_experts_mxf4.cu:3963-3967`
+  的新签名**逐项一致** ✓ ⇒ 说明**编译时看到的不是那份新声明** ✗
+  ⇒ 即：**被 `#include` 的那份 `.cu` 在编译环境里是旧版本**（例如远端 `kernels/cuda/` 的检出状态、
+  或 include 解析到了另一份副本 ✓）。
+
+**修法（一条命令可验证）**：让 harness 不再靠"include 整个 `.cu`"来拿声明，而是
+**只声明它需要的那个原型**（或 include 一个共享头 ✓）；同时确认编译时 `../dsv41_experts_mxf4.cu`
+与 `origin/main` **一致**（`git log -1 -- kernels/cuda/dsv41_experts_mxf4.cu` ✓ 与本地比对 ✓）。
+⇒ **暂缓不改**（它是 down 接线的前置仪器，非当前关键路径 ✓，见 TODO 12）；一旦要动，
+先做这两项核对即可解决 ✓。
+
+**教训（与 §110/§111 同源）**：报错的**形态**比报错的**文字**更信息丰富——"类型落到错误的形参上"
+指向**声明可见性/版本**问题，而不是实参个数问题 ✓。
