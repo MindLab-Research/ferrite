@@ -744,6 +744,20 @@ bool tl_bs_init() {
         (void)cudaGetLastError();
         fprintf(stderr, "[moe-bs] sf byte order reversed = %d\n", sr);
     }
+    // g_ldw: TMEM D read spelling. DEFAULT 1 = the per-warp lane address, which PTX ISA
+    // 9.7.18.1.1 (the lane field is an absolute lane coordinate), CUTLASS
+    // (`copy_traits_sm100.hpp` warp-partitioned tmem atoms) and Triton
+    // (`TensorMemoryToLLVM.cpp`: `tmemBase += (warp&3) << (5+16)`) all require; the isolated
+    // instrument has only ever PASSED with that spelling. `DSV41_MOE_BS_LDW=0` restores the old
+    // lane-0 spelling as an escape hatch.
+    if (ok) {
+        int lw = 1;
+        const char* e = getenv("DSV41_MOE_BS_LDW");
+        if (e != nullptr && e[0] == '0') lw = 0;
+        (void)cudaMemcpyToSymbol(g_ldw, &lw, sizeof(int));
+        (void)cudaGetLastError();
+        fprintf(stderr, "[moe-bs] per-warp TMEM lane address = %d\n", lw);
+    }
     // g_sfst: SF→TMEM delivery path (0 = production transpose+tcgen05.cp, 1 = the isolated
     // instrument's tcgen05.st register path). The production chain has never been validated
     // on its own; this gate decides whether it is the defect.

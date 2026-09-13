@@ -58,7 +58,11 @@ __device__ int g_sfrev = 0;
 // lbo=1 (16 B) / sbo=64 (1024 B) / layout_type=2 (SWIZZLE_128B). See
 // docs/agent/moe-bs-crash-investigation.md §29-§31.
 __device__ int g_sfst = 0;     // 1 = deliver the SF with tcgen05.st (isolated-instrument path)
-__device__ int g_ldw = 0;      // 1 = read D with the instrument's per-warp lane address
+__device__ int g_ldw = 1;      // 1 (DEFAULT) = read D with the per-warp TMEM lane address, which
+                               // PTX ISA 9.7.18.1.1 + CUTLASS + Triton all require (the address's
+                               // lane field is an ABSOLUTE lane coordinate and a warp may only
+                               // touch its own 32-lane partition). 0 = the old spelling with lane
+                               // field 0 for every warp (`DSV41_MOE_BS_LDW=0`, escape hatch).
 // 1 = one-shot semantic dump of the STAGED operands at k == 0 (see the dump block in the k-loop
 // and `scripts/campaign/sfdump_check.py`). Tells "the staged content is wrong" apart from "the
 // delivery/descriptor mapping is wrong" — the last two items no instrument has ever covered.

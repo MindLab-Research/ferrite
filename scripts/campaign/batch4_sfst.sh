@@ -29,8 +29,12 @@ run () {
 }
 
 for n in GD4_OLD GD4_BS GD4_SFST GD4_LDW GD4_BOTH; do rm -rf /tmp/gu_in_$n; done
-run GD4_OLD  DSV41_GATEUP_DUMP=/tmp/gu_in_GD4_OLD  DSV41_MOE_TILELANG_BS=0 DSV41_MOE_BS_HANDWRITTEN=0
-run GD4_BS   DSV41_GATEUP_DUMP=/tmp/gu_in_GD4_BS
+rm -rf /tmp/sfd_GD4_OLD /tmp/sfd_GD4_BS
+# The BS arm also collects the STAGED-operand dump in the same run (same one-shot latch), so one
+# batch yields both the official verdict AND the material the content checker needs.
+run GD4_OLD  DSV41_GATEUP_DUMP=/tmp/gu_in_GD4_OLD  DSV41_MOE_BS_SFDUMP=/tmp/sfd_GD4_OLD \
+             DSV41_MOE_TILELANG_BS=0 DSV41_MOE_BS_HANDWRITTEN=0
+run GD4_BS   DSV41_GATEUP_DUMP=/tmp/gu_in_GD4_BS   DSV41_MOE_BS_SFDUMP=/tmp/sfd_GD4_BS
 run GD4_SFST DSV41_GATEUP_DUMP=/tmp/gu_in_GD4_SFST DSV41_MOE_BS_SFST=1
 run GD4_LDW  DSV41_GATEUP_DUMP=/tmp/gu_in_GD4_LDW  DSV41_MOE_BS_LDW=1
 run GD4_BOTH DSV41_GATEUP_DUMP=/tmp/gu_in_GD4_BOTH DSV41_MOE_BS_SFST=1 DSV41_MOE_BS_LDW=1
