@@ -102,7 +102,28 @@ k=4096 时 16 个 issue（256 线程），权重侧 512 B/warp-issue ⇒ **同�
 
 ### 3.1 远端 nvcc 结果（b300, CUDA 13.2, `ubuntu@43.202.208.136`, compile-only 无 GPU）
 
-> 见本文件末尾「实测粘贴」段（交付时由工部填入本次 rc + ptxas 行）。
+```
+nvcc -gencode arch=compute_103a,code=sm_103a -O3 --use_fast_math -std=c++17 -c dsv41_glue.cu    => RC=0  errors: 0   glue.o   881,344 B
+nvcc -gencode arch=compute_103a,code=sm_103a -O3 --use_fast_math -std=c++17 -c dsv41_kernels.cu => RC=0  errors: 0   kernels.o 6,457,976 B
+```
+（`dsv41_kernels.cu` 仅 4 条既有 `#177-D` unused-variable/func 警告：:8606 k1max / :5973 nt / :5704 nwarp / :108 e2m1_to_f——全部是 HEAD 已有，与本次无关。）
+
+`-Xptxas -v` 关键行（**0 spill**）：
+
+| kernel | registers | spill | barriers |
+|---|---|---|---|
+| ① `gemv_bf16_v1_mrows_act_kernel<M>`（M=1..8） | 31 / 32 / 32 / 32 / 34 / 40 / 40 / 39 | **0 / 0 / 0 / 0 / 0 / 0 / 0 / 0** | 1 |
+| ② `wo_a_grouped_gemv_kernel<M>`（M=1..8） | 32 / 48 / 40 / 40 / 40 / 40 / 40 / 40 | **全 0** | 1 |
+
+对标：① 的新 kernel 与 legacy（`gemv_bf16_v1_mrows_kernel`）同量级寄存器、无 spill ⇒ 没有 register-pressure 副作用；smem ≤ 32 KB ⇒ 不跨 48 KB opt-in 门、不掉 block/SM。
+
+---
+
+## 3.2 同族实测旁证（peer 结论，支持本小项的选型）
+
+`e050430`（5a L2-broadcast rpb sweep verdict，同族 `gemm_fp8_mrows_l2_kernel`：**无 smem、`__ldg` 直读 L1/L2**）四臂全负（rpb=1 +4.34ms / 2 +3.45 / 3 +4.22 / 6 +3.39），判词：「**`__ldg` 直读 L1/L2 比 stage 一次进 smem 再低延迟读更慢——legacy staging 值它的成本**」，同时四臂 mean-k 2.240 逐位不动（C1–C6 等价经验确认）。
+
+⇒ 任务书给 ① 的两个候选里，**「`__ldg` 直读的向量化」这一支在同族已被实测证伪**，因此本交付选 **smem staging（M 行共享）** 支；这也把「共享 staging 值不值」的问题从推测变成了同族已有的正面证据。**但要诚实标注差异**：5a 证伪的是「**省掉** staging 去直读」；本小项是在 **保留** staging 的前提下**减少** staging 次数（nwarps× 激活重读 → 1×）。两者同向，不互相证伪也不互相替代。
 
 ---
 
