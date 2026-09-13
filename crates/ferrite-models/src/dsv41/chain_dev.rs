@@ -4747,6 +4747,14 @@ fn hc_tail_split() -> bool {
                     true,
                 )?;
             }
+            // op-level diagnostic: the routed activation's scales (post-quant)
+            // — kind 7 — verifies the quant's real-run context against the
+            // offline-computed expected scales (the xn is bit-identical).
+            if let Ok(xdp) = std::env::var("DSV41_GT_XDUMP") {
+                if layer == 0 {
+                    self.gt_dump_vec(&xdp, 7, self.s.xsc4.ptr, dim / 32)?;
+                }
+            }
             // Fixed 6-slot device-driven loop: the expert id comes from
             // route_idx on the device and the weights from route_w, so there is
             // no host round trip and the launch arguments are static.
@@ -4954,6 +4962,14 @@ fn hc_tail_split() -> bool {
                         inter_local as i32,
                         cfg.swiglu_limit,
                     )?;
+                    // op-level diagnostic: the first expert's swiglu'd
+                    // activation sample — kind 8 — splits the gate_up's output
+                    // from the down's contribution to the MoE output.
+                    if slot == 0 && layer == 0 {
+                        if let Ok(xdp) = std::env::var("DSV41_GT_XDUMP") {
+                            self.gt_dump_vec(&xdp, 8, self.s.ex_act.ptr, 16)?;
+                        }
+                    }
                     self.dev.expert_down_fp4_indirect(
                         self.s.ex_act.ptr as *const f32,
                         self.s.o.ptr as *mut f32,
