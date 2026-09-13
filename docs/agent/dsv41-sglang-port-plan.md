@@ -7,16 +7,18 @@
 
 **数数红线进展：1..63 全对（此前 35/52 崩）**——逐域对齐官方的效果在累积。
 
-**已落库的修复（全部默认 ON，DSV41_*=0 可回退）**：`bf16_xn`（xn 与官方逐位一致 0.18%→0.00%）、`win_kv_quant_rt`（fp8 往返+bf16 写回）、`bf16_kv`（kv 链两处边界，kv_RT→1.08-1.53%）、`bf16_q`（qr/s.q 两处边界，数数→1..63）、`gate_gemv_f32`（gate 分数官方 f32 域）、kinds 0-6 op 级 dump 探针（teacher-forced 逐算子对拍工具链）。
+**已落库的修复（全部默认 ON，DSV41_*=0 可回退）**：`bf16_xn`（xn 与官方逐位一致 0.18%→0.00%）、`win_kv_quant_rt`（fp8 往返+bf16 写回）、`bf16_kv`（kv 链两处边界，kv_RT→1.08-1.53%）、`bf16_q`（qr/s.q 两处边界，数数→1..63）、`gate_gemv_f32`（gate 分数官方 f32 域）、kinds 0-19 op 级 dump 探针（teacher-forced 逐算子对拍工具链）。
 
 **当前逐算子发散**：xn 0.00% ✓ / kv_gemm 0.49% ✓ / kv_RT 1.1-1.5% / attn_o 3.5-3.8%（q 链内部融合边界+sparse_attn 内部 bf16 未覆盖）/ **moe_o 4.7-10.9%（专家 e2m1 激活域=最大剩余项）**。
 
+**⚠️ e4m3 专家激活域调查（完整悖论，默认已回退 OFF）**：官方对 fp4 权重用 act_quant（fp8 e4m3+幂次 scale）激活，我们 e2m1（8× 粗）。已实现完整 e4m3 路径（内核 staging 臂+launcher 管道+quant_fp8_on 写 xq4/xsc4），但真机 40× 爆炸。**证据表**：微测试（链接 .so）三项全过（QUANT_OK/GEMV_E4M3_OK out=5127.8125 逐位/DOWN_OK so=820450 全行一致）；真机中间 dump 全部正常（k7 尺度 160/160 幂次 ✓、k10 点积 0.2-1.3× ✓、k8/k11 slot 0/1 swiglu 0.5-1.0× ✓、k3/4 路由权重与 ids 逐位同 ✓、k12==k13 无 clobber ✓）；**每槽 dump（k14-19）显示 slot 0 的 down 已满幅爆炸（0.7231）且后续槽几乎不增**——但 slot 0 的 swiglu 输入仅 0.0487 rms，算术上 down 无法放大 15×。**悖论结论：某"已验证"环节在真机组合下失效。下一假设**：①swiglu 的写入位置/是否真正运行（dump ex_act 于 swiglu 前后对照——k10 本意是 pre-swiglu 但误放在 post 位置！）；②`expert_fp4_mode()` 与 sequential 路径的交互；③ex_act 的 gate|up 布局（拼接 vs 交错）与 swiglu 期望的匹配。**MOE_BATCH 默认实为 ON**（`unwrap_or(true)`，注释"default OFF"过时）——e2m1 一直走 batched，e4m3 被禁用 batched 后强制走 sequential（e2m1+sequential 也正常 ⇒ 病在 e4m3+sequential 组合）。
+
 **下一步（按序）**：
-1. **专家域**：官方对 fp4 权重用 **act_quant（fp8 e4m3+幂次 scale, block 32）** 激活（model.py linear()），我们 routed 专家用 e2m1（8× 更粗）——正是 moe_o 的来源。SIMT batched 内核的 a_scale 是 f32 ⇒ quant1 输出可直接对接；改造面=解包 nibble→byte（dsv41_experts_mxf4.cu:610-612）+ 调用方 s.xq4/s.xsc4→s.xq/s.xsc（注意 MOE_DUAL 的 quant1(xn) 共享竞态）。down 输入官方也 act_quant（我们 f32）+ 路由权重时机（官方乘 w2 前，我们在 epilogue）。
+1. **e4m3 猎杀**（上文三假设；微测试+真机 dump 都已就绪，kinds 14-19 可复用）。
 2. sparse_attn 内部 bf16（q/kv/P 都是 BF16，acc_s_cast BF16——kernel.py:328-390）+ q 链内部融合边界。
 3. 数数 1..100 完美 → spec_gt 复测 → S2-S7 性能线（450 tok/s / bench >908.9）。
 
-**关键工具链（远端）**：`~/ref_diff.py`（teacher-forced kinds 0-6 hooks）+ `DSV41_GT_XDUMP`；官方 MP8 分片 `/opt/dlami/nvme/dsv41_mp8`；同口径参考 908.9 tok/s（sglang TP8/acc5.49）。
+**关键工具链（远端）**：`~/ref_diff.py`（teacher-forced kinds 0-6 hooks）+ `DSV41_GT_XDUMP`（kinds 0-19）；官方 MP8 分片 `/opt/dlami/nvme/dsv41_mp8`；同口径参考 908.9 tok/s（sglang TP8/acc5.49）；微测试 `/tmp/tests_gemv2.cu`、`/tmp/tests_down.cu`（链接 .so 验证内核逐位）。
 
 ## ⚠️ 战况修订（2026-09-13 深夜，实测推翻假设）
 

@@ -796,13 +796,17 @@ fn bf16_q() -> bool {
 /// (model.py linear(): fp4-weight Linears quantize the activation to FP8,
 /// block 32 with power-of-two f32 scales — exactly quant1's output format).
 /// Our routed experts used e2m1 nibbles (4-bit, 8x coarser) — the moe_o
-/// 4.7-10.9% divergence's dominant source. DEFAULT ON;
-/// `DSV41_EXPERT_ACT_E4M3=0` reverts to the e2m1 path for A/B. (The batched
-/// MoE path's fused kernel does not support the e4m3 format yet and is
-/// disabled while this is on.)
+/// 4.7-10.9% divergence's dominant source. **DEFAULT OFF pending a real-run
+/// bug hunt**: every component (quant, the gemv's e4m3 staging arm, the down)
+/// is verified BIT-EXACT in isolation against the shipped .so, and every
+/// real-run intermediate dump (scales, gate|up dots, slots 0/1's swiglu,
+/// route_w/ids, no mid-loop clobber) is sane — yet slot 0's down alone
+/// produces a ~40x-exploded s.o. See docs/agent/dsv41-sglang-port-plan.md's
+/// battle status for the full evidence table. `DSV41_EXPERT_ACT_E4M3=1`
+/// arms the (currently broken) official domain for the hunt.
 fn expert_act_e4m3() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *F.get_or_init(|| std::env::var("DSV41_EXPERT_ACT_E4M3").map(|v| v != "0").unwrap_or(true))
+    *F.get_or_init(|| std::env::var("DSV41_EXPERT_ACT_E4M3").map(|v| v == "1").unwrap_or(false))
 }
 
 /// The official's gate domain: the reference computes the gate scores in FULL
