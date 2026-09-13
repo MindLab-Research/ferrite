@@ -513,6 +513,45 @@ pub fn moe_tilelang_bs() -> bool {
     *F.get_or_init(|| std::env::var("DSV41_MOE_TILELANG_BS").map(|v| v != "0").unwrap_or(false))
 }
 
+/// `DSV41_MOE_DOWN_BS` — the **down-direction** native-fp4 blockscaled MoE arm,
+/// DEFAULT **OFF**. Read once per process, exactly like the gate/up gate above.
+///
+/// It lives in `weights.rs` with the other MoE arm gates so there is exactly one
+/// definition per gate (the up arm's gate is here because the LOADER reads it;
+/// this one has no load-time dependency, but splitting the family across two
+/// modules is how two definitions of one switch start to drift).
+///
+/// ⚠️ The asymmetry with the `.so` side: the shim re-reads this SAME env var on
+/// EVERY call (`tilelang_gen/moe_bs_dn_shim.cu`, the `getenv` in
+/// `dsv41_moe_bs_down_dev`) and declines unless it is exactly `1`. Rust ON + env
+/// off is therefore conservative (the shim declines, the proven path runs), while
+/// `DSV41_MOE_DOWN_BS=1` alone arms NOTHING — **this function is the dispatch
+/// switch**, the shim's check is the last-resort guard.
+///
+/// Independent of `DSV41_MOE_TILELANG_BS` (the up-direction block-scaled gate):
+/// the down arm only needs the upstream gate/up output at its real slot pitch,
+/// which the SIMT up path satisfies just as well. Running both in one A/B is
+/// legal but mixes two variables (the wiring doc §4.4).
+pub fn moe_down_bs() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_MOE_DOWN_BS").map(|v| v != "0").unwrap_or(false))
+}
+
+/// `DSV41_MOE_DOWN_BS_RWOP` — `1` moves the route weight into the down arm's
+/// **operand** (gather-time multiply, then quantise) instead of its epilogue.
+/// That is the ORDER of `DSV41_ROUTED_DOWN_QUANT`, so the two are **MUTUALLY
+/// EXCLUSIVE**: with both armed the weight would be applied twice — and worse,
+/// the caller passes `route_w = nullptr` whenever the prep arm owns the weight
+/// (it is already in the activation), which the operand path dereferences.
+/// The ready gate refuses the combination loudly rather than computing it.
+///
+/// Default OFF, so the arm's epilogue matches the SIMT fused-down order
+/// (`fadd_rn(tot, fmul_rn(acc, rw))` — `tilelang_gen/moe_bs_dn_handwritten.cu` §6).
+pub fn moe_down_bs_rwop() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_MOE_DOWN_BS_RWOP").map(|v| v != "0").unwrap_or(false))
+}
+
 /// Bytes of the LOAD-TIME packed e8m0 pool for one expert's ONE weight plane
 /// (`k` = that plane's reduction size). `words = k / 128` because one uint32 holds
 /// four `gran=32` ue8m0 bytes (the MXFP4 word), and the pool is group-major:

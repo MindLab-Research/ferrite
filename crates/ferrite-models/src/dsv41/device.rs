@@ -1673,6 +1673,51 @@ struct Kernels {
     /// e4m3-activation build exports it, so a stale `.so` keeps the arm OFF
     /// (reported once) instead of feeding e4m3 bytes to an fp4 kernel.
     moe_bs_act_e4m3_cap: Option<unsafe extern "C" fn() -> c_int>,
+    /// Capability marker for the **down-direction** block-scaled arm
+    /// (`dsv41_moe_bs_down_cap`, `tilelang_gen/moe_bs_dn_shim.cu`). OPTIONAL on
+    /// purpose: a `.so` built before this arm has no such symbol, so
+    /// `DSV41_MOE_DOWN_BS` stays OFF and is REPORTED — an armed gate that
+    /// silently measured the SIMT down path is this project's #1
+    /// measurement-bias trap.
+    ///
+    /// A marker symbol rather than "does `_dev` exist": this arm is expected to
+    /// gain ABI-neutral semantic revisions (the up arm's `xq4` argument changed
+    /// meaning exactly that way), and the marker is what makes such a revision
+    /// detectable instead of silently mis-read.
+    moe_bs_down_cap: Option<unsafe extern "C" fn() -> c_int>,
+    /// `dsv41_moe_bs_down_dev`: the down grouped MMA (e4m3 activation × native
+    /// packed fp4 `w2`, plus `w2`'s e8m0 plane) over the SAME BM=128 device
+    /// segment tables the block-scaled UP arm uses. No TMA, no load-time pool:
+    /// it reads the experts' existing `w2`/`w2_scale` planes directly and
+    /// quantises the f32 activation itself.
+    ///
+    /// It writes the per-assignment `[row*topk + slot][dim]` partials — the very
+    /// cells the non-fused `expert_down_fp4_batched` writes — so the existing
+    /// ascending-slot `moe_down_reduce` merges them unchanged (the numerical
+    /// contract of that reduce is not touched). `out` must be 16-byte aligned
+    /// (the epilogue is a `float4` store), which the `cudaMalloc`'d scratch is.
+    moe_bs_down_dev: Option<
+        unsafe extern "C" fn(
+            *const f32,
+            i64,
+            *mut f32,
+            *const u8,
+            i64,
+            *const u8,
+            i64,
+            *const c_int,
+            *const c_int,
+            *const c_int,
+            *const c_int,
+            *const f32,
+            i64,
+            c_int,
+            c_int,
+            c_int,
+            c_int,
+            CuStream,
+        ) -> c_int,
+    >,
     /// `DSV41_ACTQ_FLOOR` setter (`dsv41_quant_set_actq_floor`): puts the quantiser's floor on amax
     /// (`max(amax, 1e-4)`, kernel.py:76) instead of on the scale (`fmaxf(s, 1e-30)`), which is where
     /// the official has it. Inert for routed activations (amax >> 1e-4); the promotion plan covers
@@ -2414,6 +2459,8 @@ impl Device {
             moe_tilelang_gate_up_bs_dev: ko!(rt, "dsv41_moe_tilelang_gate_up_bs_dev"),
             moe_bs_pack_wsf: ko!(rt, "dsv41_moe_bs_pack_wsf"),
             moe_bs_act_e4m3_cap: ko!(rt, "dsv41_moe_bs_act_e4m3_cap"),
+            moe_bs_down_cap: ko!(rt, "dsv41_moe_bs_down_cap"),
+            moe_bs_down_dev: ko!(rt, "dsv41_moe_bs_down_dev"),
             moe_bs_sfdump_ptr: ko!(rt, "dsv41_moe_bs_sfdump_ptr"),
             moe_bs_sfdump_bytes: ko!(rt, "dsv41_moe_bs_sfdump_bytes"),
             moe_bs_gc_ptr: ko!(rt, "dsv41_moe_bs_gc_ptr"),
@@ -8244,6 +8291,66 @@ impl Device {
         Ok(true)
     }
 
+    /// The **down-direction** block-scaled arm (`dsv41_moe_bs_down_dev`,
+    /// `tilelang_gen/moe_bs_dn_shim.cu`). Contract, parameter by parameter:
+    ///
+    /// * `act`/`act_stride` — the upstream gate/up output as
+    ///   `[rows][slots][act_stride]` f32; the shim reads only the first `inter`
+    ///   floats of each slot, so `act_stride` must be the pitch the upstream arm
+    ///   ACTUALLY wrote (`2*inter` for the RAW gate‖up layout, `inter` after a
+    ///   fused swiglu) — pass the same variable the fused down launch uses.
+    /// * `out` — `[rows*topk][dim]` f32 per-assignment partials, OVERWRITE. This
+    ///   is the non-fused scratch, NOT the fused `moe_out_*` accumulator: the
+    ///   distinct writers are what keep the `ar_carry` store legitimate.
+    /// * `w2`/`w2s` + their strides — the experts' native packed fp4 plane and
+    ///   its e8m0 plane, base = expert 0, stride = `expert[1] - expert[0]`
+    ///   measured by the CALLER (the pool layout is the loader's private
+    ///   per-layer quantity).
+    /// * the four device tables — the SAME `bs_*` tables the block-scaled UP arm
+    ///   consumes (BM = 128 rows per segment), built by `moe_bs_tables_dev`.
+    /// * `route_w`/`rw_stride` — `nullptr` means "no epilogue weight", which is
+    ///   exactly the state `DSV41_ROUTED_DOWN_QUANT` leaves behind (the weight is
+    ///   already in the activation); otherwise a flat `[rows*slots]` plane, so
+    ///   `rw_stride` is 1 (any other value is declined by the shim).
+    ///
+    /// `Ok(false)` is the shim's DECLINED (`rc == 2`: its own gate is off, the
+    /// shape is outside the frozen domain, or its lazy INIT failed). The caller
+    /// must then run the proven non-fused path and report the refusal.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_bs_down_dev(
+        &self,
+        act: *const f32,
+        act_stride: i64,
+        out: *mut f32,
+        w2: *const u8,
+        w2_stride: i64,
+        w2s: *const u8,
+        w2s_stride: i64,
+        eid: *const c_int,
+        order: *const c_int,
+        counts: *const c_int,
+        nseg: *const c_int,
+        route_w: *const f32,
+        rw_stride: i64,
+        rows: i32,
+        dim: i32,
+        inter: i32,
+        topk: i32,
+    ) -> Result<bool> {
+        let f = self.need(self.kernels.moe_bs_down_dev, "dsv41_moe_bs_down_dev")?;
+        let rc = unsafe {
+            f(
+                act, act_stride, out, w2, w2_stride, w2s, w2s_stride, eid, order, counts, nseg,
+                route_w, rw_stride, rows, dim, inter, topk, self.stream,
+            )
+        };
+        if rc == 2 {
+            return Ok(false);
+        }
+        self.kerr(rc, "dsv41_moe_bs_down_dev")?;
+        Ok(true)
+    }
+
     /// Load-time fp4(e2m1 + ue8m0) → bf16 expand (`DSV41_MOE_BF16_DEQUANT`).
     /// `wq` is `[n, k/2]` packed e2m1 (low nibble = even k), `ws` is `[n, k/32]`
     /// ue8m0 (`scale = 2^(byte-127)`) and `out_bf16` is `[n, k]` bf16.
@@ -8467,6 +8574,19 @@ impl Device {
     /// probe [`Self::supports_moe_tilelang_bs`] includes it too.
     pub fn supports_moe_bs_act_e4m3(&self) -> bool {
         self.kernels.moe_bs_act_e4m3_cap.is_some()
+    }
+
+    /// True when the `.so` carries the **down-direction** block-scaled arm: its
+    /// capability marker **and** its entry point.
+    ///
+    /// Probed as a SET, and as a capability SYMBOL rather than "does `_dev`
+    /// exist", for the same pair of reasons as the up arm: a `.so` with only part
+    /// of the arm must keep `DSV41_MOE_DOWN_BS` OFF and SAY SO (otherwise the
+    /// operator measures the SIMT down path believing the grouped MMA ran — this
+    /// project's #1 measurement-bias trap), and this arm is expected to gain
+    /// ABI-neutral revisions that only a marker can version.
+    pub fn supports_moe_bs_down(&self) -> bool {
+        self.kernels.moe_bs_down_cap.is_some() && self.kernels.moe_bs_down_dev.is_some()
     }
 
     /// The `DSV41_MOE_BS_SFDUMP` staged-operand scratch as `(device ptr, bytes)`, or `None` when

@@ -825,6 +825,22 @@ pub(crate) const TILELANG_BM: usize = 16;
 /// 既越界（576 项 vs 下标 767）又静默错读（align 预填的 -1 被当 pad）。
 pub(crate) const TILELANG_BS_BM: usize = 128;
 
+/// The DOWN block-scaled arm's frozen contraction (`inter_local`), baked into
+/// `tilelang_gen/moe_bs_dn_handwritten.cu`'s K-span geometry
+/// (320 = 128 + 128 + 64 ⇒ 10 MMAs, and NO K zero-padding — see the kernel's
+/// §geometry note). The shim declines `inter != 320`; the caller refuses first so
+/// the one-shot notice can name the reason.
+pub(crate) const DSV41_DOWN_BS_K: usize = 320;
+
+/// Set once a DOWN block-scaled launch has succeeded OUTSIDE a capture, i.e.
+/// the shim's lazy INIT has already paid its `cudaMalloc` /
+/// `cudaFuncSetAttribute`. `dn_bs_init()` runs that work on the FIRST arm call,
+/// and a `cudaMalloc` inside a capture makes `cudaStreamEndCapture` fail, so the
+/// arm may only enter a capture after this flag is set (see
+/// [`DevChain::moe_down_bs_init_ok`]).
+static MOE_DOWN_BS_INITED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Host-side `moe_align` — the ferrite port of the prototype's
 /// `moe_grouped_proto.py::moe_align` (SGLang `moe_align_block_size` semantics):
 /// assignments are sorted by (expert asc, flat index asc) so every expert owns a
@@ -18367,6 +18383,189 @@ impl<'a> DevChain<'a> {
         Some((w1, u1, s1.ptr(), t1.ptr(), w_stride as u64))
     }
 
+    /// The `w2` / `w2_scale` bases and per-expert strides the DOWN block-scaled
+    /// arm needs, measured on the SAME two expert tensors [`Self::moe_bs_weights`]
+    /// uses (`expert[1] - expert[0]`, the pool's own uniform block distance).
+    ///
+    /// The down arm has NO load-time pool to validate — it reads the experts'
+    /// native packed fp4 `w2` plane (`[dim, inter/2]`, row distance `inter/2`)
+    /// and the existing e8m0 `w2_scale` plane directly. What must hold is only
+    /// that consecutive experts sit a shim-aligned distance apart: the shim's
+    /// cp.async gate requires `w2_stride % 8 == 0` and `w2s_stride % 4 == 0`.
+    /// A pool that fails that returns `None` ⇒ the arm declines loudly, never a
+    /// guessed stride (a wrong stride here is a silent wrong answer).
+    fn moe_bs_down_weights(ld: &LayerDev) -> Option<(*const u8, i64, *const u8, i64)> {
+        let a = ld.experts.first()?;
+        let b = ld.experts.get(1)?;
+        let w2 = a.w2.ptr() as *const u8;
+        let w2s = a.w2_scale.ptr() as *const u8;
+        let w2_stride = (b.w2.ptr() as i64) - (a.w2.ptr() as i64);
+        let w2s_stride = (b.w2_scale.ptr() as i64) - (a.w2_scale.ptr() as i64);
+        if w2_stride <= 0 || w2s_stride <= 0 || (w2_stride & 7) != 0 || (w2s_stride & 3) != 0 {
+            return None;
+        }
+        Some((w2, w2_stride, w2s, w2s_stride))
+    }
+
+    /// Whether the down arm's lazy INIT may be entered right now. Its first call
+    /// `cudaMalloc`s and calls `cudaFuncSetAttribute`, which is illegal inside a
+    /// CUDA-graph capture; [`MOE_DOWN_BS_INITED`] records that an earlier,
+    /// non-captured call has already paid it (after which the shim's INIT is a
+    /// no-op and captures are safe).
+    fn moe_down_bs_init_ok(&self) -> bool {
+        !self.dev.capturing() || MOE_DOWN_BS_INITED.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The ready gate for the DOWN block-scaled arm (`DSV41_MOE_DOWN_BS`, default
+    /// OFF). Every term is either a shape the shim would DECLINE or — worse —
+    /// something the operator would never accept. Same shape as
+    /// [`Self::moe_tilelang_bs_ready`]: the arm answers only when it can be
+    /// believed, everything else declines into the proven non-fused pair **plus a
+    /// one-shot notice** (this project's #1 measurement-bias trap).
+    ///
+    /// The non-shape terms, with the failure each one prevents:
+    /// * `sf_stride_pad()` — the shim derives the `w2_scale` row pitch as
+    ///   `align16(inter/32)` UNCONDITIONALLY, i.e. it ASSUMES the padded plane.
+    ///   The SIMT kernel reads the pitch at run time and is correct in both
+    ///   layouts, so with `DSV41_SF_STRIDE_PAD=0` the arm would read every
+    ///   `w2_scale` row 6 bytes early — a SILENT wrong answer. Refuse.
+    /// * `routed_down_quant() && moe_down_bs_rwop()` — both put the route weight
+    ///   into the OPERAND, so together they multiply it twice; and the caller
+    ///   passes `route_w = nullptr` in that state, which the operand path would
+    ///   dereference. Refuse (the two arms are declared mutually exclusive).
+    /// * `moe_down_bs_init_ok()` — see above: no `cudaMalloc` inside a capture.
+    fn moe_down_bs_ready(
+        &self,
+        ld: &LayerDev,
+        m: usize,
+        topk: usize,
+        dim: usize,
+        inter_local: usize,
+        n_routed: usize,
+    ) -> bool {
+        let _ = n_routed; // the tables carry the expert count; the shape terms do not need it
+        crate::dsv41::weights::moe_down_bs()
+            && self.dev.supports_moe_bs_down()
+            && crate::dsv41::weights::sf_stride_pad()
+            && !(routed_down_quant() && crate::dsv41::weights::moe_down_bs_rwop())
+            && ld.experts.len() >= 2
+            && m > 0
+            && topk >= 1
+            && m * topk <= TILELANG_SEG_CAP
+            && inter_local == DSV41_DOWN_BS_K
+            && dim > 0
+            && dim % 128 == 0
+            && dim <= 8192
+            && self.moe_down_bs_init_ok()
+    }
+
+    /// One-shot notice for an ARMED `DSV41_MOE_DOWN_BS` that did not fire. Its OWN
+    /// latch, so the UP arm's notice cannot mask it (the same reason
+    /// [`Self::moe_bs_skipped_note`] has one). `hard` marks the refusals that mean
+    /// the operator's configuration is inconsistent rather than a shape the arm
+    /// simply does not cover.
+    fn moe_down_bs_skipped_note(reason: &str, hard: bool) {
+        static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        let tag = if hard { "REFUSED" } else { "skipped" };
+        if ONCE.set(()).is_ok() {
+            eprintln!("[moe-dn-bs] ARMED but {tag}: {reason} -> this run measures the OLD path");
+        }
+    }
+
+    /// Arm + launch the DOWN block-scaled group and report whether it answered
+    /// the step. `Ok(true)` means the shim accepted the step and wrote EVERY
+    /// per-assignment partial into `out`, so the caller must
+    ///   (a) NOT run the non-fused `expert_down_fp4_batched`, and
+    ///   (b) run its usual ascending-slot `moe_down_reduce` over `out`
+    /// — which is exactly what makes this arm numerically compatible with the
+    /// path it replaces (`out` is the same buffer, same layout, same reduce).
+    ///
+    /// The device tables are ALWAYS rebuilt here rather than reused from the up
+    /// arm's step: `moe_bs_tables_dev` is idempotent (same ids / m / topk ⇒ same
+    /// tables) and stream-ordered, so rebuilding is both correct and free of any
+    /// dependence on which arm ran upstream (the two small kernels it costs are
+    /// negligible next to one down tile). Reuse would need a "built this step"
+    /// flag, i.e. state that can go stale — not worth it here.
+    #[allow(clippy::too_many_arguments)]
+    fn moe_down_bs_launch(
+        &mut self,
+        ld: &LayerDev,
+        m: usize,
+        topk: usize,
+        dim: usize,
+        inter_local: usize,
+        act: *const f32,
+        act_stride: i64,
+        out: *mut f32,
+        route_w: *const f32,
+        route_ids: *const i32,
+        route_ids_bytes: usize,
+        n_routed: usize,
+    ) -> Result<bool> {
+        if !self.moe_down_bs_ready(ld, m, topk, dim, inter_local, n_routed) {
+            // Name the terms an operator can actually fix, in the order they are
+            // most likely to be the cause (the .so, then the env pair).
+            Self::moe_down_bs_skipped_note(
+                "the step is outside the arm's domain — the .so lacks the down blockscaled \
+                 entry point / capability marker (dsv41_moe_bs_down_cap), or \
+                 DSV41_SF_STRIDE_PAD=0 (the shim assumes the padded w2_scale plane), or \
+                 DSV41_ROUTED_DOWN_QUANT and DSV41_MOE_DOWN_BS_RWOP are BOTH armed (both put \
+                 the route weight in the operand), or this is the first call inside a capture \
+                 (the shim's lazy INIT allocates), or inter_local != 320 / dim % 128 != 0 / \
+                 m*topk > 36",
+                true,
+            );
+            return Ok(false);
+        }
+        let Some((w2, w2_stride, w2s, w2s_stride)) = Self::moe_bs_down_weights(ld) else {
+            Self::moe_down_bs_skipped_note(
+                "the experts' w2 / w2_scale planes are not a uniform per-expert distance apart \
+                 at the shim's alignment (w2_stride % 8 == 0, w2s_stride % 4 == 0)",
+                true,
+            );
+            return Ok(false);
+        };
+        let tbl = self.moe_bs_tables_dev(route_ids, route_ids_bytes, m, topk, n_routed)?;
+        if !tbl {
+            Self::moe_down_bs_skipped_note(
+                "the routing table could not be expressed as <= 36 expert segments (m*topk <= 36 \
+                 and the routing buffers large enough), or the .so lacks the device moe_align",
+                false,
+            );
+            return Ok(false);
+        }
+        let done = self.dev.moe_bs_down_dev(
+            act,
+            act_stride,
+            out,
+            w2,
+            w2_stride,
+            w2s,
+            w2s_stride,
+            self.s.bs_eid.ptr as *const i32,
+            self.s.bs_order.ptr as *const i32,
+            self.s.bs_counts.ptr as *const i32,
+            self.s.bs_nseg.ptr as *const i32,
+            route_w,
+            1, // flat [rows*slots] route-weight plane (the shim declines anything else)
+            m as i32,
+            dim as i32,
+            inter_local as i32,
+            topk as i32,
+        )?;
+        if !done {
+            Self::moe_down_bs_skipped_note(
+                "the down shim declined the step (its DSV41_MOE_DOWN_BS env gate is off, the \
+                 shape is outside the frozen domain, or its INIT failed — see the shim's own \
+                 [moe-dn-bs] line)",
+                false,
+            );
+            return Ok(false);
+        }
+        MOE_DOWN_BS_INITED.store(true, std::sync::atomic::Ordering::Relaxed);
+        Ok(true)
+    }
+
     /// One-shot notice for an ARMED `DSV41_MOE_TILELANG_BS` that did not fire — the
     /// project's #1 measurement-bias trap, with its OWN latch so the two TileLang
     /// arms cannot mask each other's notice. `hard` marks the refusals that mean the
@@ -19171,7 +19370,35 @@ impl<'a> DevChain<'a> {
             // verify paths took DIFFERENT down arms (the §142 G2 audit): any A/B run
             // on the verify path would then have measured an unaligned arm. With the
             // gate OFF (default) nothing changes here.
+            // ---- DOWN BLOCK-SCALED (DSV41_MOE_DOWN_BS, default OFF) --------------
+            // The down direction's native-fp4 twin of the group above: e4m3
+            // activation × packed fp4 `w2`, grouped over the SAME BM=128 device
+            // segment tables, writing the very per-assignment partials the
+            // non-fused pair writes into `ex_down_r`. ⇒ the fixed-order
+            // ascending-slot reduce below (and its `ar_carry` variant) is reused
+            // verbatim, which is what keeps the numerical contract.
+            //
+            // Orthogonal to the UP arm: this one needs no load-time pool and reads
+            // whatever slot pitch the upstream gate/up left in `ex_act_r` (the
+            // SIMT up path satisfies it too). `bs_dn_done == false` means every
+            // pointer the proven branches below pass is the one they pass today
+            // (the OFF-equivalence argument of the wiring doc §3).
+            let bs_dn_done = self.moe_down_bs_launch(
+                ld,
+                m,
+                topk,
+                dim,
+                inter_local,
+                self.s.ex_act_r.ptr as *const f32,
+                act_slot as i64,
+                self.s.ex_down_r.ptr as *mut f32,
+                rw_eff,
+                ids_base,
+                self.s.route_idx_r.bytes,
+                n_routed,
+            )?;
             if !tl_dn_done
+                && !bs_dn_done
                 && down_fuse()
                 && !bf16_truncate()
                 && self.dev.supports_down_fuse()
@@ -19208,23 +19435,31 @@ impl<'a> DevChain<'a> {
                 // has no `rows` dimension, and the ascending-slot summation order
                 // is the numerical contract - so it keeps the exact per-row shape
                 // (scratch row r, out row r) it had before.
-                self.dev.expert_down_fp4_batched(
-                    self.s.ex_act_r.ptr as *const f32,
-                    act_slot as i64,
-                    self.s.ex_down_r.ptr as *mut f32,
-                    dim as i64,
-                    m as i32,
-                    dim as i32,
-                    inter_local as i32,
-                    rw_eff,
-                    1,
-                    topk as i32,
-                    w2_base,
-                    w2_stride,
-                    w2s_base,
-                    w2s_stride,
-                    ids_base,
-                )?;
+                // `bs_dn_done` means the grouped arm above already wrote every
+                // per-assignment partial into `ex_down_r`; re-running this launch
+                // would overwrite them with the SIMT result — precisely the
+                // "armed gate measured as the OLD path" failure this dispatch
+                // exists to avoid. The reduce loop below is SHARED by both arms
+                // (same buffer, same layout, same order).
+                if !bs_dn_done {
+                    self.dev.expert_down_fp4_batched(
+                        self.s.ex_act_r.ptr as *const f32,
+                        act_slot as i64,
+                        self.s.ex_down_r.ptr as *mut f32,
+                        dim as i64,
+                        m as i32,
+                        dim as i32,
+                        inter_local as i32,
+                        rw_eff,
+                        1,
+                        topk as i32,
+                        w2_base,
+                        w2_stride,
+                        w2s_base,
+                        w2s_stride,
+                        ids_base,
+                    )?;
+                }
                 for r in 0..m {
                     let scratch =
                         (self.s.ex_down_r.ptr as *const f32).wrapping_add(r * topk * dim);
@@ -24258,7 +24493,34 @@ fn oracle_tap() -> bool {
                 } else {
                     self.s.route_w.ptr as *const f32
                 };
-                if !tl_dn_done && down_fuse() && !bf16_truncate() && self.dev.supports_down_fuse() {
+                // ---- DOWN BLOCK-SCALED (DSV41_MOE_DOWN_BS, default OFF) ----------
+                // The `rows == 1` twin of the arm in `moe_rows`: the SAME device
+                // tables, the SAME down shim, the same per-assignment partials
+                // written into `ex_down_b` — the buffer the non-fused pair below
+                // writes — so the SAME fixed-order merges apply (the AR-store
+                // carrier included: the sum is still `s.o`'s last writer here).
+                // `route_idx` is THIS path's routing (the eager router's output);
+                // `route_idx_r` is written only by the multi-row `route_topk`.
+                let bs_dn_done = self.moe_down_bs_launch(
+                    ld,
+                    1,
+                    topk,
+                    dim,
+                    inter_local,
+                    self.s.ex_act_b.ptr as *const f32,
+                    act_slot,
+                    self.s.ex_down_b.ptr as *mut f32,
+                    rw_eff,
+                    self.s.route_idx.ptr as *const i32,
+                    self.s.route_idx.bytes,
+                    ne,
+                )?;
+                if !tl_dn_done
+                    && !bs_dn_done
+                    && down_fuse()
+                    && !bf16_truncate()
+                    && self.dev.supports_down_fuse()
+                {
                     // DSV41_SEQ_ALIGN (#5): the last argument is the gate — 1
                     // makes the serial slot loop walk the ascending-expert-id
                     // permutation (the official's accumulation order) instead of
@@ -24298,23 +24560,30 @@ fn oracle_tap() -> bool {
                         if seq_align() { 1 } else { 0 },
                     )?;
                 } else {
-                    self.dev.expert_down_fp4_batched(
-                        self.s.ex_act_b.ptr as *const f32,
-                        act_slot,
-                        self.s.ex_down_b.ptr as *mut f32,
-                        down_slot,
-                        1,
-                        dim as i32,
-                        inter_local as i32,
-                        rw_eff,
-                        1,
-                        topk as i32,
-                        w2_base,
-                        w2_stride,
-                        w2s_base,
-                        w2s_stride,
-                        ids,
-                    )?;
+                    // `bs_dn_done` means the grouped arm above already wrote every
+                    // per-slot partial into `ex_down_b`; the SIMT launch would
+                    // overwrite them. `bf16_snap` and the merges below stay shared
+                    // (they are the reference's D1 boundary and its accumulation
+                    // order, and they are no-ops when their gates are off).
+                    if !bs_dn_done {
+                        self.dev.expert_down_fp4_batched(
+                            self.s.ex_act_b.ptr as *const f32,
+                            act_slot,
+                            self.s.ex_down_b.ptr as *mut f32,
+                            down_slot,
+                            1,
+                            dim as i32,
+                            inter_local as i32,
+                            rw_eff,
+                            1,
+                            topk as i32,
+                            w2_base,
+                            w2_stride,
+                            w2s_base,
+                            w2s_stride,
+                            ids,
+                        )?;
+                    }
                     // D1 boundary — the routed experts' DOWN (`w2`) OUTPUT. The
                     // reference's `Expert.forward` returns `self.w2(...)`, an
                     // fp4 GEMM whose result is bf16 (`kernel.py:583`), and

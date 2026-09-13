@@ -36,6 +36,8 @@ run B15_PS   DSV41_GATEUP_DUMP=/tmp/b15_ps   DSV41_MOE_BS_SFDUMP=/tmp/sfd_b15 \
              DSV41_MOE_BS_MBAR_PERSTAGE=1
 run B15_PS2  DSV41_GATEUP_DUMP=/tmp/b15_ps_b DSV41_MOE_BS_MBAR_PERSTAGE=1
 run B15_PZA  DSV41_GATEUP_DUMP=/tmp/b15_za   DSV41_MOE_BS_MBAR_PERSTAGE=1 DSV41_MOE_BS_ZERO_A=1
+run B15_DC   DSV41_GATEUP_DUMP=/tmp/b15_dc   DSV41_MOE_BS_DCLEAR=1 DSV41_MOE_BS_SFDUMP=/tmp/sfd_b15
+run B15_DCZA DSV41_GATEUP_DUMP=/tmp/b15_dcza DSV41_MOE_BS_DCLEAR=1 DSV41_MOE_BS_ZERO_A=1
 
 echo "=== 1. determinism of the per-stage arm ==="
 cmp -s /tmp/b15_ps/eager/gateup.f32 /tmp/b15_ps_b/eager/gateup.f32 \
@@ -52,6 +54,21 @@ if os.path.exists(p):
 else:
     print("no dump")
 PY
+echo "=== 2b. DCLEAR (the (b)-hypothesis fix): ZERO_A must be EXACTLY 0, and the oracle must agree ==="
+python3 - <<'PY2'
+import os, numpy as np
+p = '/tmp/b15_dcza/eager/gateup.f32'
+if os.path.exists(p):
+    a = np.fromfile(p, dtype='<f4')
+    print(f"DCLEAR+ZERO_A: max|.|={np.abs(a).max():.6g} nonzero={int((a!=0).sum())} -> "
+          + ("A IS CONSUMED AS STAGED (the accumulator clear is no longer load-bearing) OK"
+             if float(np.abs(a).max()) == 0.0 else "still not consuming the staged A"))
+else:
+    print("DCLEAR+ZERO_A: no dump")
+PY2
+for e in /tmp/b15_dc/eager /tmp/b15_dc; do
+  [ -f "$e/gateup.f32" ] && { python3 "$HOME/gdu_cmp.py" "$e/gateup.f32" /tmp/gu_bs_new.f32 6 640 10.0 2>&1 | head -5; break; }
+done
 echo "=== 3. oracle agreement (the official-semantics verdict) ==="
 for d in /tmp/b15_ps; do
   e=$d; [ -d "$d/eager" ] && e=$d/eager
