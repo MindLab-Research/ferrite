@@ -157,6 +157,11 @@ B1 系三臂的断崖都在 line 52（1..51 正确然后跳 62）+ mean-k 0.64-0
 - **判定实验**：E0（V5_LEDGER 混合臂）；E1（两栈 DSPARK_DEBUG 的 tap 字节对比——决定性三分）；E2（SWALLOW × hc 三开门逐个关——最小单变量直打 S1）；E3（TAP_PARITY 护栏——hidden 等价红线，建议进验收门）。
 - **过渡策略**：acc 侧以 lazy 2.120 为基准，SWALLOW 性能结论带 ±0.78 星号，直到 E1/E2 落地。
 
+**§10.7 E5 判决（2026-09-13 03:40，两栈 DSPARK_DEBUG 的同位对比）**：
+- **lazy k_acc 直方图：11×5 + 1×3（92% 步全对）** vs SWALLOW 17×0+6×5+7×1-4——同任务同模型同 env（除路径 gate）下 draft 质量天差地别。
+- **同 pos drafts 分叉**（pos=52：lazy [201,511,201,397,201] k_acc=5 vs SWALLOW [426,397,201,20,201] k_acc=0；pos=64 同样）——**draft 的第一个预测就不同** ⇒ **(d) 成立：draft 输入状态差**（env 全同 + draft kernel 同族 ⇒ tap/latent 的系统性差异）。注意同 pos 的 token 历史已因前面 accept 差而不同——但 lazy 在数字位也预测对（换行开头）而 SWALLOW 预测错，方向性明确：**SWALLOW 的 tap 让 draft 变差**。
+- **E2 的 hc 三门不改变 tap 写出**（它们只改 hc 前端 kernel）——**tap 写出端的块/行分叉**（:10767-10793 块写 tap_r+(slot*VERIFY_ROWS)*dim vs lazy staging+lazy_tap_commit）才是 S1 的正身。**TAP_PARITY 护栏（hc-tap-parity-fix 实施中）是下一步定位的关键**。
+
 **双门禁**：每个优化臂必须同时报告 `step_ms`（[dspark] 分解）**AND** `mean-k`（A0 基线 1.34；掉了 = 数值回归，立即弃用该 gate）。
 
 1. **重编**：subagent 交付的 .cu/chain_dev 改动 → `build.sh 103a` + `cargo build --release`（双产物）+ 符号三证。
