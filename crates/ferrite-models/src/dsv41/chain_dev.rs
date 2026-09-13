@@ -322,7 +322,29 @@ struct Scratch {
     /// is graph-capturable with the rest of the step.
     dspark_tap: DevBuf,
     /// `[hc]` of `1/hc` — the mean weights for the tap's collapse.
+    ///
+    /// SINGLE-ROW contract, and deliberately so: every `rows = 1` call site
+    /// (`layer()`'s tap hook, the lazy arm's deferred hook) passes this and reads
+    /// only entry `pre + 0`. The `rows = m` hook must NOT use it — see
+    /// [`Self::dspark_pre_mean_r`].
     dspark_pre_mean: DevBuf,
+    /// `[VERIFY_ROWS][hc]` of `1/hc` — the SAME mean weights, replicated one copy
+    /// per block row.
+    ///
+    /// WHY A SEPARATE BUFFER (S1, 2026-09-13). `hc_collapse`'s `pre` is
+    /// PER-ROW-STRIDED: the kernel (`dsv41_glue.cu:304`) reads
+    /// `pre_r = pre + r * hc` and the C test that pins the contract
+    /// (`tests_dsv41_glue.cu:464-473`) allocates `pre[rows][hc]`. The tap's mean
+    /// weights are the SAME for every row, but the kernel still strides `pre` by
+    /// the row, so a `rows = m` call handed the 4-float `dspark_pre_mean` reads
+    /// PAST it for every `r >= 1` — undefined behaviour, and the tap rows the
+    /// draft consumes (`note_ctx_rows` / `carry_kept_tap` read `0..k_emit`) are
+    /// then not the mean over `hc` at all. That is the systematic
+    /// rows-`m`-only difference in the tap (the draft's `main_h`) this buffer
+    /// removes: with `[m, hc]` replicated means the block write is bit-identical
+    /// to the lazy arm's `m` single-row collapses + [`Self::lazy_tap_commit`].
+    /// Filled by [`Self::reset`] under [`tap_mean_rows`].
+    dspark_pre_mean_r: DevBuf,
     /// Per-ROW twin of `dspark_tap`, for the REAL-COMMIT path
     /// ([`Self::dspark_spec_step`]): the verify forwards `m` rows in ONE pass and
     /// the target hidden of EVERY accepted row has to reach the draft's window
@@ -1918,6 +1940,14 @@ fn sh_gate_startup_note() {
             indexer_mrows(),
             compressor_mrows(),
         );
+        // The diagnostic A/B guards, on their own line so a gate that is OFF (the
+        // steady state) does not read as an unarmed SH fold. Printed from the same
+        // `OnceLock` the probe reads, which is what makes the serve log answer
+        // "did the env leg reach the process?" without waiting for a kernel — the
+        // env-readback discipline §10.1 of the lesion audit demands. The S1 guard
+        // `DSV41_TAP_PARITY` is a `DevChain` associated fn and is reported by its
+        // own `[tap-parity]` line at the probe instead.
+        eprintln!("[sh-gate] startup (diagnostic guards): COMP_PARITY={}", comp_parity());
     });
 }
 
@@ -4006,6 +4036,47 @@ fn grp_m_cap(cfg: &Dsv41Config) -> usize {
     VERIFY_ROWS * grp_topk_max(cfg)
 }
 
+/// One compressor's whole state, as [`DevChain::comp_state_take`] captures it:
+/// the three device payloads plus the two counters and the host mirror.
+///
+/// `state_kv`/`state_score` are `ratio * head_dim` f32, `latent` is `head_dim`
+/// f32. The floats are kept as `f32` (not raw bytes) on purpose: the comparison
+/// is `to_bits()` per element, so a NaN payload or a signed zero is not merged,
+/// and the printed value is still readable as the number the draft consumed.
+#[derive(Default)]
+struct CompParityState {
+    state_kv: Vec<f32>,
+    state_score: Vec<f32>,
+    latent: Vec<f32>,
+    clen: i32,
+    out_rows: i32,
+    host_mirror: usize,
+}
+
+/// S2 (`DSV41_COMP_PARITY=1`, default OFF): the compressor-state
+/// hidden-equivalence guard — the SWALLOW commit's "block snapshot + layer-major
+/// replay" state against the "lazy per-row pool+commit" state, bit for bit.
+///
+/// WHY THIS EXISTS. `docs/agent/verify-amortization-lesion-audit.md` §10.5
+/// collapses the 0.78 accept gap onto three `rows = m` inequivalence points; S2
+/// is the compressor's STATE PROVENANCE. SWALLOW restores each compressor to the
+/// pre-block snapshot and replays the kept rows ([`DevChain::compress_replay`]),
+/// while the lazy arm lets every row commit itself as it is forwarded
+/// ([`DevChain::compress_row`]). Nobody had ever compared the two states — the
+/// audit's "unguarded hidden equivalence". The probe feeds BOTH runs the same
+/// projections, so a divergence it finds is in the state MACHINE (order, restore
+/// exactness, a stale buffer, a counter) and not in the projections — that half
+/// is S1 and needs a re-forward (E1/E3).
+///
+/// **The strict `== "1"`** matches `DSV41_TAP_PARITY` (an associated fn of
+/// `DevChain`, declared further down this file): this is a diagnostic A/B guard,
+/// so an exported-but-empty or mistyped value must not arm it. Read once and
+/// cached (hot-path rule) — it is consulted on the commit path.
+fn comp_parity() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_COMP_PARITY").map(|v| v == "1").unwrap_or(false))
+}
+
 impl<'a> DevChain<'a> {
     pub fn new(
         dev: &'a Device,
@@ -4148,6 +4219,10 @@ impl<'a> DevChain<'a> {
             premix_const: dev.alloc(fb(hc).max(8))?,
             dspark_tap: dev.alloc(fb(DSPARK_TAP_SLOTS * dim).max(8))?,
             dspark_pre_mean: dev.alloc(fb(hc).max(8))?,
+            // S1: the per-row replica the `rows = m` tap hook passes (the
+            // single-row buffer above is 4 floats — a rows = m call would stride
+            // past it). See the field's comment.
+            dspark_pre_mean_r: dev.alloc(fb(VERIFY_ROWS * hc).max(8))?,
             // the per-row twin the real commit's verify fills (see the field's
             // comment): 6 rows x 3 layers x dim f32 = 368 KB at the prod shape
             dspark_tap_r: dev.alloc(fb(DSPARK_TAP_SLOTS * VERIFY_ROWS * dim).max(8))?,
@@ -4462,6 +4537,180 @@ impl<'a> DevChain<'a> {
         if let Err(e) = dump_dev::write_step(self.dev, &rec) {
             eprintln!("[dsv41] dspark dump (pos {pos}) failed: {e}");
         }
+    }
+
+    /// E3 (`DSV41_TAP_PARITY=1`) + S1 fix (`DSV41_TAP_STRICT_ROWS=1`): bit-compare
+    /// the SWALLOW block's per-row tap block (`dspark_tap_r`, written at `rows = m`
+    /// by the fused front end) against the SAME block re-forwarded the LAZY way
+    /// (one row at a time in the deferred-tap mode, [`Self::lazy_tap_commit`]).
+    ///
+    /// When `adopt` is set (the `DSV41_TAP_STRICT_ROWS` arm) the reference block is
+    /// also COPIES BACK over `dspark_tap_r` after the original block is restored, so
+    /// the draft consumes the conservative per-row tap — see [`tap_strict_rows`].
+    ///
+    /// # What it stands on
+    ///
+    /// The tap is `hc_collapse(h_r)` with the constant `[1/hc; hc]` weights
+    /// (`dspark_pre_mean`), and `hc_collapse_kernel` is row-INDEPENDENT
+    /// (`dsv41_glue.cu:304`: `out[t] = Σ_i pre[r*hc+i] * x[(r*hc+i)*dim+c]`, one FMA
+    /// chain per element, no cross-row term). The two arms therefore agree on the
+    /// tap iff they agree on `h_r` — so a divergence reported here is a rows-`m`
+    /// divergence in the FORWARD (the hc front end's kernel/block shape, the AR
+    /// fold's summation order, a shared reduction), never in the collapse itself.
+    ///
+    /// # Sequence (the take/put-back discipline of [`Self::diff_eager_probe`])
+    ///
+    /// Called from [`Self::dspark_spec_swallowed`] right after its 6-row
+    /// `step_rows`, i.e. on the POST-block state, before the accept/commit:
+    ///
+    /// 1. **take** — D2H `dspark_tap_r` (`[DSPARK_TAP_SLOTS, VERIFY_ROWS, dim]`),
+    ///    save the graph-accounting counters;
+    /// 2. **undo the block** — [`Self::dspark_rollback`] to the pre-block state the
+    ///    caller's snapshot recorded;
+    /// 3. **the reference** — `m` single-row forwards at `pos + i`, each with
+    ///    `spec_tap_deferred = true` + [`Self::lazy_tap_commit`] (the lazy arm's own
+    ///    program), so the reference rows land in the SAME `dspark_tap_r` stride;
+    /// 4. **read the reference back**;
+    /// 5. **put it back** — roll the reference's rows back, re-run the ORIGINAL
+    ///    6-row block (deterministic, so the caller's commit sees exactly the state
+    ///    the first block left) and restore the counters; with `adopt`, the saved
+    ///    reference block is then uploaded back OVER `dspark_tap_r`;
+    /// 6. **compare** — f32 BIT compare (`to_bits`), printing the first
+    ///    `(slot, row, elem)` divergence, else IDENTICAL.
+    ///
+    /// All ranks run steps 1-5 (they are `step_rows` calls — the v5 AR sequence is
+    /// a cross-rank contract, so a rank-0-only probe would misphase the epoch); only
+    /// the print is rank 0's. A replay/download failure is reported as an `Err` only
+    /// AFTER the put-back has run, exactly as [`Self::diff_eager_probe`] does — the
+    /// put-back is unconditional.
+    fn tap_parity_probe(
+        &mut self,
+        pos: usize,
+        m: usize,
+        rows_in: &[u32],
+        host_mirrors: &[(usize, usize)],
+        adopt: bool,
+    ) -> Result<()> {
+        debug_assert_eq!(rows_in.len(), m, "tap_parity_probe: {m}-row block, {} tokens", rows_in.len());
+        let dim = self.cfg.dim;
+        let tap_len = DSPARK_TAP_SLOTS * VERIFY_ROWS * dim;
+
+        // ---- 1. take: the m-block's per-row tap block + the graph counters ----
+        let mut spec_tap = vec![0f32; tap_len];
+        {
+            let b = Device::view(self.s.dspark_tap_r.ptr, tap_len * std::mem::size_of::<f32>());
+            self.dev.download_f32(&b, &mut spec_tap)?;
+        }
+        let blocks_saved = self.verify_blocks;
+        let captures_saved = self.verify_captures;
+        let replays_saved = self.verify_replays;
+
+        // ---- 2. undo the block so the reference starts where it started ----
+        self.dspark_rollback(pos, m, host_mirrors)?;
+
+        // ---- 3. the reference: the lazy arm's program, one row at a time. The
+        //      per-row `set_pos_ctr` is load-bearing (`lazy_run_row`'s note: the
+        //      rope fallbacks read the counter), and `skip_barrier` matches the
+        //      lazy loop — every rank runs this identical sequence. ----
+        let mut replay_err: Option<FerriteError> = None;
+        for i in 0..m {
+            if let Err(e) = self.set_pos_ctr(pos + i) {
+                replay_err = Some(e);
+                break;
+            }
+            self.spec_capture = false;
+            self.spec_tap_deferred = true;
+            let res = self.step_rows_sync(&rows_in[i..=i], true, Some((pos + i) as i32));
+            self.spec_tap_deferred = false;
+            if let Err(e) = res {
+                replay_err = Some(e);
+                break;
+            }
+            if let Err(e) = self.lazy_tap_commit(i) {
+                replay_err = Some(e);
+                break;
+            }
+        }
+
+        // ---- 4. read the reference block back ----
+        let mut ref_tap = vec![0f32; tap_len];
+        {
+            let b = Device::view(self.s.dspark_tap_r.ptr, tap_len * std::mem::size_of::<f32>());
+            self.dev.download_f32(&b, &mut ref_tap)?;
+        }
+
+        // ---- 5. put it back, unconditionally: roll the reference's rows back,
+        //      re-run the ORIGINAL 6-row block (the caller's commit must see the
+        //      block's own state — the re-run is deterministic, so `argmax_r`,
+        //      the ring and the compressor carry land exactly where block 1 left
+        //      them), and put the graph counters back. ----
+        self.dspark_rollback(pos, m, host_mirrors)?;
+        self.set_pos_ctr(pos)?;
+        self.spec_capture = true;
+        let rerun = self.step_rows(rows_in);
+        self.spec_capture = false;
+        self.verify_blocks = blocks_saved;
+        self.verify_captures = captures_saved;
+        self.verify_replays = replays_saved;
+        rerun?;
+
+        if let Some(e) = replay_err {
+            return Err(e);
+        }
+
+        // ---- 6. compare, f32 bit for bit, first divergence wins ----
+        let mut first: Option<(usize, usize, usize, f32, f32)> = None;
+        'slots: for slot in 0..DSPARK_TAP_SLOTS {
+            for r in 0..m {
+                let base = (slot * VERIFY_ROWS + r) * dim;
+                for c in 0..dim {
+                    let a = spec_tap[base + c];
+                    let b = ref_tap[base + c];
+                    // Bit compare, so -0.0 vs +0.0 and NaN payloads are not
+                    // silently merged by `==` (the whole point is to catch a
+                    // 1-ULP/1-bit rows-m drift).
+                    if a.to_bits() != b.to_bits() {
+                        first = Some((slot, r, c, a, b));
+                        break 'slots;
+                    }
+                }
+            }
+        }
+
+        // ---- 6b. S1 fix arm: hand the draft the CONSERVATIVE per-row tap. The
+        //      re-run above just rewrote `dspark_tap_r` with the block's own tap,
+        //      so the saved reference has to go back on top of it. One H2D of the
+        //      whole `[slots, VERIFY_ROWS, dim]` block per round (1.8 MB at
+        //      dim = 5120). ----
+        if adopt {
+            self.dev
+                .upload_f32_at(self.s.dspark_tap_r.ptr, 0, &ref_tap)?;
+        }
+
+        if self.rank() == 0 {
+            // The slot's LAYER id, so the report names the layer directly
+            // (`dspark_target_slot` is the inverse map, config.rs:453).
+            let layer_of = |slot: usize| -> Option<usize> {
+                self.cfg.dspark_target_layer_ids.get(slot).copied()
+            };
+            match first {
+                Some((slot, r, c, a, b)) => eprintln!(
+                    "[tap-parity] MISMATCH pos={pos} m={m} slot={slot} layer={layer:?} row={r} \
+                     elem={c}: swallow={a:?} ({ab:#010x}) lazy={b:?} ({bb:#010x}){suffix}",
+                    layer = layer_of(slot),
+                    ab = a.to_bits(),
+                    bb = b.to_bits(),
+                    suffix = if adopt { " (adopted the lazy block)" } else { "" }
+                ),
+                None => eprintln!(
+                    "[tap-parity] IDENTICAL pos={pos} m={m} ({tap_len} f32, \
+                     {DSPARK_TAP_SLOTS} slots {layers:?} x {m} rows x {dim}){suffix}",
+                    layers = self.cfg.dspark_target_layer_ids,
+                    suffix = if adopt { " (adopted the lazy block)" } else { "" }
+                ),
+            }
+        }
+        Ok(())
     }
 
     /// D2H one logits row (`n` f32) from a device pointer. A view, not an
@@ -4809,6 +5058,17 @@ impl<'a> DevChain<'a> {
         {
             let mean_w = vec![1.0 / self.cfg.hc_mult as f32; self.cfg.hc_mult];
             self.dev.upload_f32_at(self.s.dspark_pre_mean.ptr, 0, &mean_w)?;
+        }
+        // S1: the SAME mean weights replicated per block row, for the `rows = m`
+        // tap hook. `hc_collapse` strides `pre` by the row, so the single-row
+        // buffer above is only valid for `rows = 1`; the `[VERIFY_ROWS, hc]` form
+        // makes the block write bit-identical to the lazy arm's per-row collapses.
+        // Correctness fix, default ON (`DSV41_TAP_MEAN_ROWS=0` restores the
+        // historical single-row pointer for a same-binary A/B — see
+        // [`tap_mean_rows`]).
+        if Self::tap_mean_rows() {
+            let mean_w = vec![1.0 / self.cfg.hc_mult as f32; VERIFY_ROWS * self.cfg.hc_mult];
+            self.dev.upload_f32_at(self.s.dspark_pre_mean_r.ptr, 0, &mean_w)?;
         }
         // The verify block's incoming premix: row r's is the CONSTANT one-hot
         // [1,0,0,0] (the m-row twin of the `premix_const` copy `step_body` makes
@@ -9355,6 +9615,21 @@ impl<'a> DevChain<'a> {
             )));
         }
 
+        // ---- 3b. E3 (`DSV41_TAP_PARITY=1`) / S1 fix (`DSV41_TAP_STRICT_ROWS=1`),
+        // both default OFF: the tap-equivalence guard. The block's per-row tap is
+        // the draft's `main_h` source for the NEXT round; this re-forwards the SAME
+        // block the lazy way and bit-compares the two tap blocks, reporting the
+        // first `(slot, row, elem)` divergence. The STRICT arm additionally hands
+        // the draft that per-row block. The call sits HERE — post-block,
+        // pre-accept — because the m-block's `dspark_tap_r` is intact and the
+        // caller's snapshot is still valid, so the probe's own rollback/re-run
+        // restores exactly this state. It must run on EVERY rank (its forwards are
+        // `step_rows` calls, i.e. AR rounds), so the gate check is hoisted into the
+        // function rather than around the call.
+        if Self::tap_parity() || Self::tap_strict_rows() {
+            self.tap_parity_probe(pos, m, &rows_in, &host_mirrors, Self::tap_strict_rows())?;
+        }
+
         // ---- 4. the accept: index-aligned on the anchor-carrying block (see the
         // doc comment), through the SHARED chain. `k_emit` counts the tokens the
         // step emits (the anchor plus the accepted drafts), 1..=m.
@@ -10018,6 +10293,14 @@ impl<'a> DevChain<'a> {
         if keep > 0 {
             self.compress_replay(pos_base as i32, keep)?;
         }
+        // S2 (`DSV41_COMP_PARITY=1`, default OFF): the compressor-state guard
+        // sits HERE — on the post-replay state, before the counter moves — so the
+        // probe's own rollback/reference/put-back cycle brackets exactly the state
+        // the replay installed. Gated OFF by default, so the steady-state commit
+        // pays one cached branch. See [`Self::comp_parity_probe`].
+        if comp_parity() {
+            self.comp_parity_probe(pos_base, m, keep, host)?;
+        }
         self.set_pos_ctr(pos_base + keep)?;
         // (4) at the END of the commit the host mirror and the device *clen must
         // describe the SAME committed prefix: the rollback restored both from the
@@ -10051,63 +10334,454 @@ impl<'a> DevChain<'a> {
         }
         let cfg = self.cfg;
         let hd = cfg.head_dim;
-        let st = self.dev.stream();
         // Re-upload the row positions so the replay does not depend on
         // `s.pos_rows` still holding what `step_rows` put there.
         let pos_rows: Vec<i32> = (0..rows).map(|r| pos_base + r as i32).collect();
         self.ul_i32(self.s.pos_rows.ptr, &pos_rows)?;
         for layer in self.compress_sources() {
             let ld = &self.w.layers[layer];
-            let (Some(_), Some(norm)) = (ld.comp_wkv.as_ref(), ld.comp_norm.as_ref()) else {
+            if ld.comp_wkv.is_none() || ld.comp_norm.is_none() {
                 continue;
-            };
-            let ratio = cfg.compress_ratio(layer).max(1);
+            }
             let kvp_base =
                 (self.s.spec_snap_kvp.ptr as *const f32).wrapping_add(layer * VERIFY_ROWS * hd);
             let scp_base =
                 (self.s.spec_snap_scp.ptr as *const f32).wrapping_add(layer * VERIFY_ROWS * hd);
+            // LAYER-major: every row of this layer, then the next layer. The lazy
+            // arm runs the same rows ROW-major (one row through every layer before
+            // the next row) — the two orders are what [`Self::comp_parity_probe`]
+            // measures against each other.
             for r in 0..rows {
-                self.dev.compressor_pool_on(
+                self.compress_replay_row(
+                    layer,
                     kvp_base.wrapping_add(r * hd),
                     scp_base.wrapping_add(r * hd),
-                    norm.as_f32(),
-                    self.layers[layer].state_kv.ptr as *mut f32,
-                    self.layers[layer].state_score.ptr as *mut f32,
-                    self.layers[layer].latent.ptr as *mut f32,
-                    self.layers[layer].out_rows.ptr as *mut i32,
-                    1,
-                    1,
-                    hd as i32,
-                    ratio as i32,
-                    pos_base + r as i32,
-                    (self.s.pos_rows.ptr as *const std::os::raw::c_int).wrapping_add(r),
-                    cfg.norm_eps,
-                    st,
+                    pos_base,
+                    r,
+                    true,
                 )?;
-                self.dev.compress_commit_on(
-                    self.layers[layer].latent.as_f32(),
-                    self.cos_comp.as_f32(),
-                    self.sin_comp.as_f32(),
-                    self.layers[layer].ring.ptr as *mut f32,
-                    self.layers[layer].out_rows.ptr as *const std::os::raw::c_int,
-                    (self.s.clen.ptr as *mut std::os::raw::c_int).wrapping_add(layer),
-                    hd as i32,
-                    cfg.rope_head_dim as i32,
-                    (cfg.rope_head_dim / 2) as i32,
-                    cfg.window_size as i32,
-                    ratio as i32,
-                    st,
-                )?;
-                // The host MIRROR of the device counter, by the SAME rule the
-                // commit kernel applies ((*pos + 1) % ratio == 0).
-                if (pos_base + r as i32 + 1) % (ratio as i32) == 0 {
-                    self.layers[layer].compress_len += 1;
-                    // A group just completed, so its index key has to exist —
-                    // `*clen - 1` is the slot the commit kernel just named.
-                    if cfg.is_index_source(layer) && cfg.indexer_owns_k(layer) {
-                        self.publish_index_key(layer)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// ONE row of [`Self::compress_replay`]: row `r` of the committed prefix,
+    /// through the single-row pool+commit pair, at its own position
+    /// `pos_base + r`, consuming the projections `kvp_row`/`scp_row`.
+    ///
+    /// The body [`Self::compress_replay`] used to inline verbatim, extracted so
+    /// the S2 parity probe ([`Self::comp_parity_probe`]) can drive the SAME
+    /// program in the LAZY order and bit-compare the two resulting compressor
+    /// states. The launches, their arguments and their relative order are
+    /// unchanged, so the live path is bit-identical by construction.
+    ///
+    /// `publish` gates the `index_k` re-publication only. The probe passes
+    /// `false`: `index_k` is deliberately outside what it compares, and the
+    /// commit has already left that slot at the value this same program writes
+    /// (the reference's counters are identical by construction), so skipping it
+    /// is a no-op on the compared state.
+    ///
+    /// Returns `true` when the row COMPLETED a group — the deterministic
+    /// `(pos + 1) % ratio == 0` rule the commit kernel applies.
+    fn compress_replay_row(
+        &mut self,
+        layer: usize,
+        kvp_row: *const f32,
+        scp_row: *const f32,
+        pos_base: i32,
+        r: usize,
+        publish: bool,
+    ) -> Result<bool> {
+        let cfg = self.cfg;
+        let hd = cfg.head_dim;
+        let ratio = cfg.compress_ratio(layer).max(1);
+        let ld = &self.w.layers[layer];
+        let (Some(_), Some(norm)) = (ld.comp_wkv.as_ref(), ld.comp_norm.as_ref()) else {
+            return Ok(false);
+        };
+        let st = self.dev.stream();
+        self.dev.compressor_pool_on(
+            kvp_row,
+            scp_row,
+            norm.as_f32(),
+            self.layers[layer].state_kv.ptr as *mut f32,
+            self.layers[layer].state_score.ptr as *mut f32,
+            self.layers[layer].latent.ptr as *mut f32,
+            self.layers[layer].out_rows.ptr as *mut i32,
+            1,
+            1,
+            hd as i32,
+            ratio as i32,
+            pos_base + r as i32,
+            (self.s.pos_rows.ptr as *const std::os::raw::c_int).wrapping_add(r),
+            cfg.norm_eps,
+            st,
+        )?;
+        self.dev.compress_commit_on(
+            self.layers[layer].latent.as_f32(),
+            self.cos_comp.as_f32(),
+            self.sin_comp.as_f32(),
+            self.layers[layer].ring.ptr as *mut f32,
+            self.layers[layer].out_rows.ptr as *const std::os::raw::c_int,
+            (self.s.clen.ptr as *mut std::os::raw::c_int).wrapping_add(layer),
+            hd as i32,
+            cfg.rope_head_dim as i32,
+            (cfg.rope_head_dim / 2) as i32,
+            cfg.window_size as i32,
+            ratio as i32,
+            st,
+        )?;
+        // The host MIRROR of the device counter, by the SAME rule the commit
+        // kernel applies ((*pos + 1) % ratio == 0).
+        let committed = (pos_base + r as i32 + 1) % (ratio as i32) == 0;
+        if committed {
+            self.layers[layer].compress_len += 1;
+            // A group just completed, so its index key has to exist —
+            // `*clen - 1` is the slot the commit kernel just named.
+            if publish && cfg.is_index_source(layer) && cfg.indexer_owns_k(layer) {
+                self.publish_index_key(layer)?;
+            }
+        }
+        Ok(committed)
+    }
+
+    // =========================================================================
+    // S2 (`DSV41_COMP_PARITY=1`, default OFF): the compressor-state
+    // hidden-equivalence guard
+    //
+    // The audit (`docs/agent/verify-amortization-lesion-audit.md` §10.5) names
+    // three inequivalence points between the SWALLOW stack and the lazy one. S2
+    // is the compressor's STATE PROVENANCE: SWALLOW reaches the committed state
+    // by "restore the block snapshot, then replay the kept rows through every
+    // compressor" (`dspark_rollback_keep` -> `compress_replay`), while the lazy
+    // arm reaches it by "run each row's own pool+commit as it goes"
+    // (`compress_row`). The audit's claim is that the two states are equal
+    // "iff the block's per-row hidden is the single-row per-row hidden" — and
+    // that equivalence had NO test. This is that test.
+    //
+    // What is and is not isolated from S1: the probe feeds the SAME projections
+    // (`spec_snap_kvp`/`scp`) to both runs, so a divergence it reports is in the
+    // state MACHINE (order, restore exactness, a stale buffer, a counter), not in
+    // the projections. S1 — whether the block's per-row projection itself equals
+    // the single-row one — needs a re-forward and is E1/E3's job.
+    // =========================================================================
+
+    /// D2H one compress source's whole state: `state_kv`/`state_score`
+    /// (`ratio * head_dim` f32 each), `latent` (`head_dim` f32), the device
+    /// counter, `out_rows`, and the host mirror.
+    fn comp_state_take(&self, layer: usize) -> Result<CompParityState> {
+        let hd = self.cfg.head_dim;
+        let ratio = self.cfg.compress_ratio(layer).max(1);
+        let mut st = CompParityState {
+            state_kv: vec![0f32; ratio * hd],
+            state_score: vec![0f32; ratio * hd],
+            latent: vec![0f32; hd],
+            clen: self.dev.download_u32(
+                (self.s.clen.ptr as *const u8).wrapping_add(layer * 4) as *const c_void,
+            )? as i32,
+            out_rows: self.dev.download_u32(self.layers[layer].out_rows.ptr as *const c_void)? as i32,
+            host_mirror: self.layers[layer].compress_len,
+        };
+        {
+            let b = Device::view(self.layers[layer].state_kv.ptr, ratio * hd * 4);
+            self.dev.download_f32(&b, &mut st.state_kv)?;
+        }
+        {
+            let b = Device::view(self.layers[layer].state_score.ptr, ratio * hd * 4);
+            self.dev.download_f32(&b, &mut st.state_score)?;
+        }
+        {
+            let b = Device::view(self.layers[layer].latent.ptr, hd * 4);
+            self.dev.download_f32(&b, &mut st.latent)?;
+        }
+        Ok(st)
+    }
+
+    /// The inverse of [`Self::comp_state_take`] — byte for byte, f32 bits and
+    /// the `i32` counters through the same `ul_i32` the position counter uses.
+    fn comp_state_put(&mut self, layer: usize, st: &CompParityState) -> Result<()> {
+        self.dev
+            .upload_f32_at(self.layers[layer].state_kv.ptr, 0, &st.state_kv)?;
+        self.dev
+            .upload_f32_at(self.layers[layer].state_score.ptr, 0, &st.state_score)?;
+        self.dev
+            .upload_f32_at(self.layers[layer].latent.ptr, 0, &st.latent)?;
+        self.ul_i32(
+            (self.s.clen.ptr as *mut u8).wrapping_add(layer * 4) as *mut c_void,
+            &[st.clen],
+        )?;
+        self.ul_i32(self.layers[layer].out_rows.ptr, &[st.out_rows])?;
+        self.layers[layer].compress_len = st.host_mirror;
+        Ok(())
+    }
+
+    /// S2 (`DSV41_COMP_PARITY=1`, default OFF): bit-compare the compressor state
+    /// the SWALLOW commit just installed (block snapshot + layer-major replay)
+    /// against the SAME rows run the LAZY way — row-major single-row pool+commit
+    /// pairs, [`Self::compress_replay_row`] one row at a time through every
+    /// compressor before the next row.
+    ///
+    /// # Why this is not vacuous
+    ///
+    /// Both runs are the same per-row program on the same projections, so a
+    /// BYTE-equal result is the assertion that the compressor state is a pure
+    /// function of `(snapshot, projections, launch arguments)` — independent of
+    /// the traversal ORDER the two arms use (layer-major vs row-major), of the
+    /// rollback's restore exactness, and of any cross-layer liveness the kernels
+    /// might have (a shared `out_rows`, a shared `clen` slice, a stale scratch).
+    /// A divergence is a concrete S2 finding with its `(layer, seg, row, elem)`.
+    ///
+    /// The order is the substance: the replay walks a LAYER's rows to completion
+    /// before touching the next layer, while the lazy arm (`step_rows(m = 1)` per
+    /// row) walks all 40 layers for one row before the next row. Nothing asserts
+    /// those two orders agree, and that is exactly the gap the audit names.
+    ///
+    /// # Sequence (the take/put-back discipline of [`Self::diff_eager_probe`])
+    ///
+    /// Called from [`Self::dspark_commit`] right after `compress_replay`:
+    ///
+    /// 1. **take** — D2H every compress source's post-replay state, and the
+    ///    replay's INPUT wiring: the projections the replay consumed
+    ///    (`spec_snap_kvp`/`scp` for the last compress source, whose rows are
+    ///    still the live `kvp_r`/`scp_r` at commit time);
+    /// 2. **undo** — [`Self::dspark_rollback_keep`] with `keep = m`: the ring
+    ///    restore loop is empty (the accepted prefix's KV must survive) while the
+    ///    compressor restore, which ignores `keep`, still runs WHOLE — the exact
+    ///    state `compress_replay` started from;
+    /// 3. **the reference** — rows `0..keep`, ROW-major, through the same
+    ///    per-row program with `publish = false`;
+    /// 4. **read back** the reference state;
+    /// 5. **put it back, unconditionally** — every taken payload and both
+    ///    counters, so the commit's `set_pos_ctr`/`inv_compress_len` see exactly
+    ///    the state step 1 captured. A replay or download failure is reported as
+    ///    an `Err` only AFTER the put-back has run;
+    /// 6. **compare** — f32 BIT compare (`to_bits`), first `(layer, seg, row,
+    ///    elem)` divergence, else IDENTICAL.
+    ///
+    /// # What it does NOT restore, and why that is sound
+    ///
+    /// The ring's COMPRESSED rows (`window + *clen`): the reference rewrites the
+    /// slots the real replay wrote, at the same indices, from the same restored
+    /// `clen` — so with the states equal (the expected case, and the only case
+    /// where the run is meant to continue) the bytes are identical. On a
+    /// divergence the probe leaves the reference's bytes there; the run is a
+    /// diagnostic at that point and prints MISMATCH. `index_k` is untouched by
+    /// design (step 3 skips the publication) and `pos_ctr` is never written by
+    /// either run (the pair reads `pos_rows`, not the counter).
+    ///
+    /// # Cost
+    ///
+    /// Two D2H passes of every compress source's state plus one extra
+    /// `keep`-row replay per spec round. Gated OFF by default and never enabled
+    /// by any code path: run it in its OWN process, never in an A/B timing arm.
+    fn comp_parity_probe(
+        &mut self,
+        pos_base: usize,
+        m: usize,
+        keep: usize,
+        host_mirrors: &[(usize, usize)],
+    ) -> Result<()> {
+        let cfg = self.cfg;
+        let hd = cfg.head_dim;
+        let sources = self.compress_sources();
+        // No snapshot (the bisect modes that never run the verify): there is no
+        // pre-block state to restore, so a reference run would DOUBLE-apply the
+        // rows and the comparison would be meaningless. Nothing to guard.
+        if host_mirrors.is_empty() || sources.is_empty() {
+            return Ok(());
+        }
+        if keep == 0 {
+            // Nothing was replayed, and `dspark_commit` returns before it calls
+            // here — kept as a guard so a future reordering cannot turn this into
+            // a second, un-restorable write pass.
+            return Ok(());
+        }
+        if self.rank() == 0 {
+            eprintln!(
+                "[comp-parity] armed pos_base={pos_base} m={m} keep={keep} \
+                 sources={} (S2 guard: block-snapshot+replay vs lazy per-row pool+commit)",
+                sources.len()
+            );
+        }
+
+        // ---- 1. take: the post-replay state, plus the replay's input wiring ----
+        let swallow: Vec<CompParityState> = sources
+            .iter()
+            .map(|&l| self.comp_state_take(l))
+            .collect::<Result<Vec<_>>>()?;
+        // The projections the replay consumed for the LAST compress source: the
+        // shared `kvp_r`/`scp_r` scratch still holds that layer's rows (it is
+        // written once per compress source, in layer order), so this is the one
+        // place `spec_snap_*` can be checked against the block's own output. A
+        // mismatch here is a WIRING defect (stride, layer index, row index), not
+        // a state-machine one — reported separately so the two cannot be confused.
+        let last = *sources.last().expect("sources is non-empty");
+        let snap_proj = {
+            let n = m * hd;
+            let mut kvp = vec![0f32; n];
+            let mut scp = vec![0f32; n];
+            {
+                let b = Device::view(
+                    (self.s.spec_snap_kvp.ptr as *mut f32)
+                        .wrapping_add(last * VERIFY_ROWS * hd) as *mut c_void,
+                    n * 4,
+                );
+                self.dev.download_f32(&b, &mut kvp)?;
+            }
+            {
+                let b = Device::view(
+                    (self.s.spec_snap_scp.ptr as *mut f32)
+                        .wrapping_add(last * VERIFY_ROWS * hd) as *mut c_void,
+                    n * 4,
+                );
+                self.dev.download_f32(&b, &mut scp)?;
+            }
+            let mut live_kvp = vec![0f32; n];
+            let mut live_scp = vec![0f32; n];
+            {
+                let b = Device::view(self.s.kvp_r.ptr, n * 4);
+                self.dev.download_f32(&b, &mut live_kvp)?;
+            }
+            {
+                let b = Device::view(self.s.scp_r.ptr, n * 4);
+                self.dev.download_f32(&b, &mut live_scp)?;
+            }
+            (last, kvp, scp, live_kvp, live_scp)
+        };
+        let (wl, kvp_s, scp_s, kvp_l, scp_l) = snap_proj;
+        let mut proj_first: Option<(&'static str, usize, usize, u32, u32)> = None;
+        for kind in 0..2 {
+            let (a, b) = if kind == 0 { (&kvp_s, &kvp_l) } else { (&scp_s, &scp_l) };
+            for (k, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+                if x.to_bits() != y.to_bits() {
+                    proj_first = Some((
+                        if kind == 0 { "kvp" } else { "scp" },
+                        k / hd,
+                        k % hd,
+                        x.to_bits(),
+                        y.to_bits(),
+                    ));
+                    break;
+                }
+            }
+            if proj_first.is_some() {
+                break;
+            }
+        }
+
+        // ---- 2. back to the state `compress_replay` started from, without
+        //      touching the ring's accepted prefix (`keep = m` empties the ring
+        //      restore loop; the compressor restore is unconditional on `keep`) ----
+        self.dspark_rollback_keep(pos_base, m, m, host_mirrors)?;
+
+        // ---- 3. the reference: the SAME rows, the LAZY order (row-major) ----
+        let pos_rows: Vec<i32> = (0..keep)
+            .map(|r| pos_base as i32 + r as i32)
+            .collect();
+        self.ul_i32(self.s.pos_rows.ptr, &pos_rows)?;
+        let mut replay_err: Option<FerriteError> = None;
+        'rows: for r in 0..keep {
+            for &layer in &sources {
+                let kvp = (self.s.spec_snap_kvp.ptr as *const f32)
+                    .wrapping_add(layer * VERIFY_ROWS * hd + r * hd);
+                let scp = (self.s.spec_snap_scp.ptr as *const f32)
+                    .wrapping_add(layer * VERIFY_ROWS * hd + r * hd);
+                if let Err(e) = self.compress_replay_row(layer, kvp, scp, pos_base as i32, r, false)
+                {
+                    replay_err = Some(e);
+                    break 'rows;
+                }
+            }
+        }
+
+        // ---- 4. read the reference back ----
+        let lazy: Vec<CompParityState> = match replay_err {
+            Some(_) => Vec::new(),
+            None => sources
+                .iter()
+                .map(|&l| self.comp_state_take(l))
+                .collect::<Result<Vec<_>>>()?,
+        };
+
+        // ---- 5. put it back, unconditionally ----
+        let mut put_err: Option<FerriteError> = None;
+        for (i, &layer) in sources.iter().enumerate() {
+            if let Err(e) = self.comp_state_put(layer, &swallow[i]) {
+                put_err = Some(e);
+                break;
+            }
+        }
+        if let Some(e) = replay_err {
+            return Err(e);
+        }
+        if let Some(e) = put_err {
+            return Err(e);
+        }
+
+        // ---- 6. compare, f32 bit for bit, first divergence wins ----
+        // Bits (not `==`), so -0.0 vs +0.0 and NaN payloads are not merged: the
+        // whole point is to catch a 1-ULP / 1-bit drift in the draft's input.
+        let mut first: Option<(&'static str, usize, usize, usize, u32, u32)> = None;
+        'layers: for (i, &layer) in sources.iter().enumerate() {
+            let (a, b) = (&swallow[i], &lazy[i]);
+            for (seg, va, vb) in [
+                ("state_kv", &a.state_kv, &b.state_kv),
+                ("state_score", &a.state_score, &b.state_score),
+                ("latent", &a.latent, &b.latent),
+            ] {
+                for (k, (x, y)) in va.iter().zip(vb.iter()).enumerate() {
+                    if x.to_bits() != y.to_bits() {
+                        first = Some((seg, layer, k / hd, k % hd, x.to_bits(), y.to_bits()));
+                        break 'layers;
                     }
                 }
+            }
+            if a.clen != b.clen {
+                first = Some(("clen", layer, 0, 0, a.clen as u32, b.clen as u32));
+                break 'layers;
+            }
+            if a.out_rows != b.out_rows {
+                first = Some(("out_rows", layer, 0, 0, a.out_rows as u32, b.out_rows as u32));
+                break 'layers;
+            }
+            if a.host_mirror != b.host_mirror {
+                first = Some((
+                    "host_mirror",
+                    layer,
+                    0,
+                    0,
+                    a.host_mirror as u32,
+                    b.host_mirror as u32,
+                ));
+                break 'layers;
+            }
+        }
+        if self.rank() == 0 {
+            match proj_first {
+                Some((kind, row, elem, ab, bb)) => eprintln!(
+                    "[comp-parity] PROJ-LIVE MISMATCH layer={wl} kind={kind} row={row} elem={elem}: \
+                     spec_snap={ab:#010x} kvp_r/scp_r={bb:#010x} — the replay's INPUT wiring, not \
+                     the state machine"
+                ),
+                None => eprintln!(
+                    "[comp-parity] proj-live OK layer={wl} (spec_snap_kvp/scp == kvp_r/scp_r \
+                     for {m} rows x {hd} — the replay consumed the block's own projections)"
+                ),
+            }
+            match first {
+                Some((seg, layer, row, elem, ab, bb)) => eprintln!(
+                    "[comp-parity] MISMATCH pos_base={pos_base} m={m} keep={keep} layer={layer} \
+                     seg={seg} row={row} elem={elem}: swallow={ab:#010x} ({:?}) lazy={bb:#010x} \
+                     ({:?})",
+                    f32::from_bits(ab),
+                    f32::from_bits(bb)
+                ),
+                None => eprintln!(
+                    "[comp-parity] IDENTICAL pos_base={pos_base} m={m} keep={keep} \
+                     ({n} compress sources, state_kv+state_score+latent+clen+out_rows+host_mirror \
+                     all bit-equal)",
+                    n = sources.len()
+                ),
             }
         }
         Ok(())
@@ -10567,6 +11241,22 @@ impl<'a> DevChain<'a> {
     }
 
 
+    /// The `pre` pointer the tap's `hc_collapse` must use for a `rows`-row block:
+    /// the per-row replicated mean ([`Scratch::dspark_pre_mean_r`]) when the block
+    /// has more than one row, the historical single-row mean otherwise.
+    ///
+    /// `hc_collapse` strides `pre` by the row (`pre + r*hc` — see the kernel's
+    /// contract test), so the single-row buffer is only valid at `rows = 1`. See
+    /// [`tap_mean_rows`] for the rows-`m` OOB this closes; `rows == 1` is kept on
+    /// the historical pointer so the decode path is bit-for-bit unchanged.
+    fn tap_pre(&self, rows: usize) -> *const f32 {
+        if rows > 1 && Self::tap_mean_rows() {
+            self.s.dspark_pre_mean_r.as_f32()
+        } else {
+            self.s.dspark_pre_mean.as_f32()
+        }
+    }
+
     /// The m-row premix slots, mirroring [`Self::premix_slot`]'s convention: 0 is
     /// the incoming block (the constant `[1,0,0,0]` for a verify pass), 1 is this
     /// layer's attn_pre (written by the attention mixes, read by the FFN collapse)
@@ -10784,7 +11474,7 @@ impl<'a> DevChain<'a> {
                 };
                 self.dev.hc_collapse(
                     self.s.h_r.ptr as *const f32,
-                    self.s.dspark_pre_mean.as_f32(),
+                    self.tap_pre(rows),
                     dst,
                     rows as i32,
                     hc as i32,
@@ -11012,7 +11702,7 @@ impl<'a> DevChain<'a> {
                 };
                 self.dev.hc_collapse(
                     self.s.h_r.ptr as *const f32,
-                    self.s.dspark_pre_mean.as_f32(),
+                    self.tap_pre(rows),
                     dst,
                     rows as i32,
                     hc as i32,
@@ -15210,6 +15900,81 @@ fn hc_tail_split() -> bool {
 /// hook is skipped when this gate is armed). `0`/unset therefore reproduces the
 /// historical numbers bit for bit and the gate is a pure A/B switch on one
 /// binary.
+/// E3 (`DSV41_TAP_PARITY=1`, default OFF): the SWALLOW arm's tap-equivalence
+/// guard — the probe that answers "is the `m`-row block's per-row tap the SAME
+/// BYTES the lazy per-row program produces?" without a GPU A/B of the whole
+/// stack.
+///
+/// WHY THIS EXISTS. The swallowed 6-row block and the lazy row-by-row arm run
+/// the SAME `[anchor, d1..d5]` tokens through two DIFFERENT hc front ends
+/// (`layer_rows` at `rows = m` vs `step_rows(m = 1)` in the deferred-tap mode),
+/// and the tap the DRAFT consumes is `hc_collapse(h_r)` — a function of the
+/// block's output `h_r`. `hc_collapse` itself is row-INDEPENDENT
+/// (`dsv41_glue.cu:304`), so ANY difference between the two arms' taps comes
+/// from a rows-`m`-only divergence in the forward that produced `h_r`. A 1-ULP
+/// drift there does not move the verify's argmax (what `DIFF_EAGER` measures)
+/// but it DOES move the weak draft model's near-ties — the accept-loss suspect.
+/// This guard turns "guessed at" into "measured": it prints the FIRST diverging
+/// `(slot, row, elem)`.
+///
+/// COST (`DSV41_TAP_PARITY=1` only): the block is re-forwarded twice — once as
+/// `m` single-row steps (the reference), once as the original 6-row replay (to
+/// put the chain back). The whole probe is a diagnostic; run it in its OWN
+/// process, never in an A/B timing arm.
+fn tap_parity() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_TAP_PARITY").map(|v| v == "1").unwrap_or(false))
+}
+
+/// S1 FIX arm (`DSV41_TAP_STRICT_ROWS=1`, default OFF): make the SWALLOW block's
+/// tap the CONSERVATIVE per-row one, i.e. adopt the reference block
+/// [`Self::tap_parity_probe`] produces (the lazy arm's `m` single-row forwards)
+/// instead of the `rows = m` block's own tap.
+///
+/// WHY THIS IS A FIX AND NOT JUST A PROBE. The tap is the draft's `main_h`
+/// source, and the draft is a weak model: a 1-ULP rows-`m` drift in `h_r` that
+/// leaves the verify's argmax untouched can still flip a near-tie draft, which is
+/// the 0.78 accept gap (SWALLOW 1.34 vs lazy 2.12). Switching the tap's
+/// production to the `m = 1` program removes that drift BY CONSTRUCTION — the
+/// tap the draft consumes is then byte-identical to the lazy arm's, whatever the
+/// m-row front end does.
+///
+/// COST, stated plainly: the block is re-forwarded twice (once per-row for the
+/// reference, once as the original 6-row replay to restore the state), so this
+/// roughly doubles the verify's forward for a SWALLOW round. It is an
+/// EXPERIMENTAL / hypothesis-validating gate — turn it on to prove the S1
+/// mechanism (accept should recover toward lazy's 2.12), not to ship. Default
+/// OFF keeps the historical numbers bit for bit.
+fn tap_strict_rows() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_TAP_STRICT_ROWS").map(|v| v == "1").unwrap_or(false))
+}
+
+/// S1 FIX (`DSV41_TAP_MEAN_ROWS`, default ON; `=0` is the historical arm): make
+/// the block tap hook pass the PER-ROW replicated mean weights
+/// ([`Scratch::dspark_pre_mean_r`]) instead of the single-row
+/// [`Scratch::dspark_pre_mean`].
+///
+/// THE BUG THIS FIXES. `hc_collapse`'s `pre` is per-row-strided — see the C
+/// contract test `tests_dsv41_glue.cu:462-482` (`pre[rows][hc]`, reference
+/// `pre[r*hc + i]`) and the kernel's own `pre_r = pre + r * hc`
+/// (`dsv41_glue.cu:304-316`). The m-row tap hook was passing the 4-float
+/// single-row mean with `rows = m`, so rows `1..m-1` read past the buffer: the
+/// tap rows the draft consumes were not the mean over `hc` at all. This is the
+/// systematic rows-`m`-only difference in the tap that `DSV41_TAP_PARITY`
+/// localises and the S1 diagnosis names (it is independent of the three hc
+/// front-end gates, which is why E2 found them innocent). The replicated buffer
+/// makes row `r`'s collapse statement-for-statement identical to the lazy arm's
+/// `m = 1` collapse, hence bit-identical after [`Self::lazy_tap_commit`].
+///
+/// `=0` keeps the historical single-row pointer (the OOB read) so the accept A/B
+/// is one binary. Rows `= 1` call sites are unaffected either way — they always
+/// read `pre + 0`.
+fn tap_mean_rows() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_TAP_MEAN_ROWS").map(|v| v != "0").unwrap_or(true))
+}
+
 fn tap_input() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *F.get_or_init(|| std::env::var("DSV41_TAP_INPUT").map(|v| v != "0").unwrap_or(false))
