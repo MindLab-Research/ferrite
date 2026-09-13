@@ -1990,3 +1990,16 @@ B 档 4 项在转正时用 `wq_check.py` 观察是否出现可观测漂移；
 **A 档 10 项即刻关闭**（不再投入）。另有一个对拍前提值得记住：
 `ref_inference/generate.py:118` 设 `torch.set_default_dtype(torch.bfloat16)`（参考实现全程 bf16 默认）
 且 `:108` 的 `world_size` **由启动环境决定** ⇒ 对拍臂的 world size 会影响 AR 项是否成立。
+
+## §78 五门的 OFF 路径安全性已逐门核实（两类实现方式）
+
+| 门 | 实现方式 | OFF 路径的保证 |
+|---|---|---|
+| `DSV41_WINDOW_KV_QUANT` (A2) | **host 侧门控**：`window_kv_quant_on()` 在 gate 关时**在任何发射之前返回**（`chain_dev.rs:21035-21037` 自带论证） | 不调用 ⇒ **逐字节等价** ✓（更强保证） |
+| `DSV41_COMPRESS_LATENT_QUANT` (A3) | 同上（`:13048/22540` 的 `if compress_latent_quant()` 包裹） | 不调用 ⇒ 等价 ✓ |
+| `DSV41_INDEXER_FP4_RT` (A4) | 同上（`if idx_fp4_rt { … }`） | 不调用 ⇒ 等价 ✓ |
+| `DSV41_ROUTED_DOWN_QUANT` | host 侧 + 每调用点分支（§53 逐行核实） | 三处调用点原样传参 ⇒ 等价 ✓ |
+| **`DSV41_ATTN_P_BF16` (I3)** | **内核侧参数**：`dsv41_pv_prod(e, kv, p_bf16)` 在 `p_bf16==0` 时返回 `e * kv`，调用方表达式 `acc*corr + <product>` **逐字未改**（`dsv41_kernels.cu:996-1011`） | 同一表达式树（编译器可见原始 `acc*corr + e*kv`）⇒ 等价 ✓ |
+
+⇒ 前四门是"**不调用**"型（最强保证）；只有 I3 必须**改既有内核**，故必须做内核侧的 OFF 等价论证——已核实 ✓。
+**转正时的不变量**：任何一门转正后，其余门的 OFF 路径**不得**被牵连改动（逐门单独转正即保证这点）。
