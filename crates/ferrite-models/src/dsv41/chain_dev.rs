@@ -1992,6 +1992,33 @@ impl<'a> DevChain<'a> {
         Ok(())
     }
 
+    /// Op-level diagnostic dump for the layer-0 bisection: one `[dim]` f32
+    /// vector (the collapse output xn or the attention output o), file
+    /// convention [u64 step][u64 kind][f32 × n] appended, rank 0 only.
+    fn gt_dump_vec(&self, path: &str, kind: u64, ptr: *mut std::ffi::c_void, n: usize) -> Result<()> {
+        if self.comm.as_ref().map(|c| c.rank).unwrap_or(0) != 0 {
+            return Ok(());
+        }
+        let mut v = vec![0f32; n];
+        let b = Device::view(ptr, n * 4);
+        self.dev.download_f32(&b, &mut v)?;
+        let sc = self.step_count as u64;
+        let io = (|| -> std::io::Result<()> {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+            f.write_all(&sc.to_le_bytes())?;
+            f.write_all(&kind.to_le_bytes())?;
+            for x in &v {
+                f.write_all(&x.to_le_bytes())?;
+            }
+            Ok(())
+        })();
+        if io.is_err() {
+            return Err(FerriteError::Config(format!("DSV41_GT_XDUMP: {io:?}")));
+        }
+        Ok(())
+    }
+
     /// One ground-truth DSpark spec step at block base `pos` with anchor
     /// `token`. Returns the committed tokens (1..=6 of them), which are exactly
     /// the tokens the eager stream would emit at positions pos+1..=pos+k+1.
@@ -2808,7 +2835,21 @@ fn hc_tail_split() -> bool {
             cfg.norm_eps,
         )?;
         }
+        // op-level diagnostic dumps for the layer-0 bisection: the collapse
+        // output (xn, kind 0) before attention, and the attention output
+        // (o, kind 1) after it. Format [u64 step][u64 kind][f32*n], rank 0.
+        let xdump = std::env::var("DSV41_GT_XDUMP").ok();
+        if let Some(xdp) = &xdump {
+            if layer == 0 {
+                self.gt_dump_vec(xdp, 0, self.s.xn.ptr, dim)?;
+            }
+        }
         let attn_hc_folded = self.attention(layer, pos)?;
+        if let Some(xdp) = &xdump {
+            if layer == 0 {
+                self.gt_dump_vec(xdp, 1, self.s.o.ptr, dim)?;
+            }
+        }
         // Tail split join: the attention (projections + AR) has now consumed the
         // EARLY half, so the LATE half's `comb` must be visible to hc_post. A
         // no-op unless hc_mixes_auto issued a split above.
