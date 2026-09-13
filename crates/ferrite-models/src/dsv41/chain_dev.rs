@@ -24364,6 +24364,32 @@ fn oracle_tap() -> bool {
                             self.s.route_idx.ptr as *const i32,
                         )?;
                     }
+                    // ---- OPT-IN one-shot dump of the routed MoE's FINAL output ----------------
+                    // Completes the per-stage set (gate|up -> swiglu -> down), so the CPU oracle can
+                    // compare the WHOLE routed block against the official semantics stage by stage —
+                    // the user's "precision must match the official exactly" requirement, measured
+                    // rather than asserted. Rust-only => no kernel rebuild.
+                    if let Some(base) = gateup_dump_path() {
+                        static ONCE_DN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                        if ONCE_DN.set(()).is_ok() {
+                            let n = dim;
+                            let mut buf = vec![0u8; n * 4];
+                            let view = Device::view(self.s.o.ptr, n * 4);
+                            match self.dev.download_u8(&view, &mut buf) {
+                                Ok(()) => {
+                                    let p = format!("{base}/eager/moe_out.f32");
+                                    match std::fs::write(&p, &buf) {
+                                        Ok(()) => eprintln!(
+                                            "[moe-dump] wrote {n} f32 to {p} (routed MoE output, \
+                                             already reduced over the {topk} slots)"
+                                        ),
+                                        Err(e) => eprintln!("[moe-dump] write {p}: {e}"),
+                                    }
+                                }
+                                Err(e) => eprintln!("[moe-dump] read moe_out: {e}"),
+                            }
+                        }
+                    }
                 }
             } else {
                 for slot in 0..topk {
