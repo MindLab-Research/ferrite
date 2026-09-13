@@ -70,3 +70,23 @@ bash ~/num100.sh <NAME> <ENV...>     # 1..100 数数；首 61 行必须 = 1..61�
 bash ~/verify_correct.sh 8899 <NAME> # 标准三测（1..100 / 拉丁乱码探针 / step p50）
 ```
 `verify_correct.sh` 已加**陈旧日志守卫**（找不到本臂日志时**响亮告警**而不再静默回退到别的 log）✓。
+
+## 6. 实测记录（2026-09-14 晚）与"数字跳跃"假说
+
+| 臂 | env | step p50 | @acc2.2 | 文本 |
+|---|---|---|---|---|
+| 原状 | （BS 臂 ON ✗） | 32.5ms | ~100 | **全乱码**（BS 臂毁模型） |
+| **P1** | BS 臂 OFF + `DSV41_VERIFY_GRAPH=1` | **10.19ms** | **318 tok/s** | `1..51` 后跳到 `62,63,64,65,66,69…` |
+| **P2** | P1 + 精度中性折叠（GATE_MROWS[_ROUTE]/ATTN/COMPRESSOR/ENGRAM/P3LITE） | **10.17ms** | **318.6** | **与 P1 逐字节相同** ⇒ 折叠族**精度中性** ✓ |
+
+⇒ **图化确认真实生效**（32.5→10.2ms = 3.2×，且 p10/p90 只有 ±0.1ms）。**P2 与 P1 文本逐字节一致** ⇒ 那批折叠门不改数值 ✓（可作为默认候选）。
+
+**"数字跳跃"的假说（待 `STEP_NOGRAPH` 对照确认）**：AGENTS.md 的 DSV41 门表记载 **spec 路径有已知缺口**
+（`DSV41_SIDS_WRITEBACK=1` 的说明原文是"**verify 值修好后开**"）⇒ 说明**verify 的取值**本身就带缺陷，
+而 spec 的 emit 直接取自 verify ⇒ 跳跃是**已知的 spec/verify 缺口**的表现，**未必是图化造成的**（图化只改发射方式）。
+⇒ **下一批单变量臂**（每条只答一个新问题）：
+1. `DSV41_SIDS_WRITEBACK=1`（spec commit 后回写 `emitted.last()` 到 `s.ids`）
+2. `DSV41_SEED_ALIGN=1`（判词路线 A：seed↔tap 对齐）
+3. `DSV41_SWALLOW_STEP=1`（吞主链步）
+4. `DSV41_VERIFY_HEAD_FOLD` / `_SLICED` 的两种组合
+→ 目标是让 **1..100 前 61 行 = 1..61**（红线），同时保住 318 tok/s。
