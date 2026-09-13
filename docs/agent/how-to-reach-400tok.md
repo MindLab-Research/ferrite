@@ -273,3 +273,25 @@ DSV41_MOE_TILELANG_BS=0 DSV41_MOE_BS_HANDWRITTEN=0
 - `gateup.f32` 的 oracle 对比**不成立**：eager 路的 dump 点在 **swiglu 之后**（`chain_dev.rs` 的 swiglu 在 24078、dump 在 24244）⇒ 拿它比 oracle 的 **raw gate|up** 必然 corr≈0 ✗。
 - `moe_out.f32` 的整块对比**被 oracle 自己警告**：我们的 `moe_out_r` 是**本 rank 的 K-部分和**且**含 shared expert**，官方值需要 8 卡部分和 ⇒ 不是同口径 ✗。
 
+## 14. 🎯 官方 API 作为"行为参照"（用户提供，2026-09-14 深夜六）——**缺口是我们的 bug**
+
+```bash
+curl -sS --noproxy '*' https://mint-alpha.macaron.xin/v1/chat/completions \
+  -H 'Authorization: Bearer <KEY>' -H 'Content-Type: application/json' \
+  -d '{"model":"deepseek-flash","messages":[{"role":"user","content":"请从1数到100，每个数字单独一行"}],
+       "max_tokens":400,"temperature":0,"stream":false}'
+```
+**实测（同一条 prompt）**：
+| 对象 | 结果 |
+|---|---|
+| **官方 deepseek-flash** | `numbers=100  gaps=[]  1..100 齐全` ✓（`usage: completion=304, reasoning=104`） |
+| 我们（最小 eager） | `numbers=75   gaps=[(51,60),(66,69),(73,84),(87,89),(95,100)]` ✗ |
+
+⇒ **⇒ 官方零缺口 ⇒ 缺口确定是*我们*的缺陷** ✗（不是"模型本来就会跳" ✗）。
+⇒ 现在有**两个官方参照**：**CPU oracle**（`gu_numpy_ref.py` / `moe_block_ref.py`，判定**数值**是否与官方逐位一致）
+＋ **官方 API**（判定**行为**：文本是否重复/乱码/丢号）✓。两者互不替代。
+
+**已确认的缺陷特征**：①最小 eager（SPEC/DSPARK/E4M3/BF16/ILV/两图全关 + BS 臂 OFF）**照样丢号** ⇒ 不是 flag ✗；
+②**两次运行缺口不同**（`[52,61]…` vs `[51,60]…`）⇒ **非确定 ⇒ 竞态** ✗；③`pos` 每步 +1 ✓ ⇒ 不是位置记账 ✗。
+⇒ 按下一条（§15）用项目自己的二分纪律定位引入它的 commit。
+
