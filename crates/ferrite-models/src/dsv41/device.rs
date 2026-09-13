@@ -1673,6 +1673,15 @@ struct Kernels {
     /// e4m3-activation build exports it, so a stale `.so` keeps the arm OFF
     /// (reported once) instead of feeding e4m3 bytes to an fp4 kernel.
     moe_bs_act_e4m3_cap: Option<unsafe extern "C" fn() -> c_int>,
+    /// `DSV41_MOE_BS_SFDUMP` scratch accessors (`dsv41_moe_bs_sfdump_ptr` /
+    /// `dsv41_moe_bs_sfdump_bytes`, `tilelang_gen/moe_bs_shim.cu`): the device address and size of
+    /// the one-shot staged-operand dump the hand-written kernel fills at `k == 0`.
+    ///
+    /// The COPY-BACK lives in Rust on purpose: a stream sync inside the shim's decode path is the
+    /// §119 lockstep deadlock class (one rank waiting on its sync while its peers sit in an
+    /// all-reduce), so the shim only allocates and hands out the pointer.
+    moe_bs_sfdump_ptr: Option<unsafe extern "C" fn() -> *mut c_void>,
+    moe_bs_sfdump_bytes: Option<unsafe extern "C" fn() -> c_int>,
     moe_down_reduce: Option<unsafe extern "C" fn(*const f32, *mut f32, c_int, c_int, CuStream) -> c_int>,
     /// `dsv41_moe_down_reduce_seq` (DSV41_SEQ_ALIGN #5): the same fixed-order sum,
     /// plus the ascending-EXPERT-ID slot permutation when `seq_align != 0`.
@@ -2395,6 +2404,8 @@ impl Device {
             moe_tilelang_gate_up_bs_dev: ko!(rt, "dsv41_moe_tilelang_gate_up_bs_dev"),
             moe_bs_pack_wsf: ko!(rt, "dsv41_moe_bs_pack_wsf"),
             moe_bs_act_e4m3_cap: ko!(rt, "dsv41_moe_bs_act_e4m3_cap"),
+            moe_bs_sfdump_ptr: ko!(rt, "dsv41_moe_bs_sfdump_ptr"),
+            moe_bs_sfdump_bytes: ko!(rt, "dsv41_moe_bs_sfdump_bytes"),
             w2_l2_prewarm: ko!(rt, "dsv41_w2_l2_prewarm"),
             attn_p_dbg_read: ko!(rt, "dsv41_attn_p_dbg_read"),
             swiglu_limit_batched: ko!(rt, "dsv41_swiglu_limit_batched"),
@@ -8423,6 +8434,24 @@ impl Device {
     /// probe [`Self::supports_moe_tilelang_bs`] includes it too.
     pub fn supports_moe_bs_act_e4m3(&self) -> bool {
         self.kernels.moe_bs_act_e4m3_cap.is_some()
+    }
+
+    /// The `DSV41_MOE_BS_SFDUMP` staged-operand scratch as `(device ptr, bytes)`, or `None` when
+    /// the `.so` is too old to carry the accessors (`dsv41_moe_bs_sfdump_ptr` / `_bytes`).
+    ///
+    /// The hand-written kernel fills it at `k == 0` (semantic read-back through the validated smem
+    /// formulas); the CALLER copies it back, because a stream sync inside the shim's decode path is
+    /// the §119 lockstep deadlock class.
+    pub fn moe_bs_sfdump(&self) -> Option<(*mut c_void, usize)> {
+        let p = self.kernels.moe_bs_sfdump_ptr?;
+        let b = self.kernels.moe_bs_sfdump_bytes?;
+        let ptr = unsafe { p() };
+        let bytes = unsafe { b() } as usize;
+        if ptr.is_null() || bytes == 0 {
+            None
+        } else {
+            Some((ptr, bytes))
+        }
     }
 
     /// True when the block-scaled arm's **device-table** set is present: the

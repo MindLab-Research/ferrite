@@ -59,6 +59,16 @@ __device__ int g_sfrev = 0;
 // docs/agent/moe-bs-crash-investigation.md §29-§31.
 __device__ int g_sfst = 0;     // 1 = deliver the SF with tcgen05.st (isolated-instrument path)
 __device__ int g_ldw = 0;      // 1 = read D with the instrument's per-warp lane address
+// 1 = one-shot semantic dump of the STAGED operands at k == 0 (see the dump block in the k-loop
+// and `scripts/campaign/sfdump_check.py`). Tells "the staged content is wrong" apart from "the
+// delivery/descriptor mapping is wrong" — the last two items no instrument has ever covered.
+__device__ int g_sfdump_on = 0;
+__device__ uint8_t* g_sfdump = nullptr;
+constexpr size_t kSfDumpA = 0;                                  // [36][128][128] u8
+constexpr size_t kSfDumpB = kSfDumpA + 36 * 128 * 128;          // [36][5][128][64] u8
+constexpr size_t kSfDumpSfa = kSfDumpB + 36 * 5 * 128 * 64;     // [36][128] u32
+constexpr size_t kSfDumpSfb = kSfDumpSfa + 36 * 128 * 4;        // [36][5][128] u32
+constexpr size_t kSfDumpBytes = kSfDumpSfb + 36 * 5 * 128 * 4;  // 2174976 B
 __device__ int g_packed = 1;   // DEFAULT ON: the MEASURED-correct layout (hw_pack_sw128)
 // Escape hatch for reference only: DSV41_MOE_BS_UNPACKED=1 restores the measured-WRONG
 // unpacked staging (relerr 1.491) that this whole investigation started from.
@@ -830,6 +840,44 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
         // the SF transpose / fence / MMA that follow. In the gate-OFF path it is the
         // exact same single barrier that used to follow the LDG/STS loops.
         __syncthreads();
+
+        // ---- OPT-IN (DSV41_MOE_BS_SFDUMP=1) one-shot semantic dump of the STAGED operands ----
+        // Read back THROUGH the validated smem formulas (`hw_smem_idx` / `hw_pack_sw128`), i.e.
+        // exactly the bytes the hardware reads, and write them in the semantic (row, K) form.
+        // The point is NOT the layout (the formulas are instrument-validated) but the CONTENT:
+        // if the loader fetched the wrong global byte, this shows it as a wrong value at the
+        // right place. The shim copies this scratch back once. Diagnostic only, uniform branch
+        // (both operands are `k` and block-uniform globals), so the barrier stays legal.
+        if (g_sfdump_on && k == 0 && g_sfdump != nullptr) {
+            __syncthreads();
+            uint8_t* dump_act = g_swapab ? B_s : A_s;
+            uint8_t* dump_w = g_swapab ? A_s : B_s;
+            uint32_t* dump_sfa = g_swapab ? SFB_s : SFA_s;
+            uint32_t* dump_sfb = g_swapab ? SFA_s : SFB_s;
+            if (n_tile == 0) {
+                for (int i = tid; i < HW_BM * HW_BK; i += 128) {
+                    const int m = i >> 7, kk = i & 127;
+                    g_sfdump[kSfDumpA + (size_t)seg * HW_BM * HW_BK + (size_t)m * HW_BK + kk] =
+                        dump_act[hw_smem_idx(m, kk, g_canon)];
+                }
+            }
+            for (int i = tid; i < HW_BM * 64; i += 128) {
+                const int r = i >> 6, col = i & 63;
+                g_sfdump[kSfDumpB + ((size_t)seg * kGridX + n_tile) * HW_BM * 64 +
+                         (size_t)r * 64 + col] = dump_w[hw_pack_sw128(r, col)];
+            }
+            if (n_tile == 0) {
+                for (int i = tid; i < HW_BM; i += 128) {
+                    reinterpret_cast<uint32_t*>(g_sfdump + kSfDumpSfa)[(size_t)seg * HW_BM + i] =
+                        dump_sfa[i];
+                }
+            }
+            for (int i = tid; i < HW_BM; i += 128) {
+                reinterpret_cast<uint32_t*>(g_sfdump + kSfDumpSfb)
+                    [((size_t)seg * kGridX + n_tile) * HW_BM + i] = dump_sfb[i];
+            }
+            __syncthreads();
+        }
 
         // (4) SF → TMEM，两条路：
         //   默认（g_sfst=0）：warp 2 转置 staged 字，再由 warp 1 lane 0 用 tcgen05.cp 搬进 TMEM

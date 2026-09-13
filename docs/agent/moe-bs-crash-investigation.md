@@ -3594,6 +3594,12 @@ OLD（旧路径，地面真值）: OUT = '1\n2\n3\n4\n5\n6\n7\n8\n9\n10'        
 ⇒ 今后一律称 **"TileLang 生成物（自研）"**，其"PASS"只说明**它自己的 fp64 金标准与它自己一致**，
 **不能**作为我们 kernel 正确的独立证据 ✗。
 
+**⚠️ 用户 2026-09-14 追加定谳：这条生成物"从来没跑成功过"** —— 与本次实测吻合：
+`HANDWRITTEN=0`（走生成物）连加载都过不去（0 step、无 `[moe-bs]` 行、http=000，§141）。
+⇒ **生成物路径在我们这条链上是死的**（含 `moe_bs_dn_shim` 的同族生成分支）：
+**不要再拿它当对照、不要再花时间让它跑起来** ✗；能用的是 `*_handwritten.cu` 一族。
+⇒ 唯一的外部真值只剩 **官方 PyTorch**（下节），必须**主 agent 亲自跑**（用户明确要求）。
+
 ### 可信真值（只有两个）
 
 | # | 真值 | 为什么可信 | 位置 |
@@ -3661,3 +3667,58 @@ G6 `y.type_as(x)` 的 bf16 收尾。
 ③ **40-stage 循环的逐 stage 重写**（隔离仪器只测 1 stage ⇒ 这是唯一"仪器盲区里的 kernel 内部"）；
 ④ 生产 SF 投递路（`tcgen05.cp` + transpose）——助手逐字节相同，但**整条路从未被独立验证过**。
 ⇒ **判据一律用"与旧路径/官方 PyTorch 逐元素对拍"**（`DSV41_GATEUP_DUMP`），不再用我们自己的参考。
+
+## §143 【进展】缺陷#2 的证据链 + 两个新门（SF 投递 / TMEM 读 lane）+ 官方对照工具
+
+### 1. 对拍点的合法性（已由 `prefill-path` 审计定谳 ✓）
+
+**plain `--serve` 的 prefill 就是"逐 token 调 `moe()`"**（`serve.rs:893` 的 `prefill_chain` 循环），
+而 `moe_tilelang_bs_ready` 在 `moe()` 开头**无条件**执行（`chain_dev.rs:23641`，`m` 是字面量 1）
+⇒ **进程内第一次 `moe()` 调用 = prefill token 0 的 layer 0**，其输入只由 embedding 派生
+（没有任何 MoE 参与）⇒ **两臂在该点的输入逐字节相同** ✓。
+⇒ 所以 `DSV41_GATEUP_DUMP` 的对拍是**有效**的（"苹果比橘子"的疑虑已排除 ✓）；日志里
+`[moe-bs-diag] … m=1` **不能**用来证明"首次触发在 decode"（它只反映第一次 `ready` 调用，而那就是 prefill token 0 ✗）。
+其余事实：`[dsv41] step pos` **只统计 decode 步**（prefill 不打该行）；48 行 = `ceil(N/16)*16`（LOOKAHEAD=16 过冲），
+与 prefill 是否 batched 无关；plain 路径**永不**走 `moe_rows`（多行只服务 DSpark spec/shadow）。
+
+### 2. A/B 判决（BS 臂 vs 旧路径，同一首层输入）
+
+```
+RAW: max|d|=10.07  median rel=1.26  frac rel>0.05=0.887  corr=0.012
+AFTER CLAMP（swiglu_limit=10，消除"旧路径内核内先 clamp"的表观差异）: corr=0.012  ⇒ clamp 解释不了任何差异 ✓
+slot 0: bs[0:3]=[-0.2141 -0.1492 0.0401]  old[0:3]=[0.0048 0.0041 -0.0058]
+```
+**结构判别（自研，`gdu_pair/gdu_perm/gdu_permrank`）**：
+- **不是段/slot 置换**：36 个 `(bs_slot, old_slot)` 配对的最大 `|corr|` 仅 0.097 ✗；
+- **不是通道置换**：`Σbs − Σold` = O(1–13)（真置换应 ≈ 0）；`sorted(bs)` 与 `sorted(old)` 的中位差 0.006
+  但**均间距**仅 ~0.0007 ⇒ 只是"同一量级的另一次抽样"，不是同一多重集 ✓；
+- **量级是对的**（slot 1–5 的 32 通道块模长比 0.85–1.15）⇒ **"同一量级、逐元素不同、非置换"** ⇒
+  典型于"标度错"或"同一输入但配错块/被跨 stage 污染"。
+- **补零通道检查**：`inter=2304` 每 rank 288，ferrite pad 到 320 ⇒ 补零通道（gate 288..319、up 288..319）
+  在**两臂都精确为 0** ✓ ⇒ 权重区域寻址没跑偏 ✓。
+
+### 3. 两个新门（本次新增，默认 OFF、逐位不改生产路径）
+
+| 门 | 作用 | 为什么它是"未验证"的那一环 |
+|---|---|---|
+| `DSV41_MOE_BS_SFST=1` | SF→TMEM 改用**隔离仪器 PASS 过的寄存器路**（`tcgen05.st`：第 (32j+l) 行的字放 (lane l, column j)，四 partition 相同）；默认走生产链 smem→`hw_sf_transpose`→`tcgen05.cp` | 仪器用 `tcgen05.st`，生产用 `tcgen05.cp` ⇒ **前者 PASS 不证明后者**（两份审计独立指出）✗ |
+| `DSV41_MOE_BS_LDW=1` | D 的 TMEM 读改用**仪器的 per-warp 地址**（`(warp*32)<<16 | C_tmem+8q`，`.32x32b.x8` ×16）；默认用 TileLang 的 `tcgen05_ld_32dp32bNx<128>(C_tmem,0,..)`（lane 字段恒 0） | TMEM lane 是 **warp 私有**的；两种写法至多一种对。仪器显式加偏移，生产不加 ⇒ 唯一能在读回侧全量错位的差异 |
+
+⚠️ 已知的次要项：即便 lane 写法是错的，**m=1 时活行是第 0 行**（warp 0 / lane 0 读到的就是 D[0][*]）
+⇒ 它**解释不了** m=1 的 gate|up 全错 ✗，但会破坏 m>1（verify）⇒ 仍必须修 ✓。
+
+### 4. 官方对照工具（用户要求：与官方 PyTorch 完全对齐，主 agent 亲自跑）
+
+| 工具 | 位置 | 作用 |
+|---|---|---|
+| 官方单层 MoE 金标准 | 远端 `/tmp/gu_official.py`（由 subagent 起草，**主 agent 执行**） | 读我们 dump 的 `x/ids`，用官方 `act_quant`+`fp4_gemm` 算同输入的 gate/up；`--src hf` 用**真 fp4**（HF ckpt 的 `layers.0.ffn.experts.<E>.w1.weight` = **I8 打包 fp4** + `.scale` = **F8_E8M0 [2304,160]**）；`--src tp8` 走 fp8 等价路 |
+| 公式级 CPU 参考 | `scripts/campaign/gu_numpy_ref.py`（本次新增，已合成用例跑通） | 直读官方 ckpt 的真 fp4 + e8m0，按 `kernel.py` 的结构（每 32-K 块部分积 → ×sa×sb → f32 累加 → bf16）算 gate/up，**无需 GPU**，可给出逐块诊断 |
+| 判决批次 | `scripts/campaign/batch3_judge.sh`（4 臂 + 官方 + 输入同一性检查）、`batch4_sfst.sh`（5 臂：OLD/BS/SFST/LDW/BOTH） | 每条臂都判"离官方多远"（max|d| / median rel / frac>5% / corr / 模长比），并 `cmp` 校验各臂 `x/ids` 是否同一 |
+
+### 5. 官方精度口径（`precision-official` 审计的逐项表，见 §142）
+
+**除已修的 G2/G3 外，还有一条实质不一致**：`quant_kernel`（激活量化，被 o/wo/qr/engram/KV 复用）
+把下限加在**标度**上（`fmaxf(s,1e-30)`，且会产出**非 2 的幂**），官方把下限加在 **amax** 上
+（`max(amax,1e-4)` ⇒ `s ≥ 2^-22`）。routed 激活（amax~O(1)）不触发 ✓，但窄幅块会触发 ⇒ 属于
+"精度不能高也不能低"的待处理项（改法：`dsv41_kernels.cu` 的 amax 先 `fmaxf(amax,1e-4)`、去掉 `1e-30` 下限；
+代价是同时改动所有复用位点的字节 ⇒ 需 e2e 回归）。

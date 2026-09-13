@@ -261,6 +261,17 @@ int* g_counts = nullptr;        // [SEG_CAP]
 // 统一成指针 —— 两条臂共用同一 launch 序列（与 bf16 shim 同构）。
 int* g_nseg = nullptr;          // [1]
 
+// ---- staged-operand dump scratch (DSV41_MOE_BS_SFDUMP, opt-in) ------------------
+// Allocated once at INIT and always handed to the kernel as a symbol, so the gate is a pure
+// runtime flag with no allocation on any path. The kernel fills it at k == 0 (see the dump
+// block); the RUST side copies it back with one blocking download after the launch returns —
+// deliberately NOT here, because a stream sync inside the shim's decode path is the §119
+// lockstep deadlock class.
+uint8_t* g_sfdump_buf = nullptr;   // kSfDumpBytes
+bool g_sfdump_armed = false;
+extern "C" void* dsv41_moe_bs_sfdump_ptr() { return g_sfdump_buf; }
+extern "C" int dsv41_moe_bs_sfdump_bytes() { return (int)kSfDumpBytes; }
+
 // ===========================================================================
 // §2 driver API 的 dlopen 绑定（build.sh 不链 -lcuda，见文件头约束 1）
 //     ⚠️ 这里**故意**不使用 cuda.h 里声明的那个符号：直接引用会引入对 libcuda 的
@@ -788,7 +799,8 @@ bool tl_bs_init() {
              cudaMalloc(&g_eid, kSegCap * sizeof(int)) == cudaSuccess &&
              cudaMalloc(&g_order, kSegCap * kBm * sizeof(int)) == cudaSuccess &&
              cudaMalloc(&g_counts, kSegCap * sizeof(int)) == cudaSuccess &&
-             cudaMalloc(&g_nseg, sizeof(int)) == cudaSuccess;
+             cudaMalloc(&g_nseg, sizeof(int)) == cudaSuccess &&
+             cudaMalloc(&g_sfdump_buf, kSfDumpBytes) == cudaSuccess;
         (void)cudaGetLastError();
     }
     if (!ok) {

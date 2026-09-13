@@ -1396,6 +1396,19 @@ pub(crate) fn gateup_dump_path() -> Option<String> {
     .clone()
 }
 
+/// `DSV41_MOE_BS_SFDUMP=<dir>` (default unset) arms the one-shot staged-operand dump the
+/// hand-written block-scaled kernel fills at `k == 0` (see the kernel's dump block and
+/// [`DevChain::moe_bs_sfdump_once`]).
+pub(crate) fn sfdump_dir() -> Option<String> {
+    static P: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    P.get_or_init(|| {
+        std::env::var("DSV41_MOE_BS_SFDUMP")
+            .ok()
+            .filter(|v| !v.is_empty() && v != "0")
+    })
+    .clone()
+}
+
 /// DSV41_ROUTED_DOWN_QUANT_DBG=1 (default OFF, only meaningful with the gate
 /// above) turns on the ONE-SHOT operand probe: the prep kernel additionally
 /// writes the five per-element values of its (row 0, slot 0, block 0) block into
@@ -17962,6 +17975,63 @@ impl<'a> DevChain<'a> {
         eprintln!("[gateup-dump] done (m={m} topk={topk} act_slot={act_slot} dim={dim})");
     }
 
+    /// `DSV41_MOE_BS_SFDUMP=<dir>` (opt-in, one-shot, blocking D2H): write the hand-written
+    /// block-scaled kernel's staged-operand dump plus the tables that index it.
+    ///
+    /// Layout (consumer: `scripts/campaign/sfdump_check.py`):
+    ///   `a.u8`    `[nseg][128][128]`  the A tile's e4m3 bytes at K-stage 0, read back THROUGH the
+    ///                                 validated smem formula — so the CONTENT is what the hardware
+    ///                                 reads, and a wrong global fetch shows as a wrong value at the
+    ///                                 right place (the layout itself is instrument-validated);
+    ///   `b.u8`    `[nseg][5][128][64]` the B tile's packed fp4 bytes at stage 0;
+    ///   `sfa.u32` `[nseg][128]`       the activation SF words the MMA consumed;
+    ///   `sfb.u32` `[nseg][5][128]`    the weight SF words;
+    ///   `meta.txt`                    nseg / topk / dim / the eid, counts and order tables.
+    ///
+    /// Called after the gate/up launch on the same stream, so the blocking download orders after
+    /// the kernel that filled it. Diagnostic only (same hazard class as the other dumps).
+    fn moe_bs_sfdump_once(&self, dir: &str, topk: usize, dim: usize) -> Result<()> {
+        let Some((ptr, bytes)) = self.dev.moe_bs_sfdump() else {
+            eprintln!(
+                "[bs-sfdump] the loaded .so has no dsv41_moe_bs_sfdump_ptr/_bytes accessor — \
+                 dump skipped (rebuild the kernels with the SFDUMP scratch)"
+            );
+            return Ok(());
+        };
+        let mut buf = vec![0u8; bytes];
+        let view = Device::view(ptr, bytes);
+        self.dev.download_u8(&view, &mut buf)?;
+        let ioerr = |what: String, e: std::io::Error| FerriteError::Config(format!("{what}: {e}"));
+        std::fs::create_dir_all(dir).map_err(|e| ioerr(format!("sfdump mkdir {dir}"), e))?;
+        const SEG: usize = 36;
+        const A: usize = SEG * 128 * 128;
+        const B: usize = SEG * 5 * 128 * 64;
+        const SFA: usize = SEG * 128 * 4;
+        if buf.len() < A + B + SFA {
+            eprintln!("[bs-sfdump] scratch is {} B, expected at least {}", buf.len(), A + B + SFA);
+            return Ok(());
+        }
+        for (name, data) in [
+            ("a.u8", &buf[0..A]),
+            ("b.u8", &buf[A..A + B]),
+            ("sfa.u32", &buf[A + B..A + B + SFA]),
+            ("sfb.u32", &buf[A + B + SFA..]),
+        ] {
+            let path = format!("{dir}/{name}");
+            std::fs::write(&path, data).map_err(|e| ioerr(format!("sfdump write {path}"), e))?;
+        }
+        let nseg = self.download_i32(&self.s.bs_nseg, 1)?[0];
+        let eid = self.download_i32(&self.s.bs_eid, SEG)?;
+        let counts = self.download_i32(&self.s.bs_counts, SEG)?;
+        let order = self.download_i32(&self.s.bs_order, SEG * 128)?;
+        let mut meta = format!("nseg={nseg}\ntopk={topk}\ndim={dim}\nseg_cap={SEG}\n");
+        meta.push_str(&format!("eid={eid:?}\ncounts={counts:?}\norder={order:?}\n"));
+        let mpath = format!("{dir}/meta.txt");
+        std::fs::write(&mpath, meta).map_err(|e| ioerr(format!("sfdump write {mpath}"), e))?;
+        eprintln!("[bs-sfdump] wrote {bytes} B + meta.txt to {dir} (nseg={nseg})");
+        Ok(())
+    }
+
     /// `DSV41_MOE_TL_HOST_ALIGN=1` diagnostic: rebuild the tables on the host and
     /// memcmp them against the device ones. A difference is an ERROR — the whole
     /// device arm rests on the two being bit-identical, so reporting one and
@@ -23931,6 +24001,15 @@ fn oracle_tap() -> bool {
                             self.s.route_w.ptr as *mut f32,
                             dim,
                         );
+                        // Second, independently gated dump on the same one-shot latch: the
+                        // hand-written kernel's STAGED-operand snapshot (filled at k == 0) plus the
+                        // tables that index it. Copied back here, after the launch, with one
+                        // blocking download — `DSV41_MOE_BS_SFDUMP=<dir>`.
+                        if let Some(dir) = sfdump_dir() {
+                            if let Err(e) = self.moe_bs_sfdump_once(&dir, topk, dim) {
+                                eprintln!("[bs-sfdump] {e}");
+                            }
+                        }
                     }
                 }
                 self.bf16_snap(
