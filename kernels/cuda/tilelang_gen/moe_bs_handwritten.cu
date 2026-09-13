@@ -39,6 +39,12 @@ __device__ int g_sv1x = 0;
 //   0 = TileLang's SW128 (layout_type=2, lbo=1, sbo=64, advance ki*32B)
 //   1 = repo-verified canonical interleave (layout_type=0, lbo=8, sbo=16, advance ki*4096B)
 __device__ int g_canon = 0;
+// SwapAB: A = WEIGHTS (e2m1), B = ACTIVATIONS (e4m3). Every GPU-verified in-tree
+// mxf8f6f4 configuration uses this orientation (tests_tcgen05_mxf8f6f4_1x.cu's probe
+// builds make_idesc_mxf8f6f4(.., a_fmt=5, b_fmt=0, ..) and tc5::e4 likewise), while the
+// two implementations that use the opposite orientation (TileLang's generated kernel,
+// err 700 at INIT) and this kernel (garbage) both fail.
+__device__ int g_swapab = 0;
 
 // smem index for a (row, kk) element of a 128-row x 128-K(tiles) operand tile.
 __device__ __forceinline__ int hw_smem_idx(int row, int kk, int canon) {
@@ -249,7 +255,7 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
             const uint8_t val = A[(int64_t)(seg * HW_BM + m) * HW_K + k * HW_BK + kk];
             // SW128 (CU_TENSOR_MAP_SWIZZLE_128B) — MUST match TileLang's TMA layout:
             //   addr(r,c) = (r/8)*1024 + (r%8)*128 + (((c/16) ^ (r%8))*16) + (c%16)
-            A_sh[hw_smem_idx(m, kk, g_canon)] = val;
+            (g_swapab ? B_sh : A_sh)[hw_smem_idx(m, kk, g_canon)] = val;
         }
 
         // (2) 所有线程协同加载 B tile (W1 前 64 行 + W3 后 64 行)
@@ -274,8 +280,8 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
             const int k0 = col * 2;      // first element K index
             const int k1 = col * 2 + 1;  // second element K index
             // SW128 swizzled write (same layout as TileLang's TMA)
-            B_sh[hw_smem_idx(row, k0, g_canon)] = packed & 0xF;
-            B_sh[hw_smem_idx(row, k1, g_canon)] = packed >> 4;
+            (g_swapab ? A_sh : B_sh)[hw_smem_idx(row, k0, g_canon)] = packed & 0xF;
+            (g_swapab ? A_sh : B_sh)[hw_smem_idx(row, k1, g_canon)] = packed >> 4;
         }
         for (int i = tid; i < HW_NH * 64; i += 128) {
             const int row = i >> 6;
@@ -285,19 +291,19 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
             const int m = HW_NH + row;  // W3 rows are after W1
             const int k0 = col * 2;
             const int k1 = col * 2 + 1;
-            B_sh[hw_smem_idx(m, k0, g_canon)] = packed & 0xF;
-            B_sh[hw_smem_idx(m, k1, g_canon)] = packed >> 4;
+            (g_swapab ? A_sh : B_sh)[hw_smem_idx(m, k0, g_canon)] = packed & 0xF;
+            (g_swapab ? A_sh : B_sh)[hw_smem_idx(m, k1, g_canon)] = packed >> 4;
         }
 
         // (3) 加载 SF
         // SFA: [40, 4608] — SFA[k][seg*128 + i] for i in [0, 128)
         for (int i = tid; i < HW_BM; i += 128) {
-            SFA_sh[i] = SFA[(int64_t)k * (HW_SEGCAP * HW_BM) + seg * HW_BM + i];
+            (g_swapab ? SFB_sh : SFA_sh)[i] = SFA[(int64_t)k * (HW_SEGCAP * HW_BM) + seg * HW_BM + i];
         }
         // SFW1/SFW3: [384, 40*320] — SFW[e][k*320 + n_tile*64 + i] for i in [0, 64)
         for (int i = tid; i < HW_NH; i += 128) {
-            SFB_sh[i] = SFW1[(int64_t)e * (40 * HW_NP) + k * HW_NP + n_tile * HW_NH + i];
-            SFB_sh[HW_NH + i] = SFW3[(int64_t)e * (40 * HW_NP) + k * HW_NP + n_tile * HW_NH + i];
+            (g_swapab ? SFA_sh : SFB_sh)[i] = SFW1[(int64_t)e * (40 * HW_NP) + k * HW_NP + n_tile * HW_NH + i];
+            (g_swapab ? SFA_sh : SFB_sh)[HW_NH + i] = SFW3[(int64_t)e * (40 * HW_NP) + k * HW_NP + n_tile * HW_NH + i];
         }
 
         __syncthreads();
@@ -346,7 +352,9 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
 
             for (int ki = 0; ki < 4; ++ki) {
                 // idesc: M=128, N=128, a_fmt=0 (E4M3), b_fmt=5 (E2M1), sf_id=ki
-                const uint32_t idesc = hw_make_idesc(HW_BM, HW_BN, 0, 5, ki);
+                // swapAB: A operand = weights (E2M1=5), B operand = activations (E4M3=0)
+                const uint32_t idesc = g_swapab ? hw_make_idesc(HW_BM, HW_BN, 5, 0, ki)
+                                                : hw_make_idesc(HW_BM, HW_BN, 0, 5, ki);
                 // K-block descriptor advance: TileLang's `desc_a + (ki*32)` where
                 // Tcgen05SMemDescriptor::operator+ does `reg32_[0] += offset >> 4`
                 // (offset in BYTES). So the advance is ki*32 bytes = ki*2 units.
@@ -420,9 +428,16 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
 
         // Store to global: C[seg*128 + row][n_tile*128 + col]
         for (int i = tid; i < HW_BM * HW_BN; i += 128) {
-            const int r = i >> 7;
-            const int c = i & 127;
-            C[(int64_t)(seg * HW_BM + r) * HW_NUP + n_tile * HW_BN + c] = C_sh[r * HW_BN + c];
+            const int r = i >> 7;   // swapAB: r = weight row (output channel); else token row
+            const int c = i & 127;  // swapAB: c = token; else output column
+            if (g_swapab) {
+                // C[m][n] with m = output channel, n = token -> transpose on store.
+                const int col = (r < HW_NH) ? (n_tile * HW_NH + r)
+                                            : (HW_NP + n_tile * HW_NH + (r - HW_NH));
+                C[(int64_t)(seg * HW_BM + c) * HW_NUP + col] = C_sh[r * HW_BN + c];
+            } else {
+                C[(int64_t)(seg * HW_BM + r) * HW_NUP + n_tile * HW_BN + c] = C_sh[r * HW_BN + c];
+            }
         }
     }
 

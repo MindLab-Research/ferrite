@@ -644,6 +644,15 @@ bool tl_bs_init() {
         (void)cudaGetLastError();
         fprintf(stderr, "[moe-bs] canon layout = %d\n", canon);
     }
+    // g_swapab: operand orientation (0 = A=activation/B=weight, 1 = A=weight/B=activation)
+    if (ok) {
+        int sw = 0;
+        const char* e = getenv("DSV41_MOE_BS_SWAPAB");
+        if (e != nullptr && e[0] == '1') sw = 1;
+        (void)cudaMemcpyToSymbol(g_swapab, &sw, sizeof(int));
+        (void)cudaGetLastError();
+        fprintf(stderr, "[moe-bs] swapAB = %d\n", sw);
+    }
 
     // (b) 常驻 scratch
     if (ok) {
