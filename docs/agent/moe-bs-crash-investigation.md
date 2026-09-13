@@ -3944,6 +3944,23 @@ wait ⇒ **到达数不可能超过等待数** ⇒ **smem 被提前覆写的竞�
 **下一动作**：batch14（判别 (a)/(b)/(c) + 读原始 `g_c`）⇒ 若指向 (a) 则立刻跑
 `batch10_fixconfirm.sh MBAR_PERSTAGE`（#1）与 `=MBAR_RING`（#2）两条臂对照 ✓。
 
+## §150 【更正 §146】ZERO_A 异常的正解是"外来数据"，不是"smem 竞态"
+
+§146 曾据 ZERO_A 非零 + 非确定性推断"异步 MMA 与 loader 的 smem 竞态"✗；§147 又用 `__syncthreads()` 的
+结构论证把该竞态排除 ✓。两者矛盾 ⇒ `alias-audit` 的**缓冲层**读法给出调和，且与 §149 的机制同向：
+
+- **写入覆盖是完整的**：gather 的 A staging 覆盖整块 16384 B（`128*8` 个 16 B chunk ✓）；
+  scatter 对 `n_assign=topk=6` 会覆盖输出的**全部** `6*640 = 3840` 个位置 ✓
+  ⇒ "3456/3840 非零"**只能**意味着 **scatter 搬走的 `g_c` 本身非零** ⇒ **MMA 没有消费刚 staged 的 A** ✓；
+- 而 memset 与 kernel **同流同序**（`exact-io-audit` 逐行核对 launch 序列 ✓）⇒ **问题不在"谁先写"，
+  在"MMA 描述符实际走的那段地址/那些 TMEM 列"** ⇒ 与 §149 的"外来 TMEM 残留"、以及
+  `alias-audit` 提的"A 的 smem 走法越出 staged 区（读到 B_sh/SFA_sh/launch 保留但未初始化的尾部）"
+  是**同一类**：**读取范围越出本轮写入范围** ⇒ 残留随运行/调度变化 ⇒ 同时解释非确定性与 ZERO_A 无关性 ✓。
+- `ex_act_b` 无越界（分配 `topk*2*inter` = 27648 float ✓ > 写入 3840 ✓；`g_c` 写入上界恰为 `36*128*640-1` ✓）
+- **SFDUMP 曾是死仪器**（`g_sfdump`/`g_sfdump_on` 从未被 host 赋值 ⇒ 任何"内容校验通过"都是假阴性 ✗）
+  ⇒ 已接线复活 ✓ ⇒ **batch15 是第一次真正的内容校验** ✓。
+- `tcgen05.alloc` 结果已加校验；`g_a/g_sfa/g_c/g_sfdump_buf` 已在 INIT 期清零（消掉"运行间"非确定的一半 ✓）。
+
 ⇒ 误差**只在算术内部**：K 元素配对 / 标度归属 / 逐元素映射中有一处不对，且它必须同时解释
 "量级对 + 逐元素不相关 + 非置换 + 非换 expert"。**下一判据 = `DSV41_MOE_BS_SFDUMP` 内容校验（`sfdump_check.py`）
 + 去假设 replay（`sfdump_replay.py`：输出是否等于"它自己 staged 的数据"的积）** ⇒ 分流"内容错" vs "使用错" ✓。

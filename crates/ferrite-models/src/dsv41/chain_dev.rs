@@ -24036,18 +24036,21 @@ fn oracle_tap() -> bool {
                         // that tells "the MMA produced this" from "the scatter/stale buffer did".
                         if sfdump_dir().is_some() {
                             if let Some((ptr, bytes)) = self.dev.moe_bs_gc() {
-                                // segment 0's tile is enough for the zero/non-zero question
-                                let want = (128 * 640 * 4).min(bytes);
+                                // The WHOLE raw tile set (all 36 segments x 5 n_tiles, 11.8 MB), not
+                                // just segment 0: which tiles are wrong is itself the localisation —
+                                // e.g. early tiles right and late tiles wrong points straight at the
+                                // late stages' completion protocol rather than at the operands.
+                                let want = bytes;
                                 let view = Device::view(ptr, want);
                                 let mut buf = vec![0u8; want];
                                 match self.dev.download_u8(&view, &mut buf) {
                                     Ok(()) => {
                                         let base = sfdump_dir().unwrap_or_default();
-                                        let p = format!("{base}/eager/gc_seg0.f32");
+                                        let p = format!("{base}/eager/gc_all.f32");
                                         match std::fs::write(&p, &buf) {
                                             Ok(()) => eprintln!(
-                                                "[bs-gc] wrote {want} B to {p} (MMA raw output, \
-                                                 segment 0 tile, before the scatter)"
+                                                "[bs-gc] wrote {want} B to {p} (MMA raw output, all \
+                                                 segments, before the scatter)"
                                             ),
                                             Err(e) => eprintln!("[bs-gc] write {p}: {e}"),
                                         }
