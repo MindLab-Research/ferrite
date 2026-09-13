@@ -118,7 +118,7 @@ extern "C" __global__ void __launch_bounds__(128, 1) main_kernel(__grid_constant
           tl::increase_descriptor_offset<int>(desc_b, ((k % 3) * 16384));
           #pragma unroll
           for (int ki = 0; ki < 4; ++ki) {
-            tl::tcgen05mma_blockscaled_ss<tl::DataType::kFloat8_e4m3, false>(uint64_t(desc_a + (ki * 32)), uint64_t(desc_b + (ki * 32)), (*reinterpret_cast<uint32_t*>(C_tmem)) + 0, ((0 < ki) ? 1 : ((k == 0) ? 0 : 1)), static_cast<uint32_t>(144708608), (*reinterpret_cast<uint32_t*>(sfa_data)) + 0, (*reinterpret_cast<uint32_t*>(sfa_data)) + 4);
+            tl::tcgen05mma_blockscaled_ss<tl::DataType::kFloat8_e4m3, false>(uint64_t(desc_a + (ki * 32)), uint64_t(desc_b + (ki * 32)), (*reinterpret_cast<uint32_t*>(C_tmem)) + 0, ((0 < ki) ? 1 : ((k == 0) ? 0 : 1)), static_cast<uint32_t>(((144708608 | (ki << 29)) | (ki << 4))), (*reinterpret_cast<uint32_t*>(sfa_data)) + 0, (*reinterpret_cast<uint32_t*>(sfa_data)) + 4);
           }
           tl::tcgen05_mma_arrive((&(consumed[(k % 3)])));
         }
