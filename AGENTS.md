@@ -105,6 +105,18 @@ random 4k/1k、**模拟 accept 5.5**）。**详情与 16 步阶梯见 `docs/agen
 3. **测量口径必须固定 accept**（他们都用模拟 5.5；我们当前实测 ~2.24）⇒ 用 `~/bench_protocol.sh`
    按同口径测（random 4k/1k、固定输出 1024、BS=1、greedy），并**同轮背靠背 A/B、一次一个变量**。
 
+### 真正的病灶：verify 的 **4.45× 未摊薄**（裁决 2026-09-13，勿再犯）
+- **正确模型**（`docs/agent/mtp-verify-amortization-model.md`）：单并发 decode 是 memory-bound，
+  **verify(m 行) 应 ≈ eager(1 行) + ε**（权重读被多行共享）。
+- **实测**：`verify = 28.17 ms` = `eager(1) = 6.33 ms` 的 **4.45×** ⇒ 这是**实现未摊薄的病** ✗，不是物理极限。
+- **缺口分解**（据已归档分析）：MoE 的 **per-row 36-sweep FMA 恒等式**（≈6×、SIMT issue-bound）
+  + **M-in-register GEMM**（≈3.8× 指令）+ **~54 次约束发射/层**。
+- **修复载体**：MoE 那部分 ← **BS 臂（tcgen05 fp4 blockscaled，`DSV41_MOE_TILELANG_BS` + `DSV41_MOE_BS_HANDWRITTEN`）**；
+  GEMM 那部分 ← MROWS 家族（已落地）；发射那部分 ← 融合/重叠门。
+- **目标量级**：verify 压到 ~6.3 ms 量级 ⇒ 配合 draft 3.87 + commit 0.47 ⇒ step ≈ 10.6 ms
+  ⇒ `tok/step 3.24 / 10.6 ms` ≈ **306 tok/s**；再往下压 step（或按 §106 的 tok/step 口径）才到 450 ✓。
+- ⚠️ **禁止**用 `[dspark] steps=` 的 `verify=` 累积均值做性能判断（含 prefill 污染，会得到"verify > step"这种不可能的结论）。
+
 ## 合并纪律（2026-09-14 事故复盘，必守）
 
 1. **合并后必须用项目自身的构建验收**（`bash build.sh 103a`），**不能只靠单文件编译**：
