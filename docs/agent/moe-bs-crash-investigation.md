@@ -1803,3 +1803,33 @@ else:
 ⚠️ **关键待确认（决定实现正确性）**：官方是"**先**舍 bf16 概率**再**乘 KV"，以及在线 softmax 的
 `corr` rescale 作用在**累积器**还是**概率**上——若作用在累积器，则只有"当前块的概率"需要 bf16 舍入。
 已要求该 subagent 读代码确认并在报告中写明顺序。
+
+## §69 【差异法审计】新路径 vs 旧路径（per-slot GEMV，**输出已知正确**）——**十项取数对照全部 SAME**
+
+方法：以**旧路径为地面真值**（它的输出是完美的），逐项比对新路径每一处取数索引。
+准绳位置：`dsv41_experts_mxf4.cu:1342-1344`（gate/up pair body）、`:3523-3719`（launcher）、
+`:2258/3734`（down）；新路径 = shim 的 gather/scatter + `moe_bs_handwritten.cu` 的 loader/epilogue。
+
+| # | 对照项 | 结论 |
+|---|---|---|
+| 1 | W1/W3 → gate/up 划分（通道 = 面内行号） | **SAME** |
+| 2 | W 的行距（`kbytes = K/2 = 2560`） | **SAME** |
+| 3 | expert 步长（两侧都实测 `w1` 指针差，**都不是 `NP*K/2`**） | **SAME** |
+| 4 | W 的 K 方向/起点/步长 + **低 nibble = 偶 K** | **SAME** |
+| 5 | 激活矩阵形态（e4m3，1 B/value，**per-activation-row**，`src_row = idx/topk`） | **SAME** |
+| 6 | 激活 SF（SFA：行距 160，byte c = K-block `4g+c`，`sf_id = ki`） | **SAME** |
+| 7 | 权重 SF（SFW1/SFW3：行距 `align16(k/32)=160`，平面 40×320 词） | **SAME** |
+| 8 | eid / order / counts（每 assignment 的专家/行/槽三元组同源） | **SAME** |
+| 9 | 输出布局（`dst = idx*640` 的代数恒等 + 门/up 列映射双射覆盖 [0,640)） | **SAME** |
+| 10 | clamp/silu 分工（旧在 pair 写盘前 clamp；新由下游 `swiglu_limit_batched` 施加） | **DIFFER（无害）** |
+
+⇒ **取数层已排除**：新路径索引与"输出正确"的旧路径**逐项等价**。
+
+### 它给出的 5 处小改动（已落 D3/D4/D5，其余记录）
+| # | 项 | 处理 |
+|---|---|---|
+| **D3** | scatter 的 `live` 未做与 gather 相同的 `min(kBm)` clamp ⇒ counts 被写坏时越界读写（静默错值而非崩溃） | **已修**（两侧同式）✓ |
+| **D4** | `dsv41_moe_bs_debug_gather` 把 **`eid` 当 `nseg`** 传 ⇒ 该诊断仪器只填前 `eid[0]` 段、**任何用它做的 parity 结论假通过/假失败** | **已修**（先上行 nseg 到 `g_nseg` 再传）✓ |
+| **D5** | `moe_bs_weights` 测了 `u_stride`（W3 的专家间距）**却丢弃**，kernel 对 W3 复用 `w_stride`（今天成立但属**隐式契约**） | **已修**（arm 条件加 `u_stride != w_stride`）✓ |
+| D1 | 激活标度强制走 ue8m0：`quant_fp8` 在 `amax==0` 时把标度抬成 `1e-30`（非幂次）被折成 `2^-100`；**该 32-K 块内激活全零 ⇒ 数值无害**，但暴露"bs 臂正确性依赖 `round_scale=true` 的幂次输出"这一隐式耦合 | **暂不改**（改 `dsv41_kernels.cu:156` 会动共享量化器数值 ⇒ 必须走转正流程）；已在文档与下面记录 |
+| D2 | 中间态 `ex_act` 旧路径 clamp、新路径不 clamp（**净结果同**，但中间态字节不同）⇒ 任何在 gate/up 与 swiglu 之间读 `ex_act` 的环节会看到未 clamp 值 | **记录**（若要逐位可比需在 scatter 加同一 clamp，代价是 ABI 加形参） |
