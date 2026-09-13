@@ -2116,3 +2116,8 @@ dsv41_glue.cu(3281): error: function "<unnamed>::glue_e2m1_encode" has already b
    以后给 subagent 的 brief 里应要求"新增辅助函数必须带唯一前缀（如 `a2_`/`a3_`/`i3_`）"。
 3. **看到 `build failed` 时，那一轮的任何 e2e 结果都不能用**（二进制陈旧 = 跑的不是你以为的代码，
    与本项目 #1 测量偏置陷阱同类）。
+
+**§83 补记（主 agent 已做的普查）**：为确认"重复定义"是否还有同类，对四个被合并的 `.cu` 做了一次扫描
+（`dsv41_glue.cu` / `dsv41_kernels.cu` / `tilelang_gen/moe_bs_shim.cu` / `tilelang_gen/moe_bs_handwritten.cu`
+里所有 `__device__`/`__global__`/`static` 函数定义名）：
+**共 73 个定义、重复名 0** ⇒ `glue_e2m1_encode` 是**唯一**的合并碰撞，已被清除 ✓。
