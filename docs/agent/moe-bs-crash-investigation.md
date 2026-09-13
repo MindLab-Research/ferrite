@@ -2204,3 +2204,23 @@ bash ~/merge_worktree.sh <worktree-dir> <新符号> [必须仍存在的符号...
 - **精度门**：**允许**输出变化（只要 DBG 为 0 + 红线不破）；判据是**数值忠实度**。
 - **性能门**（如 `DSV41_MOE_BS_CPASYNC`）：**必须**数值逐字节/逐位一致；判据是**等价性 + 时间**。
 两类门的判据**不可混用**。
+
+## §88 BS 臂诊断预案（结果到手即可按序执行，不临场找工具）
+
+现有可复用仪器（均已核实存在）：
+| 工具/门 | 位置 | 用途 |
+|---|---|---|
+| `~/wq_check.py --log A [--eager-file B]` | 远端 `~/` | **机械红线**：重复/乱码/1..61 计数/EAGER 豁免 |
+| `~/bs_vs_old.sh` | 远端 `~/` | **差异测试**：BS 臂 vs 旧 GEMV 路径（后者输出已知正确 = 地面真值） |
+| `DSV41_DIFF_EAGER=1` | `chain_dev.rs:6730 diff_eager_probe` | 逐轮把 emitted 的每个 token 重放为**单行 forward**，报**第一个 mismatch 的 index 与绝对位置** |
+| `DSV41_MOE_BS_NUMCHECK=1` | shim 的延迟探针（§73/§79） | `[NC]` 五点回读 vs 主机独立参考（**需重放期命中**） |
+| `DSV41_DSPARK_DEBUG=1` / `DSV41_ACC_HISTOGRAM=1` / `DSV41_ORACLE_TAP=1` | dspark/acc_hist | spec 路径的逐轮 trace 与 accept 直方图（用于 C 档第 2 项） |
+
+**判定顺序（文本判据到手后）**：
+1. `wq_check` **PASS** ⇒ 进 `~/endgame.sh`（全 gate 回归 + 真实 p50），随后逐门转正（§87 判据）。
+2. **FAIL** ⇒ 先 `wq_check --eager-file`（BS 关掉的那一臂）看是否**退化与 EAGER 一致**（一致 ⇒ 模型行为，不算 bug）；
+   不一致 ⇒ 依次：
+   a. `~/bs_vs_old.sh`（差异测试，最快指出"新路径 vs 旧路径"的偏离）；
+   b. `DSV41_DIFF_EAGER=1`（给出**第一个 mismatch 的绝对位置**，把问题钉到某一轮/某一 token）；
+   c. `DSV41_MOE_BS_NUMCHECK=1` + 延迟探针（若能在重放期命中 ⇒ 直接给出**哪个 (row, col) 的数值与参考差多少**）。
+3. 每次只改**一个变量**并重跑；**每次改动后必须用 `bash build.sh 103a` 走真实构建**（§83：单文件检查会漏）。
