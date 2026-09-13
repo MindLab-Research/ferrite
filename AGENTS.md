@@ -107,15 +107,37 @@ LD_LIBRARY_PATH=$HOME/ferrite/kernels/cuda ./target/release/ferrite-serve --back
 - serve 卡住/日志 mtime 停滞 = 挂了（查 `stat -c %y` + pgrep，别等）。
 - 加载错防线（三道 runtime + 三道编译期 + git hooks）见 `docs/agent/` 的加载防线文档。
 
-## 当前状态与下一步（2026-09-14 凌晨——R0 重大发现 + MoE fp4 AOT 在途）
+## 当前状态与下一步（2026-09-14 上午——fp4 MoE 首次 ARMED + cuda 700 诊断中 + Phase B/C 全线推进）
 
 **里程碑**：
-- **🎉 R0 acc 诊断重大发现**：`p1=1.00`（首 token 100% 接受）、`mean-k=3.92`（远高于 dspark 报的 2.24——那是累积平均口径）、`hist[0]=0`（零步全拒）。**acc 不是 400 的瓶颈——step 时间是唯一瓶颈**。400 tok/s 只需 step ≤12.3ms（不是之前算的 8ms）。
-- **TileLang 全部接线完成 ✓✓** + **device-side moe_align 编译 ✓✓**（0818d78）+ **capture guard v2 全 shim ✓✓** + **TileLang 0.1.14 正式补丁 ✓✓**（4be4dda）。
-- **fp4 路线（用户裁决）**：必须 fp4、无 hack、无反量化。AOT 生成挂在 T.region API（gen-script-api-fix 修复中）。
-- **GPU 纪律铁律**（用户裁决 2026-09-13）：**subagent 禁止远端一切 GPU 操作**（micro bench / tilelang 运行 / AOT / 任何 GPU 占用）——GPU 测量是主 agent 专属职责。
-- **SGLang 对比判决**（保留有效）：verify = 一次 forward、m 是 batch 维——实测 1.2-1.3× eager；MoE 摊薄完全依赖 tensor core。
-- **tcgen05 blockscaled fp4 判决**（保留有效）：0.62× bf16 + 显存收益独立成立（零 dequant——解决 +105GiB）+ 0.1.14 上游 bug 2 行 shim 绕过。
+- **fp4 MoE blockscaled 首次 FULLY ARMED ✓✓**——TMA nullptr 修复（elementStrides/globalStrides 传非 NULL）解锁了 cuTensorMapEncodeTiled；kernel 启动成功（grid=(5,36)×128, smem=200704, BM=128/BN=128/BK=128）。
+- **cuda 700（illegal access）诊断中**——gather row_div 修复（flat assignment index → row division）已提交但 crash 未消除。MMA skip 隔离测试在跑（4f8e20a）。BF16_TRUNCATE=0 排除法确认 crash 来自 BS arm 本身。
+- **Phase B 全部提交**：P3 MegaKernel（hc/norm/rope/quant 13→3 发/层 −2.7ms）+ Fusion P2（F7/F10/F8 −1.0ms）+ C4-H1 head M-tile（位级同，0 数值债）+ C4-H3 head TileLang（已接线，需 AOT）+ Orope（−0.2ms）。
+- **Phase C 设计完成**：C1 MoE down blockscaled（K-pad 320→384，--down flag）+ C5 shared expert TileLang fp8 + C2 P5 流水（设计 subagent 在飞）+ C8 accept（块加宽 DSPARK_DRAFTS 5→6 唯一到 acc 4.6 的路）。
+- **D1 bf16 截断 ✓✓**：17 个 round-trip 落点 + 8 个融合 decline 互斥（319f7bb，默认 OFF）。
+- **R0 acc 诊断 ✓✓**：p1=1.00、mean-k=3.92、tail_q=0.917——acc 不是瓶颈，step 时间是唯一瓶颈。
+
+**fp4 MoE 调试链**（6 个独立 bug 修复，全部已提交）：
+1. TMA elementStrides nullptr → 传 kElemStrideOnes
+2. BS 段表 BM=16→128（bf16 的 TILELANG_BM 不适用于 BS mover）
+3. spec_w UINT8→16U4_ALIGN16B（dtype/gdim/box 与权威 dump 对齐）
+4. kSmem 202752→268288→200704（stages 6→4 适配 B300 227KB smem 限制）
+5. BS gather flat-idx→row division（idx/topk）
+6. spec_c box[0] kBn→kBn/4（f32 元素 vs 字节单位）
+
+**400 tok/s 路线图**（post-fp4-roadmap 完整判决）：
+```
+Phase A: fp4 MoE ARMED → −4.7~7.1ms → 229 tok/s（crash 修复中）
+Phase B: P3+P2+orope+head → −3.9ms → 279 tok/s（已提交，待测试）
+Phase C: C1 down + C5 shared + C2 P5 + C8 accept → −5.3ms → 400 tok/s
+  C2 P5（−3~4ms）是唯一单挑项；不兑现 → 328-351 tok/s 需 C8 acc 补门槛
+```
+
+**用户红线**：
+- 精度完全对齐官方 PyTorch（D1 bf16 ✓ / D2 e4m3 ✓ / D3 KV block 32 在修 / D5 attention operand / D7 latent）
+- 必须 fp4、无 hack、无反量化
+- step time 不计算 graph capture
+- decode step 必须一个完整 graph、无 H2D
 
 **当前账**：step ≈28.6ms @ acc 2.24 ⇒ ~104 tok/s。
 **TileLang 预期（全接线后）**：投影 7.4→1.5ms + MoE 10→2.8ms ⇒ verify ~10-12ms ⇒ step ~14-16ms ⇒ **~200-230 tok/s**。
