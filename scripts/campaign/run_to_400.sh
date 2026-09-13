@@ -62,3 +62,16 @@ judge "P2 (graph + MoE + gate folds)" "$HOME/armrun_STEP_P2.log"
 
 echo "############ the accept length actually observed (the goal's other half) ############"
 grep -a "mean-k\|accept" "$HOME/armrun_STEP_P2.log" | tail -3
+
+echo "############ P3: P2 + the STEP graph (the decode side has the same submit-time tax) ############"
+# P1's graph covers the verify. The decode path pays the same tax: the draft (3.87 ms of the step) is
+# itself a long chain of small launches, and DSV41_GRAPH_STEP captures the whole step. arm_run.sh's
+# COMMON sets it to 0 inside GRAPH_OFF, and the override below (appended after COMMON by arm_run.sh)
+# turns it back on. Budget: verify ~5-6 ms (P2) + draft ~1 ms + commit 0.47 => step ~7 ms => ~460 tok/s.
+bash "$HOME/num100.sh" STEP_P3 \
+  DSV41_MOE_TILELANG_BS=0 DSV41_MOE_BS_HANDWRITTEN=0 DSV41_VERIFY_GRAPH=1 DSV41_GRAPH_STEP=1 \
+  DSV41_MOE_TILELANG=1 \
+  DSV41_GATE_MROWS=1 DSV41_GATE_MROWS_ROUTE=1 \
+  DSV41_ATTN_MROWS=1 DSV41_COMPRESSOR_PROJ_MROWS=1 \
+  DSV41_ENGRAM_PROJ_MROWS=1 DSV41_ENGRAM_GATHER_MROWS=1
+judge "P3 (both graphs + MoE + gate folds)" "$HOME/armrun_STEP_P3.log"
