@@ -107,34 +107,38 @@ LD_LIBRARY_PATH=$HOME/ferrite/kernels/cuda ./target/release/ferrite-serve --back
 - serve 卡住/日志 mtime 停滞 = 挂了（查 `stat -c %y` + pgrep，别等）。
 - 加载错防线（三道 runtime + 三道编译期 + git hooks）见 `docs/agent/` 的加载防线文档。
 
-## 当前状态与下一步（2026-09-14 上午——fp4 MoE 非法指令五路会审完毕 + relinquish 修复在测）
+## 当前状态与下一步（2026-09-14 中午——fp4 MoE crash 三路 runtime audit 完毕 + DIAG 在测）
 
-**里程碑**：
-- **fp4 MoE blockscaled FULLY ARMED ✓✓ + cuda 700→illegal instruction 五路会审完毕**：
-  - **根因 #1（已修）**：`tcgen05.dealloc` 前缺 `relinquish_alloc_permit`（PTX ISA 前置条件违反 → 硬件 trap）。TileLang 0.1.14 codegen 完全不生成此调用（tl_templates 无此原语）。修复：生成物手补 asm + gen 脚本 _dump() 自动注入（幂等，防重生成回滚）。
-  - **根因 #2（误判已撤销）**：idesc 的 `(ki<<4)|(ki<<29)` 不是 k_size 损坏——是 **a_sf_id/b_sf_id 字段**（选择 4 字节 SF 字中的第 ki 字节，与原型 "sf_id=ki" 逐字一致）。illegal-instr-2 的 CUTLASS 位图解读被 illegal-instr-3 的仓库自有位表（dsv41_experts_mxf4.cu:58-71）推翻。
-  - **风险 #3（待 GPU 证据）**：`a_format=0 (E4M3) × b_format=5 (E2M1)` 组合在本仓从未上过 GPU（已验证组合是它的转置 a=5×b=0，swapAB 约定）。理论上 mxf8f6f4 的 W4A8 标准形态就是 A=e4m3×B=e2m1，应该合法。
-  - **次要点**：tcgen05.ld 的 lane 字段全 0（4 warp 读同一 lane 组——可能静默错值）；W 侧 expect_transaction(4096) vs smem 8192B（半写竞态风险）。
-- **Phase B 全部提交**：P3 MegaKernel + Fusion P2 + C4-H1 head M-tile + C4-H3 head TileLang + Orope。
-- **Phase C 设计完成**：C1 down K-pad 384、C5 shared expert TileLang（27KB 设计）、C2 P5 MTile grid-stride（已实现 6bc4421）、C8 accept 块加宽判决。
-- **D1 bf16 截断 + D3 KV block 32 ✓✓**（D3 发现 window-KV 当前存 raw f32——block_size 是声明值非活调用）。
+**crash 排查完整记录**（illegal memory access in MMA kernel）：
 
-**五路会审方法论**（用户指令：5 个相同 prompt 的 subagent 独立排查）：
-- 产出：3 个严重发现（relinquish、idesc 误判、格式组合风险）+ 6 个一般/建议 + 大量"已排除"清单（mbarrier 计数、grid_constant、smem 越界、C/A 别名等 9+ 项）
-- **关键教训**：位域解读必须用仓库自有的权威位表（dsv41_experts_mxf4.cu），不能用记忆中的 CUTLASS 布局——两者在 [4,6) 位段的语义不同（b_sf_id vs k_size）
-- **结构性张力**："库缺原语 + 生成物不许手改"必然逼出手改生成物——正确解法是 gen 脚本 post-process 注入（已实现）
+**已否定假设**（三路 audit subagent + 手工验证）：
+1. ✅relinquish_alloc_permit（修复 d25d5fe 但非根因——JIT 无它也不 crash）
+2. ✅idesc ki-bits（illegal-instr-3 权威位表：[4,6)=b_sf_id 非 k_size，sf_id 选择是故意的）
+3. ✅fast math（NO_FAST_MATH 也 crash——只改变错误类型 illegal instruction↔illegal memory access）
+4. ✅w3 指针（w3-ptr-audit：w1=pool+0, w3=pool+870400, w_stride=2641920 全部正确）
+5. ✅Eid 值域（eid-init-audit：每 rank 全部 384 expert TP-split by inter 非 EP，值域 [0,384) 全合法）
+6. ✅descriptor 参数（desc-param-diff：6 个 descriptor 除有意 stride 差异外全部匹配；dtype 14=16U4_ALIGN16B 验证一致）
+7. ✅内存边界（W1 TMA reach 1,012,674,560 < pool 1,014,497,280 ✓；shared memory 全在 kSmem 内；TMEM 160<512）
+8. ✅JIT vs AOT 源码一致（diff 仅差手加的 relinquish asm）；模板一致；dtype 枚举一致
 
-**400 tok/s 路线图**（不变）：
-```
-Phase A: fp4 MoE（relinquish 修复验证中）→ 229 tok/s
-Phase B: P3+P2+orope+head → 279 tok/s（已提交待测）
-Phase C: C1 down + C5 shared + C2 P5 + C8 → 400 tok/s
-```
+**关键事实**：
+- JIT（纯布局 gstride=819200 + host descriptor）**不 crash 但读错数据**
+- AOT（块布局 gstride=2641920 + shim descriptor）**crash（illegal memory access）**
+- MMA skip 测试确认 crash 在 MMA kernel 内
+- 8/8 ranks 全部 crash
 
-**用户红线**：
-- 精度完全对齐官方 PyTorch（D1 bf16 ✓ / D2 e4m3 ✓ / D3 KV block 32 ✓ / D5 attention operand / D7 latent）
-- 必须 fp4、无 hack、无反量化
-- decode step 必须一个完整 graph、无 H2D
+**Runtime 诊断在途**：
+- Eid DIAG（一次性打印实际值）+ SYNC-DIAG（per-kernel sync 隔离 gather/MMA/scatter）
+- compute-sanitizer 脚本已部署（~/sanitizer_run.sh）——如果 DIAG 不能定位
+- 诊断决策树脚本已部署（~/diag_chain.sh）
+
+**其他交付**（全部已提交）：
+- C5 shared expert TileLang fp8 MMA（gen_sh_exp_aot.py 430行 + sh_exp_shim.cu 303行 + Rust 接线）
+- P5 MTile grid-stride（激活 staging 一次共享，DSV41_MTILE_GRIDSTRIDE gate）
+- H1 draft hc front 别名（DSV41_DRAFT_HC_FRONT）
+- D3 KV block 32（官方 block_size=32，window-KV 当前 raw f32）
+- build.sh 选择性 fast-math（tilelang_gen 无 fast math，其余保持——防 err 900 capture crash）
+- push400_test.sh 已更新含 SH_EXP_TILELANG + MTILE_GRIDSTRIDE_T=8
 
 **当前账**：step ≈28.6ms @ acc 2.24 ⇒ ~104 tok/s。
 **TileLang 预期（全接线后）**：投影 7.4→1.5ms + MoE 10→2.8ms ⇒ verify ~10-12ms ⇒ step ~14-16ms ⇒ **~200-230 tok/s**。
