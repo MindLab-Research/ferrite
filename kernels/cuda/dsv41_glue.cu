@@ -2939,7 +2939,14 @@ __global__ void win_kv_quant_rt_kernel(float* __restrict__ kv, int cols, int blo
         const __nv_fp8_e4m3 f8 = __nv_fp8_e4m3(q);
         const uint8_t code = *(const uint8_t*)&f8;
         const float dq = glue_e4m3_byte_to_f(code) * sc;
-        blk[i] = dq;
+        // ⚠️ G3 FIX (2026-09-14): the reference's `inplace=True` arm casts the
+        // dequantised value back to the INPUT dtype before writing it
+        // (`kernel.py:83-88`: `y_local[i,j] = Cast(out_dtype, Cast(f32, Cast(FP8,
+        // clamp(x/s, ..))) * s)`, and `out_dtype = in_dtype` when `inplace`,
+        // `kernel.py:52`) — i.e. the ring stores `bf16(dequant)`, exactly as this
+        // file's contract comment above says. Writing f32 here left ferrite one
+        // whole bf16 boundary MORE precise than the official ("精度不能高也不能低").
+        blk[i] = glue_bf16_round(dq);
         if (dbg != nullptr && b == 0 && i < GLUE_KVQ_DBG_BLOCK) {
             dbg[GLUE_KVQ_DBG_PRE + i] = v;
             dbg[GLUE_KVQ_DBG_AMAX + i] = amax;

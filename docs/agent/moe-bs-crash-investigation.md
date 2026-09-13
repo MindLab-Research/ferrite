@@ -3535,3 +3535,129 @@ OLD（旧路径，地面真值）: OUT = '1\n2\n3\n4\n5\n6\n7\n8\n9\n10'        
    （`serve.rs:693` 上下文的 `dspark_spec_step` 路径 ✓）⇒ **plain-decode 的诊断要用**：
    `DSV41_MOE_BS_NUMCHECK=1`（数值对拍 ✓，§139 ①）**或** kernel 隔离仪器（§138 ②）✓。
 ⇒ **下一步即 §139 的队列**（已在跑：kernel 隔离 + NUMCHECK 单臂）✓。
+
+## §141 ✅【根因·已修】BS 臂的段表**读错了路由缓冲**（eager 路径写 `route_idx`，助手硬读 `route_idx_r`）
+
+**一句话**：eager 单行路径把路由（top-k 专家 id）写在 **`route_idx`**（`[topk]` i32）里，
+而 `route_idx_r`（`[m][topk]`）**只有** `moe_rows` 的多行 `route_topk` 会写；但
+`moe_bs_tables_dev` / `moe_tilelang_tables_dev` 把 **`self.s.route_idx_r` 硬编码**进了
+`dsv41_route_group` 的入参 ⇒ eager 路径上两张段表都由**从未写过的缓冲**（全 0）构建。
+
+### 证据链（全部可复算，非推断）
+
+| # | 观测 | 结论 |
+|---|---|---|
+| ① | `[moe-bs][DIAG] Eid[0..36): 0 0 0 0 0 0 0 0 0 0 0 0 ... \| max=0` | 36 个段的 eid **全 0** ⇒ 每段都读 expert 0 的权重 |
+| ② | `[moe-bs][GATHER-DIAG] seg=0 flat=0 src_row=0: ... ✅ MATCH` | gather 与该表**自洽**：`order[0]=0` ⇒ 所有行都取 **token 0** 的激活 |
+| ③ | `all 36 eid = 0` 但 `counts[0] > 0`（② 证明段 0 有活行） | `active = [0]`、**`n_active = 1`** ⇒ 恰好只有专家 0 活跃 ⇒ `n_assign` 个 id **全是 0** |
+| ④ | agent 侧 kernel 隔离（`tests_bs_impulse`）在**生产几何**下 `const` relerr=0、**`sfprobe` D=2720 relerr=0**、**`random_sf` relerr=9.8e-05 / 1.6e-07** | tcgen05 MMA、packed smem 几何、descriptor/idesc、**SF 全路径**都数值正确 ⇒ **kernel 无罪**（③④ 合起来把缺陷锁进"取数/接线"） |
+| ⑤ | `route_topk` 写 `route_idx_r` 只出现在 `moe_rows`（多行）；eager 单行路径写 `route_idx`（`chain_dev.rs:23341` / 消费点 `23574`） | 仓库里的**硬证据**：两条路径用**两个不同的缓冲** |
+| ⑥ | 同一构建下 `OLD` 臂（旧 per-slot GEMV，读 `route_idx`）文本完美 `1..10` ✓，BS 臂垃圾 ✗（§135） | 模型/权重/量化/路由本身都对 ⇒ 只有 BS 臂读错 |
+
+**因果闭合**：ids 全 0 ⇒ `route_group` 给出 `n_active=1, active=[0], counts[0]=n_assign` ⇒
+`moe_align_from_group` 写 `nseg=1, eid[0]=0, counts_seg[0]=topk, order[0..topk)=0..topk`
+⇒ 每段用 **expert 0 的 TMA 描述符**（`Eid[seg]`）+ **token 0 的激活** 做 MMA
+⇒ 输出整体错 ⇒ 两朝向都错（§140）✓、含无效 UTF-8（大幅错误）✓、kernel 隔离 PASS（§138）✓、
+`NUMCHECK` 必然也报 "ALL MATCH"（它用同一张表当基准 ✓）——**这条解释了 NUMCHECK 为什么帮不上忙** ✗。
+`route_idx_r` 在 eager 路径上**始终是 0** ⇒ plain decode 全程垃圾 ✓（与 §135 的 48 step 全错一致）。
+
+### 修复（`chain_dev.rs`；纯 Rust 改动，`.cu` 未动 ⇒ 只需 `cargo build --release`）
+
+`ids` / `ids_bytes` 变成显式参数：`moe_bs_tables_dev`、`moe_tilelang_tables_dev`、
+`moe_tilelang_tables_host`、`moe_tilelang_tables_parity`；
+**四个调用点各传自己那条路径产出的缓冲**（`moe_rows` 传 `route_idx_r`，eager 传 `route_idx`），
+并加 `n_assign * 4 > ids_bytes` 守卫 ⇒ 短缓冲是**响亮 decline**，不是越界读 ✗。
+（eager 调用点的注释早就写着"`route_idx` 是 eager router 的输出"——**只有助手那一处自相矛盾**。）
+
+### 新增诊断（opt-in，一次性，D2H ⇒ **只许诊断臂**）
+
+`DSV41_MOE_BS_TABLE_DUMP=1` 打印**同一瞬间**的：路由 ids、`route_group` 输出
+（`n_active` / `active` / `counts_by_e`）、BS 段表（`nseg` / `eid` / `counts_seg` / `order`）
+⇒ "表与它的路由不匹配"**直接可读**，不必再从解码文本反推（本节的定位就是这么来的 ✓）。
+
+### 验证顺序（每步一变量）
+
+1. `bash ~/arm_run.sh FIX1`（BS 臂 + swapAB，无探针）⇒ 期望 `OUT: '1\n2\n...\n10'` ✓
+   且 `[DIAG] Eid` 变为**非零且互异**的专家 id ✓；
+2. `bash ~/arm_run.sh FIX2 DSV41_MOE_BS_TABLE_DUMP=1` ⇒ 快照里 `ids` 非零、
+   `nseg = n_active`、`eid` 递增、`order[0..6]` = 该 token 的 6 个 (row,slot) ✓；
+3. 文本红线 `~/wq_check.py` + `bash ~/arm_summary.sh`（`counts:` 行）✓；
+4. 之后才谈 §139 队列的性能/精度转正 ✓。
+
+## §142 【术语纠正 + 可信真值清单 + 仪器覆盖边界】别再把自己的生成物当 oracle
+
+### ⚠️ 术语纠正（用户 2026-09-14 指出，必记）
+
+**`kernels/cuda/tilelang_gen/*_tl.cu` 是"我们自己用 TileLang AOT 生成的"，不是 DeepSeek/SGLang 的官方产物。**
+`kernels/tilelang/gen_moe_bs_aot.py` 在我们机器上跑 TileLang 生成它；AGENTS 里"官方生成物 / PASS oracle"
+的说法极易误导（我自己也因此在 §139 队列里拿它当 oracle 规划过实验 ✗）。
+⇒ 今后一律称 **"TileLang 生成物（自研）"**，其"PASS"只说明**它自己的 fp64 金标准与它自己一致**，
+**不能**作为我们 kernel 正确的独立证据 ✗。
+
+### 可信真值（只有两个）
+
+| # | 真值 | 为什么可信 | 位置 |
+|---|---|---|---|
+| 1 | **官方 PyTorch 参考** | 唯一的"外部"定义（用户确认：DeepSeek 官方只发 PyTorch 实现） | 本地 `ref_inference/`（`model.py`/`kernel.py`）+ 远端 `/tmp/v41_golden/`；官方格式 ckpt `/opt/dlami/nvme/models/V41-demo-TP8` |
+| 2 | **旧路径（per-slot SIMT GEMV）** | 端到端文本已验证（`1..10` ✓ §135） | `kernels/cuda/dsv41_experts_mxf4.cu` + `chain_dev.rs` 的 `expert_gate_up_fp4_batched` 等 |
+
+**不是真值**：自研 TileLang 生成物（§上）、我们自己的隔离仪器（它只证明"我们描述的约定与硬件一致"）、
+`NUMCHECK`（它拿我们自己的数据当参考 ⇒ 对我们自己的布局错**结构性失明** ✗，且探针本身在 lockstep 下会挂 ✗）。
+
+### 现有仪器的覆盖边界（决定每个实验能证明什么）
+
+| 仪器 | 覆盖 | **不覆盖** |
+|---|---|---|
+| `tests_bs_impulse.cu`（const / sfprobe / random_sf，`BSPACK=4 BSLAYOUT=1`） | 单 stage、自建 A/B/SF、**寄存器直写 TMEM（`tcgen05.st`）** 的 MMA 数值（relerr 0 / 0 / 9.8e-05） | ① **40 stage 的循环**（每 stage 重写 smem + 逐 stage SF）② 全局取数（gather / 权重池寻址）③ **生产用的 SF 投递路（smem→transpose→`tcgen05.cp`）**④ C epilogue + scatter |
+| `DSV41_MOE_BS_TABLE_DUMP`（本次新加，Rust 侧一次性 D2H） | 路由 ids / `route_group` 输出 / 段表（eid/counts/order）——**实证了缺陷#1** ✓ | 任何数值 |
+| `DSV41_GATEUP_DUMP`（本次新加，同一模式） | 首个 `moe()` 调用的 **RAW gate\|up** +（扩展后）MoE 输入 x / ids / w / xq4 / xsc4 ⇒ 可与**旧路径**、**官方 PyTorch** 三方逐元素对照 ✓ | verify/spec 路径（只接 eager） |
+| shim `[NC]` host-double 探针 | 设计上覆盖"MMA 是否算对" | **在 lockstep 下必然挂**（0 step + `ar5-hang`，§119/§141）⇒ **不可用** ✗ |
+| `HANDWRITTEN=0`（走 TileLang 生成物） | — | **连加载都过不去**（0 step、无 `[moe-bs]` 行、http=000，§141）⇒ 不能当对照 ✗ |
+
+### 已确证的排除项（不要再重查）
+
+1. **fp4 权重解码几何**：旧路径 / `NUMCHECK` / packed 分支三方一致 —— 低 nibble = 偶 K ✓；
+   `w1..w3` 行距 2560 B ✓；scale 面 160 B 行距 + 组内最低 K-block 在 LSB ✓；
+   **expert stride 实测 2641920 B 与 `load.rs` 的六面块算式逐字节吻合**（`up(...)` 下 w2.scale 由 10→16 列 pad 多出的 `5120*(16-10)=30720` 正是差额）✓
+   ⇒ **"BS 臂读错权重字节"被排除**（审计：`wdecode-audit`，含可复算算术）。
+2. **激活标度非幂次**：`fast_round_scale` 输出恒为 2^n ⇒ `tl_bs_f_pow2_to_ue8m0` 无损；
+   任何臂日志里都**没有**触发 shim 的 "not a power of two" 警告 ✓ ⇒ 该假设排除。
+3. **SF 助手实现**：`hw_sf_transpose` / `hw_tc_cp` / `hw_make_sf_desc` 与 TileLang 原语
+   (`tcgen_05.h:126/149/160`) **逐字节相同** ✓ ⇒ 不是"抄错函数"。
+4. **缺陷#1**（段表读错缓冲）已修并实证 ✓（见 §141）。
+
+### 精度对齐（官方 = `ref_inference/`）逐项表 —— 审计结论（`precision-official`）
+
+**官方只有两个量化原语 + 两个 GEMM**：`act_quant(x,32,ue8m0)`→e4m3；`fp4_act_quant(b=16/e4m3 或 b=32/e8m0)`→e2m1；
+`fp8_gemm`/`fp4_gemm` 都是"**每 32-K 块独立部分积 → 乘 sa·sb → 累加进独立 f32**"，输出 bf16
+（`torch.get_default_dtype()` = bf16，`generate.py:118`）。
+
+| 项 | 官方 | 我方默认 | 判定 | 门 |
+|---|---|---|---|---|
+| routed 激活 | e4m3 b32 ue8m0 (`act_quant`) | **e2m1** | **偏低** | `DSV41_EXPERT_ACT_E4M3`（arm COMMON 已开 ✓） |
+| gate/up 输出边界 | **bf16**（`fp4_gemm` 输出 dtype） | f32（`bf16_snap` 由 `DSV41_BF16_TRUNCATE` 控制，arm 已开 ✓） | 一致（门开时） | `DSV41_BF16_TRUNCATE` |
+| 路由权重位置 | `weights*x` → `x.to(bf16)` → `w2` ⇒ **w2 之前、bf16 之前** | **down epilogue**（bf16 之后） | **偏高 + 序错** | `DSV41_ROUTED_DOWN_QUANT`（门内逐项已对齐 ✓，默认 OFF） |
+| down 输入 | bf16 一次 → `act_quant(...,32,ue8m0)` | **f32**（无 e4m3 往返） | **偏高** | 同上 |
+| 跨专家累加序 | **升序 expert id** | 升序 slot（top-k rank） | 序不同 | `DSV41_SEQ_ALIGN` |
+| A2 窗口 KV | `act_quant(inplace)` 后**写回 bf16** | 门内写回 **f32** ✗ **G3** | 偏高 | `DSV41_WINDOW_KV_QUANT`（转正前须补 bf16 收尾） |
+| A3 压缩 latent | fp4 **b16** + **e4m3 非幂次**标度，写回 bf16 | 逐项一致 ✓ | 一致 | `DSV41_COMPRESS_LATENT_QUANT` |
+| A4 indexer q/k | fp4 b32 幂次，写回 bf16 | 逐项一致 ✓ | 一致 | `DSV41_INDEXER_FP4_RT` |
+| I3 attention P | P 在乘 V **前**降 bf16 | 逐项一致 ✓（全部 PV 位点已接） | 一致 | `DSV41_ATTN_P_BF16` |
+| **verify 侧 fused down** | — | **缺 `!bf16_truncate()` 守卫** ⇒ 门开时 eager/verify 不一致 ✗ **G2** | 半覆盖 | 修 `chain_dev.rs:18984` |
+
+**无门、需结构性改动**（不要与上面几步混做）：G1 GEMM 累加树/标度施加点（官方"块部分积→乘标度"vs
+我们硬件 blockscaled/SIMT fma+shuffle）、G4 跨 rank `all_reduce` 归约序、G5 gate GEMV 官方是 f32 全精度、
+G6 `y.type_as(x)` 的 bf16 收尾。
+
+**转正顺序（一次一个变量）**：E4M3 → 修 G2 → `ROUTED_DOWN_QUANT` → `SEQ_ALIGN` →
+（先补 G3 再）A2 → A4/A3/I3 → 最后 G1/G4/G5/G6。
+
+### 缺陷#2 的剩余嫌疑面（当前证据下）
+
+已排除：权重解码几何（§上）、激活标度幂次性、SF 助手实现、段表（缺陷#1 ✓）、单 stage MMA 数值。
+剩余嫌疑（**按"共用路径 ⇒ 两朝向同时错"的共有性排序**）：
+① **主机侧取数**（gather 的 A 字节/标度索引；权重池寻址的 k/n_tile 切片）——`output-layout`/`a-side-ingest` 审计在查；
+② **C epilogue → scatter 列/行映射**（两朝向都经它）；
+③ **40-stage 循环的逐 stage 重写**（隔离仪器只测 1 stage ⇒ 这是唯一"仪器盲区里的 kernel 内部"）；
+④ 生产 SF 投递路（`tcgen05.cp` + transpose）——助手逐字节相同，但**整条路从未被独立验证过**。
+⇒ **判据一律用"与旧路径/官方 PyTorch 逐元素对拍"**（`DSV41_GATEUP_DUMP`），不再用我们自己的参考。

@@ -18994,7 +18994,23 @@ impl<'a> DevChain<'a> {
             // documented "no per-slot weight" path
             // (dsv41_experts_mxf4.cu:2349 / :2886 / :852).
             let rw_eff: *const f32 = if q_on { std::ptr::null() } else { rw_base };
-            if !tl_dn_done && down_fuse() && self.dev.supports_down_fuse() && !grouped_down_ok {
+            // ⚠️ `!bf16_truncate()` — the EAGER twin carries this term
+            // (`chain_dev.rs` down-fuse condition, `!tl_dn_done && down_fuse() &&
+            // !bf16_truncate() && supports_down_fuse()`), because the fused form sums
+            // the slots INSIDE one launch: the reference's per-expert bf16 output
+            // (`Expert.forward` -> `w2`, bf16) is never materialised, so the f32 sum
+            // rides on unrounded partials — one rounding per expert the reference DOES
+            // apply (`y[idx] += expert(..)`, `model.py:894`). The verify path was
+            // missing the term, so with `DSV41_BF16_TRUNCATE=1` armed the eager and
+            // verify paths took DIFFERENT down arms (the §142 G2 audit): any A/B run
+            // on the verify path would then have measured an unaligned arm. With the
+            // gate OFF (default) nothing changes here.
+            if !tl_dn_done
+                && down_fuse()
+                && !bf16_truncate()
+                && self.dev.supports_down_fuse()
+                && !grouped_down_ok
+            {
                 // ONE rows = m launch: the fused down+reduce kernel's grid is
                 // (dim/warps, 1, rows) and it derives act_row =
                 // act_base + arow*slots*act_stride, out_row = out + arow*n_total
@@ -23824,26 +23840,63 @@ fn oracle_tap() -> bool {
                 {
                     static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
                     if ONCE.set(()).is_ok() {
-                        if let Some(path) = gateup_dump_path() {
+                        if let Some(dir) = gateup_dump_path() {
                             let n = topk * act_slot as usize;
-                            let mut v = vec![0f32; n];
-                            let view = Device::view(self.s.ex_act_b.ptr, n * 4);
-                            match self.dev.download_f32(&view, &mut v) {
-                                Ok(()) => {
-                                    let bytes: Vec<u8> =
-                                        v.iter().flat_map(|x| x.to_le_bytes()).collect();
-                                    match std::fs::write(&path, &bytes) {
-                                        Ok(()) => eprintln!(
-                                            "[gateup-dump] wrote {n} f32 (topk={topk} \
-                                             act_slot={act_slot}) to {path}"
-                                        ),
-                                        Err(e) => {
-                                            eprintln!("[gateup-dump] write {path} failed: {e}")
-                                        }
-                                    }
-                                }
-                                Err(e) => eprintln!("[gateup-dump] download failed: {e}"),
+                            let mut sets: Vec<(&str, usize, usize)> = vec![
+                                // (file, element count, element size in bytes)
+                                ("gateup.f32", n, 4),
+                                ("x.f32", dim, 4),
+                                ("xq4.u8", dim, 1),
+                                ("xsc4.f32", dim / 32 + 8, 4),
+                            ];
+                            if let Ok(d) = std::fs::create_dir_all(&dir) {
+                                let _ = d;
                             }
+                            for (name, count, esz) in sets.drain(..) {
+                                let path = format!("{dir}/{name}");
+                                let view = Device::view(
+                                    match name {
+                                        "gateup.f32" => self.s.ex_act_b.ptr,
+                                        "x.f32" => self.s.xn.ptr,
+                                        "xq4.u8" => self.s.xq4.ptr,
+                                        _ => self.s.xsc4.ptr,
+                                    },
+                                    count * esz,
+                                );
+                                let mut bytes = vec![0u8; count * esz];
+                                match self.dev.download_u8(&view, &mut bytes) {
+                                    Ok(()) => match std::fs::write(&path, &bytes) {
+                                        Ok(()) => eprintln!(
+                                            "[gateup-dump] {path}: {count} x {esz}B"
+                                        ),
+                                        Err(e) => eprintln!("[gateup-dump] write {path}: {e}"),
+                                    },
+                                    Err(e) => eprintln!("[gateup-dump] read {name}: {e}"),
+                                }
+                            }
+                            for (name, count, esz) in [
+                                ("ids.i32", topk, 4usize),
+                                ("w.f32", topk, 4usize),
+                            ] {
+                                let path = format!("{dir}/{name}");
+                                let ptr = if name == "ids.i32" {
+                                    self.s.route_idx.ptr
+                                } else {
+                                    self.s.route_w.ptr
+                                };
+                                let view = Device::view(ptr, count * esz);
+                                let mut bytes = vec![0u8; count * esz];
+                                match self.dev.download_u8(&view, &mut bytes) {
+                                    Ok(()) => {
+                                        let _ = std::fs::write(&path, &bytes);
+                                        eprintln!("[gateup-dump] {path}: {count} x {esz}B");
+                                    }
+                                    Err(e) => eprintln!("[gateup-dump] read {name}: {e}"),
+                                }
+                            }
+                            eprintln!(
+                                "[gateup-dump] done (topk={topk} act_slot={act_slot} dim={dim})"
+                            );
                         }
                     }
                 }
