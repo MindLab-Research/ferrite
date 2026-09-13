@@ -1964,3 +1964,29 @@ cargo test -p ferrite-models --lib routed_down_prep → 6 passed; 0 failed
 | `DSV41_ROUTED_DOWN_QUANT` | routed down 的乘法点 + 调用方不再传 `row_weight` | ✓ §53 已逐行核实（唯一三处改动） |
 
 ⇒ 五门均**无半挂**（或已按契约说明）。**转正时仍须逐门单独验证**（§64 的流程）。
+
+## §77 【精度·最后一项闭环】累加序（≤ulp）穷举审计：**10 项可 CPU 关闭，风险唯一落点是 head logits**
+
+审计（`accum-order-audit`，纯静态 + 纯 CPU f32 仿真标定）的核心论断（全文最重要的一句）：
+
+> **官方每个算子末端都有一个 bf16（或 fp8）量化边界** —— `RMSNorm → (w*x).to(dtype)`、
+> `Expert → x.to(dtype)`、`MoE → y.type_as(x)`、attention 的 `o` 是 BF16 tensor、`hc_pre/hc_post → .to(x.dtype)`。
+> ≤1e-6 的 f32 序差被这些边界吞掉后，只表现为"**每行 0.3~1 个元素移动 1 个量化 ulp**"。
+> **唯一的例外是 head 的 logits：它是 f32、没有边界、末端直接 argmax** ⇒ 全部风险的落点。
+
+**量级标定（可复算）**：`u = 2^-24`；串行 n 项 `|δ| ≲ (n-1)u`；平衡树深度 d `|δ| ≲ d·u`；
+量化边界 ulp：bf16 = 2^-9（值∈[1,2)）、e4m3 = 2^-4。实测两种结构差 ≈ **5e-7（median，~8 ulp）**
+⇒ 代入 bf16 边界：`5e-7/1.95e-3 = 2.6e-4` × 5120 元素 = **每行约 1.3 个元素偏 1 个 bf16 ulp**。
+
+| 分档 | 项数 | 处置 |
+|---|---|---|
+| **A. CPU 即可判定无害（立刻关闭）** | **10** | 下游有量化边界 + 末端非 argmax/比较 |
+| **B. 量级已可判无害，建议 1 次 GPU 抽检** | 4 | 分母链/跨 rank 域；风险在"边界是否真的生效"这一**配置假设**（与 §64 的出货 env 清单同源） |
+| **C. 必须 GPU 量化** | **3** | 无量化边界 + 末端是 argmax/topk：**head logits**、indexer topk、draft/verify 程序差（直接影响 accept） |
+| 其中**可廉价对齐** | 2 | #5 MoE down 的 slot→expert-id 求和排列；#13 swiglu 的 silu 形式 |
+
+⇒ **行动**：C 档 3 项纳入 GPU 验证清单（与精度五门的转正同窗口执行即可）；
+B 档 4 项在转正时用 `wq_check.py` 观察是否出现可观测漂移；
+**A 档 10 项即刻关闭**（不再投入）。另有一个对拍前提值得记住：
+`ref_inference/generate.py:118` 设 `torch.set_default_dtype(torch.bfloat16)`（参考实现全程 bf16 默认）
+且 `:108` 的 `world_size` **由启动环境决定** ⇒ 对拍臂的 world size 会影响 AR 项是否成立。
