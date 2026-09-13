@@ -792,6 +792,40 @@ struct Kernels {
             c_int, c_int, c_int, c_int, c_int, CuStream,
         ) -> c_int,
     >,
+    // WO_PAIR-ROWS (`dsv41_gemm_fp8_mrows_q_f32`, from dsv41_kernels.cu): the
+    // verify block's `wo_a_grouped -> quant -> wo_b` chain as TWO launches, with
+    // the INTERMEDIATE QUANT folded into the second one. The kernel is
+    // `gemm_fp8_mtile_kernel<M, 1>` -- the just-delivered MTILE program with the
+    // activation operand re-derived in-warp (`quant_kernel<0>`'s arithmetic for
+    // this warp's own 32-element scale block) instead of read from the quantiser's
+    // global output.
+    //
+    // Numerics: `out` is BIT-IDENTICAL to `wo_a_grouped_gemv_kernel<M>` +
+    // `m x quant_kernel<0>` + `gemm_fp8_mtile_kernel<M, 0>` (see the C entry's
+    // header: the quant is `quant_kernel<0>` term for term, the fold is the
+    // shipped MTILE program). Unlike B6
+    // ([`Self::gemm_fp8_mrows_f32`]), this arm CAN be judged by a byte comparison.
+    // What it saves is the `m` per-row quant launches the f32-source pitch forced
+    // (the `quant_fp8` ABI has no `a_stride`).
+    //
+    // Neither the fp8 nor its scales are materialised (the byte lives in a
+    // register), which is safe exactly where B6 is safe: within `attention_rows`
+    // the last reader of `xq_r`/`xsc_r` IS the quant this replaces, and the next
+    // reader (`indexer_front_rows`) re-quantises first.
+    //
+    // Optional: a stale .so without the symbol keeps the `quant_fp8 + proj_mrows`
+    // pair, and the C entry returns 2 (declined, never cudaErrorInvalidValue) for
+    // `m` outside 1..=8, `k` not a multiple of 32 (the quant's scale block), a
+    // null pointer, `a_stride < k`, `out_stride < n`, an smem over the device
+    // ceiling, or a run configured for the reordering `DSV41_GEMV_FP8_MODE` 0/1
+    // arms / `DSV41_NO_GEMV_FP8`.
+    // ABI: (a_f32, a_stride, w, w_scale, bias, out, m, n, k, out_stride, s).
+    gemm_fp8_mrows_q_f32: Option<
+        unsafe extern "C" fn(
+            *const f32, c_int, *const u8, *const u8, *const f32, *mut f32,
+            c_int, c_int, c_int, c_int, CuStream,
+        ) -> c_int,
+    >,
     // v2 (vectorized float4 + K-split) f32 M=1 GEMV, from dsv41_glue.cu.
     // Optional: an older .so without the symbol keeps the v1 kernel above.
     // Same ABI as v1: (w, x, out, n=out_f, k=in_f, s).
@@ -1762,6 +1796,7 @@ impl Device {
             gemm_fp8_mrows_rope_norm: ko!(rt, "dsv41_gemm_fp8_mrows_rope_norm"),
             gemm_fp8_mrows2: ko!(rt, "dsv41_gemm_fp8_mrows2"),
             gemm_fp8_mrows_f32: ko!(rt, "dsv41_gemm_fp8_mrows_f32"),
+            gemm_fp8_mrows_q_f32: ko!(rt, "dsv41_gemm_fp8_mrows_q_f32"),
             argmax: ko!(rt, "dsv41_argmax"),
             engram_hash_step: ko!(rt, "dsv41_engram_hash_step"),
             window_idxs: ko!(rt, "dsv41_window_idxs"),
@@ -5247,6 +5282,72 @@ impl Device {
     /// against.
     pub fn supports_gemm_fp8_mrows_f32(&self) -> bool {
         self.kernels.gemm_fp8_mrows_f32.is_some()
+    }
+
+    /// WO_PAIR-ROWS: the verify's `wo_a_grouped -> quant -> wo_b` chain with the
+    /// INTERMEDIATE QUANT folded into the wo_b launch (`gemm_fp8_mtile_kernel<M,1>`
+    /// -- see the `Kernels::gemm_fp8_mrows_q_f32` field for the numerics contract).
+    /// `a_f32` is the RAW `wo_r` matrix (`rows` x `a_stride` ELEMENTS, the `k`
+    /// contracted columns at the start of each row); `out` is the wo_b result.
+    ///
+    /// `Ok(false)` means NOT performed -- keep the `m x quant_fp8 + proj_mrows`
+    /// block: either the loaded .so predates the symbol, or the C entry declined
+    /// (it returns 2, never cudaErrorInvalidValue, so a decline can never read as a
+    /// launch failure). `rows` outside 1..=8 is refused here as well, the bound the
+    /// template dispatch covers.
+    ///
+    /// ABI: the `gemm_fp8_mrows_f32` argument order with `a_stride` moved next to
+    /// `a` (the activation's own pitch belongs with the activation).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_fp8_mrows_q_f32(
+        &self,
+        a_f32: *const f32,
+        a_stride: i32,
+        w: *const u8,
+        w_scale: *const u8,
+        bias: *const f32,
+        out: *mut f32,
+        rows: i32,
+        n: i32,
+        k: i32,
+        out_stride: i32,
+    ) -> Result<bool> {
+        let Some(f) = self.kernels.gemm_fp8_mrows_q_f32 else {
+            return Ok(false);
+        };
+        if !(1..=8).contains(&rows) {
+            return Ok(false);
+        }
+        let rc = unsafe {
+            f(
+                a_f32,
+                a_stride,
+                w,
+                w_scale,
+                bias,
+                out,
+                rows,
+                n,
+                k,
+                out_stride,
+                self.stream,
+            )
+        };
+        // 2 = the kernel's "declined" (shape/mode), the caller falls back.
+        if rc == 2 {
+            return Ok(false);
+        }
+        self.kerr(rc, "dsv41_gemm_fp8_mrows_q_f32")?;
+        Ok(true)
+    }
+
+    /// True when the loaded .so carries WO_PAIR-ROWS
+    /// (`dsv41_gemm_fp8_mrows_q_f32`). A stale .so leaves
+    /// `DSV41_VERIFY_WO_PAIR_MROWS` inert and the verify's wo_b on the
+    /// `m x quant_fp8 + proj_mrows` block, which is the reference WO_PAIR-ROWS was
+    /// written against.
+    pub fn supports_gemm_fp8_mrows_q_f32(&self) -> bool {
+        self.kernels.gemm_fp8_mrows_q_f32.is_some()
     }
 
     /// Fused M=1 gate GEMV + MoE route: ONE launch where `gemv_bf16_command` +

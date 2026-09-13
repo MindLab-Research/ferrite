@@ -1459,16 +1459,55 @@ impl<'a> DsparkDev<'a> {
             } else {
                 self.pre_ffn.ptr as *mut f32
             };
-            // hc_mixes for the attention sub-block: writes THIS block's attn_pre
-            // (slot 1), post and comb.
-            self.hc_mixes(
-                self.h.ptr as *const f32,
-                ld,
-                false,
-                self.pre_attn.ptr as *mut f32,
-                self.post.ptr as *mut f32,
-                self.comb.ptr as *mut f32,
-            )?;
+            // P3-lite segment A (`DSV41_P3LITE_HC_FRONT` /
+            // `DSV41_DRAFT_P3LITE_A_SEG`, `draft-p3lite-segment-fusion.md` §2.1):
+            // the whole attention-side hc front end — `hc_mixes` AND the
+            // collapse+norm — as ONE `dsv41_draft_hc_front`. The collapse reads
+            // `collapse_pre` (the INCOMING premix slot), never the `pre` the mixes
+            // write, so the two phases share no buffer and the single launch is
+            // bit-identical to the pair (see `hc_front_fused`).
+            //
+            // ⚠️ Phase 2 of the fused launch IS `hc_collapse_norm`, i.e. the P3a
+            // a1 fold. With `DSV41_BF16_TRUNCATE=1` AND `DSV41_P3A_COLLAPSE_NORM=0`
+            // the un-fused site below would run `hc_collapse` + `rmsnorm` (no
+            // truncate) while the fused launch applies truncate, so that
+            // combination keeps the pair (the FFN site has only the
+            // `hc_collapse_norm` form and takes the fold unconditionally).
+            let attn_norm = need(&ld.attn_norm, "mtp.*.attn_norm.weight")?;
+            // The premix this block collapses with: `pre_in` historically, the
+            // alternating slot under a3 (see the loop head).
+            let collapse_pre: *const f32 = if p3a.premix_pp {
+                premix_cur
+            } else {
+                self.pre_in.ptr as *const f32
+            };
+            let mut attn_front_fused = false;
+            if draft_p3lite().hc_front
+                && (p3a.collapse_norm || !crate::dsv41::chain_dev::bf16_truncate())
+            {
+                attn_front_fused = self.hc_front_fused(
+                    self.h.ptr as *const f32,
+                    ld,
+                    false,
+                    self.pre_attn.ptr as *mut f32,
+                    self.post.ptr as *mut f32,
+                    self.comb.ptr as *mut f32,
+                    collapse_pre,
+                    self.xn.ptr as *mut f32,
+                )?;
+            }
+            if !attn_front_fused {
+                // hc_mixes for the attention sub-block: writes THIS block's attn_pre
+                // (slot 1), post and comb.
+                self.hc_mixes(
+                    self.h.ptr as *const f32,
+                    ld,
+                    false,
+                    self.pre_attn.ptr as *mut f32,
+                    self.post.ptr as *mut f32,
+                    self.comb.ptr as *mut f32,
+                )?;
+            }
             // the hc_mixes coefficients (pre/post/comb) — the golden harness's
             // `stage{s}.attn.hc_pre/hc_post/hc_comb`, never diffed before; the
             // ffn input's 4.4% residual (which flips top-k expert picks and
@@ -1484,8 +1523,9 @@ impl<'a> DsparkDev<'a> {
             self.dump_unit_idx("mixes_ffn_pre", s, ffn_out as *const f32, &[bs, hc]);
             self.dump_unit_idx("mixes_ffn_post", s, self.post.ptr as *const f32, &[bs, hc]);
             self.dump_unit_idx("mixes_ffn_comb", s, self.comb.ptr as *const f32, &[bs, hc, hc]);
-            // collapse with the INCOMING premix, then the attn norm
-            let attn_norm = need(&ld.attn_norm, "mtp.*.attn_norm.weight")?;
+            // collapse with the INCOMING premix, then the attn norm (`attn_norm`
+            // and `collapse_pre` are resolved ABOVE, where the fused front end —
+            // which carries this same collapse inside its phase 2 — needs them).
         // THE decisive dump: the first 10 weights of this rank's attn_norm.
         // The checkpoint's mtp.0.attn_norm starts [-0.0491, -0.0457, -0.0481,
         // ...] (BF16, read straight from the safetensors). If this dump shows
@@ -1493,13 +1533,6 @@ impl<'a> DsparkDev<'a> {
         // would explain rmsnorm exploding while hand-computation with the
         // checkpoint's values stays normal.
         self.dump_unit_idx("attn_norm_w", s, attn_norm.as_f32(), &[16]);
-            // The premix this block collapses with: `pre_in` historically, the
-            // alternating slot under a3 (see the loop head).
-            let collapse_pre: *const f32 = if p3a.premix_pp {
-                premix_cur
-            } else {
-                self.pre_in.ptr as *const f32
-            };
             // P3a a1 (`DSV41_DRAFT_P3A`): the FFN half's own fused kernel,
             // `dsv41_hc_collapse_norm`, is exactly this pair — its header
             // (`dsv41_kernels.cu`:7942-7947) pins the collapse's `fmaf` chain and
@@ -1513,7 +1546,7 @@ impl<'a> DsparkDev<'a> {
             // is never in global memory. A `DSV41_DSPARK_UNIT_DUMP` capture taken
             // with this gate ON therefore has one unit fewer (and `h_norm_block`
             // unchanged) — capture goldens with the gates OFF, as always.
-            if p3a.collapse_norm {
+            if p3a.collapse_norm && !attn_front_fused {
                 self.dev.hc_collapse_norm(
                     self.h.ptr as *mut f32,
                     collapse_pre,
@@ -1525,7 +1558,7 @@ impl<'a> DsparkDev<'a> {
                     eps,
                     crate::dsv41::chain_dev::bf16_truncate(),
                 )?;
-            } else {
+            } else if !attn_front_fused {
                 self.dev.hc_collapse(
                     self.h.ptr as *const f32,
                     collapse_pre,
@@ -1614,17 +1647,37 @@ impl<'a> DsparkDev<'a> {
             };
 
             // ---- FFN sub-block ----
-            self.hc_mixes(
-                res_cur,
-                ld,
-                true,
-                ffn_out,
-                self.post.ptr as *mut f32,
-                self.comb.ptr as *mut f32,
-            )?;
+            // P3-lite segment A, FFN half: the same `dsv41_draft_hc_front` fold
+            // as the attention site above (see `hc_front_fused`). The FFN site has
+            // only the `hc_collapse_norm` form, so it always passes `truncate =
+            // bf16_truncate()` and the fold needs no extra guard.
+            let mut ffn_front_fused = false;
+            if draft_p3lite().hc_front {
+                ffn_front_fused = self.hc_front_fused(
+                    res_cur,
+                    ld,
+                    true,
+                    ffn_out,
+                    self.post.ptr as *mut f32,
+                    self.comb.ptr as *mut f32,
+                    self.pre_attn.ptr as *const f32,
+                    self.xn.ptr as *mut f32,
+                )?;
+            }
+            if !ffn_front_fused {
+                self.hc_mixes(
+                    res_cur,
+                    ld,
+                    true,
+                    ffn_out,
+                    self.post.ptr as *mut f32,
+                    self.comb.ptr as *mut f32,
+                )?;
+            }
             // the FFN collapses with THIS block's attn_pre, not the incoming one
             let ffn_norm = need(&ld.ffn_norm, "mtp.*.ffn_norm.weight")?;
-            self.dev.hc_collapse_norm(
+            if !ffn_front_fused {
+                self.dev.hc_collapse_norm(
                 res_cur as *mut f32,
                 self.pre_attn.ptr as *const f32,
                 ffn_norm.as_f32(),
@@ -1635,6 +1688,7 @@ impl<'a> DsparkDev<'a> {
                 eps,
                 crate::dsv41::chain_dev::bf16_truncate(),
             )?;
+            }
             // the MoE's input (post ffn-norm) — the same semantic as the golden
             // harness's `stage{s}.ffn.in`, for the MoE-segment diff.
             self.dump_unit_idx("ffn_in", s, self.xn.ptr as *const f32, &[bs, dim]);

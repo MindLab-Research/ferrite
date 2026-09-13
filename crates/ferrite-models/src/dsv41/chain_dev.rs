@@ -5859,6 +5859,68 @@ impl<'a> DevChain<'a> {
         })
     }
 
+    /// WO_PAIR-ROWS (`DSV41_VERIFY_WO_PAIR_MROWS=1`, DEFAULT OFF — A/B first): the
+    /// m-row verify block's OUTPUT PROJECTION as TWO launches with the intermediate
+    /// quant folded into the second one.
+    ///
+    /// THE CHAIN IT REPLACES (`attention_rows`, the `mrows` branch). `wo_a` was
+    /// already the block-amortised grouped GEMV (`dsv41_wo_a_grouped_fp8`, one
+    /// launch for all `m` rows), but the fp8 activation `wo_b` consumes could only
+    /// be produced by a PER-ROW loop:
+    ///
+    ///     for r in 0..m { quant_fp8(wo_r + r*ol_total -> xq_r + r*ol_local) }   // m launches
+    ///     proj_mrows(wo_b)                                                       // 1 launch
+    ///
+    /// The loop exists purely because `quant_fp8` derives the SOURCE row pitch
+    /// from `cols` (`src = x + r*cols`) while `wo_r`'s real pitch is `ol_total`
+    /// (8x `ol_local` under TP8) — the same ROW-STRIDE class the caller documents
+    /// for `o_r`. `dsv41_gemm_fp8_mrows_q_f32` removes it by taking the pitch as a
+    /// parameter AND quantising in-warp, so the whole projection costs
+    ///
+    ///     wo_a_grouped_fp8          (existing, 1 launch)   wo_r = [m, ol_total] f32
+    ///     gemm_fp8_mrows_q_f32      (THIS arm, 1 launch)   wo_out_r = [m, dim] f32
+    ///
+    /// = 2 launches per layer serving all `m` rows (the `sglang-verify-model.md`
+    /// §4 "融合对齐" row: verify eats the eager fusion shape's rows form).
+    ///
+    /// NUMERICS — BIT-IDENTICAL to the chain above, which is why this gate can be
+    /// judged by a byte comparison (unlike [`Self::wob_mrows_f32`], whose f32 lever
+    /// is strictly more accurate rather than equal). The two halves:
+    ///   * the in-kernel quant is `quant_kernel<0>` term for term (the warp's 32
+    ///     lanes are exactly one 32-element scale block, so the amax is the same
+    ///     `shfl_xor` tree, the scale the same `fast_round_scale(amax, 1/448)` and
+    ///     the byte the same `__nv_fp8_e4m3(clamp(v * (1.0f/sc), +-448))`);
+    ///   * the fold is `gemm_fp8_mtile_kernel<M, 0>` (the shipped MTILE program),
+    ///     unchanged — `AQ` is a compile-time selector.
+    ///
+    /// `DSV41_MROWS_MTILE` must be armed for the reference chain to be the MTILE
+    /// program: with it OFF `proj_mrows` dispatches `gemm_fp8_mrows_kernel<M>` (the
+    /// M-in-register program) and the two are NOT the same operand layout. The call
+    /// site checks this (`Self::mrows_mtile_armed`) and declines otherwise, keeping
+    /// the chain. A stale `.so` (no symbol) falls back the same way the gate being
+    /// unset does.
+    fn verify_wo_pair_mrows() -> bool {
+        static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *F.get_or_init(|| {
+            std::env::var("DSV41_VERIFY_WO_PAIR_MROWS").map(|v| v == "1").unwrap_or(false)
+        })
+    }
+
+    /// True when `DSV41_MROWS_MTILE` is armed (`!= 0`), i.e. `proj_mrows` would
+    /// dispatch the MTILE program. Read from the SAME env the C entry reads, and
+    /// used ONLY by [`Self::verify_wo_pair_mrows`]'s guard: WO_PAIR-ROWS is a
+    /// transcription of the MTILE program, so it may only stand in for a chain
+    /// that actually ran MTILE. A per-call `getenv` would be a hot-path slip, so
+    /// this is cached like every other gate in this file.
+    fn mrows_mtile_armed() -> bool {
+        static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *F.get_or_init(|| {
+            std::env::var("DSV41_MROWS_MTILE")
+                .map(|v| v.trim() != "0" && !v.trim().is_empty())
+                .unwrap_or(false)
+        })
+    }
+
     /// chain-pair-grid-sync (DSV41_WO_PAIR, default OFF): the wo_a -> wo_b pair as
     /// ONE grid-sync launch (`dsv41_gemm_fp8_wo_pair`) instead of two, with a
     /// sense-reversing device-wide barrier between the phases. Each row is still
@@ -13305,7 +13367,53 @@ impl<'a> DevChain<'a> {
             )?;
         }
         if !took_wob && mrows {
-            // ⚠️ ROW STRIDE FIX (same class as the o_r quant above):
+            // ---- WO_PAIR-ROWS (`DSV41_VERIFY_WO_PAIR_MROWS=1`, DEFAULT OFF) ----
+            // The verify's output projection as TWO launches with the INTERMEDIATE
+            // QUANT folded into the second: `wo_a_grouped_fp8` above already wrote
+            // `wo_r` for all `m` rows, and `dsv41_gemm_fp8_mrows_q_f32` is the
+            // MTILE program with `quant_kernel<0>`'s byte re-derived in-warp, so
+            // the per-row loop below (m `quant_fp8` launches, the only reason this
+            // block is a loop at all) disappears.
+            //
+            // The guards mirror the arm's exact contract:
+            //   * `mrows_mtile_armed()` — this kernel IS `gemm_fp8_mtile_kernel<M,
+            //     1>`, so it may only stand in for a chain whose wo_b actually ran
+            //     MTILE (otherwise the reference is `gemm_fp8_mrows_kernel<M>`, a
+            //     different operand layout, and "bit-identical to what you replaced"
+            //     would be a false claim);
+            //   * `!took_wob` — the B6 f32 arm (above) replaces the whole block
+            //     already and must keep precedence (both are default-OFF arms; if a
+            //     run arms both, B6 wins and this one stays inert, which the WO_PAIR
+            //     GPU manual calls out as a shadowed-arm trap);
+            //   * the shape guards are the C entry's own (`1..=8`, `k % 32 == 0`,
+            //     `a_stride >= k`, `out_stride >= n`) — the entry returns 2 and the
+            //     caller keeps the loop below, so no guard is duplicated here beyond
+            //     `mrows`.
+            // ⚠️ STALE-READER CHECK: like B6, this arm does NOT write `xq_r`/`xsc_r`
+            // (the fp8 byte is consumed in registers). Verified at HEAD: within
+            // `attention_rows` their last use IS the quant this replaces, and the
+            // next reader (`indexer_front_rows`) runs its own `quant_rows` first.
+            // `a_stride = ol_total`: `wo_r`'s TRUE row pitch, which `quant_fp8`
+            // could not be told (it derives the source stride from `cols`).
+            if Self::verify_wo_pair_mrows()
+                && Self::mrows_mtile_armed()
+                && self.dev.supports_gemm_fp8_mrows_q_f32()
+            {
+                took_wob = self.dev.gemm_fp8_mrows_q_f32(
+                    self.s.wo_r.ptr as *const f32,
+                    ol_total as i32, // a_stride: the TRUE row pitch of `wo_r`
+                    ld.wo_b.as_ref().unwrap().as_u8(),
+                    ld.wo_b_scale.as_ref().unwrap().as_u8(),
+                    std::ptr::null(),
+                    self.s.wo_out_r.ptr as *mut f32,
+                    m as i32,
+                    dim as i32,
+                    ol_local as i32,
+                    dim as i32, // out_stride
+                )?;
+            }
+        }
+        if !took_wob && mrows {
             // `quant_rows` derives the SOURCE row stride from `cols`, but `wo_r`'s
             // real pitch is `ol_total` (8x `ol_local` under TP8) — a block call
             // quantised garbage from row 0's tail for every r>=1. Pack row by row.
