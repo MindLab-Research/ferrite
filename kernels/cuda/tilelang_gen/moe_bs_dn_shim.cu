@@ -189,14 +189,20 @@ static bool dn_bs_init() {
                                    (int)DN_SMEM_DOUBLE) == cudaSuccess;
     (void)cudaGetLastError();
     if (ok) {
-        int cp = g_dn_cpasync ? 1 : 0, wd = 0;
+        int cp = g_dn_cpasync ? 1 : 0, wd = 0, lw = 1;
         const char* e = getenv("DSV41_MOE_DOWN_BS_WAITDBG");
         if (e != nullptr && e[0] == '1') wd = 1;
+        // The TMEM lane field is an absolute lane coordinate (PTX 9.7.18.1.1): the default is the
+        // corrected per-warp spelling. `DSV41_MOE_DOWN_BS_LDW=0` restores lane 0 for every warp so
+        // the fix can be attributed in one build instead of only pass/fail.
+        e = getenv("DSV41_MOE_DOWN_BS_LDW");
+        if (e != nullptr && e[0] == '0') lw = 0;
         (void)cudaMemcpyToSymbol(dn_g_cpasync, &cp, sizeof(int));
         (void)cudaMemcpyToSymbol(dn_g_waitdbg, &wd, sizeof(int));
+        (void)cudaMemcpyToSymbol(dn_ldw, &lw, sizeof(int));
         (void)cudaGetLastError();
-        fprintf(stderr, "[moe-dn-bs] cpasync=%d rw_in_operand=%d smem=%zu waitdbg=%d\n", cp,
-                (int)g_dn_rwop, g_dn_smem, wd);
+        fprintf(stderr, "[moe-dn-bs] cpasync=%d rw_in_operand=%d smem=%zu waitdbg=%d ldw=%d\n", cp,
+                (int)g_dn_rwop, g_dn_smem, wd, lw);
     }
     if (ok) {
         ok = cudaMalloc(&g_dn_a, (size_t)DN_SEGCAP * DN_BM * DN_K) == cudaSuccess &&

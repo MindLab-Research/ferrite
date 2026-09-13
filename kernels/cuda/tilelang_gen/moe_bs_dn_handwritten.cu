@@ -99,6 +99,9 @@ __device__ __forceinline__ void dn_tc_dealloc(uint32_t tmem, int ncols) {
 // 运行期开关（shim 从 env 读一次后 cudaMemcpyToSymbol；asm 必须编译期，两种拼写都编进来）
 __device__ int dn_g_cpasync = 0;   // DSV41_MOE_DOWN_BS_CPASYNC（默认 1 = 双缓冲）
 __device__ int dn_g_waitdbg = 0;   // DSV41_MOE_DOWN_BS_WAITDBG（默认 0）
+// 1（默认）= TMEM 读带 warp 分区偏移（PTX 9.7.18.1.1 + CUTLASS/Triton 的要求，见
+// gate/up 臂同一条定谳）；0 = 旧的 lane 恒 0 写法（DSV41_MOE_DOWN_BS_LDW=0，仅用于 A/B 归因）。
+__device__ int dn_ldw = 1;
 
 // block-scaled mxf8f6f4 MMA。`.scale_vec::1X` **不加**（gate/up 臂的定谳：官方生成码没有它，
 // 加了会破坏 eager —— 见 AGENTS.md「`DSV41_MOE_BS_SCALEVEC1X` 也须保持 OFF」）。
@@ -619,7 +622,16 @@ extern "C" __global__ void __launch_bounds__(128, 3) moe_bs_dn_kernel(
             float* dst = Out + (size_t)idx * (size_t)dim + (size_t)n_tile * DN_BN;
             for (int c0 = 0; c0 < DN_BN; c0 += 32) {
                 uint32_t v[32];
-                dn_tc_ld_x32(C_tmem + (uint32_t)c0, v);
+                // TMEM lane field is an ABSOLUTE lane coordinate and a warp may only touch its own
+                // 32-lane partition (PTX ISA 9.7.18.1.1 + 9.7.18.8.1; CUTLASS builds the same
+                // "+32 lanes per warp" atom; Triton does `tmemBase += (warpId&3) << (5+16)`). The
+                // previous spelling passed lane 0 for every warp, so warps 1..3 read rows 32..127
+                // from a partition they do not own — silently wrong for every m>1 verify row.
+                // Default is the corrected form; DSV41_MOE_DOWN_BS_LDW=0 restores the old one so the
+                // two can be A/B'd in one build (the gate/up arm needed exactly that to attribute).
+                dn_tc_ld_x32(dn_ldw ? (((uint32_t)(warp * 32) << 16) | (C_tmem + (uint32_t)c0))
+                                    : (C_tmem + (uint32_t)c0),
+                             v);
                 dn_tc_wait_ld();
                 float f[32];
 #pragma unroll
@@ -641,7 +653,9 @@ extern "C" __global__ void __launch_bounds__(128, 3) moe_bs_dn_kernel(
             // pad 行：仍必须把 TMEM 读掉（tcgen05.ld 是 warp 级同步操作，不能分叉跳过）
             for (int c0 = 0; c0 < DN_BN; c0 += 32) {
                 uint32_t v[32];
-                dn_tc_ld_x32(C_tmem + (uint32_t)c0, v);
+                dn_tc_ld_x32(dn_ldw ? (((uint32_t)(warp * 32) << 16) | (C_tmem + (uint32_t)c0))
+                                    : (C_tmem + (uint32_t)c0),
+                             v);
                 dn_tc_wait_ld();
             }
         }
