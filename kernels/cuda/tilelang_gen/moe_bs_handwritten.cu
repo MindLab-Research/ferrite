@@ -472,6 +472,7 @@ constexpr int HW_K = 5120;    // total K
 constexpr int HW_NUP = 640;   // total output columns (2 * 320)
 constexpr int HW_NP = 320;    // weight rows per plane
 constexpr int HW_NH = 64;     // rows per half-tile (W1 or W3)
+constexpr int HW_NT = HW_NUP / HW_BN;  // 5 — the n_tile count (the shim's `kGridX`)
 constexpr int HW_SEGCAP = 36;
 constexpr int HW_KITER = HW_K / HW_BK;  // 40
 
@@ -863,7 +864,7 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
             }
             for (int i = tid; i < HW_BM * 64; i += 128) {
                 const int r = i >> 6, col = i & 63;
-                g_sfdump[kSfDumpB + ((size_t)seg * kGridX + n_tile) * HW_BM * 64 +
+                g_sfdump[kSfDumpB + ((size_t)seg * HW_NT + n_tile) * HW_BM * 64 +
                          (size_t)r * 64 + col] = dump_w[hw_pack_sw128(r, col)];
             }
             if (n_tile == 0) {
@@ -874,7 +875,7 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
             }
             for (int i = tid; i < HW_BM; i += 128) {
                 reinterpret_cast<uint32_t*>(g_sfdump + kSfDumpSfb)
-                    [((size_t)seg * kGridX + n_tile) * HW_BM + i] = dump_sfb[i];
+                    [((size_t)seg * HW_NT + n_tile) * HW_BM + i] = dump_sfb[i];
             }
             __syncthreads();
         }
