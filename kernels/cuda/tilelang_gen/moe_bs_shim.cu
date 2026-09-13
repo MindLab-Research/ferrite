@@ -896,23 +896,24 @@ extern "C" int dsv41_moe_tilelang_gate_up_bs_dev(
     static bool g_eid_diag_done = false;
     if (!g_eid_diag_done) {
         g_eid_diag_done = true;
-        int eid_host[kSegCap];
-        cudaError_t ec = cudaMemcpyAsync(eid_host, eid_dev, kSegCap * sizeof(int),
-                                         cudaMemcpyDeviceToHost, s);
-        if (ec == cudaSuccess) ec = cudaStreamSynchronize(s);
-        if (ec == cudaSuccess) {
-            int bad = -1;
-            for (int i = 0; i < (int)kSegCap; ++i) {
-                if (eid_host[i] < 0 || eid_host[i] >= (int)kE) { bad = i; break; }
+        // FIX(eid-init-audit): skip during CUDA graph capture — D2H + stream
+        // sync inside a capture is illegal and would fail the capture (which
+        // is the whole point of this device-tables entry point).
+        cudaStreamCaptureStatus cap_st = cudaStreamCaptureStatusNone;
+        cudaStreamIsCapturing(s, &cap_st);
+        if (cap_st == cudaStreamCaptureStatusNone) {
+            int eid_host[kSegCap];
+            cudaError_t ec = cudaMemcpyAsync(eid_host, eid_dev, kSegCap * sizeof(int),
+                                             cudaMemcpyDeviceToHost, s);
+            if (ec == cudaSuccess) ec = cudaStreamSynchronize(s);
+            if (ec == cudaSuccess) {
+                int mx = eid_host[0];
+                for (int i = 1; i < (int)kSegCap; ++i) if (eid_host[i] > mx) mx = eid_host[i];
+                fprintf(stderr, "[moe-bs][DIAG] Eid[0..%d):", (int)kSegCap);
+                for (int i = 0; i < (int)kSegCap && i < 12; ++i) fprintf(stderr, " %d", eid_host[i]);
+                fprintf(stderr, "%s | max=%d\n",
+                        kSegCap > 12 ? " ..." : "", mx);
             }
-            fprintf(stderr, "[moe-bs][DIAG] Eid[0..%d):", (int)kSegCap);
-            for (int i = 0; i < (int)kSegCap && i < 12; ++i) fprintf(stderr, " %d", eid_host[i]);
-            fprintf(stderr, "%s | max=%d | %s\n",
-                    kSegCap > 12 ? " ..." : "",
-                    *std::max_element(eid_host, eid_host + kSegCap),
-                    bad >= 0 ? "OUT-OF-RANGE!" : "all-in-range");
-        } else {
-            fprintf(stderr, "[moe-bs][DIAG] Eid copy failed: %s\n", cudaGetErrorString(ec));
         }
     }
     moe_bs_up_tl_kernel<<<dim3((unsigned)kGridX, (unsigned)kSegCap), kThreads, kSmem, s>>>(
