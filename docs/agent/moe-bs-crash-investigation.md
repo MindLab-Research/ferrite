@@ -2301,3 +2301,22 @@ AGENTS.md 已明写"nsys 轮只看 kernel 相对倍数（AR 形态已变），�
 **方法论教训（比结论更值钱）**：**现象的相关性不等于因果**。我因"日志里刷屏 ar5-hang + OUT 为空"
 就下了"根因"判断，而**同一时间窗内的对照组（F1/P1，同样缺该 env）却完全正常**——
 **下结论前必须先找对照组**（本次由用户质询促成，感谢）。
+
+## §91 项目对 ar5-hang 的既有定论（与 §90 的关系）+ 诊断臂的图门已显式钉住
+
+用户质询后主 agent 检索项目文档，发现**已有系统性结论**（`docs/agent/400-final-frontier-analysis.md`）：
+- `:27`：**"'batched 被 ar5-hang 阻塞'这句话必须精确为'batched + CUDA graph 被阻塞'"**；
+- `:28`：**"SWALLOW **nograph**（`SWALLOW_STEP=1` + `VERIFY_GRAPH=0`）已实测 **0 ar5-hang + 零拉丁**"**；
+- `:351`：**"只是'batched+graph'被 ar5-hang 阻塞——nograph 已 0 hang + 零拉丁"**。
+
+⇒ **与本轮取证一致**：该停滞属"**batched + 图**"这一**窄配置**，`nograph` 实测 0 hang ✓。
+⇒ **但 U1 那一轮尚未被完全解释**：我的诊断臂当时**已把 5 个图门全关**，而
+`DSV41_VERIFY_GRAPH` / `DSV41_DRAFT_GRAPH` **默认本就是 OFF**（`chain_dev.rs:4233`、`dspark_dev.rs:186`）——
+按文档它**不该** hang。可能的原因留待后续（例如 `DSV41_MOE_BS_*` 臂自身在首次请求时的某条路径、
+或该轮的构建/时序差异）⇒ **不硬下结论**（§90 的教训）。
+
+**本轮据此做的两件事（都是"不依赖假设"的稳妥化）**：
+1. **把两个 DSpark 图门显式钉进 `arm_run.sh` 的 `GRAPH_OFF`**（`DSV41_VERIFY_GRAPH=0 DSV41_DRAFT_GRAPH=0`）——
+   今天它们默认 OFF，但**默认值可能变**；诊断臂不应把"是否 nograph"留给运气。
+2. `DSV41_AR_V5=0` 的缓解**保留但定位明确**：它是**改变 AR 形态**的钝器 ⇒ **只用于诊断轮**，
+   性能数字必须来自不带它的轮次（AGENTS.md 已明写同一纪律）。
