@@ -61,6 +61,8 @@ def main():
     ap.add_argument("--layer", type=int, default=0)
     ap.add_argument("--kmax", type=int, default=DIM,
                     help="limit K to this many elements (pair with DSV41_MOE_BS_STAGE1=1)")
+    ap.add_argument("--kmin", type=int, default=0,
+                    help="K range start in elements (pair DSV41_MOE_BS_KEEP_STAGE=s with kmin=128*s)")
     ap.add_argument("--row", type=int, default=0,
                     help="which row of a multi-row dump to use (0 = first; -1 = last)")
     ap.add_argument("--out", default="/tmp/gu_numpy.f32")
@@ -195,8 +197,11 @@ def main():
             wv[:, 1::2] = e2m1_to_f(hi.astype(np.uint8))
             av = e4m3_to_f(our_codes[:DIM]).astype(np.float32)
             acc = np.zeros(seg_w.shape[0], dtype=np.float32)
-            kmax = max(32, min(a.kmax, DIM))
-            for b in range(kmax // 32):
+            # K range in elements: --kmin/--kmax pair with DSV41_MOE_BS_KEEP_STAGE=s
+            # (kmin = 128*s, kmax = 128*(s+1)) or with DSV41_MOE_BS_STAGE1=1 (kmax = 128).
+            kmin = max(0, min(a.kmin, DIM - 32)) // 32 * 32
+            kmax = max(kmin + 32, min(a.kmax, DIM)) // 32 * 32
+            for b in range(kmin // 32, kmax // 32):
                 part = (av[b * 32:(b + 1) * 32] * wv[:, b * 32:(b + 1) * 32]).sum(axis=1)
                 acc += part * our_s[b] * e8m0_to_f(seg_s[:, b]).astype(np.float32)
             out[0, slot, half * 320:(half + 1) * 320] = acc.astype(np.float32)

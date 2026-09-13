@@ -70,6 +70,7 @@ __device__ int g_ldw = 1;      // 1 (DEFAULT) = read D with the per-warp TMEM la
 // and `scripts/campaign/sfdump_check.py`). Tells "the staged content is wrong" apart from "the
 // delivery/descriptor mapping is wrong" — the last two items no instrument has ever covered.
 __device__ int g_sfdump_on = 0;
+__device__ int g_sfdump_k = 0;   // which K-stage the snapshot captures (k == 0 is blind to advances)
 __device__ uint8_t* g_sfdump = nullptr;
 constexpr size_t kSfDumpA = 0;                                  // [36][128][128] u8
 constexpr size_t kSfDumpB = kSfDumpA + 36 * 128 * 128;          // [36][5][128][64] u8
@@ -869,7 +870,7 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
         // if the loader fetched the wrong global byte, this shows it as a wrong value at the
         // right place. The shim copies this scratch back once. Diagnostic only, uniform branch
         // (both operands are `k` and block-uniform globals), so the barrier stays legal.
-        if (g_sfdump_on && k == 0 && g_sfdump != nullptr) {
+        if (g_sfdump_on && k == g_sfdump_k && g_sfdump != nullptr) {
             __syncthreads();
             uint8_t* dump_act = g_swapab ? B_s : A_s;
             uint8_t* dump_w = g_swapab ? A_s : B_s;

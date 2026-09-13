@@ -272,6 +272,12 @@ bool g_sfdump_armed = false;
 extern "C" void* dsv41_moe_bs_sfdump_ptr() { return g_sfdump_buf; }
 extern "C" int dsv41_moe_bs_sfdump_bytes() { return (int)kSfDumpBytes; }
 
+// DSV41_MOE_BS_KEEP_STAGE=<s> (default -1): zero the gathered A bytes outside K in
+// [128s, 128s+128) so the arm's output is that stage's partial. Paired with the oracle's matching
+// K range it checks the per-stage base-address advances against each other — the class that is
+// invisible to both the single-stage instrument and a k == 0 content dump.
+__device__ int g_keep_stage = -1;
+
 // ===========================================================================
 // §2 driver API 的 dlopen 绑定（build.sh 不链 -lcuda，见文件头约束 1）
 //     ⚠️ 这里**故意**不使用 cuda.h 里声明的那个符号：直接引用会引入对 libcuda 的
@@ -572,7 +578,21 @@ __global__ void tl_moe_bs_gather_kernel(const uint8_t* __restrict__ xq4,
         for (int i = threadIdx.x; i < abytes; i += kMovThreads) adst[i] = 0;
     } else {
         const uint8_t* asrc = xq4 + (int64_t)src_row * abytes;
-        for (int i = threadIdx.x; i < abytes; i += kMovThreads) adst[i] = asrc[i];
+        for (int i = threadIdx.x; i < abytes; i += kMovThreads) {
+            // DSV41_MOE_BS_KEEP_STAGE=s (default -1 = off): keep only K in [128s, 128s+128), i.e.
+            // zero the A bytes of every other stage. The arm's output then IS stage s's partial, so
+            // the CPU oracle can be asked for exactly that K range and the four per-stage base
+            // advances (A `k*128`, W `k*64` bytes, SFA `k*4608`, SFW `k*320`) can be checked against
+            // each other. Both the single-stage instrument and a k==0 content dump are structurally
+            // blind to this class — a k=0-degenerate advance is invisible by construction.
+            uint8_t v = asrc[i];
+            if (g_keep_stage >= 0 &&
+                (i < (int64_t)g_keep_stage * 128 ||
+                 i >= (int64_t)(g_keep_stage + 1) * 128)) {
+                v = 0;
+            }
+            adst[i] = v;
+        }
     }
     // (b) 标度：f32 -> ue8m0，4 字节装一个字；group-major（字 g 覆盖 128 个 K）
     for (int g = threadIdx.x; g < sf_words; g += kMovThreads) {
@@ -757,6 +777,33 @@ bool tl_bs_init() {
         (void)cudaMemcpyToSymbol(g_ldw, &lw, sizeof(int));
         (void)cudaGetLastError();
         fprintf(stderr, "[moe-bs] per-warp TMEM lane address = %d\n", lw);
+    }
+    // g_keep_stage: keep only one 128-K stage's A bytes (DSV41_MOE_BS_KEEP_STAGE=<s>), so the
+    // arm's output is that stage's partial and the per-stage base advances can be checked against
+    // each other with the oracle's matching K range.
+    {
+        int ks = -1;
+        const char* e = getenv("DSV41_MOE_BS_KEEP_STAGE");
+        if (e != nullptr) {
+            int v = atoi(e);
+            if (v >= 0 && v < 40) ks = v;
+        }
+        (void)cudaMemcpyToSymbol(g_keep_stage, &ks, sizeof(int));
+        (void)cudaGetLastError();
+        fprintf(stderr, "[moe-bs] keep-only K-stage = %d\n", ks);
+    }
+    // g_sfdump_k: which K-stage the SFDUMP snapshot captures (default 0). A snapshot at k == 0
+    // cannot see any per-stage advance error at all, so this must be settable.
+    if (ok) {
+        int dk = 0;
+        const char* e = getenv("DSV41_MOE_BS_SFDUMP_K");
+        if (e != nullptr) {
+            int v = atoi(e);
+            if (v >= 0 && v < 40) dk = v;
+        }
+        (void)cudaMemcpyToSymbol(g_sfdump_k, &dk, sizeof(int));
+        (void)cudaGetLastError();
+        fprintf(stderr, "[moe-bs] SFDUMP K-stage = %d\n", dk);
     }
     // g_stage1: run only K-stage 0 (the isolation instrument's regime) — DSV41_MOE_BS_STAGE1=1.
     if (ok) {
