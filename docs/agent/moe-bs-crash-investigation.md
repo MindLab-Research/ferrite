@@ -1,7 +1,6 @@
 # fp4 MoE BS illegal memory access 完整排查记录（2026-09-14）
 
-> 状态：排查中（DIAG 测试在跑）。本文记录到当前为止的全部排查过程、已否定假设、和剩余嫌疑。
-> JIT 隔离测试已证明 **kernel 设计本身无问题**（不 crash），问题在 AOT 编译/接线链路。
+> 状态：排查中（no-TL-proj 判别实验在跑）。单元测试已证明 **BS 臂完全正常**（m=1/5/6 全 PASS），crash 是模型执行上下文的交互问题。
 
 ## 症状
 
@@ -133,3 +132,23 @@
 2. **JIT 隔离**是最有效的判别实验：直接区分"kernel 设计问题"vs"编译/接线问题"
 3. **静态分析有极限**：当所有边界/指针/参数都验证正确时，需要 runtime 诊断
 4. **旧日志陷阱**：build 失败时测试不跑，旧日志残留会误导判断——必须 `rm -f` 旧日志 + fail-fast
+
+## 代码级二分策略（2026-09-14 晚——用户指令：直接重写）
+
+**二分步骤 1：memory clobber only**（0b67ea9）
+- 只加 `"memory"` clobber 到 MMA 模板（不加 `.scale_vec::1X`）
+- 测试中——如果修复，编译器重排是根因
+
+**二分步骤 2：手写 kernel**（8fb3d8a）
+- 完全重写 MMA kernel（`moe_bs_handwritten.cu`）
+- 基于验证过的 tcgen05 原语（tests_tcgen05_mxf8f6f4_1x.cu）
+- 顺序执行（无 TMA/mbarrier pipeline）
+- 直接 global load（不用 TMA descriptor）
+- `__syncthreads()` 同步（不用 mbarrier）
+- Gate: `DSV41_MOE_BS_HANDWRITTEN=1`
+- 测试脚本: `~/test_handwritten.sh`
+- 如果手写版工作而 TileLang 不工作 → TileLang pipeline 结构是根因
+
+**二分步骤 3（备用）：DEV 入口表复制**
+- 让 DEV 入口 D2D 复制调用方表到 shim scratch
+- 测试是否调用方表指针有问题
