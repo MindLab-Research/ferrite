@@ -4753,6 +4753,10 @@ fn hc_tail_split() -> bool {
             if let Ok(xdp) = std::env::var("DSV41_GT_XDUMP") {
                 if layer == 0 {
                     self.gt_dump_vec(&xdp, 7, self.s.xsc4.ptr, dim / 32)?;
+                    // the raw e4m3 bytes' first 64 (as 16 reinterpreted f32) —
+                    // kind 12 — to detect a mid-loop clobber (compared against
+                    // kind 13, dumped after the routed loop).
+                    self.gt_dump_vec(&xdp, 12, self.s.xq4.ptr, 16)?;
                 }
             }
             // Fixed 6-slot device-driven loop: the expert id comes from
@@ -5001,6 +5005,10 @@ fn hc_tail_split() -> bool {
         if let Ok(xdp) = std::env::var("DSV41_GT_XDUMP") {
             if layer == 0 {
                 self.gt_dump_vec(&xdp, 9, self.s.o.ptr, 32)?;
+                // the e4m3 bytes' first 64 AFTER the routed loop — kind 13 —
+                // if these differ from kind 12, something clobbered the
+                // activation mid-loop.
+                self.gt_dump_vec(&xdp, 13, self.s.xq4.ptr, 16)?;
             }
         }
 
