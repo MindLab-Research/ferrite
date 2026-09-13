@@ -3446,3 +3446,27 @@ cd ~/ferrite/kernels/cuda && nvcc -gencode arch=compute_103a,code=sm_103a -O2 -s
 ⇒ **回归修复在两个朝向下都成立** ✓（共 4 臂、0 次 hang ✓，可复用，不重跑 ✓）；
 ⇒ **默认朝向比 swapAB 快 ~35%**（213→139 ms）——与 swapAB 分支多一次 epilogue 转置一致 ✓，
 是后续性能工作的一个现成数据点 ✓（**注意**：图关掉的诊断臂步时不是性能数，这里只作相对比较 ✓）。
+
+## §138 ⚠️ 下一臂必读：冲激仪器的**默认几何 ≠ 我们 kernel 的几何**（否则测出误导结论）
+
+`tests_bs_impulse.cu` 的环境默认值（实测 `:539-547`）：
+```
+BSLAYOUT=0（canonical）  BSPACK=0（unpacked）  BSB=0x02
+BSLBO=8  BSSBO=16  BSLAY=0  BSKBS=4096   ← 这是 "MEASURED canonical packed" 那套
+```
+而**我们 kernel 实际用的是**（§47 定谳、§116/§127 预验证）：
+
+| 参数 | 我们 kernel | 仪器默认 |
+|---|---|---|
+| 布局 | **SW128（layout=2）** | canonical（0） |
+| lbo / sbo | **1 / 64** | 8 / 16 |
+| K 组 region stride | 16 B/块、递进 **2 units** | 4096 B、递进 256 units |
+
+⇒ **按默认跑会测到"另一套布局"**，无论 PASS/FAIL 都**不能用于判定我们 kernel** ✗。
+
+**下一臂的正确用法（待 A2/D1 结果出来后执行）**：
+```bash
+/tmp/bsimp const   ;  /tmp/bsimp sweep     # 需先按上表设置 BSLBO/BSSBO/BSLAY/BSADV/BSKBS/BSLAYOUT
+```
+⇒ **执行前请先对照 `tests_bs_impulse.cu` 里 staging 分支的判据**（它支持 `BSLAYOUT=1`=SW128 ✓），
+把与我们 kernel 同构的那组 env 记下来（这是**一次性**的，之后复用 ✓）。
