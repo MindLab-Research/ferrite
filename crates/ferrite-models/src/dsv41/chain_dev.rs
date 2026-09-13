@@ -24091,6 +24091,32 @@ fn oracle_tap() -> bool {
                         )?;
                     }
                 }
+                // ---- OPT-IN (DSV41_MOE_DUMP=1, reuses the gate|up dump directory) --------------
+                // One-shot dump of the MoE's DOWNSTREAM stages so the whole routed block can be
+                // compared against the official semantics stage by stage (gate|up is already dumped
+                // before the swiglu). Rust-side only => no kernel rebuild, and it is the same
+                // blocking-D2H hazard class as the other dumps (diagnostic arms only).
+                if let Some(base) = gateup_dump_path() {
+                    static ONCE_SW: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                    if ONCE_SW.set(()).is_ok() {
+                        let n = topk * act_slot as usize;
+                        let mut buf = vec![0u8; n * 4];
+                        let view = Device::view(self.s.ex_act_b.ptr, n * 4);
+                        match self.dev.download_u8(&view, &mut buf) {
+                            Ok(()) => {
+                                let p = format!("{base}/eager/swiglu.f32");
+                                match std::fs::write(&p, &buf) {
+                                    Ok(()) => eprintln!(
+                                        "[moe-dump] wrote {n} f32 to {p} (silu(gate)*up, in place, \
+                                         pitch act_slot={act_slot})"
+                                    ),
+                                    Err(e) => eprintln!("[moe-dump] write {p}: {e}"),
+                                }
+                            }
+                            Err(e) => eprintln!("[moe-dump] read swiglu: {e}"),
+                        }
+                    }
+                }
                 // D1 boundary — the experts' ACTIVATION, `F.silu(gate) * up`, which
                 // the reference rounds with `x.to(dtype)` before `w2` runs on it
                 // (`model.py:847-849`: `return self.w2(x.to(dtype))`). The rounded

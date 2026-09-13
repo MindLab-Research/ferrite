@@ -3961,6 +3961,33 @@ wait ⇒ **到达数不可能超过等待数** ⇒ **smem 被提前覆写的竞�
   ⇒ 已接线复活 ✓ ⇒ **batch15 是第一次真正的内容校验** ✓。
 - `tcgen05.alloc` 结果已加校验；`g_a/g_sfa/g_c/g_sfdump_buf` 已在 INIT 期清零（消掉"运行间"非确定的一半 ✓）。
 
+## §151 本轮新增的门/纪律（以及一次证据状态更正）
+
+**新增门（全部默认 OFF，逐条编译验证过）**
+
+| 门 | 作用 | 判据 |
+|---|---|---|
+| `DSV41_MOE_BS_DCLEAR=1` | K 循环**之前**用 `tcgen05.st.32x32b.x4` 把 D 的 128 列显式清 0 ⇒ "首个 `enable_d=0` MMA 完成初始化"**不再承重** | 与 oracle 对齐；`+ZERO_A` 必须**精确为 0** |
+| `DSV41_MOE_BS_DCLEAR=2` | 同上但写 **qNaN 哨兵** ⇒ 兼**探测器**：任何未被本次 launch 覆写的列会把 NaN 传进输出 | 正确路径 **nan 计数必须为 0**；nan>0 ⇒ **外来列机制被证实且不再是静默** ✓ |
+| `DSV41_MOE_BS_DRAIN=1` | K 循环后一次 `commit` + 相位恒 0 的等待（`commit` 累积跟踪本线程**全部**先前 async 操作 ⇒ 不依赖 per-stage 记账） | 与 oracle 对齐 + 确定性 |
+| `DSV41_MOE_BS_PRECLEAR=1` | 发射前异步清调用方输出（区分"陈旧残留"与"本轮算出的值"） | 预清后若对齐 oracle ⇒ 陈旧残留 |
+| `DSV41_ACTQ_FLOOR=1` | 把量化下限放到 **amax**（官方 `kernel.py:76` 位置）⇒ 覆盖 `dsv41_kernels.cu` 与 `dsv41_glue.cu`（后者放在 `glue_fast_round_scale` 内部 ⇒ **一处改动覆盖 4 个调用点**） | 与官方逐字节对齐（对 routed 激活惰性） |
+
+**证据状态更正（重要）**：batch14 所有臂 `steps=0 / OUT=''` **不是** kernel 问题，而是
+**`.so` 与二进制的 build-id 不一致**（我的 `ensure_built.sh` 因**远端拷贝被截断**而在第 27 行语法错
+⇒ 只重编了 `.so`、cargo 没跑）⇒ 引擎**拒绝启动**（正是它的 build-id 守卫 ✓）。
+同时核对：被 kill 的 batch6 的 `LV_ZA` 证据链**完整**（`ARMED=1 / ZERO-DIAG mode=2 (A) / GATHER-DIAG=1` ✓）
+⇒ **此前的 ZERO_A 观测有效**，无需撤回 ✓。
+
+**新增纪律（三条，都是本轮踩出来的）**
+
+1. **构建产物三道门**：①`ensure_built.sh` 按 `.cu` 内容哈希门控（源码未变 ⇒ 零构建）②构建失败**硬中止**
+   （否则用陈旧 `.so` 测量 ✗）③`check_artifacts.sh` 现在**比对 `.so` 与二进制的 build-id**（不一致 ⇒
+   批次级中止，不再白跑一轮）✓；
+2. **脚本分发必须 md5 双验 + 远端 `bash -n`**（本地 `bash -n` 过得去 ≠ 远端拷贝完整 ✗）；
+3. **`.cu` 改动攒批**：每次 `.cu` 编辑都会触发 `build.sh`（8 TU ≈3.5 分钟）；**批次在飞时不改 `.cu`** ✓
+   （纯 Rust 改动走 mtime 门控 ⇒ 零 kernel 构建 ✓）。
+
 ⇒ 误差**只在算术内部**：K 元素配对 / 标度归属 / 逐元素映射中有一处不对，且它必须同时解释
 "量级对 + 逐元素不相关 + 非置换 + 非换 expert"。**下一判据 = `DSV41_MOE_BS_SFDUMP` 内容校验（`sfdump_check.py`）
 + 去假设 replay（`sfdump_replay.py`：输出是否等于"它自己 staged 的数据"的积）** ⇒ 分流"内容错" vs "使用错" ✓。
