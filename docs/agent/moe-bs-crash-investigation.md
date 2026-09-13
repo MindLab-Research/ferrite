@@ -3320,3 +3320,26 @@ bash ~/staged_verify.sh bench    # 博客口径（random 4k/1k、固定 1024 输
 ```
 ⚠️ `bench`/`probe` 两个 stage 目前**自己拼 serve 环境**（就是缺 `LD_LIBRARY_PATH` 的那条 ✗）⇒
 在它们改用 `arm_run` 派生环境之前，**只依赖 arm1/arm2/cpasync/promote_nodbg/spec** ✓（这五个都走已证路径 ✓）。
+
+## §131 【判定表·可复算】450 tok/s 到底要什么（不掺愿望，供全队对齐）
+
+全部数字可**逐项复算**（`tok/s = (mean-k + 1) / step`；`step = verify + draft + commit`）：
+
+| 口径 | tok/step | step | 结果 |
+|---|---|---|---|
+| **SGLang 全优化态**（4×GB300、**模拟** accept 5.5） | 6.5 | **≈7.44 ms** | 873.6 tok/s |
+| **ferrite 现状**（**真实** acc 2.24） | 3.24 | **32.51 ms**（verify 28.17 + draft 3.87 + commit 0.47） | **~100 tok/s** |
+| 若**只追平 SGLang 的 verify**（7.3 ms，项目文档里的硬锚点） | 3.24 | 11.64 ms | **278 tok/s** ✗ |
+| **要 450 @ acc 2.2** | 3.24 | **≤7.20 ms** ⇒ **verify ≤ 2.86 ms** | 需比 SGLang 实测的 verify **再快 2.5×** ✗ |
+| **要 450 @ acc 3.5** | 4.5 | ≤10.00 ms ⇒ **verify ≤ 5.66 ms** | 与 SGLang 同量级 ✓ |
+
+**三条硬结论**：
+1. **目标不是幻觉**：SGLang 在 4 卡上确实拿到 873 tok/s ✓；我们 8 卡 100 ✗ ⇒ 差距真实但**可度量**；
+   注意他们的 **step ≈ 其 verify（7.3ms）** ⇒ **draft 被压进 verify 的影子**（博客第 13/14/15 步的小批量投影/indexer/C2 融合干的就是这件事 ✓）。
+2. **用户判定标准（acc 2.2 下 450）是更硬的那条** ✗：它要求 verify ≤ 2.86 ms（比 SGLang 还快 2.5×）；
+   **若 accept 抬到 ~3.5**，门槛降到 verify ≤ 5.66 ms（与 SGLang 同量级 ✓）。
+3. **"提 accept"与"压 verify"是相乘关系**（两者都放大 `tok/step ÷ step` 的分子/分母收益）⇒
+   **两条一起走才现实**；单靠任一条都不够（只追平 SGLang 的 verify 只有 278 ✗）。
+⇒ 因此路线 = **① verify 削减**（BS 臂 gate/up + down blockscaled + cp.async + 融合重叠）
+**② accept 提升**（`ATTN_PROJ_ALIGN` / `DRAFT_MOE_MROWS` / `[acc-hist]` 从未实测 ⇒ 先测）
+**③ draft/commit 压缩**（博客第 13-15 步：小批量投影、indexer 后处理、C2 verify 压缩融合）。
