@@ -2971,3 +2971,22 @@ engram 在 draft 侧**不存在**。⇒ **draft 侧真正的可动项只有 (a) 
 ⇒ **两条路都通**，但**都要求 verify 进入 3–7 ms 量级** ⇒ **verify 削减是唯一的主线** ✓（与 §102/§114 一致）。
 ⇒ **落地载体**（按 §100/§112）：verify 侧 **MoE gate/up 的 BS 臂**（已就绪待验证）+ **down 的 blockscaled**（已入库待接线）
 + **cp.async 双缓冲**（已入库待验证）+ MROWS 族（已落地）+ 融合/重叠门。
+
+## §116 cp.async 性能门的**代码层预验证**：逐位一致性有依据（它是最可达的 verify 削减，约 −12 ms）
+
+按 §115 的算术（verify 需削 25 ms），**cp.async 双缓冲**是当前树里**最大的可达削减**
+（交接文档量化：verify 34.5 → 22 ms，**约 −12 ms**）。它已在主树、默认 OFF、待 GPU 验证。
+主 agent 读码预验证（performance gate 的判据是"**逐位一致** + p50 改善"）：
+
+| 检查项 | 实测 | 结论 |
+|---|---|---|
+| stage 数 | `NS = g_cpasync ? 2 : 1`；`s = g_cpasync ? (k & 1) : 0` | 门关时 `NS=1, s=0` ⇒ **单 stage 原语义** ✓ |
+| 写入偏移公式 | `hw_issue_stage` 的注释与实现明确引用 **同一套 SW128 公式**：`addr(m,kk) = (m/8)*1024 + (m%8)*128 + (((kk/16)^(m%8))*16) + (kk%16)` | **与非 cp.async 路径逐字相同** ✓ |
+| fp4 布局 | 仍走 `hw_pack_sw128`（§47 的容器语义） | 不变 ✓ |
+| 描述符/idesc/递进 | 其自带 INVARIANTS 声明"descriptors stay lbo=1/sbo=64/layout=2 with the ki*32 B K-advance, idesc unchanged, nibble order unchanged → the MMA consumes the same bytes in the same order. Double buffering only changes WHEN the bytes are written." | **只改"何时写"，不改"写什么/写哪"** ✓ |
+| 安全回退 | 三个对齐检查 `a_cp_ok / w_cp_ok / sf_cp_ok`（`A & 15 == 0` 等）不满足即**不走 cp.async** ⇒ 退回普通装载 | **不会因对齐问题出错** ✓ |
+| 不引入的东西 | 明确"no TMA / no mbarrier-based multi-stage pipeline (that path crashed here)" | 规避了历史上崩溃的那条路 ✓ |
+
+⇒ **结论**：该门的"逐位一致"在**代码层已成立**（同公式、同描述符、只改时序、且有对齐回退）✓
+⇒ GPU 验证只需确认 **① 两臂数值逐位一致 ② p50 改善**（`~/verify_all.sh` 的 §2b 已实现该 A/B，含逐位比对与 p50 对照）✓。
+⇒ **优先级**：在 verify 削减这条主线上，它是"落地即可用"的最大单项 ⇒ **应排在 GPU 窗口的前列** ✓。
