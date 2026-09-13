@@ -2091,3 +2091,28 @@ subagent `head-logits-verify-prep` 的纯 CPU 交付（含 f32 仿真标定）�
 
 **处置**：head 输入边界的专用门控属**可选优化**（其唯一收益是"逐项转正"的粒度；而出货配置已开整批门 ⇒
 **该项在出货配置下本就对齐** ✓）。故**不为此投入**，除非后续需要单独 A/B 该边界。
+
+## §83 【流程事故 + 修复】精度合并引入**重复函数定义** ⇒ 完整构建失败；单文件检查漏掉了它
+
+**现象**：T3 回合的输出显示 `1 error detected in the compilation of "./dsv41_glue.cu"` + `build failed`
+⇒ 该轮二进制**陈旧**（臂跑的是旧 `.so`）⇒ **该轮结果作废**。
+
+**根因**（用与 build.sh **相同**的标志复现才看到）：
+```
+dsv41_glue.cu(3281): error: function "<unnamed>::glue_e2m1_encode" has already been defined
+                                      (previous definition at line 3001)
+```
+⇒ **A3 的合并**加了带 `fminf(fabsf(v), 6.0f)` clamp 的 `glue_e2m1_encode`，
+**A2/A4 的合并**又加了同名（"假定调用方已 clamp"）的版本 ⇒ 同一匿名命名空间内**重复定义**。
+
+**修法**：**保留带 clamp 的那一版**（官方的 `fp4_quant_kernel` 正是 `T.clamp(x/s, ±6)` 之后再 `Cast(FP4,…)`
+⇒ clamp 属官方语义），删除无 clamp 的重复版；其调用方改用前者。
+**复验**：用 build.sh 的真实标志（`-O3 --use_fast_math`）编译 ⇒ **0 error**，产出 1.26 MB 目标文件 ✓。
+
+**教训（重要，已写进本次流程）**：
+1. **合并后必须用项目自身的构建验收**（`bash build.sh 103a`），**不能只靠单文件编译**——
+   我的单文件检查当时报 RC=0，却没暴露这个重复定义（标志/上下文不同）。
+2. **多个 subagent 往同一个大文件（`dsv41_glue.cu`）加"同名小工具函数"是重复定义的高危模式**——
+   以后给 subagent 的 brief 里应要求"新增辅助函数必须带唯一前缀（如 `a2_`/`a3_`/`i3_`）"。
+3. **看到 `build failed` 时，那一轮的任何 e2e 结果都不能用**（二进制陈旧 = 跑的不是你以为的代码，
+   与本项目 #1 测量偏置陷阱同类）。
