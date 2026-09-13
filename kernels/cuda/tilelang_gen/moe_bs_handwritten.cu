@@ -71,6 +71,16 @@ __device__ int g_packed = 0;
 __device__ int g_packgeom = 0;
 
 __device__ __forceinline__ int hw_pack_idx(int row, int col /* packed byte index, 0..63 */) {
+    if (g_packgeom == 3) {
+        // candidate E (most likely): PLAIN row-major, no swizzle at all. Derived from the
+        // official host-side TMA descriptor arguments (moe_bs_up_tl_host.cu:939-1000):
+        // gdim=(5120,320,384), gstride=(1,2560,819200) BYTES so W1 is [n][K/2] with a
+        // 2560 B row (K/2 packed), box=(128,64,1) -- i.e. 64 BYTES per row, giving the
+        // observed 128*64 = 8192 B sub-tile -- and the trailing 1,1,1,0 suggest swizzle 0.
+        // Plain rows then pair with lbo=1 (16 B = one packed K-block), sbo=32 (512 B = 8
+        // rows x 64 B) and layout_type=0 in the descriptor table below.
+        return row * 64 + col;
+    }
     if (g_packgeom == 1) {
         // candidate B: byte(row, kb) = (row%8)*16 + kb*128 + (row/8)*512, kb = col/16
         return (row & 7) * 16 + (col >> 4) * 128 + (row >> 3) * 512 + (col & 15);
@@ -412,12 +422,15 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
             // candidate B -> lbo=8/sbo=32/layout=0
             // candidate D -> lbo=1/sbo=32/layout=4 (SWIZZLE_64B — the documented match for a
             //                64-byte inner box; see common.h:751-757)
-            const uint64_t a_pk = (g_packgeom == 1) ? hw_make_desc(A_sh, 8, 32, 0)
+            // geom 3 (candidate E) -> lbo=1 / sbo=32 / layout=0 (plain rows, SWIZZLE_NONE)
+            const uint64_t a_pk = (g_packgeom == 3) ? hw_make_desc(A_sh, 1, 32, 0)
+                                 : ((g_packgeom == 1) ? hw_make_desc(A_sh, 8, 32, 0)
                                  : ((g_packgeom == 2) ? hw_make_desc(A_sh, 1, 32, 4)
-                                                      : hw_make_desc(A_sh, 1, 64, 2));
-            const uint64_t b_pk = (g_packgeom == 1) ? hw_make_desc(B_sh, 8, 32, 0)
+                                                      : hw_make_desc(A_sh, 1, 64, 2)));
+            const uint64_t b_pk = (g_packgeom == 3) ? hw_make_desc(B_sh, 1, 32, 0)
+                                 : ((g_packgeom == 1) ? hw_make_desc(B_sh, 8, 32, 0)
                                  : ((g_packgeom == 2) ? hw_make_desc(B_sh, 1, 32, 4)
-                                                      : hw_make_desc(B_sh, 1, 64, 2));
+                                                      : hw_make_desc(B_sh, 1, 64, 2)));
             const uint64_t a_desc_base = a_packed ? a_pk
                                      : (g_canon ? hw_make_desc(A_sh, 8, 16, 0)    // canonical SWIZZLE_NONE
                                                 : hw_make_desc(A_sh, 1, 64, 2));  // TileLang SW128

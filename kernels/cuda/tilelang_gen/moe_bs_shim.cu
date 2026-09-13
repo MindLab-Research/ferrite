@@ -655,7 +655,7 @@ bool tl_bs_init() {
     if (ok) {
         int pg = 0;
         const char* e = getenv("DSV41_MOE_BS_PACKGEOM");
-        if (e != nullptr && (e[0] == '1' || e[0] == '2')) pg = e[0] - '0';
+        if (e != nullptr && e[0] >= '0' && e[0] <= '3') pg = e[0] - '0';
         (void)cudaMemcpyToSymbol(g_packgeom, &pg, sizeof(int));
         (void)cudaGetLastError();
         fprintf(stderr, "[moe-bs] pack geometry = %d\n", pg);
