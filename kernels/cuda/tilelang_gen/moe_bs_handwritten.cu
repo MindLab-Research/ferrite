@@ -72,6 +72,33 @@ __device__ int g_packed = 1;   // DEFAULT ON: the MEASURED-correct layout (hw_pa
 // The empirical calibration (relerr==0 on a dense parity) is authoritative.
 __device__ int g_packgeom = 0;
 
+// g_cpasync: cp.async DOUBLE BUFFERING (gate DSV41_MOE_BS_CPASYNC, DEFAULT OFF).
+// ---------------------------------------------------------------------------
+// The sequential kernel exposes the whole staging latency once per K-iteration:
+// issue A/B/SF  -> LDG->STS dependency stalls the block -> __syncthreads ->
+// SF transpose (warp 2 only; warps 0/1/3 wait) -> fence -> tcgen05.cp + 4x MMA ->
+// mbarrier wait. Nothing overlaps.
+//
+// With g_cpasync=1 the A/B/SF buffers are split into TWO stages and the global
+// -> smem staging is done with `cp.async` (no register round trip, no LDG->STS
+// dependency), with the loads for K-iteration k+1 issued at the TOP of iteration
+// k so that they run concurrently with the SF transpose + MMA of iteration k:
+//
+//   per-iteration timeline (gate ON)
+//     [issue k+1 -> stage (k+1)&1] [wait k -> stage k&1] [sync] [transpose SF(k)]
+//     [fence] [tcgen05.cp + MMA(k)] [mbar wait]   <- the MMA of k overlaps the
+//                                                    in-flight loads of k+1
+//
+// INVARIANTS (must not change — see docs/agent/moe-bs-crash-investigation.md §47):
+//   * global memory layout / read formulas are IDENTICAL to the sequential path;
+//   * the fp4 operand is still staged with hw_pack_sw128 (packed bytes in 16 B
+//     containers of which only the first 8 B are read);
+//   * descriptors stay lbo=1/sbo=64/layout=2 with the ki*32 B K-advance, idesc
+//     unchanged, nibble order unchanged -> the MMA consumes the same bytes in the
+//     same order. Double buffering only changes WHEN the bytes are written.
+//   * no TMA / no mbarrier-based multi-stage pipeline (that path crashed here).
+__device__ int g_cpasync = 0;
+
 // AUTHORITATIVE fp4 smem layout, measured to EXACT parity (relerr = 0) on B300/sm_103a:
 // the hardware consumes two packed 4-bit elements per byte, but each byte pair lives in a
 // 16-BYTE container of which ONLY THE FIRST 8 BYTES ARE READ (TMA dtype 16U4_ALIGN16B =
@@ -228,6 +255,54 @@ __device__ __forceinline__ uint64_t hw_make_sf_desc(void *smem_ptr) {
 }
 
 // ============================================================
+// cp.async primitives (gate DSV41_MOE_BS_CPASYNC — see g_cpasync)
+// ============================================================
+// Only the non-bulk `cp.async` family is used here (sm_80 style). It is NOT the
+// same thing as the TMA/`cp.async.bulk` + mbarrier pipeline that crashed this
+// kernel historically: there is no descriptor, no mbarrier, no multi-stage
+// barrier object — completion is observed with the per-thread group counter
+// (`cp.async.commit_group` / `cp.async.wait_group`) plus a plain __syncthreads().
+//
+// cp-size restrictions (PTX ISA "cp.async"):
+//   * `.cg` (cache global, bypass L1) supports ONLY cp-size 16;
+//   * `.ca` (cache all levels) supports cp-size 4, 8, 16.
+// src and dst must both be aligned to cp-size — the per-operand alignment is
+// checked at runtime before the copies are issued (see hw_issue_stage).
+__device__ __forceinline__ void hw_cp_async16(void *smem_dst, const void *gmem_src) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;"
+                 :: "r"((uint32_t)__cvta_generic_to_shared(smem_dst)), "l"(gmem_src));
+}
+__device__ __forceinline__ void hw_cp_async8(void *smem_dst, const void *gmem_src) {
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 8;"
+                 :: "r"((uint32_t)__cvta_generic_to_shared(smem_dst)), "l"(gmem_src));
+}
+__device__ __forceinline__ void hw_cp_async4(void *smem_dst, const void *gmem_src) {
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;"
+                 :: "r"((uint32_t)__cvta_generic_to_shared(smem_dst)), "l"(gmem_src));
+}
+// Close the current per-thread group (all cp.asyncs issued since the last commit).
+__device__ __forceinline__ void hw_cp_async_commit() {
+    asm volatile("cp.async.commit_group;" ::: "memory");
+}
+// Wait until at most N of THIS thread's groups are still in flight. N must be a
+// compile-time immediate, hence the template (one instantiation per call site).
+template <int N>
+__device__ __forceinline__ void hw_cp_async_wait() {
+    asm volatile("cp.async.wait_group %0;" :: "n"(N) : "memory");
+}
+
+// 16 B-chunk base offset of an operand tile row, i.e. hw_smem_idx(m, c*16) — the
+// byte-wise formula collapses to `base + j` for the 16 bytes j = 0..15 of chunk c.
+//   SW128 (layout_type=2): addr(m,kk) = (m/8)*1024 + (m%8)*128 + (((kk/16)^(m%8))*16) + (kk%16)
+__device__ __forceinline__ int hw_smem_idx16_sw128(int m, int c) {
+    return (m >> 3) * 1024 + (m & 7) * 128 + (((c ^ (m & 7)) & 7) << 4);
+}
+//   canonical (layout_type=0): (kk/32)*4096 + (m/8)*256 + (m%8)*16 + ((kk%32)/16)*128 + (kk%16)
+__device__ __forceinline__ int hw_smem_idx16_canon(int m, int c) {
+    return (c >> 1) * 4096 + (m >> 3) * 256 + (m & 7) * 16 + (c & 1) * 128;
+}
+
+// ============================================================
 // 手写 MoE BS gate/up kernel — 顺序执行
 // ============================================================
 // Grid: (kGridX=5, kSegCap=36), Block: 128 threads (4 warps)
@@ -243,6 +318,223 @@ constexpr int HW_NP = 320;    // weight rows per plane
 constexpr int HW_NH = 64;     // rows per half-tile (W1 or W3)
 constexpr int HW_SEGCAP = 36;
 constexpr int HW_KITER = HW_K / HW_BK;  // 40
+
+// ============================================================
+// cp.async staging of ONE K-iteration into one stage (gate DSV41_MOE_BS_CPASYNC)
+// ============================================================
+// Byte-for-byte identical to the three sequential loader loops in the k-loop body
+// (same source addresses, same smem addresses) — only the transport differs:
+//   * A tile   : 128 rows x 128 B e4m3 = 1024 x 16 B chunks, 8 per thread.
+//                Global src  = A + row*5120 + k*128 + c*16  (5120 = 320*16 ⇒ 16 B aligned)
+//                Smem  dst   = (m/8)*1024 + (m%8)*128 + ((c ^ (m%8))*16)   [SW128]
+//                            = (c/2)*4096 + (m/8)*256 + (m%8)*16 + (c%2)*128 [canon]
+//                Both are exactly the 16 bytes hw_smem_idx(m, c*16..c*16+16).
+//   * B tile   : packed fp4, 2 planes x 64 rows x 64 packed bytes = 1024 x 8 B
+//                chunks. A packed row is 8 containers of 16 B of which only the
+//                first 8 B are read (§47), so the natural copy granularity is
+//                8 B: global src = ... + c*8 lands at the container's byte 0..7.
+//                dst = (row/8)*1024 + (row%8)*128 + ((c ^ (row%8))*16), and W3
+//                (rows 64..127) is the same formula + 8192 B.
+//                ⇒ 16 B copies are NOT usable here: the 16 B container swizzle
+//                would have to be undone (and would fetch the 8 dead bytes too).
+//   * SF       : 1 x 4 B per thread for the activation SF (128 words) and 2 x 4 B
+//                for threads 0..63 (SFW1 + SFW3, disjoint global locations).
+//                A 4 B cp.async is the smallest size available.
+__device__ __forceinline__ void hw_issue_stage(
+    int k,
+    const uint8_t* __restrict__ A, const uint8_t* __restrict__ W1,
+    const uint8_t* __restrict__ W3,
+    const uint32_t* __restrict__ SFA, const uint32_t* __restrict__ SFW1,
+    const uint32_t* __restrict__ SFW3,
+    int seg, int n_tile, int e, int64_t w_stride, int tid,
+    uint8_t* A_s, uint8_t* B_s, uint32_t* SFA_s, uint32_t* SFB_s,
+    bool a_cp_ok, bool w_cp_ok, bool sf_cp_ok)
+{
+    // swapAB flips which smem tile holds which operand (A_s = the MMA's A operand)
+    uint8_t* act_sh = g_swapab ? B_s : A_s;    // e4m3 activation tile (128 x 128 B)
+    uint8_t* w_sh   = g_swapab ? A_s : B_s;    // packed fp4 weight tile (128 x 64 B data)
+    uint32_t* sf_act = g_swapab ? SFB_s : SFA_s;
+    uint32_t* sf_w   = g_swapab ? SFA_s : SFB_s;
+
+    // (1) activation tile — 16 B chunks (cp.async.cg, the only size .cg supports)
+    if (a_cp_ok) {
+        for (int i = tid; i < HW_BM * 8; i += 128) {
+            const int m = i >> 3;   // activation row [0,128)
+            const int c = i & 7;    // 16 B chunk inside the 128 B K-tile (= tid&7)
+            const uint8_t* src = A + (int64_t)(seg * HW_BM + m) * HW_K + (int64_t)k * HW_BK + c * 16;
+            const int dst = g_canon ? hw_smem_idx16_canon(m, c) : hw_smem_idx16_sw128(m, c);
+            hw_cp_async16(act_sh + dst, src);
+        }
+    } else {
+        // unaligned base pointer (cannot happen for g_a which comes from cudaMalloc,
+        // but cp.async on a misaligned address is UB) -> byte-wise LDG/STS
+        for (int i = tid; i < HW_BM * HW_BK; i += 128) {
+            const int m = i >> 7;
+            const int kk = i & 127;
+            act_sh[hw_smem_idx(m, kk, g_canon)] =
+                A[(int64_t)(seg * HW_BM + m) * HW_K + k * HW_BK + kk];
+        }
+    }
+
+    // (2) weight tile (packed fp4): 8 B chunks, W1 rows 0..63 and W3 rows 64..127
+    if (g_packed) {
+        if (w_cp_ok) {
+            for (int i = tid; i < HW_NH * 8; i += 128) {
+                const int row = i >> 3;  // in-plane row [0,64)
+                const int c = i & 7;     // 8 B chunk inside the 64 B packed row
+                const int64_t off = (int64_t)e * w_stride +
+                                    (int64_t)(n_tile * HW_NH + row) * 2560 +
+                                    (int64_t)k * 64 + c * 8;
+                const int dst = (row >> 3) * 1024 + (row & 7) * 128 + (((c ^ (row & 7)) & 7) << 4);
+                hw_cp_async8(w_sh + dst, W1 + off);
+                hw_cp_async8(w_sh + dst + 8192, W3 + off);   // m = 64+row ⇒ +8 row-groups*1024
+            }
+        } else {
+            // w_stride (caller-measured expert stride) is not a multiple of 8 ⇒ the
+            // src would not satisfy cp.async's alignment rule. Same bytes, plain loads.
+            for (int i = tid; i < HW_NH * 64; i += 128) {
+                const int row = i >> 6;
+                const int col = i & 63;
+                const int64_t off = (int64_t)e * w_stride +
+                                    (int64_t)(n_tile * HW_NH + row) * 2560 + (int64_t)k * 64 + col;
+                w_sh[hw_pack_sw128(row, col)] = W1[off];
+                w_sh[hw_pack_sw128(HW_NH + row, col)] = W3[off];
+            }
+        }
+    } else {
+        // unpacked escape hatch (measured WRONG, §47): the byte -> 2-nibble split is a
+        // transform, not a copy, so cp.async cannot express it -> plain loads.
+        for (int i = tid; i < HW_NH * 64; i += 128) {
+            const int row = i >> 6;
+            const int col = i & 63;
+            const int64_t off = (int64_t)e * w_stride +
+                                (int64_t)(n_tile * HW_NH + row) * 2560 + (int64_t)k * 64 + col;
+            const uint8_t p1 = W1[off];
+            const uint8_t p3 = W3[off];
+            const int k0 = col * 2;
+            const int k1 = col * 2 + 1;
+            w_sh[hw_smem_idx(row, k0, g_canon)] = p1 & 0xF;
+            w_sh[hw_smem_idx(row, k1, g_canon)] = p1 >> 4;
+            w_sh[hw_smem_idx(HW_NH + row, k0, g_canon)] = p3 & 0xF;
+            w_sh[hw_smem_idx(HW_NH + row, k1, g_canon)] = p3 >> 4;
+        }
+    }
+
+    // (3) SF — 4 B words (the group-major packed scales, one u32 per K-block)
+    if (sf_cp_ok) {
+        if (tid < HW_BM) {
+            hw_cp_async4(sf_act + tid,
+                         SFA + (int64_t)k * (HW_SEGCAP * HW_BM) + seg * HW_BM + tid);
+        }
+        if (tid < HW_NH) {
+            const int64_t off = (int64_t)e * (40 * HW_NP) + (int64_t)k * HW_NP +
+                                n_tile * HW_NH + tid;
+            hw_cp_async4(sf_w + tid, SFW1 + off);
+            hw_cp_async4(sf_w + HW_NH + tid, SFW3 + off);
+        }
+    } else {
+        if (tid < HW_BM) {
+            sf_act[tid] = SFA[(int64_t)k * (HW_SEGCAP * HW_BM) + seg * HW_BM + tid];
+        }
+        if (tid < HW_NH) {
+            const int64_t off = (int64_t)e * (40 * HW_NP) + (int64_t)k * HW_NP +
+                                n_tile * HW_NH + tid;
+            sf_w[tid] = SFW1[off];
+            sf_w[HW_NH + tid] = SFW3[off];
+        }
+    }
+}
+
+// ============================================================
+// Sequential staging of ONE K-iteration (the pre-2026-09-14 path, verbatim)
+// ============================================================
+// This is a pure refactor of the three loader loops that used to live inline in
+// the k-loop body. Called with the single-buffer pointers (NS == 1, s == 0) it
+// writes exactly the same bytes to exactly the same smem addresses in exactly the
+// same order as before, so the gate-OFF path is unchanged bit for bit.
+__device__ __forceinline__ void hw_load_stage_seq(
+    int k,
+    const uint8_t* __restrict__ A, const uint8_t* __restrict__ W1,
+    const uint8_t* __restrict__ W3,
+    const uint32_t* __restrict__ SFA, const uint32_t* __restrict__ SFW1,
+    const uint32_t* __restrict__ SFW3,
+    int seg, int n_tile, int e, int64_t w_stride, int tid,
+    uint8_t* A_s, uint8_t* B_s, uint32_t* SFA_s, uint32_t* SFB_s)
+{
+    uint8_t* act_sh = g_swapab ? B_s : A_s;
+    uint8_t* w_sh   = g_swapab ? A_s : B_s;
+    uint32_t* sf_act = g_swapab ? SFB_s : SFA_s;
+    uint32_t* sf_w   = g_swapab ? SFA_s : SFB_s;
+
+    // (1) 所有线程协同加载 A tile — **CORE MATRIX 布局**（不是 row-major！）
+    // UMMA smem descriptor 期望 core matrix 布局:
+    //   addr(m, k) = (m/8)*1024 + (k/16)*128 + (m%8)*16 + (k%16)
+    // 这是 8行×16B 的 core matrix 顺序排列（m_block 外层，k_block 内层）
+    for (int i = tid; i < HW_BM * HW_BK; i += 128) {
+        const int m = i >> 7;   // row [0,128)
+        const int kk = i & 127; // col [0,128) — byte index for e4m3
+        const uint8_t val = A[(int64_t)(seg * HW_BM + m) * HW_K + k * HW_BK + kk];
+        // SW128 (CU_TENSOR_MAP_SWIZZLE_128B) — MUST match TileLang's TMA layout:
+        //   addr(r,c) = (r/8)*1024 + (r%8)*128 + (((c/16) ^ (r%8))*16) + (c%16)
+        act_sh[hw_smem_idx(m, kk, g_canon)] = val;
+    }
+
+    // (2) 所有线程协同加载 fp4 操作数（= W1 前 64 行 + W3 后 64 行）
+    //     门控 OFF：unpacked 1 字节/元素（**实测是错的**——硬件按 packed 读，见 §29），
+    //     门控 DSV41_MOE_BS_PACKED=1：整字节写入（2 元素/字节），几何见 hw_pack_idx
+    // B = W1 前 64 行 + W3 后 64 行
+    for (int i = tid; i < HW_NH * 64; i += 128) {
+        const int row = i >> 6;   // 0-63 (W1 row)
+        const int col = i & 63;   // 0-63 (packed column)
+        const uint8_t packed =
+            W1[(int64_t)e * w_stride + (int64_t)(n_tile * HW_NH + row) * 2560 + k * 64 + col];
+        // unpack to 2 elements, write in core matrix layout
+        // NIBBLE ORDER: LOW nibble = FIRST element (even K index), HIGH = SECOND
+        // This matches the old MoE path's GEMV convention:
+        //   s_lut2[t] = (decode(t & 0xF), decode(t >> 4))
+        //   gp0 = fmaf(sa[0], gt0.x, gp0)  // sa[0] (even K) × LOW nibble
+        //   gp1 = fmaf(sa[1], gt0.y, gp1)  // sa[1] (odd K) × HIGH nibble
+        // And fp4_pack_kernel: packed = (lo & 0xF) | (hi << 4), lo = element 2i
+        if (g_packed) {
+            // the hardware reads two elements per byte, in 16 B containers of which
+            // only the first 8 B are read -> write the source packed byte as-is at the
+            // authoritative offset (MEASURED exact-parity layout, see hw_pack_sw128)
+            w_sh[hw_pack_sw128(row, col)] = packed;
+        } else {
+            const int k0 = col * 2;      // first element K index
+            const int k1 = col * 2 + 1;  // second element K index
+            // SW128 swizzled write (same layout as TileLang's TMA)
+            w_sh[hw_smem_idx(row, k0, g_canon)] = packed & 0xF;
+            w_sh[hw_smem_idx(row, k1, g_canon)] = packed >> 4;
+        }
+    }
+    for (int i = tid; i < HW_NH * 64; i += 128) {
+        const int row = i >> 6;
+        const int col = i & 63;
+        const uint8_t packed =
+            W3[(int64_t)e * w_stride + (int64_t)(n_tile * HW_NH + row) * 2560 + k * 64 + col];
+        const int m = HW_NH + row;  // W3 rows are after W1
+        if (g_packed) {
+            w_sh[hw_pack_sw128(m, col)] = packed;
+        } else {
+            const int k0 = col * 2;
+            const int k1 = col * 2 + 1;
+            w_sh[hw_smem_idx(m, k0, g_canon)] = packed & 0xF;
+            w_sh[hw_smem_idx(m, k1, g_canon)] = packed >> 4;
+        }
+    }
+
+    // (3) 加载 SF
+    // SFA: [40, 4608] — SFA[k][seg*128 + i] for i in [0, 128)
+    for (int i = tid; i < HW_BM; i += 128) {
+        sf_act[i] = SFA[(int64_t)k * (HW_SEGCAP * HW_BM) + seg * HW_BM + i];
+    }
+    // SFW1/SFW3: [384, 40*320] — SFW[e][k*320 + n_tile*64 + i] for i in [0, 64)
+    for (int i = tid; i < HW_NH; i += 128) {
+        sf_w[i] = SFW1[(int64_t)e * (40 * HW_NP) + k * HW_NP + n_tile * HW_NH + i];
+        sf_w[HW_NH + i] = SFW3[(int64_t)e * (40 * HW_NP) + k * HW_NP + n_tile * HW_NH + i];
+    }
+}
 
 // smem 布局（总 98304 + SF 2048 = ~100KB，B300 227KB 内）
 // A tile: [128, 128] e4m3 = 16384 B
@@ -271,23 +563,32 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
     const int lane = tid & 31;       // 0-31
 
     // ---- smem layout ----
-    // A: [0, 16384) e4m3 tile
-    // B: [16384, 32768) unpacked fp4 tile
-    // SFA: [32768, 33280) activation SF
-    // SFB: [33280, 33792) weight SF
-    // mbar: [33792, 33800) MMA completion barrier
-    // C staging: [0, 65536) f32 output (overlaps A/B/SF/mbar — written after all MMAs,
-    //             mbarrier is no longer needed at that point)
-    // Total: 65536 bytes (dominated by C)
+    // NS = g_cpasync ? 2 : 1 stages. With NS == 1 (the default) every offset below
+    // evaluates to the historical sequential value, byte for byte:
+    //   A: [0, 16384) e4m3 tile            B: [16384, 32768) packed fp4 tile
+    //   SFA: [32768, 33280) activation SF  SFB: [33280, 33792) weight SF
+    //   mbar: [33792, 33800) MMA completion barrier
+    //   C staging: [0, 65536) f32 output (overlaps A/B/SF/mbar — written after all MMAs)
+    //   Total: 65536 bytes (dominated by C)
+    // With NS == 2 only the OPERAND region doubles (stage stride = the NS==1 size):
+    //   A: [0, 32768) | B: [32768, 65536) | SFA: [65536, 66560) | SFB: [66560, 67584)
+    //   mbar: [67584, 67592)          ⇒ operand region = 67592 B
+    //   C staging is STILL [0, 65536) and therefore still aliases the operands: the
+    //   epilogue runs after the last mbarrier wait, all 40 MMA groups have completed
+    //   and the final wait_group 0 has drained every cp.async ⇒ no reader is left.
+    //   Footprint = max(65536, 67592) = 67592 B < 227 KiB/block ✓ (and ≤ the 65536 B
+    //   C region + one stage, so 3 CTAs/SM still fit: 3*67592 = 202776 B of 227 KiB).
     extern __shared__ __align__(1024) uint8_t hw_smem[];
-    uint8_t* A_sh = hw_smem;                                   // [128, 128] e4m3
-    uint8_t* B_sh = hw_smem + 16384;                           // [128, 128] unpacked fp4
-    uint32_t* SFA_sh = (uint32_t*)(hw_smem + 32768);           // [128] activation SF
-    uint32_t* SFB_sh = (uint32_t*)(hw_smem + 33280);           // [128] weight SF
-    float* C_sh = (float*)hw_smem;                             // [128, 128] f32 (overlaps A/B — safe: written after all MMAs, mbarrier no longer needed)
-    // mbarrier for MMA completion — placed AFTER SF, within C's overlap range
-    // (safe: mbarrier is only used during k-loop; C overwrites it in epilogue after all waits)
-    uint64_t* mma_bar = (uint64_t*)(hw_smem + 33792);          // 8 bytes
+    const int NS = g_cpasync ? 2 : 1;
+    uint8_t* A_sh = hw_smem;                                   // NS stages × [128, 128] e4m3
+    uint8_t* B_sh = hw_smem + NS * 16384;                      // NS stages × [128, 64] packed fp4
+    uint32_t* SFA_sh = (uint32_t*)(hw_smem + 2 * NS * 16384);  // NS × [128] activation SF
+    uint32_t* SFB_sh = SFA_sh + NS * 128;                      // NS × [128] weight SF
+    float* C_sh = (float*)hw_smem;                             // [128, 128] f32 (aliases the operand region — safe: written after all MMAs)
+    // mbarrier for MMA completion — placed AFTER SF (one per kernel, NOT per stage:
+    // there is exactly one tcgen05.commit per K-iteration, so the parity alternation
+    // k&1 is unchanged from the sequential path)
+    uint64_t* mma_bar = (uint64_t*)(SFB_sh + NS * 128);        // 8 bytes
 
     // ---- TMEM allocation (warp 0 only) ----
     __shared__ __align__(16) uint hw_C_tmem;
@@ -318,95 +619,79 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
     __syncthreads();
     asm volatile("fence.proxy.async.shared::cta;");  // async-proxy view of the smem operands
 
-    // ---- K-loop (sequential, no pipeline) ----
+    // ---- K-loop: cp.async double-buffered (gate ON) / sequential (gate OFF) ----
+    // cp.async alignment predicates (uniform across the block, evaluated once):
+    //   * A : src = A + row*5120 + k*128 + c*16 — every term is a multiple of 16
+    //         (5120 = 320*16) and A comes from cudaMalloc ⇒ 16 B aligned. The
+    //         destination 16 B chunks are 16 B aligned by construction.
+    //   * B : src = W1/W3 + e*w_stride + row*2560 + k*64 + c*8 — 2560/64/8 are all
+    //         multiples of 8, but w_stride is CALLER-MEASURED, so it is checked.
+    //   * SF: 4 B words; base pointers are cudaMalloc'd (256 B aligned) and every
+    //         offset is expressed in u32 units.
+    // A failing predicate falls back to plain LDG/STS FOR THAT OPERAND ONLY — same
+    // bytes, same smem addresses, just latency-exposed (no numerics difference).
+    const bool a_cp_ok  = g_cpasync && (((uintptr_t)A & 15u) == 0u);
+    const bool w_cp_ok  = g_cpasync && g_packed &&
+                          ((((uintptr_t)W1 | (uintptr_t)W3) & 7u) == 0u) &&
+                          (((uint64_t)w_stride & 7u) == 0u);
+    const bool sf_cp_ok = g_cpasync &&
+                          ((((uintptr_t)SFA | (uintptr_t)SFW1 | (uintptr_t)SFW3) & 3u) == 0u);
+
+    if (g_cpasync) {
+        // PROLOGUE: stage 0 holds k = 0 — the one load that cannot be overlapped
+        hw_issue_stage(0, A, W1, W3, SFA, SFW1, SFW3, seg, n_tile, e, w_stride, tid,
+                       A_sh, B_sh, SFA_sh, SFB_sh, a_cp_ok, w_cp_ok, sf_cp_ok);
+        hw_cp_async_commit();
+    }
+
     for (int k = 0; k < HW_KITER; ++k) {
-        // (1) 所有线程协同加载 A tile — **CORE MATRIX 布局**（不是 row-major！）
-        // UMMA smem descriptor 期望 core matrix 布局:
-        //   addr(m, k) = (m/8)*1024 + (k/16)*128 + (m%8)*16 + (k%16)
-        // 这是 8行×16B 的 core matrix 顺序排列（m_block 外层，k_block 内层）
-        for (int i = tid; i < HW_BM * HW_BK; i += 128) {
-            const int m = i >> 7;   // row [0,128)
-            const int kk = i & 127; // col [0,128) — byte index for e4m3
-            const uint8_t val = A[(int64_t)(seg * HW_BM + m) * HW_K + k * HW_BK + kk];
-            // SW128 (CU_TENSOR_MAP_SWIZZLE_128B) — MUST match TileLang's TMA layout:
-            //   addr(r,c) = (r/8)*1024 + (r%8)*128 + (((c/16) ^ (r%8))*16) + (c%16)
-            (g_swapab ? B_sh : A_sh)[hw_smem_idx(m, kk, g_canon)] = val;
-        }
+        const int s = g_cpasync ? (k & 1) : 0;
+        uint8_t* A_s = A_sh + (size_t)s * HW_BM * HW_BK;   // this iteration's A stage
+        uint8_t* B_s = B_sh + (size_t)s * HW_BM * HW_BK;
+        uint32_t* SFA_s = SFA_sh + s * HW_BM;
+        uint32_t* SFB_s = SFB_sh + s * HW_BM;
 
-        // (2) 所有线程协同加载 B tile (W1 前 64 行 + W3 后 64 行)
-        // W1[e][n_tile*64 + row][k*128..k*128+127) — packed fp4，需要 unpack
-        // packed: [384, 320, 2560] — expert e 的 W1 面
-        // row r 的第 k*128..k*128+127 列 = packed bytes [r*2560 + k*64 .. +64)
-        // (2) 所有线程协同加载 fp4 操作数（= W1 前 64 行 + W3 后 64 行）
-        //     门控 OFF：unpacked 1 字节/元素（**实测是错的**——硬件按 packed 读，见 §29），
-        //     门控 DSV41_MOE_BS_PACKED=1：整字节写入（2 元素/字节），几何见 hw_pack_idx
-        // B = W1 前 64 行 + W3 后 64 行
-        for (int i = tid; i < HW_NH * 64; i += 128) {
-            const int row = i >> 6;   // 0-63 (W1 row)
-            const int col = i & 63;   // 0-63 (packed column)
-            const uint8_t packed =
-                W1[(int64_t)e * w_stride + (int64_t)(n_tile * HW_NH + row) * 2560 + k * 64 + col];
-            // unpack to 2 elements, write in core matrix layout
-            // NIBBLE ORDER: LOW nibble = FIRST element (even K index), HIGH = SECOND
-            // This matches the old MoE path's GEMV convention:
-            //   s_lut2[t] = (decode(t & 0xF), decode(t >> 4))
-            //   gp0 = fmaf(sa[0], gt0.x, gp0)  // sa[0] (even K) × LOW nibble
-            //   gp1 = fmaf(sa[1], gt0.y, gp1)  // sa[1] (odd K) × HIGH nibble
-            // And fp4_pack_kernel: packed = (lo & 0xF) | (hi << 4), lo = element 2i
-            if (g_packed) {
-                // the hardware reads two elements per byte, in 16 B containers of which
-                // only the first 8 B are read -> write the source packed byte as-is at the
-                // authoritative offset (MEASURED exact-parity layout, see hw_pack_sw128)
-                (g_swapab ? A_sh : B_sh)[hw_pack_sw128(row, col)] = packed;
+        if (g_cpasync) {
+            // (0) PREFETCH k+1 into the OTHER stage, then wait for stage s. Buffer
+            //     (1-s) was last read by iteration k-1, whose MMAs completed at the
+            //     end of that iteration (mbarrier wait + __syncthreads) ⇒ it is free.
+            if (k + 1 < HW_KITER) {
+                hw_issue_stage(k + 1, A, W1, W3, SFA, SFW1, SFW3, seg, n_tile, e, w_stride, tid,
+                               A_sh + (size_t)(1 - s) * HW_BM * HW_BK,
+                               B_sh + (size_t)(1 - s) * HW_BM * HW_BK,
+                               SFA_sh + (1 - s) * HW_BM, SFB_sh + (1 - s) * HW_BM,
+                               a_cp_ok, w_cp_ok, sf_cp_ok);
+                hw_cp_async_commit();
+                hw_cp_async_wait<1>();   // the prefetch group stays in flight; stage s is done
             } else {
-                const int k0 = col * 2;      // first element K index
-                const int k1 = col * 2 + 1;  // second element K index
-                // SW128 swizzled write (same layout as TileLang's TMA)
-                (g_swapab ? A_sh : B_sh)[hw_smem_idx(row, k0, g_canon)] = packed & 0xF;
-                (g_swapab ? A_sh : B_sh)[hw_smem_idx(row, k1, g_canon)] = packed >> 4;
+                hw_cp_async_wait<0>();   // last iteration: nothing prefetched, drain all
             }
-        }
-        for (int i = tid; i < HW_NH * 64; i += 128) {
-            const int row = i >> 6;
-            const int col = i & 63;
-            const uint8_t packed =
-                W3[(int64_t)e * w_stride + (int64_t)(n_tile * HW_NH + row) * 2560 + k * 64 + col];
-            const int m = HW_NH + row;  // W3 rows are after W1
-            if (g_packed) {
-                (g_swapab ? A_sh : B_sh)[hw_pack_sw128(m, col)] = packed;
-            } else {
-                const int k0 = col * 2;
-                const int k1 = col * 2 + 1;
-                (g_swapab ? A_sh : B_sh)[hw_smem_idx(m, k0, g_canon)] = packed & 0xF;
-                (g_swapab ? A_sh : B_sh)[hw_smem_idx(m, k1, g_canon)] = packed >> 4;
-            }
+        } else {
+            // the pre-2026-09-14 sequential staging, verbatim (see hw_load_stage_seq)
+            hw_load_stage_seq(k, A, W1, W3, SFA, SFW1, SFW3, seg, n_tile, e, w_stride, tid,
+                              A_s, B_s, SFA_s, SFB_s);
         }
 
-        // (3) 加载 SF
-        // SFA: [40, 4608] — SFA[k][seg*128 + i] for i in [0, 128)
-        for (int i = tid; i < HW_BM; i += 128) {
-            (g_swapab ? SFB_sh : SFA_sh)[i] = SFA[(int64_t)k * (HW_SEGCAP * HW_BM) + seg * HW_BM + i];
-        }
-        // SFW1/SFW3: [384, 40*320] — SFW[e][k*320 + n_tile*64 + i] for i in [0, 64)
-        for (int i = tid; i < HW_NH; i += 128) {
-            (g_swapab ? SFA_sh : SFB_sh)[i] = SFW1[(int64_t)e * (40 * HW_NP) + k * HW_NP + n_tile * HW_NH + i];
-            (g_swapab ? SFA_sh : SFB_sh)[HW_NH + i] = SFW3[(int64_t)e * (40 * HW_NP) + k * HW_NP + n_tile * HW_NH + i];
-        }
-
+        // Block-wide visibility of stage s: every thread's own cp.async group has
+        // completed (wait_group above) and this barrier orders those writes against
+        // the SF transpose / fence / MMA that follow. In the gate-OFF path it is the
+        // exact same single barrier that used to follow the LDG/STS loops.
         __syncthreads();
 
         // (4) warp 2: SF 转置（tcgen05_cp 需要的 smem 布局）
         if (warp == 2) {
-            hw_sf_transpose(SFA_sh);
-            hw_sf_transpose(SFB_sh);
+            hw_sf_transpose(SFA_s);
+            hw_sf_transpose(SFB_s);
         }
         __syncthreads();
 
         // (4.5) ★ ASYNC-PROXY FENCE (root cause fix 2026-09-14):
         // The MMA (tcgen05.mma) and the SF copy (tcgen05.cp) read shared memory through
-        // the ASYNC proxy, while A_sh / B_sh / SFA_sh / SFB_sh were just written with
-        // GENERIC stores. Per the PTX memory model the generic writes must be made
-        // visible to the async proxy with `fence.proxy.async` — TileLang's generated
+        // the ASYNC proxy, while the operand stage (A_s / B_s / SFA_s / SFB_s — single
+        // buffer A_sh/B_sh/SFA_sh/SFB_sh when the cp.async gate is OFF) was just
+        // written with GENERIC accesses (LDG/STS stores OR cp.async copies). Per the
+        // PTX memory model those generic-proxy writes must be made visible to the async
+        // proxy with `fence.proxy.async` — TileLang's generated
         // code does exactly this (tl::fence_proxy_async() in its consumer path) but our
         // hand-written kernel only fenced once outside the k-loop. Without it the MMA
         // can read STALE smem from the previous k-iteration/launch. This is invisible
@@ -424,8 +709,8 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
             // SF copy: SFA → SF_tmem+0, SFB → SF_tmem+4
             // (elect_one_sync: single thread issues the copy)
             if (lane == 0) {
-                hw_tc_cp(hw_make_sf_desc(SFA_sh), SF_tmem + 0);
-                hw_tc_cp(hw_make_sf_desc(SFB_sh), SF_tmem + 4);
+                hw_tc_cp(hw_make_sf_desc(SFA_s), SF_tmem + 0);
+                hw_tc_cp(hw_make_sf_desc(SFB_s), SF_tmem + 4);
             }
 
             // MMA: 4 sub-MMAs (ki=0-3, each covers 32 K elements)
@@ -451,14 +736,14 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
             // The packed layout pairs with the VENDOR's unchanged descriptor (1,64,2) and
             // the standard ki*32 B advance — measured exact PARITY with relerr = 0 when
             // combined with hw_pack_sw128, and FAILING for every other combination.
-            const uint64_t a_pk = hw_make_desc(A_sh, 1, 64, 2);
-            const uint64_t b_pk = hw_make_desc(B_sh, 1, 64, 2);
+            const uint64_t a_pk = hw_make_desc(A_s, 1, 64, 2);
+            const uint64_t b_pk = hw_make_desc(B_s, 1, 64, 2);
             const uint64_t a_desc_base = a_packed ? a_pk
-                                     : (g_canon ? hw_make_desc(A_sh, 8, 16, 0)    // canonical SWIZZLE_NONE
-                                                : hw_make_desc(A_sh, 1, 64, 2));  // TileLang SW128
+                                     : (g_canon ? hw_make_desc(A_s, 8, 16, 0)    // canonical SWIZZLE_NONE
+                                                : hw_make_desc(A_s, 1, 64, 2));  // TileLang SW128
             const uint64_t b_desc_base = b_packed ? b_pk
-                                     : (g_canon ? hw_make_desc(B_sh, 8, 16, 0)
-                                                : hw_make_desc(B_sh, 1, 64, 2));
+                                     : (g_canon ? hw_make_desc(B_s, 8, 16, 0)
+                                                : hw_make_desc(B_s, 1, 64, 2));
 
             for (int ki = 0; ki < 4; ++ki) {
                 // idesc: M=128, N=128, a_fmt=0 (E4M3), b_fmt=5 (E2M1), sf_id=ki

@@ -232,6 +232,23 @@ constexpr size_t kSmem = 166912;  // stages=3: ab 98304 + sf 3072 + c 65536
 // 每 expert 的 packed SF 池字节（w1 与 w3 各一份）
 constexpr size_t kSfPlaneBytes = (size_t)kSfWords * kNp * 4;  // 51200 B/面/expert
 
+// ---- 手写 kernel 的动态 smem（gate DSV41_MOE_BS_HANDWRITTEN=1 的路径）--------
+// 手写 kernel 的布局（见 moe_bs_handwritten.cu 的 smem layout 注释）：
+//   门控 DSV41_MOE_BS_CPASYNC **OFF**（默认）：单缓冲 A/B/SF/mbar = 33800 B，C staging
+//     65536 B 与 offset 0 别名 ⇒ launch 只需 65536 B（= 历史值，逐字节不变）。
+//   门控 **ON**：操作数区分成 2 个 stage，A 2×16384 | B 2×16384 | SFA 2×512 | SFB 2×512
+//     | mbar 8 = 67592 B；C staging 仍是 [0, 65536) 且仍与操作数别名（epilogue 在
+//     最后一次 mbarrier wait + wait_group 0 之后才写）⇒ launch 需 max(65536, 67592)
+//     = 67592 B。3 个 CTA 共 202776 B < 227 KiB/SM ✓（smem 不成为 occupancy 限制）。
+// ⚠️ 两者都必须 ≤ SetAttribute 设的上限，否则 launch err 1 静默回退。这里把上限一次
+//    设成最大值（只是抬高允许值；OFF 路径仍按 65536 发射，行为不变）。
+constexpr size_t kSmemHwSingle = 65536;
+constexpr size_t kSmemHwDouble = 67592;
+static_assert(kSmemHwDouble <= 227 * 1024, "handwritten smem exceeds the sm_100 227 KiB/block limit");
+// 由 tl_bs_init() 从 env 读一次；device 侧的 g_cpasync 用同一个值 ⇒
+// 「stage 布局」与「launch 的 smem 大小」不可能不一致。
+static bool g_hw_cpasync = false;
+
 // ---- 常驻 scratch（INIT 期分配一次，进程生命周期内复用）--------------------
 uint8_t* g_a = nullptr;         // [SEG_CAP*BM, dim] u8 e4m3（1 B/value）
 uint32_t* g_sfa = nullptr;      // [kSfWords * SEG_CAP*BM] u32 group-major
@@ -647,10 +664,12 @@ bool tl_bs_init() {
                                    (int)kSmem) == cudaSuccess;
     (void)cudaGetLastError();
     // HANDWRITTEN kernel 也需要自己的 SetAttribute（smem=65536 > 48KB 默认）
+    // 上限一次设成双缓冲的最大值（67592）：gate OFF 时仍按 65536 发射，行为不变；
+    // 若只设 65536 而 gate ON，launch 会返回 err 1 并静默回退老路径。
     if (ok) {
         ok = cudaFuncSetAttribute(moe_bs_handwritten_kernel,
                                   cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                  65536) == cudaSuccess;
+                                  (int)kSmemHwDouble) == cudaSuccess;
         (void)cudaGetLastError();
     }
     // HANDWRITTEN kernel 的 .scale_vec::1X 运行期选择（asm 必须编译期，两种拼写
@@ -713,6 +732,19 @@ bool tl_bs_init() {
         (void)cudaMemcpyToSymbol(g_swapab, &sw, sizeof(int));
         (void)cudaGetLastError();
         fprintf(stderr, "[moe-bs] swapAB = %d\n", sw);
+    }
+    // g_cpasync: cp.async DOUBLE BUFFERING of the HANDWRITTEN kernel's A/B/SF staging
+    // (gate DSV41_MOE_BS_CPASYNC, DEFAULT OFF). Both the device-side stage layout
+    // (g_cpasync) and the launch-time dynamic smem size are derived from this single
+    // host-side flag, so they can never disagree.
+    if (ok) {
+        const char* e = getenv("DSV41_MOE_BS_CPASYNC");
+        g_hw_cpasync = (e != nullptr && e[0] == '1');
+        int cp = g_hw_cpasync ? 1 : 0;
+        (void)cudaMemcpyToSymbol(g_cpasync, &cp, sizeof(int));
+        (void)cudaGetLastError();
+        fprintf(stderr, "[moe-bs] handwritten cp.async double buffer = %d (smem %zu)\n",
+                cp, g_hw_cpasync ? kSmemHwDouble : kSmemHwSingle);
     }
 
     // (b) 常驻 scratch
@@ -1168,7 +1200,9 @@ extern "C" int dsv41_moe_tilelang_gate_up_bs_dev(
             fprintf(stderr, "[moe-bs] HANDWRITTEN kernel active (DSV41_MOE_BS_HANDWRITTEN=1) — "
                             "sequential execution, no TMA pipeline\n");
         }
-        moe_bs_handwritten_kernel<<<dim3((unsigned)kGridX, (unsigned)kSegCap), 128, 65536, s>>>(            g_a, (const uint8_t*)w1, (const uint8_t*)w3, g_sfa,
+        moe_bs_handwritten_kernel<<<dim3((unsigned)kGridX, (unsigned)kSegCap), 128,
+                                        g_hw_cpasync ? kSmemHwDouble : kSmemHwSingle, s>>>(
+            g_a, (const uint8_t*)w1, (const uint8_t*)w3, g_sfa,
             (const uint32_t*)sfw1, (const uint32_t*)sfw3, eid_dev, g_c, w_stride);
         cudaError_t ehw = cudaGetLastError();
         if (ehw != cudaSuccess) return (int)ehw;
