@@ -3999,6 +3999,58 @@ wait ⇒ **到达数不可能超过等待数** ⇒ **smem 被提前覆写的竞�
 | 🔍 **DeepGEMM 的 clear 判据是 `k_block_idx`（"每个 (m,n) 输出 tile 都重新 clear 一次"）** | 同 §1 | **已核对并撤回误读**：我们的 `enable_d` 判据对**每个 CTA 的一块 (m,n) tile** 各清一次 —— gate/up 臂 grid=(5,36) ⇒ 每 CTA 一块 128×128 ✓；down 臂 `DN_SPANS=3` 是 **K-stage**（K=320=128+128+64 ✓）、grid x = `dim/DN_BN` ⇒ **每 CTA 也只覆盖一块 N-tile** ✓ ⇒ 三者（DeepGEMM / gate-up / down）**同粒度** ✓（起初把 `sp` 误读成 N-chunk ✗，已由源码核对更正 ✓） |
 | `tcgen05.mma` **没有 `.init` 变体**；`tcgen05.st` 需 `tcgen05.wait::st`；跨线程可见性靠 `tcgen05.fence::before/after_thread_sync` | PTX ISA 9.x | 与 §149 的加固一致 ✓（`DCLEAR` 用 `st`+`wait::st` ✓；故新派审计专门核对 fence） |
 
+## §153 判定表：机制 → 预期签名 → 动作（**结果一到就直接执行，不再多一轮解读**）
+
+| 观测（batch15/16 的读法） | 机制判定 | 立刻执行的动作 |
+|---|---|---|
+| `ZERO_ALL`（A+SF+eid 全零）下输出 **非 0** 且 `gc_*` 原始 tile **非 0** | MMA 读到了本轮没写的 TMEM（外来残留；§149/§150） | 开 `DSV41_MOE_BS_DCLEAR=2`（哨兵）→ 若输出**无 NaN** ⇒ 已修 ✓；若**有 NaN** ⇒ 定位到具体列/grid 位置（`gc_all.f32` 按 seg/n_tile 切开看是**哪几块**） |
+| `DCLEAR=2` 下输出 **含 NaN** | 某些列**任何** MMA 都没写 ⇒ 描述符/`ki` 覆盖不全（或 `C_tmem` 列基址错） | 查 D 的列覆盖：`n_dim`/`idesc`/`C_tmem` 分配列数；用 `gc_all` 的 NaN 分布反推缺失列 → 见 `addr-crosscheck` 的 8 项表 |
+| `ZERO_ALL` 下输出 **恰好 0**，但无 `DCLEAR` 时 **非 0** | clear MMA 本身正常，问题在**多 stage 累加** | 开 `MBAR_PERSTAGE`（或 `DRAIN`）：若两次运行**逐位相同**且对齐 oracle ⇒ 已修 ✓ |
+| 两次同配置运行**仍然不同**（`cmp` 失败） | 仍有未消除的时序/残留 | 同时开 `DRAIN=1` + `PERSTAGE=1` + `CLEAR=2` 复测；若仍不同 ⇒ 用 `SPIN_CAP=1` 强制走 abort 路径看是否变为**确定性哨兵**（即"等待确实超时"） |
+| `SFDUMP` 内容校验**报出不匹配**（首次真实校验，§151） | staged 内容与官方 ckpt 不同（装载/gather/pack） | 按 checker 指出的**第一个不等位置**定位：A/SFA ⇒ gather；B/SFB ⇒ 装载期 pack |
+| `KEEP_STAGE=s` 的输出等于**别的 stage** 的 oracle 偏积 | per-stage 推进错位（A 与标度不同步） | 修正对应推进（A `k*128` / W `k*64` / SFA `k*4608` / SFW `k*320`）——由 `addr-crosscheck` 表给出该处的**行内展开式** |
+| 以上全部**正常**但文本仍错 | 缺陷在 **gate/up 之外**（down/swiglu/共享专家/attention） | 用 `moe_out.f32` + `swiglu.f32` + 整块 oracle（`wholeblock-oracle` 在产）逐阶段定位 |
+
+**纪律**：每条只允许**一次**判定（上表直接映射）；**不再新增仪器**，除非上表所有行都无法解释观测 ✓。
+
+## §154 【已证伪，禁止再追】cp.async 预取竞争；以及两条"可信 vs 不可信"的判定
+
+**① `cp.async` 竞争假设：证伪 ✗。** 门 `DSV41_MOE_BS_CPASYNC` **默认 OFF**（`moe_bs_shim.cu:237` 明写）⇒ 迄今所有臂跑的都是**顺序加载**路径 ⇒ "预取未等待 ⇒ MMA 读半装好的 stage"**不可能是**我们观测到的病因 ✓。**以后不许再提这条**（除非门的默认值被改 ✓）。
+
+**② 三条 ZERO 读数的可信度判定（`batch11` 免费数据 + 代码核对）**
+
+| 读数 | 值 | 判定 |
+|---|---|---|
+| `ZERO_ALL`（A+SF+**eid** 全零） | 1.23e-36 ≈ 0 | **不可信** ✗：mode 3/4 会零 `eid`，而段表**由 eid 构建** ⇒ 表退化 ⇒ scatter 什么都不写 ⇒ `ex_act_b` 保持 `cudaMalloc` 后的原样（近零）⇒ 这是**空缓冲**，不是"零乘积" ✓ |
+| `ZERO_A`（只零 A） | 0.248 | **可信** ✓（表正常、散布正常）；⇒ **单独把 A 置零，乘积不为零** ✗ |
+| `ZERO_SF`（只零 SF） | 0.165 | **可信** ✓；⇒ **单独把 SF 置零，乘积不为零** ✗ |
+
+两个单因子读数**互相矛盾于乘积模型** ⇒ 它们共同指向"**MMA 读取的操作数不是我们刚写进全局缓冲的那份**"（即 staged smem 与我们的预期不一致）✓ —— 与**唯一两条完全可信的异常**一致：
+(a) 与官方 oracle 不符（median rel≈1.2、corr≈0.04；用逐位校验过 oracle 判定 ✓）；
+(b) **同样输入两次运行输出不同**（max|d|=8.54；输入 x/ids/xq4/xsc4 已逐字节核对相同 ✓）。
+
+⇒ **剩下的时序源**（按可证伪性排序）：①**MMA 完成等待提前通过**（epilogue/散射读到未写完状态）⇒ 由 `MBAR_PERSTAGE` / `DRAIN` 判决（batch15/16）②**scatter 的 smem 读范围 > epilogue 的写范围**（新 CTA 的 smem 未定义）⇒ 可**静态判定**，已派专项审计 ✓。
+**新探针**：`DSV41_MOE_BS_ZERO_ASF=1`（mode 5：只零 A+SF，**eid 保持**）⇒ 表有效、散布正常 ⇒ **零乘积必须是精确 0**；非零即证明 MMA 读的不是我们 staged 的操作数 ✓。
+
+## §155 🎯 多 slot barrier 的到达落点（batch15 的判决，当前头号战场）
+
+**实测**：`DSV41_MOE_BS_MBAR_PERSTAGE=1`（每 K-stage 一个 barrier，相位恒 0）⇒ **每个 stage 的等待都自旋到上限**：
+step **153 ms**（对照默认 **13 ms**）、日志冻结、watchdog 杀 ✗✗。而**默认单 barrier**（slot 0）**完全正常** ✓。
+
+**代码核对**（`moe_bs_handwritten.cu`）：三条路径的地址与相位表达式**逻辑上都是对的** ——
+`bar = g_mbar_perstage ? &mma_bar[k] : (g_mbar_ring ? &mma_bar[k & 1] : mma_bar)`、
+`phase = g_mbar_perstage ? 0u : (g_mbar_ring ? ((k>>1)&1) : (k&1))`（`:1179-1182`）；
+init 正确（40 个 `mbarrier.init(..., 1)` + `fence.mbarrier_init` ✓）；commit/wait 同一线程对 ✓（发射者 warp1 lane0、等待者 tid0 ✓）。
+⇒ **⇒ 结论：逻辑对、到达没落 ⇒ 问题在"`tcgen05.commit` 的 barrier 操作数语义"**
+（`hw_tc_commit` 用 `…mbarrier::arrive::one.**shared::cluster**.b64` + `__cvta_generic_to_shared` ✓，`:226-229`）。
+参照物：**隔离仪器 `tests_bs_impulse.cu` PASS**，它也只用**一个** `__shared__ s_mbar`（`:273/394/398`）⇒ 与默认路径同构 ✓，**因此从未检验过多 slot** ✓。
+
+**待判（batch17 已备、精简为 5 条臂）**：`MBAR_RING`（slot 0/1）vs `DRAIN`（slot 40）——
+ring 也挂 ⇒ 寻址/指令形式；ring 正常 ⇒ 我的 per-stage 循环/初始化逻辑 ✗。
+
+**纪律（用户 2026-09-14 明确）**：**禁止 pass 2**（不重跑已判定的臂）；**禁止空跑 baseline**（基准已有）；
+**不堆新仪器**（仪器已够：oracle / 阶段 dump / 判别门 / 检查器）⇒ 每条臂必须回答一个**尚未被回答**的问题 ✓。
+
 ⇒ 误差**只在算术内部**：K 元素配对 / 标度归属 / 逐元素映射中有一处不对，且它必须同时解释
 "量级对 + 逐元素不相关 + 非置换 + 非换 expert"。**下一判据 = `DSV41_MOE_BS_SFDUMP` 内容校验（`sfdump_check.py`）
 + 去假设 replay（`sfdump_replay.py`：输出是否等于"它自己 staged 的数据"的积）** ⇒ 分流"内容错" vs "使用错" ✓。
