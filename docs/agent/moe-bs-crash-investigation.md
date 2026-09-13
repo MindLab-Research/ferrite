@@ -3517,3 +3517,21 @@ grep -E "\[acc-hist" ~/armrun_ACC.log | tail -30       # 逐 step 直方图 + �
 ```
 **判读**：拿到真实 `k_acc` 分布后，才能回答 §106 留下的问题——**2.24 是"draft 质量的合理值"还是"有条件被浪费"** ✗；
 若分布显示大量 step 打满块长（k_acc=5 ✓）而均值仍低 ⇒ 说明**部分 step 空转**（可修的机制问题 ✓）。
+
+## §140 【收窄】两个朝向都错 ⇒ 缺陷在**共用环节**，不在朝向分支
+
+A2/D1 臂实测（同构建、同 prompt、各 48 step、`ar5-hang=0`）：
+```
+A2（默认/非 swapAB）: OUT = '\n(\ufffd \t\ufffd-- \ufffd-- 6- 6. 6. 6. 6. 6. 6. 6. 6. 6'   ✗
+D1（DIFF_EAGER, swapAB）: OUT = '\n+人\n+人\n-人\n-人\n人\n人…'                  ✗（且无 diff 行）
+C1（swapAB）        : OUT = '\n-\t\t\t… 7. 1. 0. 1. 0. 1.0.0.0(1.0.0.0'         ✗
+OLD（旧路径，地面真值）: OUT = '1\n2\n3\n4\n5\n6\n7\n8\n9\n10'                ✓
+```
+**三条推论**：
+1. **两个朝向都错** ✗ ⇒ 缺陷在**两者共用**的环节（loader 取数 / SF / K 循环 / MMA 发射），
+   **不是** swapAB 的 epilogue 分支 ✓（排除 §62/§45 那一支）；
+2. **两臂的垃圾里都含无效 UTF-8（`\ufffd`）** ✗ ⇒ 错误是**大幅**的（不是细微标度偏移）；
+3. **`DSV41_DIFF_EAGER` 在 plain decode 下不产 `[diff]` 行** ✗ —— 它挂在 **spec 步骤**里
+   （`serve.rs:693` 上下文的 `dspark_spec_step` 路径 ✓）⇒ **plain-decode 的诊断要用**：
+   `DSV41_MOE_BS_NUMCHECK=1`（数值对拍 ✓，§139 ①）**或** kernel 隔离仪器（§138 ②）✓。
+⇒ **下一步即 §139 的队列**（已在跑：kernel 隔离 + NUMCHECK 单臂）✓。
