@@ -291,27 +291,6 @@ __device__ __forceinline__ void hw_tc_wait_ld() {
     asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
 }
 
-// SF 的 smem→TMEM 前置换：把"每行一个 u32"的 smem 转成 UTCCP(`32x128b.warpx4`) 要的形状。
-//
-// ⚠️ 形态必须与 DeepGEMM（SGLang 在 SM100/103 上跑同款模型的**生产实现**）一致：
-//     out[lane*4 + j] = in[j*32 + lane]        （`sm100_fp8_fp4_gemm_1d1d.cuh` 的
-//                                              `utccp_required_smem_warp_transpose`）
-// 我们此前用的是 TileLang 模板 `tcgen05_sf_warp_transpose` 的版本，它对源下标多了一个
-// `^ (lane>>3)` 的 XOR ⇒ 对 lane ≥ 8 的行（即 3/4 的行）会把 4 个 32-K 块的标度互相错位。
-// 该 XOR 路径从未被独立验证（隔离仪器走 `tcgen05.st`，完全绕过本函数），而 DeepGEMM 的
-// 无 XOR 版本是外部生产证据 ⇒ **默认改成无 XOR**。`DSV41_MOE_BS_SFXOR=1` 可退回旧形态。
-__device__ __forceinline__ void hw_sf_transpose(uint32_t* smem_ptr) {
-    const int lane = threadIdx.x & 31;
-    uint32_t values[4];
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        values[i] = smem_ptr[(g_sfxor ? (i ^ (lane >> 3)) : i) * 32 + lane];
-    }
-    __syncwarp();
-#pragma unroll
-    for (int i = 0; i < 4; ++i) smem_ptr[lane * 4 + i] = values[i];
-}
-
 // SF copy to TMEM（从 TileLang tcgen05_cp 复制——32x128b.warpx4 shape）
 __device__ __forceinline__ void hw_tc_cp(uint64_t smem_desc, uint32_t tmem_col) {
     asm volatile("tcgen05.cp.cta_group::1.32x128b.warpx4 [%0], %1;"
