@@ -2556,3 +2556,34 @@ W 回合（`83c08750`）的配置特征：
 改为回答三件事：① `k_acc` 与"每步接受 token 数"是否同一口径；② 在不改 draft 质量的前提下，
 spec 机制本身有无被浪费的接受机会（block 偏小、过早 commit、mask 误挡）；③ **收益换算**：
 acc 2.2→3.0/3.5 各对应多少 tok/s（**并明确"提 acc"与"压 step"哪个更划算**）。
+
+## §100 【GEMM dispatch 审计结论】快慢分裂在哪里（对应博客第一条教训）
+
+来源：subagent `gemm-dispatch-audit`（纯 CPU 只读，逐调用点追 env 门 + 形状启发式 + `supports_*()`，
+并以 `~/push400_hw_test.sh` 的**逐字 env 列表**为"出货配置"基准）。
+
+### 结论 1：稠密投影族**已经还清**博客第一条教训 ✓
+出货配置把 **wq_a/wkv/wq_b/wo_a/wo_b（verify+eager）、routed gate/up、共享专家、head** 全部推到了
+TileLang/tcgen05 快内核（`DSV41_GEMM_TILELANG=1` + `_EAGER=1`、`DSV41_MOE_TILELANG_BS=1`、
+`DSV41_SH_EXP_TILELANG=1`、`DSV41_HEAD_TILELANG=1`）✓ ⇒ SGLang 那条"FP8 布局不匹配→慢回退"
+在本项目稠密族上**不存在** ✓。
+
+### 结论 2：**最大结构性缺口 = MoE down 方向没有 blockscaled/tcgen05** ✗
+- **gate/up**：走 tcgen05 block-scaled MMA（快）✓
+- **down**：仍走 SIMT `expert_gemv_fp4_down_reduce_kernel` —— **v3 profile 1.00 ms/步、占 10.3%**，
+  且是**占用率受限**的核 ⇒ "快慢分裂最刺眼的一条" ✓
+⇒ **这是对标博客第 12 步（verify/MoE 融合）时最大的一块肉**，且与我们 BS 臂的工作**同源**
+（同一套 fp4 blockscaled 语义，§47 的容器布局可直接复用）✓。
+
+### 结论 3：**draft（MTP）侧整体没进 TileLang/tcgen05** ✗
+`draft_moe` 的 routed gate/up/down **全是 SIMT fp4**；`draft_attention` 的四个投影走
+`gemm_fp8_mx(m=bs)` 的 **16-row TILE MMA program**，既不是 verify 的 mrows program、也不是 TileLang
+⇒ 而博客第 11 步（DSpark）恰是最大单步杠杆（×3）⇒ **draft 侧的 kernel 化是仅次于 down 的杠杆** ✓。
+
+### 结论 4：若干"内核就绪、只差一个 env"
+compressor 投影 mrows、`ATTN_PROJ_ALIGN` 等**代码已在**，出货脚本未开 ⇒ **先验证再开**（§87 判据）✓。
+
+### 其它值得注意的中速项
+- `wo_b`（eager）：`DSV41_WOB_F32` **默认 ON** ⇒ 走 SIMT f32 GEMV，**跳过 fp8 往返**（非 tensor core）⇒ 中等；
+- `idx_wq_b`：TileLang wq_b 在该站 **decline**（`out_stride == n`，`chain_dev.rs:7305-7306`）⇒ 落 SIMT `gemm_fp8_mx_rope`；
+- `comp_wkv/comp_wgate`（eager）：`lin_f32_on` → SIMT f32 GEMV。
