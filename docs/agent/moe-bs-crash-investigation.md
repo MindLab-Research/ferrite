@@ -2902,8 +2902,13 @@ tests_dn_bs_parity.cu(347)/(359): error: too few arguments in function call
 ```
 - 一处**已修**：`dsv41_expert_down_reduce_fp4_batched`（SIMT 参考）在 `DSV41_SEQ_ALIGN` 合并（#5）后**多了一个 `seq_align` 形参**
   ⇒ harness 写于该 ABI 变更之前 ⇒ 已补 `0` ✓（279/306 行）。
-- **剩余两处（347/359）**：调用**新 shim 的入口** `dsv41_moe_bs_down_dev`（`moe_bs_dn_shim.cu:244`）时同样少传参数/类型不符
-  ⇒ 修法：**照 `moe_bs_dn_shim.cu:244` 的完整形参表补齐这两处调用**（并确认 `cudaStream_t` 作为最后一个实参）。
+- **剩余两处（347/359）的更正**：主 agent 逐项核对后确认**实参个数与形参表是匹配的** ✗（harness 传 18 个、
+  `moe_bs_dn_shim.cu:244` 也是 18 个形参，`cudaStream_t` 都在最后）⇒ **所以最初"少传参数"的推断是错的**。
+  报错里"`cudaStream_t` 与 `int` 不兼容"更像**同一个 TU 里出现了第二个（较短的）声明**或**声明可见性/顺序**问题 ——
+  但 `grep -rn dsv41_moe_bs_down_dev` 只找到：**harness 的 4 处调用（196/289/348/365）+ shim 的注释与定义**，
+  没有第二个声明 ✗ ⇒ **根因待定**（下一步应看完整编译输出与 shim 里该函数的可见性/`#include` 顺序）。
+  ⇒ **处置：暂缓**（它是"验证用仪器"，不是当前关键路径；新 down kernel 本身**编译 0 error** 且**未接分发、完全惰性**）。
+  修好它之后的用途：在 GPU 上做新旧 down 的逐元素对拍（§112 第 2 步）。
 - **编译命令（口径已定，别再试错）**：必须**从 `tilelang_gen/` 目录**编，并带三个 `-I`：
   ```bash
   cd <repo>/kernels/cuda/tilelang_gen
