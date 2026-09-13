@@ -1344,6 +1344,7 @@ extern "C" int dsv41_moe_tilelang_gate_up_bs_dev(
     // real data; m=6 crashes. If zeroing X makes m=6 work, X is the trigger.
     {
         static const int g_zero_mode = []() {
+            if (getenv("DSV41_MOE_BS_ZERO_ASF") != nullptr) return 5;
             const char* v = getenv("DSV41_MOE_BS_ZERO_SF");
             if (v != nullptr && v[0] != '0') return 1;  // SF only
             v = getenv("DSV41_MOE_BS_ZERO_A");
@@ -1363,9 +1364,15 @@ extern "C" int dsv41_moe_tilelang_gate_up_bs_dev(
                 fprintf(stderr, "[moe-bs][ZERO-DIAG] mode=%d (%s) — MMA sees zeroed data\n",
                         g_zero_mode, what);
             }
-            if (g_zero_mode == 1 || g_zero_mode == 4)
+            // Mode 5 = A + SF zeroed but eid INTACT. Modes 3/4 zero the expert ids, and the segment
+            // tables are BUILT from those ids — so a zeroed eid breaks the tables, the scatter then
+            // writes nothing, and ex_act_b keeps whatever the fresh allocation held. That made the
+            // ZERO_ALL reading (~1.2e-36, "the MMA is faithful") a FALSE signal: it was an untouched
+            // buffer, not a zero product. Mode 5 removes the confound and is the only ZERO_* probe
+            // whose output means what it says.
+            if (g_zero_mode == 1 || g_zero_mode == 4 || g_zero_mode == 5)
                 cudaMemsetAsync(g_sfa, 0, (size_t)kSfWords * kSegCap * kBm * 4, s);
-            if (g_zero_mode == 2 || g_zero_mode == 4)
+            if (g_zero_mode == 2 || g_zero_mode == 4 || g_zero_mode == 5)
                 cudaMemsetAsync(g_a, 0, (size_t)kSegCap * kBm * kDim, s);
             if (g_zero_mode == 3 || g_zero_mode == 4) {
                 int zeros[kSegCap];

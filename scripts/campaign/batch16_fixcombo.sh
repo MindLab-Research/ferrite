@@ -36,6 +36,17 @@ run F3_PS    DSV41_GATEUP_DUMP=/tmp/f3   DSV41_MOE_BS_MBAR_PERSTAGE=1
 run F4_ALL   DSV41_GATEUP_DUMP=/tmp/f4   DSV41_MOE_BS_DCLEAR=2 DSV41_MOE_BS_DRAIN=1 DSV41_MOE_BS_MBAR_PERSTAGE=1
 run F4_ALL_B DSV41_GATEUP_DUMP=/tmp/f4b  DSV41_MOE_BS_DCLEAR=2 DSV41_MOE_BS_DRAIN=1 DSV41_MOE_BS_MBAR_PERSTAGE=1
 run F1_DC2ZA DSV41_GATEUP_DUMP=/tmp/f1za DSV41_MOE_BS_DCLEAR=2 DSV41_MOE_BS_ZERO_A=1
+# The ZERO probes contradict each other on the *old* data: ZERO_ALL gives ~0 (1.2e-36) while ZERO_A
+# alone gives 0.248 and ZERO_SF alone 0.165 — impossible for a product, so at least one of those
+# single-factor probes is broken (or only partially applied). The raw tile settles it: if `gc` is
+# non-zero with A supposedly zeroed, A really reached the MMA (probe ineffective); if `gc` is zero
+# while `ex_act_b` is not, the value appears AFTER the MMA (scatter/stale), which is a different fix.
+run F5_ZA_GC DSV41_GATEUP_DUMP=/tmp/f5z DSV41_MOE_BS_SFDUMP=/tmp/sfdf5 DSV41_MOE_BS_ZERO_A=1
+run F5_SF_GC DSV41_GATEUP_DUMP=/tmp/f5s DSV41_MOE_BS_SFDUMP=/tmp/sfdf5s DSV41_MOE_BS_ZERO_SF=1
+# THE decisive probe: A and SF zeroed, expert ids INTACT (mode 5), so the tables stay valid and
+# the scatter actually runs. A zero product must therefore give an exactly-zero output; anything
+# non-zero means the MMA is not reading the operands we staged.
+run F6_ASF   DSV41_GATEUP_DUMP=/tmp/f6  DSV41_MOE_BS_SFDUMP=/tmp/sfdf6 DSV41_MOE_BS_ZERO_ASF=1
 
 echo "=== verdicts ==="
 python3 - <<'PY'
@@ -69,3 +80,25 @@ echo
 echo "READ: nan==0 everywhere => no column was left unwritten (the sentinel never survived)."
 echo "      nan>0          => the foreign-column mechanism is REAL and now loud instead of silent."
 echo "      F1_DC2ZA max|.|==0 => the staged A IS consumed (the accumulator clear is no longer load-bearing)."
+echo
+echo "=== the ZERO-probe contradiction, settled on the RAW tile (before the scatter) ==="
+python3 - <<'PY'
+import os, numpy as np
+def rd(p):
+    return np.fromfile(p, dtype='<f4') if os.path.exists(p) else None
+for tag, d in (('ZERO_A ', '/tmp/f5z'), ('ZERO_SF', '/tmp/f5s')):
+    gc = rd(f'{d}/eager/gc_all.f32') if os.path.exists(f'{d}/eager/gc_all.f32') else rd(f'{d}/eager/gc_seg0.f32')
+    e = rd(f'{d}/eager/gateup.f32')
+    gs = f'{d}/eager/gc_all.f32' if os.path.exists(f'{d}/eager/gc_all.f32') else f'{d}/eager/gc_seg0.f32'
+    print(f'{tag}: gc={gs}')
+    print(f'   gc  : ' + ('no dump' if gc is None else f'max|.|={np.abs(gc).max():.6g} nonzero={int((gc!=0).sum())}'))
+    print(f'   out : ' + ('no dump' if e is None else f'max|.|={np.abs(e).max():.6g} nonzero={int((e!=0).sum())}'))
+    if gc is not None and e is not None:
+        if float(np.abs(gc).max()) > 0 and float(np.abs(e).max()) > 0:
+            print('   => the MMA OUTPUT is non-zero with that factor zeroed: the probe did not reach the MMA.')
+        elif float(np.abs(gc).max()) == 0 and float(np.abs(e).max()) > 0:
+            print('   => the MMA output IS zero but the caller buffer is not: the value appears AFTER the')
+            print('      MMA (scatter / stale caller buffer) — a completely different fix.')
+        else:
+            print('   => both zero: the probe works as advertised.')
+PY
