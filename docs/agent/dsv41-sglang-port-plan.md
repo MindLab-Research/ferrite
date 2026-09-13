@@ -3,6 +3,15 @@
 > 用户指令链：① 参考官方 PyTorch 彻底改好正确性；② MTP block-5 step ≈ 7ms 即达标（同口径 > sglang 873.6 tok/s）；③ eager 之外的算子判垃圾，**照抄 SGLang**（BBuf/sglang@835c3909，V4.1-Flash 真源；master 无 V4.1）；④ 移植→确认正确→优化到比他们快。
 > 验证机：AWS b300-4（ubuntu@43.202.208.136，8×B300，模型 /opt/dlami/nvme/models/DeepSeek-V4.1-Flash）。
 
+## ⚠️ 战况修订（2026-09-13 深夜，实测推翻假设）
+
+1. **tag 的 eager 文本也坏**：port-dspark（=tag）数数 1..51 后跳 60（与 HEAD 同型同位；p50=6.22ms 与文档 6.15 吻合）。tag 时代"好"的判据是四段短文本（max_tokens=48），长程腐蚀从未测过。⇒ **正确性锚不是 tag，是官方 PyTorch 语义**（用户原话的字面执行）。
+2. **E1**（HEAD + MOE_BATCH=0 + 8 parity 门 + bf16 边界）：仍在 52 行坏（token 变 62）⇒ parity 门不是（唯一）病因；**MOE_BATCH=0 可恢复前 61 行**（但 p50 6.2→16.3ms）⇒ batched MoE 路径确实另有腐蚀。
+3. **one-shot 判别**：绕过整个 serve 层，腐蚀一模一样 ⇒ **病灶在模型/内核层**。
+4. **W2 三角定位**（改 prompt 长度）：首坏 token 的序列位置 117/95/101（prompt 15/27/13），形态还不同（跳数 vs 跑偏+EOS）⇒ **累积漂移**，非硬边界（window=128 回卷公式手工验证是正确的）。
+5. **漂移猎杀工具链（已就绪）**：官方 MP8 分片在 `/opt/dlami/nvme/dsv41_mp8`（WORLD_SIZE=8 NCCL 可跑官方 model.py）；`~/ref_count.py`（官方贪心数数=能力金标）、`~/ref_diff.py`（teacher-forced 逐步 logits dump）、`~/compare_logits.py`（按"预测位置"对齐，报首个 argmax 分歧 + 幅度形态）、我们侧 `DSV41_GT_LOGITS_DUMP` 探针（rank0 逐步全量 logits append，诊断专用）。
+6. **S3a（真值 spec）已实现**（`spec_step_gt`：verify=6 串行 golden 步 + 每行快照 premix/state_kv/state_score/clen/compress_len + commit 恢复 snap[k+2]；draft 模式 noise/self/cycle）——金标准 = **spec 流 ≡ eager 流**。
+
 ## 0. 基座决策（已定）
 
 - **基座 = tag `dsv41-6.15ms-162toks`（8a5a952，09-12 02:16）**：纯 eager 基座，chain_dev.rs 仅 4668 行，无任何 dspark/mrows 机器；eager 正确（用户锚点）、step 6.15ms。
