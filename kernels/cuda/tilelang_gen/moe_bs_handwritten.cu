@@ -255,6 +255,112 @@ __device__ __forceinline__ uint64_t hw_make_sf_desc(void *smem_ptr) {
 }
 
 // ============================================================
+// whp_* — BOUNDED WAITS (2026-09-13)
+// ============================================================
+// The incident this hardens against:
+//
+//   serve hung intermittently, the log flooding
+//     `[ar5-hang] rank=2 site=0 peer=6 need=2 cur=1 spins>5000000 TIMEOUT -> PARK`
+//   with ZERO `[dsv41] step pos=` lines in the whole round while a control round
+//   (same env, same build) produced 48 step lines. The all-reduce wait is itself
+//   BOUNDED — it PARKS after 5e6 spins — so that line is a SYMPTOM: some rank
+//   never published its stamp. A rank that never RETURNS FROM HERE never reaches
+//   its next all-reduce either, so every peer parks on it. That is exactly the
+//   observed shape, and exactly intermittent: it needs the MMA completion to fail
+//   to arrive ONE time.
+//
+//   The waiting point able to do that is the MMA-completion wait, which was an
+//   UNBOUNDED spin
+//       WAIT: mbarrier.try_wait.parity.shared::cta.b64 P, [bar], phase;
+//       @!P bra WAIT;
+//   executed by tid 0 alone, with the other 127 threads parked on the
+//   __syncthreads() that follows. If the commit never arrived — MMA skipped,
+//   issue/commit/wait count mismatch, phase desync, an early exit before the
+//   issue — P stayed false forever: no thread ever passed that barrier, the
+//   kernel never returned, the stream never advanced.
+//
+// Design contract (see docs/agent/moe-bs-crash-investigation.md §93):
+//   * BOUNDEDNESS IS UNCONDITIONAL. No gate can restore an infinite spin; a
+//     hang is never the thing anyone wants, and this is a safety property, not
+//     an experiment.
+//   * THE NORMAL PATH IS UNCHANGED. In the steady state the FIRST `try_wait`
+//     returns true, so the loop costs one compare + one branch per K-iteration
+//     and adds no memory traffic, no sleep and no synchronization.
+//   * THE FAILURE IS NEVER SILENT. The one-line "bounded wait expired" report is
+//     NOT gated (rate-limited to 8 prints, like `ar5_timeout`): this project's
+//     red line is silent wrongness, and a silent early exit would hand the caller
+//     garbage C. Only the VERBOSE state dump is behind `DSV41_MOE_BS_WAITDBG=1`
+//     (default OFF).
+__device__ int g_waitdbg = 0;                         // DSV41_MOE_BS_WAITDBG
+__device__ unsigned long long g_wait_abort_n = 0ull;  // expired waits, whole grid
+// Spin cap for ONE MMA-completion wait. A worst-case MMA group is O(10 us) and a
+// probe is O(10 ns), so this is ~4 orders of magnitude of headroom; the property
+// that matters is that it is FINITE.
+#define WHP_MMA_SPIN_CAP (1u << 22)
+
+// One mbarrier parity probe: the SAME instruction as the original loop, but the
+// result is returned to C instead of driving an asm-level back-branch. The bound
+// therefore lives in readable C — a counter inside an asm template is the kind
+// of thing that breaks silently.
+__device__ __forceinline__ bool whp_mbar_probe(uint64_t* bar, uint32_t phase) {
+    uint32_t done;
+    asm volatile("{\n\t.reg .pred P;\n\t"
+                 "mbarrier.try_wait.parity.shared::cta.b64 P, [%1], %2;\n\t"
+                 "selp.b32 %0, 1, 0, P;\n\t}"
+                 : "=r"(done)
+                 : "r"((uint32_t)__cvta_generic_to_shared(bar)), "r"(phase));
+    return done != 0u;
+}
+
+// Raw 64-bit read of the mbarrier word — DIAGNOSTIC ONLY. The mbarrier's internal
+// layout is opaque ("implementation-specific"), so the value is dumped verbatim
+// and NOT decoded into claims about pending counts.
+__device__ __forceinline__ unsigned long long whp_ld_smem_u64(const void* p) {
+    unsigned long long v;
+    asm volatile("ld.volatile.shared.u64 %0, [%1];"
+                 : "=l"(v) : "r"((uint32_t)__cvta_generic_to_shared(p)));
+    return v;
+}
+
+// Report ONE expired MMA wait. `k`/`phase`/`seg`/`n_tile`/warp/lane pin the
+// iteration that failed. The well-defined extra datum is the probe on the OTHER
+// parity: if the barrier has completed parity `phase ^ 1` instead, the arrival
+// happened but the parity arithmetic is off (a double arrival or a phase desync);
+// if neither parity is ready, the arrival never happened at all.
+__device__ __noinline__ void whp_mma_timeout_report(
+    uint64_t* bar, uint32_t phase, int k, int seg, int n_tile, int warp, int lane) {
+    const unsigned long long nth = atomicAdd(&g_wait_abort_n, 1ull) + 1ull;
+    if (nth <= 8ull) {
+        printf("[moe-bs-wait] TIMEOUT mma-arrive: block=(%d,%d) k=%d phase=%u warpid=%d "
+               "lane=%d spins>%u -> ABORT (bounded wait: the kernel bails out instead "
+               "of spinning forever)\n",
+               seg, n_tile, k, phase, warp, lane, (unsigned)WHP_MMA_SPIN_CAP);
+    }
+    if (g_waitdbg) {
+        const int other_ready = whp_mbar_probe(bar, phase ^ 1u) ? 1 : 0;
+        printf("[moe-bs-wait-dbg] nth=%llu block=(%d,%d) k=%d expected_parity=%u "
+               "other_parity_ready=%d mbar_raw=0x%016llx seg_idx=%d n_tile=%d warpid=%d "
+               "lane=%d clock=%lld abort_n=%llu\n",
+               nth, seg, n_tile, k, phase, other_ready, whp_ld_smem_u64(bar),
+               seg, n_tile, warp, lane, clock64(), g_wait_abort_n);
+    }
+}
+
+// BOUNDED MMA-completion wait. Returns true when the wait EXPIRED (the caller
+// must stop and must NOT touch the TMEM accumulator).
+__device__ __forceinline__ bool whp_mma_wait_bounded(
+    uint64_t* bar, uint32_t phase, int k, int seg, int n_tile) {
+    for (uint32_t spins = 0;; ++spins) {
+        if (whp_mbar_probe(bar, phase)) return false;
+        if (spins >= WHP_MMA_SPIN_CAP) {
+            whp_mma_timeout_report(bar, phase, k, seg, n_tile, threadIdx.x >> 5,
+                                   threadIdx.x & 31);
+            return true;
+        }
+    }
+}
+
+// ============================================================
 // cp.async primitives (gate DSV41_MOE_BS_CPASYNC — see g_cpasync)
 // ============================================================
 // Only the non-bulk `cp.async` family is used here (sm_80 style). It is NOT the
@@ -593,6 +699,12 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
     // ---- TMEM allocation (warp 0 only) ----
     __shared__ __align__(16) uint hw_C_tmem;
     __shared__ __align__(16) uint hw_SF_tmem;
+    // Bounded-wait failure latch (see the whp_* block at the top of the file):
+    // written by tid 0 BEFORE the per-iteration barrier and read by ALL 128 threads
+    // right AFTER it, so the entire block leaves the k-loop together and the later
+    // __syncthreads() calls stay non-divergent. `volatile` so the load cannot be
+    // hoisted out of the k-loop.
+    __shared__ volatile int hw_wait_fail;
     if (warp == 0) {
         hw_tc_alloc(&hw_C_tmem, 128);   // 128 columns for C
         hw_tc_alloc(&hw_SF_tmem, 32);    // 32 columns for SF
@@ -609,6 +721,7 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
 
     // ---- init mbarrier (1 arrival from tcgen05.commit) ----
     if (tid == 0) {
+        hw_wait_fail = 0;   // no wait has expired yet; published by the barrier below
         asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;"
                      :: "r"((uint32_t)__cvta_generic_to_shared(mma_bar)));
         // mbarrier-init visibility uses the DEDICATED fence and must come BEFORE the
@@ -783,15 +896,19 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
         }
 
         // (6) 所有线程等待 MMA 完成（mbarrier wait + syncthreads）
+        // ⚠️ BOUNDED since 2026-09-13 (see the whp_* block at the top of the file).
+        // This used to be `WAIT: mbarrier.try_wait.parity ... @!P bra WAIT` — an
+        // UNBOUNDED spin by tid 0 alone, with the other 127 threads parked on the
+        // __syncthreads() below. If the commit never arrived, nothing ever passed
+        // that barrier: the kernel never returned, the rank never reached its next
+        // all-reduce, and every peer PARKed on it (the `[ar5-hang]` flood with zero
+        // steps in the round). Now the spin is capped and a timeout is REPORTED and
+        // the whole block takes the abort path together.
         if (tid == 0) {
             // mbarrier wait (phase 0 for first use, then alternating)
-            const uint32_t phase = k & 1;
-            asm volatile(
-                "{\n\t.reg .pred P;\n\t"
-                "WAIT:\n\t"
-                "mbarrier.try_wait.parity.shared::cta.b64 P, [%0], %1;\n\t"
-                "@!P bra WAIT;\n\t}"
-                :: "r"((uint32_t)__cvta_generic_to_shared(mma_bar)), "r"(phase));
+            if (whp_mma_wait_bounded(mma_bar, k & 1, k, seg, n_tile)) {
+                hw_wait_fail = 1;   // published to all 128 threads by the barrier below
+            }
         }
         // tcgen05 thread-sync fences (TileLang's pattern): the MMA is an async tcgen05
         // operation, so ordering its completion with the barrier that lets other threads
@@ -799,8 +916,30 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
         asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
         __syncthreads();
         asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+        // Every thread reads the SAME latch value here (__syncthreads() is the
+        // shared-memory visibility edge, and the latch is volatile so the load cannot
+        // be hoisted out of the k-loop) ⇒ the block exits the loop as a block, which
+        // is what keeps the following __syncthreads() calls non-divergent.
+        if (hw_wait_fail) break;
 
         // (7) 下一轮 k-iteration 会覆盖 smem——MMA 已完成，安全
+    }
+
+    // ---- ABORT PATH: the MMA completion never arrived inside the bounded window ----
+    // Do NOT read TMEM (the accumulator holds an unknown mix of K-iterations) and do
+    // NOT write C_sh: the only correct behaviour is to release the TMEM columns and
+    // return so the caller's next CUDA call reports the failure instead of the rank
+    // hanging the whole serve. The loud report already happened in
+    // whp_mma_timeout_report. With the cp.async gate ON there may still be in-flight
+    // groups here; they are abandoned deliberately — nothing on this path reads the
+    // staged smem, and adding a drain would put a second wait on the failure path.
+    if (hw_wait_fail) {
+        __syncthreads();
+        if (warp == 0) {
+            hw_tc_dealloc(C_tmem, 128);
+            hw_tc_dealloc(SF_tmem, 32);
+        }
+        return;
     }
 
     // ---- epilogue: read TMEM → registers → smem → global ----

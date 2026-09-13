@@ -746,6 +746,19 @@ bool tl_bs_init() {
         fprintf(stderr, "[moe-bs] handwritten cp.async double buffer = %d (smem %zu)\n",
                 cp, g_hw_cpasync ? kSmemHwDouble : kSmemHwSingle);
     }
+    // g_waitdbg: VERBOSE diagnostics for a BOUNDED-wait timeout in the handwritten
+    // kernel (gate DSV41_MOE_BS_WAITDBG, DEFAULT OFF). Only the PRINTING is gated —
+    // the bound itself is unconditional (safety property, see the whp_* block in
+    // moe_bs_handwritten.cu): a one-line report is emitted even with this OFF,
+    // because a silent early exit would hand the caller garbage C.
+    if (ok) {
+        int wd = 0;
+        const char* e = getenv("DSV41_MOE_BS_WAITDBG");
+        if (e != nullptr && e[0] == '1') wd = 1;
+        (void)cudaMemcpyToSymbol(g_waitdbg, &wd, sizeof(int));
+        (void)cudaGetLastError();
+        fprintf(stderr, "[moe-bs] wait diagnostics (verbose) = %d\n", wd);
+    }
 
     // (b) 常驻 scratch
     if (ok) {
