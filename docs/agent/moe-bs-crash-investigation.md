@@ -1681,3 +1681,23 @@ C[(int64_t)(seg * HW_BM + c) * HW_NUP + n_tile * HW_BN + r] = C_sh[r * HW_BN + c
 ### 注意（下一个待查项）
 **非 swapAB 分支经同一核验是"匹配 scatter"的** ⇒ 因此 **F2 臂（非 swapAB）仍然错，必是另一个缺陷**，
 且该缺陷**在两条朝向共用**。待 `bs-wiring-audit` / `old-new-diff-audit` 两条审计线报告。
+
+## §63 【精度·配置缺口】出货臂**没有开** `DSV41_ROUTED_DOWN_QUANT` ⇒ 两处修复默认不生效
+
+审计的 NEEDS-GPU N1 指出"出货臂的 env 组合无法从源码判定"，主 agent 直接查了脚本（CPU 可判定）：
+- `~/push400_hw_test.sh` 的 env 列表里**没有** `DSV41_ROUTED_DOWN_QUANT`（也没有 `..._DBG`）；
+- `~/verify_correct.sh` 同样没有；
+- 补丁本身默认 **OFF**（`chain_dev.rs:1236-1245`）。
+
+⇒ **在出货/回归的实际配置下，§14/§21 的两处精度修复（路由权重时机、routed-down 输入量化）并未生效**
+⇒ 相对官方仍**不对齐**（我方精度偏高）。这与用户的硬性要求直接冲突。
+
+**行动顺序（不可颠倒）**：
+1. **先上机验证**补丁本身正确（§58 的命令：`arm_run RQ1 DSV41_ROUTED_DOWN_QUANT=1 DSV41_ROUTED_DOWN_QUANT_DBG=1`
+   ⇒ 五点回读与主机参考逐元素差 0）；
+2. 验证通过后**把 `DSV41_ROUTED_DOWN_QUANT=1` 加进出货/回归脚本**（`push400_hw_test.sh`、`verify_correct.sh`），
+   并跑 `wq_check.py` 确认文本红线不回退（官方语义下输出应几乎不变）；
+3. 一并把 A2/A3/A4 三条缺失量化（§61）的实现按同样流程转正。
+
+**注意**：这三个门控**都会改变数值**（把"精度偏高"降到官方水平）⇒ 每次转正都必须走
+"DBG 对拍 → 文本红线 → 全 gate 回归"三步，且**逐项单独转正**（一次一个变量）。
