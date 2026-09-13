@@ -1554,3 +1554,33 @@ python3 wq_check.py --selftest
 - **容器与 K-block 的一致性**（自洽推演）：一个 16 B 容器 = 8 packed 字节 = **16 个元素** ⇒
   32 元素的 K-block = **2 个容器** = 32 B ⇒ 与描述符 `ki*32 B` 递进**完全自洽** ✓；
   一行 64 packed 字节 = 8 容器 = 128 元素 ✓ ⇒ footprint 128 B ✓（与 §47/§48 一致 ✓）
+
+## §57 TileLang 路径复活可行性（subagent `tl-path-revival`）+ 一条重要更正
+
+### 更正：err700 很可能**不是这个 kernel 产生的**（错误归属/latching）
+它的首要嫌疑是**错误闩存**：本文件 §(配置探针段) 已记录该 700 出现在**配置探针阶段**
+（`dsv41_bf16_roundtrip` / `dsv41_gemm_fp8_mx_f32`）被闩存到后续无关调用上；
+而 SYNC-DIAG 揭穿后指出本 kernel 的真实错误类型是 **illegal instruction**，
+"illegal memory access" 是 context poisoning 的**二级效应**。
+⇒ 之前把 700 当成"本 kernel 的越界"这条推断**要收回**。
+
+### 描述符逐字段对比：官方生成物 vs 已 PASS 的最小参考 —— **无一项不一致**
+（它先解出 TVM FFI 的参数序：`[0]desc_ptr [1]dtype [2]rank [3]global_addr` 随后
+`gdim[rank] / gstride[rank] / box[rank] / estride[rank]` 再 4 项 `ilv, swz, l2, oob`，
+并用 4 个独立样本交叉验算自洽。）核心对照：
+
+| 项 | 官方生成物 | 已 PASS 参考 | 一致 |
+|---|---|---|---|
+| fp4 dtype | **14 = 16U4_ALIGN16B** | 14 | ✅ |
+| fp4 `box[0]` 单位 | **128（4-bit 元素 = 64 B 数据）** | 128（4-bit 元素） | ✅ |
+| fp4 行距 | 2560 B = K/2 | 128 B = K/2 | ✅ |
+| fp4 swizzle | **SWIZZLE_128B** | 同 | ✅ |
+| fp4 smem 足迹 | 64 行 × **128 B/行** = 8192（W1 槽） | 128 行 × 128 B/行 = 16384 | ✅ |
+| **fp4 `expect_transaction`** | **4096 = 64×64 B 数据** | 8192 = 128×64 B 数据 | ✅ **都是"槽的一半"** |
+| A dtype/box | u8：128×128 | 同 | ✅ |
+| SF | SFA 1-D bulk 512 B；**SFW1/SFW3 走 2-D 描述符，box=(64,1)** | 同 | ✅ |
+
+⇒ **§47 的语义在 TL 路径下无需任何改动**：官方 TMA 自己就做 16 B 容器展开
+（`expect_transaction` 只报"数据字节"= 槽的一半，正是这件事的直接证据）。
+⇒ 结论：**err700 不在描述符层**；TL 路径真正的剩余风险是 **3-stage TMA+mbarrier 流水线在 m>1 下的行为**，
+这条**只能 GPU 验证**（留给主 agent，且与当前 e2e 缺陷是两件事）。
