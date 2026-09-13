@@ -16,7 +16,11 @@ git checkout -q origin/main -- kernels crates 2>/dev/null
 git log --oneline -1
 bash "$HOME/ensure_built.sh" || { echo "BUILD GATE FAILED"; exit 1; }
 BASE="DSV41_SPEC=1 DSV41_DSPARK=1 DSV41_VERIFY_GRAPH=1 DSV41_GRAPH_STEP=1 DSV41_AR_V5=0 DSV41_MOE_TILELANG_BS=0 DSV41_MOE_BS_HANDWRITTEN=0"
-for pair in "DRAFTGRAPH:DSV41_DRAFT_GRAPH=1" "PROJALIGN:DSV41_ATTN_PROJ_ALIGN=1"; do
+# VERIFY_FORK is the verify-side counterpart of the plain path's double-stream overlap (the blog's
+# step 8, +23%): the mapping reports it exists, is default OFF, and has never been wired on the
+# verify path ("把 layer() 的三处 side-stream fork 原样搬进 verify").
+for pair in "DRAFTGRAPH:DSV41_DRAFT_GRAPH=1" "PROJALIGN:DSV41_ATTN_PROJ_ALIGN=1" \
+            "VERIFYFORK:DSV41_VERIFY_FORK=1"; do
   tag=${pair%%:*}; envs=${pair#*:}
   echo "########## $tag : $envs ##########"
   pkill -9 -x ferrite-serve 2>/dev/null
