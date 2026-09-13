@@ -730,6 +730,102 @@ pub(crate) fn moe_batch() -> bool {
     *F.get_or_init(|| std::env::var("DSV41_MOE_BATCH").map(|v| v != "0").unwrap_or(true))
 }
 
+/// `DSV41_MOE_TILELANG=1` (default OFF) dispatches the ROUTED gate/up + down to the
+/// TileLang bf16 grouped-GEMM arm (`kernels/cuda/tilelang_gen/moe_bf16_shim.cu`,
+/// prototype: docs/agent/tilelang-moe-grouped.md). It replaces the per-(row, slot)
+/// fp4 GEMV sweep with one dense operand block per expert segment: GPU-measured
+/// **70.0µs/layer** (up 45.5 + dn 24.5) = **28.0%** of the 250µs SIMT baseline.
+///
+/// THREE preconditions, all enforced at the call site (an armed gate must NEVER
+/// silently measure the OLD path — this project's #1 measurement-bias trap):
+///   1. the `.so` carries both shim symbols (`supports_moe_tilelang`);
+///   2. the routed gate/up weights have a **bf16 copy** (DSV41_MOE_BF16_DEQUANT at
+///      load time) — without it the arm declines and reports;
+///   3. the step is NOT inside a CUDA-graph capture: the host moe_align needs a D2H
+///      read of `route_idx_r` (+ three tiny H2D uploads), which is illegal in a
+///      capture. The device-side moe_align is the documented follow-up
+///      (prototype §8-3).
+/// `"0"` means OFF even though it is "set"; read ONCE and cached (the house rule).
+pub(crate) fn moe_tilelang() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_MOE_TILELANG").map(|v| v != "0").unwrap_or(false))
+}
+
+/// `DSV41_MOE_BF16_DEQUANT=1` (default OFF) expands the routed experts'
+/// fp4(e2m1 + ue8m0) weights into a **bf16 copy** at LOAD time — the TileLang bf16
+/// arm's precondition (§4.3-3 of the prototype). Cost: 4x the fp4 expert bytes
+/// resident; see kernels/cuda/tilelang_gen/PROVENANCE.md §8 for the per-rank budget
+/// (⚠️ the owner decides — the prototype doc's "+15GB/rank" assumed 8-way EXPERT
+/// sharding, which ferrite's loader does not do).
+pub(crate) fn moe_bf16_dequant() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_MOE_BF16_DEQUANT").map(|v| v != "0").unwrap_or(false))
+}
+
+/// The TileLang MoE segment cap: `VERIFY_ROWS * topk_max` = 36. It is BAKED into the
+/// generated kernels' `grid.y` (TileLang grid dims are compile-time), so the host
+/// tables must be exactly this long and every entry past `nseg` must be a pad.
+pub(crate) const TILELANG_SEG_CAP: usize = 36;
+/// The generated kernels' MMA M-tile: every segment's rows are padded to this.
+pub(crate) const TILELANG_BM: usize = 16;
+
+/// Host-side `moe_align` — the ferrite port of the prototype's
+/// `moe_grouped_proto.py::moe_align` (SGLang `moe_align_block_size` semantics):
+/// assignments are sorted by (expert asc, flat index asc) so every expert owns a
+/// CONTIGUOUS run of rows, which is what lets one dense GEMM block serve a whole
+/// expert segment.
+///
+/// PURE FUNCTION of the routing table: no atomics, no block-scheduling dependence,
+/// so the same `idx` always yields the same tables bit-for-bit.
+///
+/// `idx` is the flattened routing table `route_idx_r[m][topk]` (`row*topk + slot`,
+/// so `slot = a % topk`, `row = a / topk`). Returns
+/// `(order, counts, eid, nseg)`, each of the first three exactly
+/// [`TILELANG_SEG_CAP`]-long (`TILELANG_BM` rows for `order`) and **zero-filled past
+/// `nseg`**: the generated kernels launch with a fixed `grid.y = SEG_CAP`, so a
+/// stale tail entry would be read (and, worse, a stale `counts` would make the
+/// scatter write garbage). `order[seg*BM + r]` is the assignment index of segment
+/// `seg`'s row `r`, or `-1` for a pad row. `None` when the routing cannot be
+/// expressed (`idx` empty, a negative id, or more than `SEG_CAP` segments).
+pub(crate) fn moe_align_host(idx: &[i32], topk: usize) -> Option<(Vec<i32>, Vec<i32>, Vec<i32>, usize)> {
+    if idx.is_empty() || topk == 0 || idx.iter().any(|&v| v < 0) {
+        return None;
+    }
+    let mut order = vec![-1i32; TILELANG_SEG_CAP * TILELANG_BM];
+    let mut counts = vec![0i32; TILELANG_SEG_CAP];
+    let mut eid = vec![0i32; TILELANG_SEG_CAP];
+    // Stable sort by expert: `(expert, flat index)` ascending. `slice::sort_by_key`
+    // is stable, and a VECTOR of the indices is what we sort, so equal experts keep
+    // their flat order (the SGLang/prototype contract).
+    let mut perm: Vec<usize> = (0..idx.len()).collect();
+    perm.sort_by_key(|&a| idx[a]);
+    let mut nseg = 0usize;
+    let mut a = 0usize;
+    while a < perm.len() {
+        if nseg >= TILELANG_SEG_CAP {
+            return None; // more segments than the kernels' baked grid.y
+        }
+        let e = idx[perm[a]];
+        let mut b = a;
+        while b < perm.len() && idx[perm[b]] == e {
+            b += 1;
+        }
+        let run = b - a;
+        if run > TILELANG_BM {
+            return None; // one segment cannot exceed the MMA M-tile
+        }
+        let base = nseg * TILELANG_BM;
+        for (r, &pi) in perm[a..b].iter().enumerate() {
+            order[base + r] = pi as i32;
+        }
+        counts[nseg] = run as i32;
+        eid[nseg] = e;
+        nseg += 1;
+        a = b;
+    }
+    Some((order, counts, eid, nseg))
+}
+
 /// Mirrors dsv41_experts_mxf4.cu's dispatch test
 /// (`rows == 1 && getenv("DSV41_NO_GEMV_FP4") == nullptr`, a BARE getenv: any
 /// value at all, even "0", sends the rows==1 call through the tcgen05 GEMM).
@@ -5435,7 +5531,14 @@ impl<'a> DevChain<'a> {
         // k = dim = 5120); every other single-row projection declines here and keeps
         // `gemm_fp8_mx_or_swap` below unchanged, so OFF (and the non-wkv shapes)
         // are bit-for-bit today's path.
-        if Self::gemm_tilelang_wkv() {
+        // ⚠️ E2E DIAGNOSIS (2026-09-13 04:05): the T-arm's first request died with
+        // a sticky illegal-access surfacing at the MoE kernel — the eager lin site
+        // feeds `quant1`'s single-row `s.xq/s.xsc` whose scale layout needs its own
+        // ABI audit (the verify proj_mrows path is parity-proven; this one is not).
+        // The eager arm is therefore gated SEPARATELY (default OFF) until that audit:
+        // DSV41_GEMM_TILELANG alone = verify-only; add DSV41_GEMM_TILELANG_EAGER=1
+        // to re-arm the eager half.
+        if Self::gemm_tilelang_wkv() && Self::gemm_tilelang_eager() {
             if self.dev.supports_gemm_fp8_tilelang_wkv() {
                 if self.dev.gemm_fp8_tilelang_wkv(
                     self.s.xq.as_u8(),
@@ -5893,6 +5996,18 @@ impl<'a> DevChain<'a> {
         static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *F.get_or_init(|| {
             std::env::var("DSV41_GEMM_TILELANG")
+                .map(|v| v == "1")
+                .unwrap_or(false)
+        })
+    }
+
+    /// The EAGER half's separate arm (see the lin-site comment): default OFF
+    /// until the single-row `quant1` scale-layout ABI audit lands. The verify
+    /// half (proj_mrows) is parity-proven and arms on GEMM_TILELANG alone.
+    fn gemm_tilelang_eager() -> bool {
+        static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *F.get_or_init(|| {
+            std::env::var("DSV41_GEMM_TILELANG_EAGER")
                 .map(|v| v == "1")
                 .unwrap_or(false)
         })
@@ -15053,6 +15168,110 @@ impl<'a> DevChain<'a> {
         Ok(true)
     }
 
+    /// The TileLang MoE grouped-GEMM arm's HOST half: read `route_idx_r` back and
+    /// run the port of the prototype's `moe_align` on it.
+    ///
+    /// ⚠️ `download_u8` is a FULL device sync, which is exactly why the arm is
+    /// eager-only: see [`Self::moe_tilelang_ready`] (`!capturing()`). The device
+    /// side moe_align is the documented follow-up (prototype §8-3); until then an
+    /// armed `DSV41_MOE_TILELANG` inside a graph would be an illegal capture op, so
+    /// the gate declines there rather than failing the step.
+    ///
+    /// Returns `Ok(None)` when the routing cannot be expressed as segments (see
+    /// [`moe_align_host`]) — the caller then keeps the proven launches.
+    fn moe_tilelang_tables(
+        &self,
+        m: usize,
+        topk: usize,
+    ) -> Result<Option<(Vec<i32>, Vec<i32>, Vec<i32>, usize)>> {
+        let n = m * topk;
+        if n == 0 || n * 4 > self.s.route_idx_r.bytes {
+            return Ok(None);
+        }
+        let mut bytes = vec![0u8; n * 4];
+        self.dev.download_u8(&self.s.route_idx_r, &mut bytes)?;
+        let idx: Vec<i32> = bytes
+            .chunks_exact(4)
+            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        Ok(moe_align_host(&idx, topk))
+    }
+
+    /// Whether the TileLang arm can serve THIS step (§"接线" — every refusal is a
+    /// decline into the proven launch, and the caller reports the ones that matter).
+    ///
+    /// The terms are, in order:
+    ///   * `DSV41_MOE_TILELANG` armed, `.so` carries both shim symbols;
+    ///   * NOT inside a CUDA-graph capture (the host moe_align needs a D2H read —
+    ///     the arm's single real limitation, prototype §8-3);
+    ///   * the generated kernels' FROZEN shapes: `n_routed == 384` (the `e < 384`
+    ///     guard is baked into the dump), `dim == 5120`, `inter_local == 320`,
+    ///     `topk ∈ [1,6]`, `m ∈ [1,6]`;
+    ///   * the bf16 weight copies exist AND are the contiguous `[E, N, K]` pool the
+    ///     shim's `e*N*K` pointer arithmetic assumes (stride is checked at the call
+    ///     site, where the expert pair is in hand).
+    fn moe_tilelang_ready(
+        &self,
+        ld: &LayerDev,
+        m: usize,
+        topk: usize,
+        dim: usize,
+        inter_local: usize,
+        n_routed: usize,
+    ) -> bool {
+        moe_tilelang()
+            && !self.dev.capturing()
+            && self.dev.supports_moe_tilelang()
+            && n_routed == 384
+            && dim == 5120
+            && inter_local == 320
+            && (1..=6).contains(&topk)
+            && (1..=6).contains(&m)
+            && ld.experts.len() >= 2
+            && ld.experts[0].up_bf16.is_some()
+            && ld.experts[1].up_bf16.is_some()
+            && ld.experts[0].dn_bf16.is_some()
+            && ld.experts[1].dn_bf16.is_some()
+    }
+
+    /// One-shot notice for an ARMED gate that did not fire — the project's #1
+    /// measurement-bias trap (an armed arm must never silently measure the OLD
+    /// path). `hard` marks the refusals that mean the operator's configuration is
+    /// inconsistent (missing bf16 copy / non-uniform pool) rather than a runtime
+    /// shape the arm simply does not cover.
+    fn moe_tilelang_skipped_note(reason: &str, hard: bool) {
+        static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        let tag = if hard { "REFUSED" } else { "skipped" };
+        if ONCE.set(()).is_ok() {
+            eprintln!("[moe-tilelang] ARMED but {tag}: {reason} -> this run measures the OLD path");
+        }
+    }
+
+    /// The two bf16 weight planes of the routed experts, as the `[E, N, K]` bases
+    /// the shim indexes (`base + e*N*K`). `None` when either pool is missing or the
+    /// per-expert stride is not exactly `N*K*2` bytes — the shim derives the expert
+    /// offset arithmetically, so a non-uniform pool would be a SILENT wrong answer,
+    /// not a fault. Declining is the only safe answer.
+    ///
+    /// `up` is `[E, 2*inter, dim]` (N = gate then up) and `dn` is `[E, dim, inter]`.
+    fn moe_tilelang_weights(
+        ld: &LayerDev,
+        dim: usize,
+        inter_local: usize,
+    ) -> Option<(*const std::ffi::c_void, *const std::ffi::c_void)> {
+        let (a, b) = (&ld.experts[0], &ld.experts[1]);
+        let up = (a.up_bf16.as_ref()?, b.up_bf16.as_ref()?);
+        let dn = (a.dn_bf16.as_ref()?, b.dn_bf16.as_ref()?);
+        let up_stride = (up.1.ptr() as i64) - (up.0.ptr() as i64);
+        let dn_stride = (dn.1.ptr() as i64) - (dn.0.ptr() as i64);
+        let up_expect = (2 * inter_local * dim * 2) as i64;
+        let dn_expect = (dim * inter_local * 2) as i64;
+        if up_stride != up_expect || dn_stride != dn_expect {
+            return None;
+        }
+        Some((up.0.ptr() as *const std::ffi::c_void, dn.0.ptr() as *const std::ffi::c_void))
+    }
+
     /// The multi-row MoE: the m-row twin of [`Self::moe`], ending in the MoE
     /// all-reduce over the block's rows. Returns whether that AR took the
     /// `DSV41_VERIFY_AR_FOLD` fold, i.e. its pubred epilogue already wrote this
@@ -15272,11 +15491,11 @@ impl<'a> DevChain<'a> {
             if expert_act_e4m3() && !e4m3 {
                 act_e4m3_skipped_note();
             }
-            let gateup_fused = gateup_fuse()
+            let mut gateup_fused = gateup_fuse()
                 && self.dev.supports_gateup_fuse()
                 && expert_fp4_mode() == 2
                 && (dim % 512) == 0;
-            let act_slot = if gateup_fused {
+            let mut act_slot = if gateup_fused {
                 inter_local
             } else {
                 2 * inter_local
@@ -15408,6 +15627,71 @@ impl<'a> DevChain<'a> {
             }
             let ids_base = self.s.route_idx_r.ptr as *const i32;
             let rw_base = self.s.route_w_r.ptr as *const f32;
+            // ---- TILELANG grouped GEMM (DSV41_MOE_TILELANG) ----------------------
+            // The expert-centric replacement for the per-(row, slot) GEMV sweep:
+            // `moe_align` groups the assignments by expert (host side — see
+            // `moe_tilelang_tables`), the shim gathers the block's activations into
+            // one contiguous operand per segment, one grouped MMA covers them all,
+            // and the scatter puts the result back at each (row, slot)'s offset.
+            //
+            // It slots in EXACTLY where the batched gate/up launch sat: the shim
+            // writes the RAW gate‖up layout (the same bytes the unfused batched
+            // launch writes), so the separate swiglu pass below stays enabled and
+            // the down stride stays the raw `2*inter` pitch. Nothing downstream of
+            // `ex_act_r` changes — which is what makes the A/B parity checkable
+            // (docs/agent/tilelang-moe-wiring.md §5).
+            //
+            // Every refusal is a DECLINE into the proven launches (plus a one-shot
+            // notice): an armed gate must never silently measure the OLD path.
+            let tl_ready = self.moe_tilelang_ready(ld, m, topk, dim, inter_local, n_routed);
+            let mut tl_gu = false;
+            let mut tl_tables: Option<(Vec<i32>, Vec<i32>, Vec<i32>, usize)> = None;
+            let mut tl_w: Option<(*const std::ffi::c_void, *const std::ffi::c_void)> = None;
+            if moe_tilelang() && !tl_ready {
+                Self::moe_tilelang_skipped_note(
+                    "the step is outside the arm's domain (a CUDA-graph capture, a frozen-shape \
+                     mismatch, or the .so lacks the shim symbols)",
+                    true,
+                );
+            } else if tl_ready && !grp_gu {
+                tl_tables = self.moe_tilelang_tables(m, topk)?;
+                tl_w = Self::moe_tilelang_weights(ld, dim, inter_local);
+                if let Some(tables) = tl_tables.as_ref() {
+                    let (order, counts, eid, nseg) = tables;
+                    tl_gu = self.dev.moe_tilelang_gate_up_bf16(
+                        self.s.xn_r.ptr as *const f32,
+                        self.s.ex_act_r.ptr as *mut f32,
+                        tl_w.map(|w| w.0).unwrap_or(std::ptr::null()),
+                        eid.as_ptr(),
+                        order.as_ptr(),
+                        counts.as_ptr(),
+                        *nseg as i32,
+                        m as i32,
+                        dim as i32,
+                        inter_local as i32,
+                        topk as i32,
+                    )?;
+                }
+                if tl_w.is_none() {
+                    Self::moe_tilelang_skipped_note(
+                        "the routed experts' bf16 copies are missing or are not a contiguous \
+                         [E, N, K] pool (build with DSV41_MOE_BF16_DEQUANT=1 and rebuild the .so)",
+                        true,
+                    );
+                } else if !tl_gu && !grp_gu {
+                    Self::moe_tilelang_skipped_note(
+                        "the shim declined the up shape (see its shape gate) or the routing table \
+                         could not be expressed as <= 36 expert segments of <= 16 rows",
+                        false,
+                    );
+                }
+                if tl_gu {
+                    // Raw gate‖up: keep the separate swiglu launch and the raw
+                    // downstream slot stride (see the block comment above).
+                    gateup_fused = false;
+                    act_slot = 2 * inter_local;
+                }
+            }
             // ---- ONE rows = m launch per stage, for all m activation rows --------
             // The kernels' `rows` argument is now the THIRD grid dimension
             // (`expert_gemv_fp4_batched_kernel`: `blockIdx.z`, see its layout
@@ -15443,7 +15727,7 @@ impl<'a> DevChain<'a> {
             // path's — that is precisely the "armed gate measured as the OLD path"
             // failure this dispatch exists to avoid. `grp_gu == false` is the
             // fallback: this launch answers the step, unchanged.
-            if !grp_gu {
+            if !grp_gu && !tl_gu {
                 let (qa, qs) = (self.s.xq4_r.as_u8(), self.s.xsc4_r.as_f32());
                 self.dev.expert_gate_up_fp4_batched(
                     qa,
@@ -15522,7 +15806,51 @@ impl<'a> DevChain<'a> {
                      has no entry point to be dispatched from",
                 );
             }
-            if down_fuse() && self.dev.supports_down_fuse() && !grouped_down_ok {
+            // ---- TILELANG down (DSV41_MOE_TILELANG): the grouped down GEMM --------
+            // Runs only when the up half above took the arm (`tl_gu`), i.e. when
+            // `ex_act_r` is the TileLang up's output at the RAW 2*inter slot pitch.
+            // The shim writes the per-slot partials into `ex_down_r` — the very
+            // buffer `dsv41_expert_down_fp4_batched` writes, at the very same
+            // offsets — so the fixed ascending-slot `moe_down_reduce` loop below is
+            // reused verbatim and the merge order (the numerical contract) is
+            // untouched. A shim decline falls straight through to the proven
+            // branches (one-shot notice inside the arm).
+            let mut tl_dn_done = false;
+            if tl_gu {
+                if let (Some(tables), Some(w)) = (tl_tables.as_ref(), tl_w) {
+                    let (order, counts, eid, nseg) = tables;
+                    tl_dn_done = self.dev.moe_tilelang_down_bf16(
+                        self.s.ex_act_r.ptr as *const f32,
+                        self.s.ex_down_r.ptr as *mut f32,
+                        w.1,
+                        eid.as_ptr(),
+                        order.as_ptr(),
+                        counts.as_ptr(),
+                        *nseg as i32,
+                        m as i32,
+                        dim as i32,
+                        inter_local as i32,
+                        topk as i32,
+                        act_slot as i32,
+                    )?;
+                }
+                if tl_dn_done {
+                    for r in 0..m {
+                        let scratch =
+                            (self.s.ex_down_r.ptr as *const f32).wrapping_add(r * topk * dim);
+                        let out = (self.s.moe_out_r.ptr as *mut f32).wrapping_add(r * dim);
+                        self.dev.moe_down_reduce(scratch, out, dim as i32, topk as i32)?;
+                    }
+                } else {
+                    Self::moe_tilelang_skipped_note(
+                        "the up half took the arm but the down shim declined -> the down \
+                         direction falls back to the SIMT path (the up result is unchanged \
+                         because the down launch reads `ex_act_r`, which both arms fill)",
+                        false,
+                    );
+                }
+            }
+            if !tl_dn_done && down_fuse() && self.dev.supports_down_fuse() && !grouped_down_ok {
                 // ONE rows = m launch: the fused down+reduce kernel's grid is
                 // (dim/warps, 1, rows) and it derives act_row =
                 // act_base + arow*slots*act_stride, out_row = out + arow*n_total
@@ -18799,13 +19127,73 @@ fn tap_input() -> bool {
                     && gateup_fuse()
                     && self.dev.supports_gateup_fuse()
                     && expert_fp4_mode() == 2;
-                let act_slot = if gateup_fused {
+                let mut act_slot = if gateup_fused {
                     inter_local as i64
                 } else {
                     (2 * inter_local) as i64
                 };
                 let down_slot = dim as i64;
-                if !ran_tc {
+                // ---- TILELANG grouped GEMM (DSV41_MOE_TILELANG), eager side --------
+                // The single-row twin of the arm in `moe_rows`: the SAME gate, the
+                // SAME tables (`moe_align` over `route_idx[topk]`, one row) and the
+                // SAME shims. `ex_act_b` is [topk][2*inter] and `ex_down_b` is
+                // [topk][dim], i.e. exactly the `rows == 1` instances of the
+                // multi-row layouts, so the two call sites pass identical shapes and
+                // the double-sided swap is bit-for-bit the same computation.
+                //
+                // ⚠️ `route_idx` (the eager router's output) lives on the DEVICE, so
+                // `moe_tilelang_tables` performs a D2H read — eager-only, like the
+                // verify side (see `moe_tilelang_ready`).
+                let tl_ready = self.moe_tilelang_ready(ld, 1, topk, dim, inter_local, ne);
+                let mut tl_gu = false;
+                let mut tl_tables: Option<(Vec<i32>, Vec<i32>, Vec<i32>, usize)> = None;
+                let mut tl_w: Option<(*const std::ffi::c_void, *const std::ffi::c_void)> = None;
+                if moe_tilelang() && !tl_ready {
+                    Self::moe_tilelang_skipped_note(
+                        "the step is outside the arm's domain (a CUDA-graph capture, a frozen-shape \
+                         mismatch, or the .so lacks the shim symbols)",
+                        true,
+                    );
+                } else if tl_ready {
+                    tl_tables = self.moe_tilelang_tables(1, topk)?;
+                    tl_w = Self::moe_tilelang_weights(ld, dim, inter_local);
+                    if let Some(tables) = tl_tables.as_ref() {
+                        let (order, counts, eid, nseg) = tables;
+                        tl_gu = self.dev.moe_tilelang_gate_up_bf16(
+                            self.s.xn.ptr as *const f32,
+                            self.s.ex_act_b.ptr as *mut f32,
+                            tl_w.map(|w| w.0).unwrap_or(std::ptr::null()),
+                            eid.as_ptr(),
+                            order.as_ptr(),
+                            counts.as_ptr(),
+                            *nseg as i32,
+                            1,
+                            dim as i32,
+                            inter_local as i32,
+                            topk as i32,
+                        )?;
+                    }
+                    if tl_w.is_none() {
+                        Self::moe_tilelang_skipped_note(
+                            "the routed experts' bf16 copies are missing or are not a contiguous \
+                             [E, N, K] pool (build with DSV41_MOE_BF16_DEQUANT=1 and rebuild the .so)",
+                            true,
+                        );
+                    } else if !tl_gu {
+                        Self::moe_tilelang_skipped_note(
+                            "the shim declined the up shape (see its shape gate) or the routing table \
+                             could not be expressed as <= 36 expert segments of <= 16 rows",
+                            false,
+                        );
+                    }
+                    if tl_gu {
+                        // Raw gate‖up (see the verify-side block): keep the separate
+                        // swiglu launch (the SECOND `gateup_fused` below carries the
+                        // `&& !tl_gu` term) and the raw downstream slot stride.
+                        act_slot = (2 * inter_local) as i64;
+                    }
+                }
+                if !ran_tc && !tl_gu {
                     // ONE pass: `xq4`/`xsc4` hold the activation in whichever form
                     // the quantisation above produced (e4m3 bytes when `e4m3` is
                     // set, packed e2m1 otherwise) and `act_e4m3` tells the kernel
@@ -18889,6 +19277,7 @@ fn tap_input() -> bool {
                 // the tcgen05 epilogue never fuses, so its [2*inter] output needs
                 // the separate swiglu launch.
                 let gateup_fused = !ran_tc
+                    && !tl_gu
                     && gateup_fuse()
                     && self.dev.supports_gateup_fuse()
                     && expert_fp4_mode() == 2
@@ -18917,7 +19306,62 @@ fn tap_input() -> bool {
                 // `act_stride`: it is whatever pitch the gate/up call wrote, so
                 // the gate_up+swiglu fusion's inter-width layout is picked up here
                 // without any change in this call.
-                if down_fuse() && self.dev.supports_down_fuse() {
+                // ---- TILELANG down (DSV41_MOE_TILELANG), eager side ----------------
+                // Only when the up half above took the arm: the shim writes the
+                // per-slot partials into `ex_down_b` — the buffer the non-fused pair
+                // below writes — so the SAME fixed-order merges apply (the AR-store
+                // carrier included: the sum is still `s.o`'s last writer here).
+                let mut tl_dn_done = false;
+                if tl_gu {
+                    if let (Some(tables), Some(w)) = (tl_tables.as_ref(), tl_w) {
+                        let (order, counts, eid, nseg) = tables;
+                        tl_dn_done = self.dev.moe_tilelang_down_bf16(
+                            self.s.ex_act_b.ptr as *const f32,
+                            self.s.ex_down_b.ptr as *mut f32,
+                            w.1,
+                            eid.as_ptr(),
+                            order.as_ptr(),
+                            counts.as_ptr(),
+                            *nseg as i32,
+                            1,
+                            dim as i32,
+                            inter_local as i32,
+                            topk as i32,
+                            act_slot as i32,
+                        )?;
+                    }
+                    if tl_dn_done {
+                        if ar_carry && !shared_here {
+                            let c = self.comm.clone().expect("ar_carry implies a collective");
+                            ar_carried = self.dev.moe_down_reduce_ar(
+                                self.s.ex_down_b.ptr as *const f32,
+                                self.s.o.ptr as *mut f32,
+                                dim as i32,
+                                topk as i32,
+                                c.peer_slots_f32(),
+                                c.epoch_u32(),
+                                c.world as i32,
+                                c.rank as i32,
+                                c.slot_stride_elems(),
+                            )?;
+                        }
+                        if !ar_carried {
+                            self.dev.moe_down_reduce(
+                                self.s.ex_down_b.ptr as *const f32,
+                                self.s.o.ptr as *mut f32,
+                                dim as i32,
+                                topk as i32,
+                            )?;
+                        }
+                    } else {
+                        Self::moe_tilelang_skipped_note(
+                            "the up half took the arm but the down shim declined -> the down \
+                             direction falls back to the SIMT path",
+                            false,
+                        );
+                    }
+                }
+                if !tl_dn_done && down_fuse() && self.dev.supports_down_fuse() {
                     self.dev.expert_down_reduce_fp4_batched(
                         self.s.ex_act_b.ptr as *const f32,
                         act_slot,
