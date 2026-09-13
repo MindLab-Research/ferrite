@@ -83,3 +83,23 @@ bash "$HOME/num100.sh" STEP_P3O \
   DSV41_SPEC=1 DSV41_MOE_TILELANG_BS=0 DSV41_MOE_BS_HANDWRITTEN=0 \
   DSV41_VERIFY_GRAPH=1 DSV41_GRAPH_STEP=1 DSV41_AR_V5=0 DSV41_MOE_BATCH=0
 judge "P3O (P0 + old per-slot MoE)" "$HOME/armrun_STEP_P3O.log"
+
+echo "############ P4: P0 + the shared-expert m-row batching (the biggest verify family) ############"
+# shared-expert-reread's finding: moe_rows launches the shared expert per row (`for r in 0..m`,
+# chain_dev.rs:19508), so its weights are staged once PER ROW — a 6.0x read amplification on the
+# family that is 27.9% of verify (7.4-12.5 ms per step depending on which accounting). All the
+# multi-row doors (SH_EXP_MROWS / SH_PAIR_M / SH_EXP_FUSED / SH_EXP_TILELANG) are OFF by default;
+# SH_EXP_MX2 (w1|w3 in one launch) is already on in the baseline. One door at a time.
+bash "$HOME/num100.sh" STEP_P4M \
+  DSV41_SPEC=1 DSV41_MOE_TILELANG_BS=0 DSV41_MOE_BS_HANDWRITTEN=0 \
+  DSV41_VERIFY_GRAPH=1 DSV41_GRAPH_STEP=1 DSV41_AR_V5=0 \
+  DSV41_SH_EXP_MROWS=1
+judge "P4M (P0 + shared-expert m-row batching)" "$HOME/armrun_STEP_P4M.log"
+
+echo "############ P4P: P0 + the shared-expert paired multi-row (SH_PAIR_M) ############"
+bash "$HOME/num100.sh" STEP_P4P \
+  DSV41_SPEC=1 DSV41_MOE_TILELANG_BS=0 DSV41_MOE_BS_HANDWRITTEN=0 \
+  DSV41_VERIFY_GRAPH=1 DSV41_GRAPH_STEP=1 DSV41_AR_V5=0 \
+  DSV41_SH_PAIR_M=1
+judge "P4P (P0 + SH_PAIR_M)" "$HOME/armrun_STEP_P4P.log"
+
