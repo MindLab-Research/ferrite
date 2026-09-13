@@ -1776,3 +1776,15 @@ else:
 ```
 ⇒ 与 §61/发给 A3 的 brief **逐项一致** ✓；且**注释原文直接点名是 "compressed KV"**，
 独立印证 A3 的目标就是压缩 latent（block=16，`model.py:760`）✓；A4（indexer）走 `else` 的**幂次**分支 ✓。
+
+## §67 排除：RoPE 系数与 YaRN（出货配置下惰性）
+
+审计列了一项"RoPE 系数"。主 agent 直接对照两侧常量来源：
+- 官方 `ref_inference/model.py:87-90`：`compress_rope_theta = 40000.0`、`original_seq_len = 0`、
+  `rope_theta = 10000.0`、`rope_factor = 40`。
+- 我方 `crates/ferrite-models/src/dsv41/config.rs:63-65`：同名字段（`compress_rope_theta` 默认 40000.0 ✓），
+  传入点 `chain_dev.rs:5302/5309` 传 `cfg.rope_theta` / `cfg.compress_rope_theta` / `cfg.original_seq_len`。
+⇒ **两侧同源（同一份 config.json）**，且 **`original_seq_len = 0`** ⇒ 官方的 YaRN 外推分支
+（`precompute_freqs_cis(..., original_seq_len, base, factor, ...)`，`model.py:369`）**惰性**、
+`rope_factor` 不参与计算 ⇒ **出货配置下该项对齐** ✓（若要改 `original_seq_len` 才需重新核对，
+这一条已记入"NEEDS-GPU/需配置确认"清单）。
