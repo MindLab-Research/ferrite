@@ -116,6 +116,21 @@
 // instruction, use the explicit `-gencode arch=compute_103a,code=sm_103a` form.
 // =============================================================================
 
+// =============================================================================
+// ⚠️⚠️ WARNING — THIS HARNESS'S VERDICTS ARE NOT TRUSTWORTHY AS OF 2026-09-14 ⚠️⚠️
+// =============================================================================
+// It reports a BIT-IDENTICAL D across different smem layouts, which is physically
+// impossible: two different write formulas put different contents in smem, need
+// different descriptors, and must therefore be read differently. Its D read-back /
+// per-case state is the suspect (adding the three tcgen05 fences did NOT change the
+// result). Its "16/16 FAIL" therefore establishes NOTHING about the operand
+// orientation, the layout, or the SF path.
+// See docs/agent/moe-bs-crash-investigation.md §18 (and §20 for the fenced variant).
+// Use instead: (a) the in-situ NUMCHECK probe with DSV41_GRAPH_STEP=0 (that file's
+// §16) and (b) a fresh minimal instrument that SELF-PROVES the MMA fired (TMEM
+// poisoning + data sensitivity), e.g. kernels/cuda/tests_bs_impulse.cu.
+// =============================================================================
+
 #include <cuda_runtime.h>
 
 #include <cmath>
