@@ -1949,3 +1949,18 @@ cargo test -p ferrite-models --lib routed_down_prep → 6 passed; 0 failed
 已按 §70 方法应用（含删除行 ⇒ 用 `patch -p1 -F3`，**无 `.rej`/`.orig` 残留**），
 落地确认：新符号 19 + 13 处 ✓、**此前四处修复全部仍在**（D5=1 / A2=8 / A3=9 / A4=17）✓；
 门控 `DSV41_ATTN_P_BF16` 默认 **OFF**。验收（cargo + 全库单测 + 内核单文件）在跑。
+
+## §76 精度五门的"半挂"覆盖性核查（设计内非法 ⇒ 必须逐门确认）
+
+**纪律**：接线契约要求"要么全部改、要么明确说明哪些没改以及为什么"——半挂配置是**设计内非法**。
+主 agent 逐门实读调用点（不只看 subagent 报告）：
+
+| 门 | 需覆盖的路径 | 实读结果 |
+|---|---|---|
+| **A2** `DSV41_WINDOW_KV_QUANT` | 融合路径（`ring_win_fuse`）+ 非融合路径（`ring_append`） | ✓ **一处插入即覆盖两者**：量化作用在**行**上、位于两条 ring 内核之前（`chain_dev.rs:21020-21038` 自带论证："ring_win_fuse()/DSV41_RING_WIN_FUSE=0 因此不改变该臂"） |
+| **A3** `DSV41_COMPRESS_LATENT_QUANT` | 双链的两条路径 | ✓ 两个调用点 `chain_dev.rs:13050` 与 `:22545` |
+| **A4** `DSV41_INDEXER_FP4_RT` | indexer 的 **k** 与 **q** | ✓ 包装器 `indexer_fp4_rt_launch`（`:22125`）的两个调用点：`:22242` 传 `b"k\0"`、`:22345` 传 q 侧 |
+| **I3** `DSV41_ATTN_P_BF16` | **全部** PV 乘加点（含 spec/verify 复用路径） | 由 `prec-i3-pv-bf16-p` 交付清单给出（报告含调用点清单）；合并后已做符号/旧修复确认 |
+| `DSV41_ROUTED_DOWN_QUANT` | routed down 的乘法点 + 调用方不再传 `row_weight` | ✓ §53 已逐行核实（唯一三处改动） |
+
+⇒ 五门均**无半挂**（或已按契约说明）。**转正时仍须逐门单独验证**（§64 的流程）。
