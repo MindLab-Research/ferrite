@@ -6041,6 +6041,262 @@ static inline int dsv41_mrows_l2bcast_for(int m) {
     return fold_r;
 }
 
+// ===========================================================================
+// MTILE (DSV41_MROWS_MTILE, 2026-09-13): M INTO THE GEMM TILE --
+// `gemm_fp8_mtile_kernel<M>` below. Design: docs/agent/mrows-mtile-design.md.
+// ===========================================================================
+// WHY (the root lesion restated as an INSTRUCTION account, not a chain).
+// `gemm_fp8_mrows_kernel<M>` gives ONE WARP per OUTPUT ROW and folds all M
+// activation rows inside that warp (`float acc[M]`). The M activation rows are
+// the SAME DATA for every one of the `n` warps, yet each of them pays the whole
+// M fold: per (warp, kb) the legacy program issues 2 weight LDS + 3M activation
+// LDS + 1 weight-scale LDG + (1+M) decode FMUL + M FMA = 5M + 4. At the verify's
+// M = 6 / n = 512 that is 34 instructions per (warp, kb) for SIX output elements,
+// i.e. 5.67 per element, and 24 of those 34 (71%) are the ACTIVATION side -- paid
+// `n` times over. That is the whole 52.1us / 5-row = 5x measurement: not a
+// dependency chain, a LINEARLY REPLICATED fold. (The MPAR design's own count
+// table has the same 34; this kernel's header states the consequence.)
+//
+// WHAT CHANGES. M becomes the ROW AXIS OF A WARP-LOCAL REGISTER TILE: a warp
+// computes a whole (M x bn) block -- ALL M activation rows against `bn` of the
+// block's output rows -- instead of one output row. Two reuses follow:
+//   * the weight byte (and its decode) is read ONCE per (warp, kb) and folded
+//     against all M rows  -- the reuse the legacy kernel already had;
+//   * the activation byte (and its decode) is read ONCE per (warp, kb) and
+//     folded against all `bn` output rows  -- the reuse the legacy kernel did
+//     NOT have, and the one this kernel exists for.
+// Per (warp, kb) that is 3bn weight LDS + 3M activation LDS/LDG + (M+bn) decode
+// FMUL + M*bn FMA, and the grid is n/bn warps wide instead of n, so the TOTAL is
+//   ((4M/bn) + 4 + M) * n   vs the legacy  (5M + 4) * n.
+// At M = 6 that is 0.65x at bn = 2 and 0.47x at bn = 4 -- the only member of the
+// three M-amortisation arms that REDUCES the instruction count. For scale:
+//   * MPAR (M as a WARP axis) = 1.59x the instructions -> measured NEGATIVE twice
+//     (audit §10.9: "the 1.59x instruction cost > the benefit, structural ceiling
+//     confirmed");
+//   * 5a (L2 direct read, no staging) = the SAME instruction count -> measured
+//     NEGATIVE on all four rpb arms (+3.4~4.3 ms).
+// So the bet here is the OPPOSITE of MPAR's: MPAR bet latency-bound (more warps
+// wins) and lost; this bets issue/throughput-bound (fewer instructions wins). If
+// it loses too, neither model holds and the finding must be reported rather than
+// tuned away (mrows-mtile-design.md §4 last paragraph).
+//
+// WHY THE WEIGHT IS STILL STAGED (the 5a lesson used correctly). 5a removed the
+// private smem slab and read the weight straight from L1/L2 -- measured negative,
+// because at rpb = 1 the grid is n (=3200-3840) blocks of duplicated L1/L2
+// requests (audit §10.9). Here the block's weight tile is `nw*bn` rows staged
+// ONCE by cp.async16 and read from low-latency smem, so the weight's DRAM traffic
+// is n*k per launch (1x) and its request count is 1x. The ACTIVATION is what is
+// NOT staged: its per-warp read is M bytes (6), not n, and each byte already
+// serves `bn` rows inside the warp, so a block-wide activation slab would only
+// re-introduce a per-block prologue -- the fold_r / MPAR lesion ("the repeated
+// quantity is the PROLOGUE, not the bytes").
+//
+// GEOMETRY. BLOCK_M = 8 (>= VERIFY_ROWS = 6, a power of two, and the m <= 8
+// dispatch ceiling). A warp is identified by (m_block, n_block); with BLOCK_M = 8
+// covering every production M there is exactly ONE m_block, so the coordinate
+// that varies is n_block = warp. The PROLOGUE ORDER is MPAR's reworked one verbatim
+// (issue the slab -> build the table as its cover -> wait -> barrier): the first
+// MPAR cut built the table first and left each block's DRAM round trip fully
+// exposed, which was one of its two measured death terms.
+//
+// NUMERICS -- BIT-IDENTICAL to `gemm_fp8_mrows_kernel<M>` and therefore to the
+// m = 1 launch of the same row (the legacy kernel's C1-C6):
+//   * C1 same K walk: `kb` ascends 0..nb_k-1, `j = kb*32 + lane`;
+//   * C2 same operands, same bytes: the weight byte is the staged slab byte at
+//     the 1:1 flat index (`(n_block*bn + nn)*k + j` == `w[row*k + j]`, because the
+//     slab is the contiguous global range `w[row0*k .. (row0+nrows)*k)`); the
+//     activation byte is `a[q*k + j]` -- the very byte the legacy kernel copies
+//     into `s_a[q*k + j]`, and a copy's width is not observable (C2's own
+//     argument), so reading the source is the same byte; `s_lut[b] ==
+//     e4m3_to_f(b)` BY CONSTRUCTION (the table is built from it), `w_scale` /
+//     `a_scale` are the same words, and `j>>5 == kb`;
+//   * C3 same reduction tree: `shfl_xor` off = 16,8,4,2,1 emitted verbatim, run
+//     ONCE per (warp, activation row, output row) -- each element is still
+//     computed by exactly ONE warp, with ONE tree;
+//   * C4/C5 no cross-row and no cross-K recombination: `acc[q][nn]` is an
+//     independent serial chain, nothing is ever added across q or nn, no K-split;
+//   * C6 codegen pin: the same `acc[q][nn] += av[q] * wv` with the legacy
+//     `#pragma unroll 32` source form.
+// The two a32 arms (C2) are the same expression by construction (one FMUL for the
+// operand either way), so the single inline form below is bit-identical at EITHER
+// setting of DSV41_GEMV_A32; the gate is deliberately not re-read here, exactly
+// as the MPAR and 5a kernels documented. `av[q]` is computed once per (q, kb) and
+// reused across `nn` -- the same product, in the same operand order, the legacy
+// a32 = 1 arm materialises into a register before folding.
+//
+// ABI: (a, a_scale, w, w_scale, bias, out, n, k, out_stride, bn). Same pointers
+// and meaning as the legacy kernel; `bn` is the warp tile's N extent (output rows
+// per warp). `fold_r` / `act_cp16` / `a32` are properties of the M-in-register
+// fold this kernel does not have. The launcher declines unless `bn >= 1`,
+// `k % 32 == 0` (all launchers reject it, and it also makes the 16B staging
+// exact: k % 32 == 0 => 16 | k, so the slab has NO tail), and the dynamic smem
+// fits the device ceiling.
+constexpr int kMrowsMtileBNMax = 4;   // register-tile N bound (acc[M][BN_MAX])
+constexpr int kMrowsMtileBM = 8;      // the M tile: >= VERIFY_ROWS = 6, power of two
+template <int M>
+__global__ void __launch_bounds__(256)
+gemm_fp8_mtile_kernel(const uint8_t* __restrict__ a, const float* __restrict__ a_scale,
+                      const uint8_t* __restrict__ w, const uint8_t* __restrict__ w_scale,
+                      const float* __restrict__ bias, float* __restrict__ out, int n, int k,
+                      int out_stride, int bn) {
+    constexpr int BM = kMrowsMtileBM;
+    // The rows this specialisation actually folds. `RN = M` at every reachable
+    // shape (the launcher caps m at 8 == BM), so BLOCK_M = 8 costs NOTHING: it is
+    // the tile's declared extent / alignment, and the 2 pad rows of a m = 6 launch
+    // are never computed (no "compute 8, throw 2 away").
+    constexpr int RN = (M < BM) ? M : BM;
+    constexpr int BN_MAX = kMrowsMtileBNMax;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int nw = (int)(blockDim.x >> 5);
+    const int nb_k = k >> 5;
+    const int n16 = k >> 4;
+    // warp -> (m_block, n_block). BM = 8 >= every production M => ONE m_block;
+    // the axis is still written down because it is the tile coordinate, and the
+    // N one is what the warp index resolves to.
+    const int n_block = warp;
+    const int row0 = blockIdx.x * nw * bn;          // the block's first output row
+    const int row_base = row0 + n_block * bn;       // this warp's first output row
+    // smem: the block's weight tile (`nw*bn` rows of `k` bytes) | the 256-entry
+    // e4m3 table. NO activation slab (see the header): the activation's reuse is
+    // the warp-local `bn` axis, and a block-wide copy would only re-introduce a
+    // per-block prologue.
+    extern __shared__ uint8_t smem[];
+    uint8_t* s_w = smem;
+    float* s_lut = reinterpret_cast<float*>(s_w + (size_t)nw * (size_t)bn * (size_t)k);
+    // PROLOGUE ORDER (MPAR's reworked order, verbatim): ISSUE -> COMMIT ->
+    // BUILD THE TABLE (the only producer-independent cover) -> WAIT -> BARRIER.
+    // The slab is the contiguous global range `w[row0*k .. (row0+nrows)*k)`, so a
+    // flat 16B-unit index maps onto it 1:1; one unit per THREAD (not per warp --
+    // MPAR's first cut issued the same 16B copy from all 32 lanes, i.e. a 32x
+    // redundant request per unit).
+    const int nrows = min(nw * bn, n - row0);       // >= 1: the grid is ceil(n/(nw*bn))
+    const uint8_t* __restrict__ wsrc = w + (size_t)row0 * (size_t)k;
+    const bool w16 = dsv41_f4_ok(wsrc) && dsv41_f4_ok(s_w);   // block-uniform
+    if (w16) {
+        const int nflat = nrows * n16;
+        for (int i = threadIdx.x; i < nflat; i += blockDim.x)
+            dsv41_cp_async16(s_w + ((size_t)i << 4), wsrc + ((size_t)i << 4));
+        dsv41_cp_commit();
+    }
+    // The e4m3 decode table, built UNDER the slab transfer (the order note above).
+    for (int i = threadIdx.x; i < 256; i += blockDim.x) s_lut[i] = e4m3_to_f((uint8_t)i);
+    if (w16) {
+        // Retire the slab here: the reader of `s_w[...]` may be a DIFFERENT warp
+        // than the writer, so the transfer must complete before the barrier
+        // publishes it (the legacy prologue could leave it in flight because each
+        // warp staged its OWN row).
+        dsv41_cp_wait_all();
+    } else {
+        // k % 16 tail / unaligned arm: unreachable for every launcher (they all
+        // reject `k & 31`, which makes `row0*k` and the slab 16B multiples).
+        for (int i = threadIdx.x; i < nrows * k; i += blockDim.x) s_w[i] = wsrc[i];
+    }
+    // Cross-warp publication (the order note above).
+    __syncthreads();
+    if (row_base < n) {
+        // THE REGISTER TILE: RN activation rows x bn output rows. `acc[q][nn]` is
+        // the element `out[q][row_base + nn]`, and its chain is the legacy chain.
+        float acc[RN][BN_MAX];
+        #pragma unroll
+        for (int q = 0; q < RN; ++q)
+            #pragma unroll
+            for (int nn = 0; nn < BN_MAX; ++nn) acc[q][nn] = 0.f;
+        // Rows this warp actually writes (bn capped by the n tail). Warp-uniform,
+        // so the early returns / breaks below are warp-uniform branches and the
+        // `shfl_xor` full mask stays valid.
+        const int nvalid = min(bn, n - row_base);
+        #pragma unroll 32
+        for (int kb = 0; kb < nb_k; ++kb) {
+            const int j = kb * 32 + lane;
+            // ONE activation decode per (q, kb), shared by the warp's whole N tile.
+            // The byte comes from L1 (`__ldg`): the legacy kernel's `s_a[q*k+j]` is
+            // a PURE COPY of this address, and a copy's width is not observable.
+            float av[RN];
+            #pragma unroll
+            for (int q = 0; q < RN; ++q)
+                av[q] = e4m3_to_f(__ldg(a + (size_t)q * (size_t)k + j)) *
+                        __ldg(a_scale + (size_t)q * (size_t)nb_k + kb);
+            #pragma unroll
+            for (int nn = 0; nn < BN_MAX; ++nn) {
+                if (nn >= nvalid) break;
+                const int row = row_base + nn;
+                // The weight byte of THIS output row, out of the staged slab (1:1
+                // flat index), decoded once and then folded against all RN rows --
+                // the legacy `wv` hoist (C4).
+                const float sb = ue8m0_to_f(__ldg(w_scale + (size_t)(row >> 5) * (size_t)nb_k + kb));
+                const float wv =
+                    s_lut[s_w[(size_t)(n_block * bn + nn) * (size_t)k + j]] * sb;
+                #pragma unroll
+                for (int q = 0; q < RN; ++q) acc[q][nn] += av[q] * wv;
+            }
+        }
+        // One `shfl_xor` tree per ELEMENT (the legacy tree, run per (q, nn)).
+        #pragma unroll
+        for (int q = 0; q < RN; ++q)
+            #pragma unroll
+            for (int nn = 0; nn < BN_MAX; ++nn) {
+                if (nn >= nvalid) break;
+                float a_q = acc[q][nn];
+                for (int off = 16; off > 0; off >>= 1) a_q += __shfl_xor_sync(0xFFFFFFFFu, a_q, off);
+                if (lane == 0) {
+                    const int row = row_base + nn;
+                    const float v = a_q + (bias != nullptr ? bias[row] : 0.f);
+                    out[(size_t)q * (size_t)out_stride + (size_t)row] = v;
+                }
+            }
+    }
+}
+
+// MTILE gate (DSV41_MROWS_MTILE, 2026-09-13). Armed (any value != 0) selects
+// `gemm_fp8_mtile_kernel<M>` -- the M-into-the-GEMM-tile program, warp tile
+// (M x bn), the block's weight tile staged once. `DSV41_MROWS_MTILE_BN` (1..4,
+// default 2) is the tile's N extent, the arm's ONLY tuning axis. Unset / `0` is
+// OFF: the shipped M-in-register program, byte for byte.
+//
+// PRECEDENCE: MTILE > 5a (L2BCAST) > MPAR > legacy. Two alternative programs may
+// not run at once, and this tree has been bitten by the "armed but inert"
+// phantom-gate shape often enough that the shadowed arm is NAMED in the receipt
+// rather than silently dropped.
+static const int g_mrows_mtile = [] {
+    const char* e = getenv("DSV41_MROWS_MTILE");
+    if (e == nullptr) return 0;
+    return atoi(e);
+}();
+static const int g_mrows_mtile_bn = [] {
+    const char* e = getenv("DSV41_MROWS_MTILE_BN");
+    if (e == nullptr) return 2;               // the design's default N extent
+    int v = atoi(e);
+    if (v < 1) v = 1;
+    if (v > kMrowsMtileBNMax) v = kMrowsMtileBNMax;
+    return v;
+}();
+// 0 = OFF; > 0 = armed. `n` is accepted (and unused) so the resolution helper has
+// the same shape as `dsv41_mrows_mpar_for`, which the test binary pins with one
+// argument; the arm's geometry is resolved by `dsv41_mrows_mtile_warps_for` below.
+static inline int dsv41_mrows_mtile_for(int m, int n = 0) {
+    (void)n;
+    if (g_mrows_mtile == 0) return 0;   // OFF: today's program
+    if (m < 1 || m > kMrowsMtileBM) return 0;
+    return 1;
+}
+// Warps per block for the M-tile arm -- "THE WIDEST BLOCK THAT STILL COVERS THE
+// SMs", the coverage-aware rule `dsv41_mrows_mpar_for`'s rework landed (and the
+// exact reason MPAR's first `auto` lost: it took the widest block, which left wkv
+// at 103 blocks and the shared expert at 58 on a 148-SM part). Here the block
+// covers `nw*bn` output rows, so `nw <= n/(bn*sms)` keeps `grid = ceil(n/(nw*bn))
+// >= sms`. Clamped up to 1 (never 0), and down to the legacy block width so the
+// arm never makes the block wider than the program it replaces.
+static inline int dsv41_mrows_mtile_warps_for(int n, int bn) {
+    if (bn < 1) bn = 1;
+    int cover = n / (bn * dsv41_sm_count());
+    if (cover < 1) cover = 1;
+    int nw = dsv41_mrows_warps_for(n);
+    if (nw > cover) nw = cover;
+    if (nw < 1) nw = 1;
+    return nw;
+}
+
 // See the kernel header above for the layout and the bit-identity argument (C1-C6).
 // Returns 0 (launched) or 2 (declined: the caller keeps its per-row loop, whose
 // numerics are the same by construction).
@@ -6120,6 +6376,99 @@ extern "C" int dsv41_gemm_fp8_mrows(const uint8_t* a, const float* a_scale,
     // the mpar arm then declines and the legacy arm runs (loudly, see the
     // receipt below).
     const int mpar = dsv41_mrows_mpar_for(m, n);
+    // MTILE (DSV41_MROWS_MTILE, 2026-09-13): the M-INTO-THE-GEMM-TILE program --
+    // `gemm_fp8_mtile_kernel<M>`, a warp-local (M x bn) register tile, the block's
+    // weight tile staged once, the activation read straight from L1. Design:
+    // docs/agent/mrows-mtile-design.md.
+    //
+    // PRECEDENCE: this arm runs FIRST -- it is the design's正解, the only one of
+    // the three M-amortisation arms that REDUCES the per-element instruction count
+    // (0.65x at bn=2 / 0.47x at bn=4 vs the legacy 1.00x, MPAR's 1.59x and 5a's
+    // 1.00x). 5a and MPAR are therefore the shadowed arms, and this receipt names
+    // them when it sees them armed (the "armed but inert" shape this tree has been
+    // bitten by). Like both of them it requires `fold_r == m`: the M axis is
+    // carried by the tile, so the legacy grid fold must stay OFF (two independent
+    // M folds would stage the weight tile ng times, the fold_r 6x regression).
+    const int mtile = dsv41_mrows_mtile_for(m, n);
+    if (mtile > 0 && fold_r == m) {
+        const int bn = g_mrows_mtile_bn;
+        // "The widest block that still covers the SMs" -- see the helper's header.
+        const int nw = dsv41_mrows_mtile_warps_for(n, bn);
+        // weight tile (nw*bn rows of k bytes) + the 256-entry e4m3 table. NO
+        // activation slab: the activation's reuse is the warp-local bn axis, and a
+        // block-wide copy would only re-introduce a per-block prologue (the
+        // fold_r / MPAR lesion). Strictly smaller than the legacy program's smem
+        // at wq_a/wkv, within a KB of it at wq_b/wo_b.
+        const size_t smem_mt =
+            (size_t)nw * (size_t)bn * (size_t)k + (size_t)256 * sizeof(float);
+        const int smrows = nw * bn;
+        const dim3 grid_mt((unsigned)((n + smrows - 1) / smrows));
+        if (smem_mt <= (size_t)dsv41_smem_ceiling(gemm_fp8_mtile_kernel<1>)) {
+            if (smem_mt > 48 * 1024) {
+                // Same per-kernel attribute discipline as the other two arms:
+                // EVERY M specialisation needs its own ceiling or the launch dies
+                // with cudaErrorInvalidValue at the m the verify actually uses.
+                cudaError_t e = cudaSuccess;
+#define FERRITE_SET_MROWS_MTILE_SMEM(k)                                                \
+    do {                                                                               \
+        cudaError_t r = cudaFuncSetAttribute(                                          \
+            gemm_fp8_mtile_kernel<k>, cudaFuncAttributeMaxDynamicSharedMemorySize,     \
+            dsv41_smem_ceiling(gemm_fp8_mtile_kernel<k>));                             \
+        if (r != cudaSuccess && e == cudaSuccess) e = r;                               \
+    } while (0)
+                FERRITE_SET_MROWS_MTILE_SMEM(1);
+                FERRITE_SET_MROWS_MTILE_SMEM(2);
+                FERRITE_SET_MROWS_MTILE_SMEM(3);
+                FERRITE_SET_MROWS_MTILE_SMEM(4);
+                FERRITE_SET_MROWS_MTILE_SMEM(5);
+                FERRITE_SET_MROWS_MTILE_SMEM(6);
+                FERRITE_SET_MROWS_MTILE_SMEM(7);
+                FERRITE_SET_MROWS_MTILE_SMEM(8);
+#undef FERRITE_SET_MROWS_MTILE_SMEM
+                if (e != cudaSuccess) { (void)cudaGetLastError(); return (int)e; }
+            }
+            // ACTIVITY RECEIPT (the act_cp16 / mpar / l2 precedent, same reason):
+            // the arm has its own kernel NAME, but the DECLINE branches (gate
+            // unset, fold_r != m, smem over ceiling) have none. ONE line per
+            // process, on the first ARMED launch, naming the geometry that launch
+            // resolved to and any arm this one shadows.
+            {
+                static int reported = 0;
+                if (reported++ == 0)
+                    fprintf(stderr,
+                            "[mrows-mtile] ARMED m=%d n=%d k=%d bn=%d nw=%d -> block=%d warps, "
+                            "grid=%d, smem=%zu%s%s\n",
+                            m, n, k, bn, nw, nw, (int)grid_mt.x, smem_mt,
+                            (g_mrows_l2bcast != 0)
+                                ? "  [DSV41_MROWS_L2BCAST also armed -> shadowed by this arm]"
+                                : "",
+                            (mpar > 0) ? "  [DSV41_MROWS_MPAR also armed -> shadowed by this arm]"
+                                       : "");
+            }
+            const int blk_mt = nw * 32;
+            switch (m) {
+                case 1: gemm_fp8_mtile_kernel<1><<<grid_mt, blk_mt, smem_mt, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, bn); break;
+                case 2: gemm_fp8_mtile_kernel<2><<<grid_mt, blk_mt, smem_mt, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, bn); break;
+                case 3: gemm_fp8_mtile_kernel<3><<<grid_mt, blk_mt, smem_mt, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, bn); break;
+                case 4: gemm_fp8_mtile_kernel<4><<<grid_mt, blk_mt, smem_mt, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, bn); break;
+                case 5: gemm_fp8_mtile_kernel<5><<<grid_mt, blk_mt, smem_mt, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, bn); break;
+                case 6: gemm_fp8_mtile_kernel<6><<<grid_mt, blk_mt, smem_mt, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, bn); break;
+                case 7: gemm_fp8_mtile_kernel<7><<<grid_mt, blk_mt, smem_mt, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, bn); break;
+                case 8: gemm_fp8_mtile_kernel<8><<<grid_mt, blk_mt, smem_mt, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, bn); break;
+                default: return 2;
+            }
+            return (int)cudaGetLastError();
+        }
+        // smem over the device ceiling: decline LOUDLY and let the next arm take
+        // it. The m <= 8 / k <= 7168 production shapes never reach this (the widest
+        // tile is wq_a's 41 KB at bn=2), but an exotic caller must not be silently
+        // mis-served by a launch that would fail anyway.
+        static int reported_over = 0;
+        if (reported_over++ == 0)
+            fprintf(stderr,
+                    "[mrows-mtile] DECLINED m=%d n=%d k=%d bn=%d nw=%d: smem=%zu > ceiling\n", m,
+                    n, k, bn, nw, smem_mt);
+    }
     // ⑤a L2-BROADCAST (DSV41_MROWS_L2BCAST, 2026-09-13): the alternative program
     // `gemm_fp8_mrows_l2_kernel<M>` -- M back into the GRID (the fold_r shape),
     // but the weight read straight from L1/L2 instead of staged through a private

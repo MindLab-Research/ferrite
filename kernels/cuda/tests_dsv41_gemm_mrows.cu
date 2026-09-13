@@ -410,6 +410,66 @@ int mr_mpar_contract() {
     return fails;
 }
 
+// --------------------------------------- MTILE contract pin (DSV41_MROWS_MTILE)
+// `g_mrows_mtile` / `g_mrows_mtile_bn` are FILE-SCOPE consts read from `getenv` at
+// LOAD time (same as `g_mrows_fold_r` / `g_mrows_mpar`), so the M-into-the-GEMM-tile
+// arm cannot be swept inside one process: one process per `DSV41_MROWS_MTILE_BN`
+// value, as the header says. What THIS pin proves inside any single process is the
+// RESOLUTION the launcher will use:
+//   * OFF (unset / `0`) -> `dsv41_mrows_mtile_for` returns 0 at every m, i.e. the
+//     shipped default is byte-for-byte the M-in-register program the arms above test;
+//   * ARMED -> `nw` lands in [1, dsv41_mrows_warps_for(n)] (the arm never makes a
+//     block WIDER than the program it replaces) and the coverage rule is a real
+//     invariant: the grid `ceil(n/(nw*bn))` is non-zero and covers every output row
+//     (`grid*nw*bn >= n`), which is the MPAR-auto lesson this rule exists for.
+//
+// The BIT-IDENTITY itself is carried by the mr_case arms: with the gate set,
+// `dsv41_gemm_fp8_mrows` launches `gemm_fp8_mtile_kernel<m>` instead, and the same
+// "m-row launch == m single-row launches, bit for bit" check runs on it. So
+// `DSV41_MROWS_MTILE=1 DSV41_MROWS_MTILE_BN=N ./t_gemm_mrows` *is* the parity test.
+int mr_mtile_contract() {
+    const int want = g_mrows_mtile;      // the file-scope const the launcher reads
+    const int bn = g_mrows_mtile_bn;     // the resolved warp-tile N extent
+    printf("  [mtile] DSV41_MROWS_MTILE=%s (const=%d)  DSV41_MROWS_MTILE_BN=%s (bn=%d) -> %s\n",
+           getenv("DSV41_MROWS_MTILE") == nullptr ? "<unset>" : getenv("DSV41_MROWS_MTILE"), want,
+           getenv("DSV41_MROWS_MTILE_BN") == nullptr ? "<unset>" : getenv("DSV41_MROWS_MTILE_BN"),
+           bn, want == 0 ? "OFF: M-in-register (the shipped default)" : "M-tile (M x bn)");
+    int fails = 0;
+    MR_CHECK(bn >= 1 && bn <= kMrowsMtileBNMax, "[mtile] bn=%d outside [1,%d]", bn,
+             kMrowsMtileBNMax);
+    // The production shapes (same set the other pins use) + a wide one.
+    struct { const char* what; int n, m; } sh[] = {
+        {"wkv", 512, 6},   {"wq_a", 1280, 5}, {"wq_b", 4096, 6},
+        {"wo_b", 5120, 5}, {"sh_w1/w3", 288, 6}, {"lazy/m=1", 512, 1},
+    };
+    for (int m = 1; m <= 8; ++m) {
+        const int r = dsv41_mrows_mtile_for(m);
+        if (want == 0) {
+            MR_CHECK(r == 0, "[mtile] OFF m=%d: dsv41_mrows_mtile_for=%d, want 0", m, r);
+        } else {
+            MR_CHECK(r > 0, "[mtile] armed m=%d: dsv41_mrows_mtile_for=%d, want >0", m, r);
+        }
+    }
+    for (const auto& s : sh) {
+        const int nw = dsv41_mrows_mtile_warps_for(s.n, bn);
+        const int cap = dsv41_mrows_warps_for(s.n);
+        const int grid = (s.n + nw * bn - 1) / (nw * bn);
+        printf("           %-11s n=%-5d bn=%d -> nw=%d grid=%d (legacy nw cap=%d)\n", s.what, s.n,
+               bn, nw, grid, cap);
+        MR_CHECK(nw >= 1 && nw <= cap, "[mtile] %s: nw=%d outside [1,%d]", s.what, nw, cap);
+        MR_CHECK(grid >= 1 && grid * nw * bn >= s.n,
+                 "[mtile] %s: grid=%d x nw=%d x bn=%d does not cover n=%d", s.what, grid, nw, bn,
+                 s.n);
+        if (want == 0)
+            MR_CHECK(dsv41_mrows_mtile_for(s.m, s.n) == 0,
+                     "[mtile] %s: OFF must resolve to 0", s.what);
+    }
+    if (fails == 0)
+        printf("  [mtile] OK  (%s)\n",
+               want == 0 ? "OFF => 0 at every m" : "armed: nw in [1, legacy nw], grid covers n");
+    return fails;
+}
+
 // ------------------------------------------------------------- the declines
 int mr_case_declines() {
     std::vector<uint8_t> a(4096, 0x38), w(4096, 0x38), ws(4096, 0x7Bu);
@@ -504,6 +564,12 @@ int main(int argc, char** argv) {
     // per `rpb` — the gate is a load-time const, so an in-process sweep is
     // impossible by construction.
     g_fails += mr_mpar_contract();
+    // MTILE (DSV41_MROWS_MTILE): the resolution + coverage pin. The PARITY of the
+    // M-into-the-GEMM-tile kernel is carried by every mr_case arm above when the
+    // gate is set (the launcher dispatches to `gemm_fp8_mtile_kernel<m>`); run this
+    // suite once per `DSV41_MROWS_MTILE_BN` — the gate is a load-time const, so an
+    // in-process sweep is impossible by construction.
+    g_fails += mr_mtile_contract();
     if (!quick) {
         // Every dispatch case the launcher's switch can take.
         for (int m = 1; m <= 8; ++m)

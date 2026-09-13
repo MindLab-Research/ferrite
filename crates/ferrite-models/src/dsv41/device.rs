@@ -847,6 +847,23 @@ struct Kernels {
     ring_win_fuse_ph: Option<unsafe extern "C" fn(
         *mut f32, *const f32, *const c_int, c_int, c_int, *mut i32, *const c_int, c_int, CuStream,
     ) -> c_int>,
+    // RING-WIN-MROWS (`DSV41_RING_WIN_MROWS=1`): the whole verify block's append +
+    // per-row causal window indices in ONE launch - the rows form of
+    // `ring_win_fuse` with an explicit `idxs` row stride (`ist = window +
+    // index_topk`, so each row's bytes land where the per-row call wrote them).
+    // Caller enforces `*pos_ctr + m - 1 < window` (no ring turnover). Optional:
+    // an older .so without the symbol keeps the per-row path.
+    ring_win_fuse_mrows: Option<unsafe extern "C" fn(
+        *mut f32,
+        *const f32,
+        *const c_int,
+        c_int,
+        c_int,
+        c_int,
+        *mut i32,
+        c_int,
+        CuStream,
+    ) -> c_int>,
     // DSpark verify: the m-row block append + per-row CAUSAL window indices in
     // one launch (the multi-row twin of `ring_win_fuse`). Row r's window ends
     // at *pos_ctr + r, so the intra-block causal order falls out of the ring
@@ -1685,6 +1702,7 @@ impl Device {
             apply_rope_q: ko!(rt, "dsv41_apply_rope_q"),
             ring_win_fuse: ko!(rt, "dsv41_ring_win_fuse"),
             ring_win_fuse_ph: ko!(rt, "dsv41_ring_win_fuse_ph"),
+            ring_win_fuse_mrows: ko!(rt, "dsv41_ring_win_fuse_mrows"),
             verify_ring_win: ko!(rt, "dsv41_verify_ring_win"),
             dspark_ring_save: ko!(rt, "dsv41_dspark_ring_save"),
             dspark_ring_restore: ko!(rt, "dsv41_dspark_ring_restore"),
@@ -5959,6 +5977,38 @@ impl Device {
         };
         let rc = unsafe { f(ring, kv, pos_ctr, window, hd, idxs, clen, index_topk, self.stream) };
         self.kerr(rc, "dsv41_ring_win_fuse_ph")?;
+        Ok(true)
+    }
+
+    /// RING-WIN-MROWS (`DSV41_RING_WIN_MROWS=1`): one launch for the whole verify
+    /// block's ring append + per-row causal window indices - the rows form of
+    /// [`Self::ring_win_fuse`] with an explicit `idxs` row stride. `pos_ctr` is
+    /// the `pos_rows` array (row r's start position is `*pos_ctr + r`), `kv` is
+    /// the contiguous `[m, hd]` block, and row r's indices land at
+    /// `idxs + r * idx_stride` - the exact base the per-row call used
+    /// (`idxs_r + r*ist`), so row r's bytes are identical to it.
+    ///
+    /// ⚠️ The CALLER must guarantee `*pos_ctr + m - 1 < window` (no ring
+    /// turnover) - see the kernel header. `Ok(false)` means the `.so` lacks the
+    /// symbol and the caller keeps the per-row path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ring_win_fuse_mrows(
+        &self,
+        ring: *mut f32,
+        kv: *const f32,
+        pos_ctr: *const c_int,
+        window: i32,
+        hd: i32,
+        m: i32,
+        idxs: *mut i32,
+        idx_stride: i32,
+    ) -> Result<bool> {
+        let f = match self.kernels.ring_win_fuse_mrows {
+            Some(f) => f,
+            None => return Ok(false),
+        };
+        let rc = unsafe { f(ring, kv, pos_ctr, window, hd, m, idxs, idx_stride, self.stream) };
+        self.kerr(rc, "dsv41_ring_win_fuse_mrows")?;
         Ok(true)
     }
 

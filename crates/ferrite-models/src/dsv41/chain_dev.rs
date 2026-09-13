@@ -3134,6 +3134,29 @@ fn verify_ring_win_fuse() -> bool {
     *F.get_or_init(|| std::env::var("DSV41_RING_WIN_FUSE").map(|v| v == "1").unwrap_or(false))
 }
 
+/// RING-WIN-MROWS (`DSV41_RING_WIN_MROWS=1`, DEFAULT OFF — A/B first): replace the
+/// verify's per-row `ring_win_fuse` calls (one launch per row, 6 per layer at
+/// `m = 6`) with ONE whole-block launch (`dsv41_ring_win_fuse_mrows`, the rows form
+/// of `ring_win_fuse` with an explicit `idxs` row stride).
+///
+/// ⚠️ **The safety precondition is NOT in this gate — it is enforced at the call
+/// site**: `pos_base + m - 1 < window` (no ring turnover). The rows kernel appends
+/// every row up front, and row r reads its window's slots; once the ring is full
+/// that window spans every slot, so a later row's append destroys an entry row r
+/// still needs. This is EXACTLY why the original block-wide `verify_ring_win` had
+/// to be reverted (audit defect #2). With no turnover row r's window is
+/// `[0, pos_r]` (slots `{0..pos_r}`, disjoint from every later append), so the
+/// hoist is byte-identical to the per-row interleave. In steady state (the ring
+/// has turned over) the arm is therefore correctly DECLINED and the per-row path
+/// runs — the steady-state win is [`verify_ring_win_fuse`] (`DSV41_RING_WIN_FUSE=1`,
+/// 12 -> 6 launches/layer), not this one.
+///
+/// Read ONCE and cached: the check runs 40x/step inside graph capture.
+fn ring_win_mrows() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_RING_WIN_MROWS").map(|v| v == "1").unwrap_or(false))
+}
+
 /// B3 (DSV41_COMP_PLACEHOLDER_FUSE, default ON): the recency-placeholder launch
 /// (30/step, ~1.0us each) writes `idxs[win, win+take)` into the SAME buffer the
 /// `ring_win_fuse` epilogue already writes `idxs[0, win)` into, and `sparse_attn`
@@ -12524,6 +12547,33 @@ impl<'a> DevChain<'a> {
         // per-row calls used (`q_r + r*nh*hd`, `o_r + r*nh*hd`). `xq_r`/`xsc_r` are
         // NOT affected — they are this rank's compact `nlh*hd` block in both worlds.
         let attn_row_pitch: i32 = if world == 1 { 0 } else { (nh * hd) as i32 };
+        // RING-WIN-MROWS (`DSV41_RING_WIN_MROWS=1`, DEFAULT OFF — A/B first): the
+        // whole block's append + per-row causal window in ONE launch
+        // (`dsv41_ring_win_fuse_mrows`), i.e. the rows form of the per-row
+        // `ring_win_fuse` below with the block's `idxs` row stride `ist`. See
+        // [`ring_win_mrows`] for why `pos_base + m - 1 < win` is the CORRECTNESS
+        // precondition, not a tuning term: the rows kernel appends every row up
+        // front, and a turned-over ring would let a later row's append clobber a
+        // slot row r still reads (audit defect #2 — the reverted block-wide
+        // `verify_ring_win`). It is the SAME term the W2-MROWS attention arm
+        // carries, so the two fire on the same regime. When it takes, the per-row
+        // append/window below is skipped for every row; a decline (gate off,
+        // consumer layer, stale `.so`, turned-over ring) leaves the per-row path
+        // byte for byte.
+        let rw_mrows = owns_kv
+            && m > 1
+            && ring_win_mrows()
+            && (pos_base as i64) + (m as i64) - 1 < win as i64
+            && self.dev.ring_win_fuse_mrows(
+                ring_ptr as *mut f32,
+                self.s.kv_r.ptr as *const f32,
+                self.s.pos_rows.ptr as *const std::os::raw::c_int,
+                win as i32,
+                hd as i32,
+                m as i32,
+                self.s.idxs_r.ptr as *mut i32,
+                ist as i32,
+            )?;
         for r in 0..m {
             // ---- 1) ring append + THIS row's causal window ----
             // (audit defect #2: the window half.) `window_idxs(r)` must run after
@@ -12547,7 +12597,10 @@ impl<'a> DevChain<'a> {
             // (12 -> 6 launches per layer at `m = 6`). The rollback is the pair,
             // unchanged, so a decline (gate OFF, or a `.so` without the symbol)
             // reproduces today's path launch for launch.
-            if owns_kv {
+            // RING-WIN-MROWS: when the hoisted block launch above took, every row's
+            // append AND window indices are already written - skipping this whole
+            // block is what turns 6 (or 12) ring+window launches into 1.
+            if owns_kv && !rw_mrows {
                 let rw_fused = verify_ring_win_fuse()
                     && self.dev.ring_win_fuse(
                         ring_ptr as *mut f32,

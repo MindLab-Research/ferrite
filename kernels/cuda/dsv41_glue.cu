@@ -1213,6 +1213,75 @@ extern "C" int dsv41_ring_win_fuse_ph(float* ring, const float* kv, const int* p
     return (int)cudaGetLastError();
 }
 
+// RING-WIN-MROWS (`DSV41_RING_WIN_MROWS=1`): the whole verify block's ring append
+// AND per-row causal window indices in ONE launch - the rows dimension of
+// `ring_win_fused_kernel`, i.e. the SAME per-row program (identical `slot =
+// (*pos_ctr + r) % window` append, identical decode-branch index arithmetic) with
+// the row index on the grid AND an explicit `idxs` row stride.
+//
+// The stride is what the older `dsv41_verify_ring_win` could not express: it wrote
+// `idxs[r*window + c]` (row pitch = window), while the verify's `idxs_r` block
+// pitches its rows at `ist = window + index_topk` (so `sparse_attn` reads row r at
+// `idxs_r + r*ist`). Passing `ist` reproduces the per-row `idxs_r + r*ist` base
+// exactly; row r's bytes are then identical to the per-row `ring_win_fuse` call it
+// replaces.
+//
+// ⚠️ CALLER-ENFORCED PRECONDITION: `*pos_ctr + m - 1 < window` (the block must
+// NOT turn the ring over). The append half writes every row UP FRONT, and row r
+// reads the slots of positions `[max(0, pos_r - window + 1), pos_r]`. Once the
+// ring is full that set is EVERY slot, so a later row's append destroys one entry
+// row r still reads - which is exactly why the original block-wide
+// `verify_ring_win` had to be reverted (audit defect #2). With no turnover row
+// r's window only spans positions `[0, pos_r]`, i.e. slots `{0..pos_r}`, all
+// strictly below every later append's slot, so hoisting the whole block's appends
+// ahead of row 0's readers is byte-identical to the per-row interleave. A
+// violation is silent corruption, not a perf change - `chain_dev.rs` gates this
+// call on the SAME `pos_base + m - 1 < window` term the W2-MROWS attention arm
+// uses.
+__global__ void ring_win_fused_mrows_kernel(float* __restrict__ ring, const float* __restrict__ kv,
+                                            const int* __restrict__ pos_ctr, int window, int hd,
+                                            int m, int idx_stride, int32_t* __restrict__ idxs) {
+    const int base = *pos_ctr;
+    // ---- append half: m*hd elements, strided grid-stride loop (rows distinct
+    //      slots because no turnover) ----
+    const int total = m * hd;
+    for (int e = threadIdx.x + (int)blockIdx.x * blockDim.x; e < total;
+         e += gridDim.x * blockDim.x) {
+        const int j = e / hd, i = e % hd;
+        const int slot = (base + j) % window;
+        ring[(size_t)slot * (size_t)hd + (size_t)i] = kv[(size_t)e];
+    }
+    // ---- indices half: m*window entries, first block only (it is tiny) ----
+    if (blockIdx.x != 0) return;
+    for (int e = threadIdx.x; e < m * window; e += blockDim.x) {
+        const int r = e / window, c = e % window;
+        const int start_pos = base + r;
+        int idx;
+        if (start_pos == 0) {
+            idx = (c == 0) ? 0 : -1;
+        } else {
+            const int oldest = (start_pos % window) + 1;
+            long long v = ((long long)c < (long long)window - oldest)
+                              ? (long long)oldest + c
+                              : (long long)c - ((long long)window - oldest);
+            if (v > (long long)start_pos) v = -1;
+            idx = (int)v;
+        }
+        idxs[(size_t)r * (size_t)idx_stride + (size_t)c] = idx;
+    }
+}
+
+extern "C" int dsv41_ring_win_fuse_mrows(float* ring, const float* kv, const int* pos_ctr,
+                                         int window, int hd, int m, int32_t* idxs, int idx_stride,
+                                         cudaStream_t s) {
+    if (window <= 0 || hd <= 0 || m <= 0) return (int)cudaSuccess;
+    const int n = (m * hd > m * window) ? m * hd : m * window;
+    const unsigned blocks = (unsigned)((n + 127) / 128);
+    ring_win_fused_mrows_kernel<<<blocks, 128, 0, s>>>(ring, kv, pos_ctr, window, hd, m, idx_stride,
+                                                      idxs);
+    return (int)cudaGetLastError();
+}
+
 
 // AR v5 launchers removed: DSV41 now calls the shared ferrite_p2p_ar_v5
 // (ferrite_kernels.cu). The three DSV41 entry points (dsv41_ar_v5_store /
