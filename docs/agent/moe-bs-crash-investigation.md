@@ -682,3 +682,46 @@ ssh ubuntu@43.202.208.136 'cd ~/ferrite/kernels/cuda/tilelang_gen && \
 （`SHIM_RC=0` = 手写 kernel + shim 全部编译通过。）
 
 **本轮实测**：该检查在 `DSV41_MOE_BS_SFREV`（§19）落地后**通过** ⇒ 下一个 GPU 窗口不会因编译错误浪费。
+
+## §23 【设计级事实】官方 `fp4_gemm` **不用**硬件 block_scale —— 这决定了我们的排查定位
+
+读官方源码（`ref_inference/kernel.py:520-557`）确认，官方 fp4 GEMM 的主循环是：
+
+```python
+for k in T.Pipelined(K_iters, num_stages=2):          # block_K = 32
+    T.copy(A[...k*block_K], A_shared)                  # e4m3 激活
+    T.copy(B[...k*block_K], B_fp4_shared)              # fp4 权重
+    for i, j in T.Parallel(block_N, block_K):
+        B_shared[i, j] = T.Cast(FP8, T.Cast(FP32, B_fp4_shared[i, j]))   # fp4 -> e4m3（无损）
+    for i in T.Parallel(block_N):
+        scale_b_frag[i] = T.Cast(FP32, scales_b[bx*block_N + i, k])       # per-(n, K-block)
+    for i in T.Parallel(block_M):
+        scale_a_frag[i] = T.Cast(FP32, scales_a[by*block_M + i, k // n_sub])
+    T.gemm(A_shared, B_shared, C_local, transpose_B=True)                 # ← 普通 FP8×FP8 MMA
+    for i, j in T.Parallel(block_M, block_N):
+        C_local_accum[i, j] += C_local[i, j] * scale_a_frag[i] * scale_b_frag[j]   # ← 标度在累加里显式乘
+    T.clear(C_local)
+```
+
+**三条推论**：
+1. 官方的数值 = `Σ_k (a·b) · 2^(sa[m][k/32]) · 2^(sb[n][k/32])`，**标度是在 f32 累加器里显式应用**的，
+   用的是普通 MMA（**没有** `kind::mxf8f6f4.block_scale`、没有 TMEM SF 操作数）。
+   数学上与我们用硬件 block_scale 想做的事**等价**——但**实现路径完全不同**。
+2. ⇒ **硬件 block_scale 这条路在树内没有任何可用参考**：
+   PH0 探针（唯一的"验证过"来源）在**本机跑不过它自己的金标准**（§18）；
+   `tc5::e4`/`mxf4` 两臂在仓里也未被 GPU parity 证实。所以"SF 语义按我们的假设"这一点
+   **从来没有被任何在本机通过的东西证明过**。
+3. ⇒ 我们的残余误差（"哪个 K-block 的标度被用上"这一族问题）**正好落在没有参考的那一环**上，
+   与 §19 的 SF 字节序假设同源。**这解释了为什么 16 组合微基准（含 PH0 风格的原语）全都失败。**
+
+**因此排查的正确形态**（两条独立判据）：
+- **A. 硬件路径是否正确**：冲激/字节映射探针（`bs-impulse-probe`，§20/§19）+ in-situ `[NC]` 数值（§16）——
+  直接问"给定输入，硬件算出来的数对不对"。
+- **B. 用官方当 oracle**：官方 `fp4_gemm` 在**同一台机同一样本**上能复现 float64 金标准到 bf16 精度（3.8e-3），
+  所以它本身就是一个**可用的 oracle**；把同一批字节喂进我们的 kernel、逐元素比官方输出，
+  看误差**在哪个维度上成规律**（行/列/K-block），比继续试配置快。
+
+**性能上的权衡（备忘）**：若最终判定硬件 block_scale 在本机不可用，退路是**按官方的方式做**
+（每 K-block 一次普通 MMA + f32 累加器里显式乘标度）。代价是每 K-block 需要独立累加（160 个 block），
+要么用多个 TMEM 累加器 + epilogue 里做 rank-1 缩放（4 个累加器/128 列可行，但跨 40 个 k-iteration
+的标度不同 ⇒ 需要每轮 TMEM 读回缩放 ⇒ 昂贵），要么接受更大开销。**优先把硬件路径搞对**。
