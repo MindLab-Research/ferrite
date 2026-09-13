@@ -206,8 +206,9 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
             const int m = i >> 7;   // row [0,128)
             const int kk = i & 127; // col [0,128) — byte index for e4m3
             const uint8_t val = A[(int64_t)(seg * HW_BM + m) * HW_K + k * HW_BK + kk];
-            // Core matrix layout: (m/8)*1024 + (k/16)*128 + (m%8)*16 + (k%16)
-            A_sh[(m >> 3) * 1024 + (kk >> 4) * 128 + (m & 7) * 16 + (kk & 15)] = val;
+            // SW128 (CU_TENSOR_MAP_SWIZZLE_128B) — MUST match TileLang's TMA layout:
+            //   addr(r,c) = (r/8)*1024 + (r%8)*128 + (((c/16) ^ (r%8))*16) + (c%16)
+            A_sh[(m >> 3) * 1024 + (m & 7) * 128 + ((((kk >> 4) ^ (m & 7))) << 4) + (kk & 15)] = val;
         }
 
         // (2) 所有线程协同加载 B tile (W1 前 64 行 + W3 后 64 行)
@@ -231,8 +232,9 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
             // And fp4_pack_kernel: packed = (lo & 0xF) | (hi << 4), lo = element 2i
             const int k0 = col * 2;      // first element K index
             const int k1 = col * 2 + 1;  // second element K index
-            B_sh[(row >> 3) * 1024 + (k0 >> 4) * 128 + (row & 7) * 16 + (k0 & 15)] = packed & 0xF;
-            B_sh[(row >> 3) * 1024 + (k1 >> 4) * 128 + (row & 7) * 16 + (k1 & 15)] = packed >> 4;
+            // SW128 swizzled write (same layout as TileLang's TMA)
+            B_sh[(row >> 3) * 1024 + (row & 7) * 128 + ((((k0 >> 4) ^ (row & 7))) << 4) + (k0 & 15)] = packed & 0xF;
+            B_sh[(row >> 3) * 1024 + (row & 7) * 128 + ((((k1 >> 4) ^ (row & 7))) << 4) + (k1 & 15)] = packed >> 4;
         }
         for (int i = tid; i < HW_NH * 64; i += 128) {
             const int row = i >> 6;
@@ -242,8 +244,8 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
             const int m = HW_NH + row;  // W3 rows are after W1
             const int k0 = col * 2;
             const int k1 = col * 2 + 1;
-            B_sh[(m >> 3) * 1024 + (k0 >> 4) * 128 + (m & 7) * 16 + (k0 & 15)] = packed & 0xF;
-            B_sh[(m >> 3) * 1024 + (k1 >> 4) * 128 + (m & 7) * 16 + (k1 & 15)] = packed >> 4;
+            B_sh[(m >> 3) * 1024 + (m & 7) * 128 + ((((k0 >> 4) ^ (m & 7))) << 4) + (k0 & 15)] = packed & 0xF;
+            B_sh[(m >> 3) * 1024 + (m & 7) * 128 + ((((k1 >> 4) ^ (m & 7))) << 4) + (k1 & 15)] = packed >> 4;
         }
 
         // (3) 加载 SF
@@ -253,20 +255,8 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
         }
         // SFW1/SFW3: [384, 40*320] — SFW[e][k*320 + n_tile*64 + i] for i in [0, 64)
         for (int i = tid; i < HW_NH; i += 128) {
-            // Weight SF byte swap (matching activation SF swap for consistency)
-            // pack_wsf stores p[0] in LSB — we need it in MSB to match the
-            // swapped activation SF byte order (sf_id=0 → MSB hypothesis)
-            {
-                uint32_t w1sf = SFW1[(int64_t)e * (40 * HW_NP) + k * HW_NP + n_tile * HW_NH + i];
-                uint32_t w3sf = SFW3[(int64_t)e * (40 * HW_NP) + k * HW_NP + n_tile * HW_NH + i];
-                // Byte-swap: reverse the 4 bytes
-                w1sf = ((w1sf & 0xFF000000) >> 24) | ((w1sf & 0x00FF0000) >> 8) |
-                       ((w1sf & 0x0000FF00) << 8) | ((w1sf & 0x000000FF) << 24);
-                w3sf = ((w3sf & 0xFF000000) >> 24) | ((w3sf & 0x00FF0000) >> 8) |
-                       ((w3sf & 0x0000FF00) << 8) | ((w3sf & 0x000000FF) << 24);
-                SFB_sh[i] = w1sf;
-                SFB_sh[HW_NH + i] = w3sf;
-            }
+            SFB_sh[i] = SFW1[(int64_t)e * (40 * HW_NP) + k * HW_NP + n_tile * HW_NH + i];
+            SFB_sh[HW_NH + i] = SFW3[(int64_t)e * (40 * HW_NP) + k * HW_NP + n_tile * HW_NH + i];
         }
 
         __syncthreads();
@@ -291,8 +281,8 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
             // smem descriptors for A and B tiles
             // layout=0 (no swizzle), LBO=1 (16B = core matrix row stride), SBO=64 (1024B = 8-row atom stride)
             // (数据已按 core matrix 布局写入，无需 swizzle)
-            const uint64_t a_desc_base = hw_make_desc(A_sh, 64, 8, 0);  // layout=0 (no swizzle)
-            const uint64_t b_desc_base = hw_make_desc(B_sh, 64, 8, 0);  // layout=0 (no swizzle)
+            const uint64_t a_desc_base = hw_make_desc(A_sh, 1, 64, 2);  // TileLang exact: lbo=1, sbo=64, SW128(layout=2)
+            const uint64_t b_desc_base = hw_make_desc(B_sh, 1, 64, 2);  // TileLang exact: lbo=1, sbo=64, SW128(layout=2)
 
             for (int ki = 0; ki < 4; ++ki) {
                 // idesc: M=128, N=128, a_fmt=0 (E4M3), b_fmt=5 (E2M1), sf_id=ki
@@ -305,8 +295,8 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
                 // core matrix + layout=0. With synthetic data (all same bytes),
                 // this 2× error was invisible. With real data, it reads the
                 // WRONG K-block's data → garbage output.
-                const uint64_t a_desc = a_desc_base + (uint64_t)(ki * 16);
-                const uint64_t b_desc = b_desc_base + (uint64_t)(ki * 16);
+                const uint64_t a_desc = a_desc_base + (uint64_t)(ki * 2);
+                const uint64_t b_desc = b_desc_base + (uint64_t)(ki * 2);
                 // enable_d: 0 for first MMA (clear accumulator), 1 for rest
                 const uint32_t enable_d = (k == 0 && ki == 0) ? 0 : 1;
 
