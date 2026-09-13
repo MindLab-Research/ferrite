@@ -860,7 +860,13 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
                         sentinel);
         }
         hw_tc_wait_st();
+        // Publish these TMEM stores to the async proxy before any MMA reads D. Order (per PTX
+        // 9.7.18.8.x): the writing threads fence, the barrier orders, the issuing thread acquires.
+        // Without it the MMA may read the pre-existing TMEM rather than the sentinel — which would
+        // make the detector useless exactly when it matters.
+        asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
         __syncthreads();
+        asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
     }
 
     // ---- init mbarrier (1 arrival from tcgen05.commit) ----
@@ -895,6 +901,22 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
     __syncthreads();
+    // `tcgen05.alloc` leaves TMEM UNINITIALISED and its result was never inspected: a failed or
+    // unexpected allocation makes the epilogue read columns THIS LAUNCH NEVER WROTE (the residue of
+    // whatever previously ran on this SM), which explains the two live anomalies better than anything
+    // else. Only the LANE field is checked — a column base of 0 is a perfectly legal allocation for
+    // the first CTA on an SM (PTX 9.7.18.1.1), so `C_tmem == 0` would be a false positive.
+    // ⚠️ This MUST sit AFTER the mbarrier-init block: that block begins with `hw_wait_fail = 0;`, so a
+    // check placed before it had its flag cleared immediately and the abort path became unreachable —
+    // the "fail-safe" silently degraded to a print (found by newgates-review).
+    if (warp == 0 &&
+        (((C_tmem >> 16) & 0x1FFu) != 0u || ((SF_tmem >> 16) & 0x1FFu) != 0u)) {
+        printf("[moe-bs-handwritten] BAD TMEM ALLOC C=%08x SF=%08x (lane field set) — aborting this "
+               "block so the output is a sentinel, not foreign TMEM\n",
+               C_tmem, SF_tmem);
+        hw_wait_fail = 1;
+        __syncthreads();
+    }
     asm volatile("fence.proxy.async.shared::cta;");  // async-proxy view of the smem operands
 
     // ---- K-loop: cp.async double-buffered (gate ON) / sequential (gate OFF) ----
@@ -1243,11 +1265,12 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
             hw_tc_commit(&mma_bar[HW_KITER]);
         }
         if (tid == 0) {
-            asm volatile(
-                "{\n\t.reg .pred P;\n\tDRAIN:\n\t"
-                "mbarrier.try_wait.parity.shared::cta.b64 P, [%0], 0;\n\t"
-                "@!P bra DRAIN;\n\t}"
-                :: "r"((uint32_t)__cvta_generic_to_shared(&mma_bar[HW_KITER])));
+            // Reuse the same bounded wait the per-stage path uses, so the drain cannot become an
+            // unbounded spin (this file's own discipline) and a timeout is reported rather than
+            // silently read through.
+            if (whp_mma_wait_bounded(&mma_bar[HW_KITER], 0u, HW_KITER, 0, 0)) {
+                hw_wait_fail = 1;
+            }
         }
         __syncthreads();
     }
