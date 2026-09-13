@@ -61,14 +61,25 @@
 
 ## 当前嫌疑（按可能性排序）
 
-1. **TMA descriptor 的运行时行为差异**：JIT 的 TVM FFI 可能做了额外的 setup（我们的 shim 没做）
-   - 待验证：SYNC-DIAG（per-kernel sync 隔离 gather/MMA/scatter）
-   
-2. **tcgen05 指令的环境依赖**：某些 tcgen05 指令可能需要特定的 CUDA context 状态
-   - 待验证：compute-sanitizer（精确 crash 位置）
+1. **~~TMA descriptor 运行时差异~~** → **已被 SYNC-DIAG 否定**：eager 路径（m=1）MMA 完全正常
+2. **~~tcgen05 指令环境依赖~~** → **已被 .scale_vec::1X 修复**（待验证）
+3. **spec 路径（m=6）特有问题** → `.scale_vec::1X` + `"memory"` clobber 修复已提交（472fe57）
 
-3. **未知的编译差异**：链接方式（独立 .so vs 大 .so 链接）可能影响代码生成
-   - 待验证：如果 SYNC-DIAG 隔离到 MMA，用 compute-sanitizer 定位
+## ROOT CAUSE 分析（2026-09-14 中午更新）
+
+**SYNC-DIAG 揭示的关键事实**：
+- eager 路径（m=1）：gather OK → MMA OK → scatter OK（多个 step 全部通过）
+- spec 路径（m=6 verify）：pos 15 处 crash
+- **crash 只发生在 spec/verify 路径**，eager 路径完全正常
+
+**修复（对比验证过的手写代码发现）**：
+TileLang 模板 `tcgen05mma.h:694-710` 与验证代码 `tests_tcgen05_mxf8f6f4_1x.cu:781-797` 的两个差异：
+1. **`.scale_vec::1X` 后缀缺失**：没有它硬件用默认 SF 布局 → 可能读 TMEM 越界 → illegal memory access
+2. **`"memory"` clobber 缺失**：没有它编译器可能重排内存操作 → 与 TMA 加载竞态 → 硬件检测到非法访问模式
+
+**为什么 spec 路径才 crash**：
+- m=1（eager）：段全空，SF 数据全 0，MMA 计算量最小，竞态窗口小
+- m=6（verify）：36 个活段，真实 SF 数据，MMA 计算密集，竞态窗口大 → 触发 crash
 
 ## 诊断工具（已部署远端）
 
