@@ -244,7 +244,13 @@ constexpr size_t kSfPlaneBytes = (size_t)kSfWords * kNp * 4;  // 51200 B/面/exp
 //    设成最大值（只是抬高允许值；OFF 路径仍按 65536 发射，行为不变）。
 constexpr size_t kSmemHwSingle = 65536;
 constexpr size_t kSmemHwDouble = 67592;
-static_assert(kSmemHwDouble <= 227 * 1024, "handwritten smem exceeds the sm_100 227 KiB/block limit");
+// The MMA-completion mbarriers live immediately after the SF region, i.e. at exactly the operand
+// region's end: with NS == 2 the first barrier already sat on the very last valid 8 bytes, so the
+// 2-entry ring (and the 40-entry per-stage array) would have run past the end. Reserve the array
+// explicitly instead of relying on the operand sum happening to leave room.
+constexpr size_t kHwMbarExtra = 512;   // 40 * 8 B + alignment headroom
+static_assert(kSmemHwDouble + kHwMbarExtra <= 227 * 1024,
+              "handwritten smem exceeds the sm_100 227 KiB/block limit");
 // 由 tl_bs_init() 从 env 读一次；device 侧的 g_cpasync 用同一个值 ⇒
 // 「stage 布局」与「launch 的 smem 大小」不可能不一致。
 static bool g_hw_cpasync = false;
@@ -700,7 +706,7 @@ bool tl_bs_init() {
     if (ok) {
         ok = cudaFuncSetAttribute(moe_bs_handwritten_kernel,
                                   cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                  (int)kSmemHwDouble) == cudaSuccess;
+                                  (int)(kSmemHwDouble + kHwMbarExtra)) == cudaSuccess;
         (void)cudaGetLastError();
     }
     // HANDWRITTEN kernel 的 .scale_vec::1X 运行期选择（asm 必须编译期，两种拼写
@@ -864,7 +870,7 @@ bool tl_bs_init() {
         (void)cudaMemcpyToSymbol(g_cpasync, &cp, sizeof(int));
         (void)cudaGetLastError();
         fprintf(stderr, "[moe-bs] handwritten cp.async double buffer = %d (smem %zu)\n",
-                cp, g_hw_cpasync ? kSmemHwDouble : kSmemHwSingle);
+                cp, g_hw_cpasync ? kSmemHwDouble + kHwMbarExtra : kSmemHwSingle + kHwMbarExtra);
     }
     // g_waitdbg: VERBOSE diagnostics for a BOUNDED-wait timeout in the handwritten
     // kernel (gate DSV41_MOE_BS_WAITDBG, DEFAULT OFF). Only the PRINTING is gated —
