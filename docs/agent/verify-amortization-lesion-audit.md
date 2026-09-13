@@ -102,7 +102,24 @@ B1 系三臂的断崖都在 line 52（1..51 正确然后跳 62）+ mean-k 0.64-0
 
 **NCU 补充（m5.ncu-rep，mrows_bench 微基准）**：gemm_fp8_mrows<5/6> 的 **DRAM 0.67-0.79%、Compute 12.8-13%、L1 14.1-14.6%、Occupancy 13.4%、40 regs**——kernel 完全没跑满（latency-bound 特征）⇒ **MPAR（warp 并行 M）符号利好**；m=1 gemv（m4）DRAM 9.1%/L1 44.2% 同样 latency-bound。
 
-**遗留问题**：弃用的四 gate（VERIFY_ROPE/GATE_ROUTE/1b/P3B）覆盖的正是 40×/25× 病灶区——它们"逐位承诺"却改了 accept，**需要找出四者中哪个真的破位**（第五刀单拆），否则 rope/norm 的 per-row 折叠无法安全启用。
+## 10. best 系列实测（2026-09-13 01:10-01:40，双门禁 + 3 请求形态）
+
+| 臂 | gate 增量 | verify | 判定 |
+|---|---|---|---|
+| best1 | +1b +VERIFY_ROPE | 27.53（−1.14） | ✓ 兑现（计数 mean-k 1.34 ✓） |
+| best2 | +ATTN_MROWS（TP8 row_pitch） | **24.55（−2.98）** | ✓ 票面兑现（计数 1.30 ✓；partial decline："compressor commits per row and left no device snapshot" 只挡部分块） |
+| best3 | +COMPRESSOR_PROJ +ENGRAM_PROJ | 24.45（−0.10） | ✗ 票面高估 10×（nsys 实占 0.3% vs 审计 3.5-5ms）；gate ARMED 生效但无肉 |
+| mpar1 | +MROWS_MPAR=1 | 25.07（+0.52） | ✗ 负向（LUT 复制 ×5120 块 + 激活复制） |
+| mparA | +MROWS_MPAR=auto（rpb=6） | 25.20-25.46（+0.7~0.9） | ✗ 负向（同上，LUT ×854 块）——**MPAR 需回炉：LUT 全局常量化/激活 smem 共享/中间 rpb 档** |
+| moeg | +MoE grouped 四件套 + GROUPED_DOWN | **misaligned 挂**（8 rank 中 7 个） | 🔴 SF 根修后 tcgen05/grouped-down 的首次 e2e 触发 misaligned——诊断中（CUDA_LAUNCH_BLOCKING 定位 kernel） |
+
+**当前最优栈 = best2**（verify 24.55ms，累计 −4.1ms；计数 acc 1.30 保持）。p50 口径首读：mparA 全步 p50=28.76ms（含 draft+verify+commit+间隙）。
+
+**acc 任务依赖实测**：计数 1.34 / python 代码 ~0.58（draft 对代码预测差）——**400 的 8ms+acc2-3 判据在代码任务上不成立**，任务形态是 400 验证的关键变量。
+
+**两条结构性教训**：
+1. **票面必须用 nsys 时间占比算**（COMP/ENGRAM 高估 10×；ATTN_MROWS 兑现因为 nsys 占 5.1%）。
+2. **mrows 零摊销实锤**（52.1µs/5 行 = 单行 gemv 的 5×）——**MPAR 前一切 mrows 化无时间收益**（gemv-lesion 的前置铁律）；共享专家 480 发/步的折叠（SH 族）也要等 MPAR 回炉后才有效。
 
 **双门禁**：每个优化臂必须同时报告 `step_ms`（[dspark] 分解）**AND** `mean-k`（A0 基线 1.34；掉了 = 数值回归，立即弃用该 gate）。
 
