@@ -49,6 +49,18 @@
 //                        invariant under them — rows are independent; the
 //                        geometry only decides how many rows share a block's
 //                        staging). Worth running under a couple of settings.
+//   DSV41_MROWS_MPAR     selects the M-PARALLEL program (`gemm_fp8_mrows_mp_
+//                        kernel<m>`, one warp per (output row, activation row)
+//                        pair) instead of the M-in-register one. FILE-SCOPE
+//                        const read at LOAD time (like DSV41_MROWS_FOLD_R), so
+//                        the arm is one PROCESS per value:
+//                          for n in 1 2 3 5; do DSV41_MROWS_MPAR=$n ./t_gemm_mrows; done
+//                          DSV41_MROWS_MPAR=auto ./t_gemm_mrows
+//                        With the gate set EVERY mr_case arm above dispatches to
+//                        the M-parallel kernel, so "m-row launch == m single-row
+//                        launches, bit for bit" is checked on it. Unset / `0` is
+//                        the shipped default: the M-in-register program, byte
+//                        for byte. See docs/agent/mrows-mpar-design.md.
 //
 // THE TWO L4/L5 GATES THIS SUITE NOW COVERS (2026-09-12, plan
 // docs/agent/l4l5-next-batch-implementation-plan.md §6 N1 "parity 扩轴"):
@@ -360,6 +372,44 @@ int mr_fold_r_contract() {
     return fails;
 }
 
+// ----------------------------------------- MPAR contract pin (DSV41_MROWS_MPAR)
+// `g_mrows_mpar` is a FILE-SCOPE const read from `getenv` at LOAD time (same as
+// `g_mrows_fold_r`), so the M-PARALLEL arm cannot be swept inside one process:
+// one process per value, as the header says. What THIS pin proves inside any
+// single process is the RESOLUTION the launcher will use:
+//   * OFF (unset / `0`) -> `dsv41_mrows_mpar_for` returns 0 at every m, i.e. the
+//     shipped default is byte-for-byte the M-in-register program the other arms
+//     above already test;
+//   * ARMED (`=N` or auto) -> the resolved `rpb` lands in [1, 1024/(32m)] (the
+//     1024-thread block budget `rpb*m` warps must fit).
+//
+// The BIT-IDENTITY itself is carried by the mr_case arms: with the gate set,
+// `dsv41_gemm_fp8_mrows` launches `gemm_fp8_mrows_mp_kernel<m>` instead, and the
+// same "m-row launch == m single-row launches, bit for bit" check runs on it.
+// So `DSV41_MROWS_MPAR=N ./t_gemm_mrows` *is* the parity test — this pin only
+// keeps an OFF run from silently drifting into the armed branch (and vice versa).
+int mr_mpar_contract() {
+    const int want = g_mrows_mpar;  // the file-scope const the launcher reads
+    printf("  [mpar] DSV41_MROWS_MPAR=%s (file-scope const=%d) -> %s\n",
+           getenv("DSV41_MROWS_MPAR") == nullptr ? "<unset>" : getenv("DSV41_MROWS_MPAR"), want,
+           want == 0 ? "OFF: M-in-register (the shipped default)" : (want < 0 ? "auto" : "explicit"));
+    int fails = 0;
+    for (int m = 1; m <= 8; ++m) {
+        const int rpb = dsv41_mrows_mpar_for(m);
+        const int cap = 1024 / (32 * m);
+        if (want == 0) {
+            MR_CHECK(rpb == 0, "[mpar] OFF m=%d: dsv41_mrows_mpar_for=%d, want 0", m, rpb);
+        } else {
+            MR_CHECK(rpb >= 1 && rpb <= cap, "[mpar] m=%d: rpb=%d outside [1,%d]", m, rpb, cap);
+            MR_CHECK(rpb * m * 32 <= 1024, "[mpar] m=%d: rpb*m*32=%d > 1024", m, rpb * m * 32);
+        }
+    }
+    if (fails == 0)
+        printf("  [mpar] OK  (%s)\n",
+               want == 0 ? "OFF => rpb=0 at every m" : "armed rpb inside [1, 1024/(32m)]");
+    return fails;
+}
+
 // ------------------------------------------------------------- the declines
 int mr_case_declines() {
     std::vector<uint8_t> a(4096, 0x38), w(4096, 0x38), ws(4096, 0x7Bu);
@@ -410,6 +460,12 @@ int main(int argc, char** argv) {
     printf("   DSV41_GEMV_FP8_MODE=%d  DSV41_NO_GEMV_FP8=%d  nwarps(n=1280)=%d  nwarps(n=4096)=%d\n",
            g_gemv_fp8_mode, (int)(getenv("DSV41_NO_GEMV_FP8") != nullptr),
            dsv41_gemv_warps_for(1280), dsv41_gemv_warps_for(4096));
+    // MPAR (DSV41_MROWS_MPAR): which program the launcher below will take.
+    // 0 => the M-in-register kernel; >0 => `gemm_fp8_mrows_mp_kernel<m>` with
+    // `rpb` output rows per block (see mrows-mpar-design.md §2).
+    printf("   DSV41_MROWS_MPAR=%s  -> %s\n",
+           getenv("DSV41_MROWS_MPAR") == nullptr ? "<unset>" : getenv("DSV41_MROWS_MPAR"),
+           g_mrows_mpar == 0 ? "M-in-register (default)" : "M-PARALLEL warp-per-(row,actrow)");
     int dev = 0;
     cudaGetDevice(&dev);
     cudaDeviceProp prop{};
@@ -442,6 +498,12 @@ int main(int argc, char** argv) {
     //     (`for fr in 1 2 3 6; do DSV41_MROWS_FOLD_R=$fr ...; done`) — the arms
     //     above then re-check bit-identity on the folded grid.
     g_fails += mr_fold_r_contract();
+    // MPAR (DSV41_MROWS_MPAR): the resolution pin. The PARITY of the M-parallel
+    // kernel is carried by every mr_case arm above when the gate is set (the
+    // launcher dispatches to `gemm_fp8_mrows_mp_kernel<m>`); run this suite once
+    // per `rpb` — the gate is a load-time const, so an in-process sweep is
+    // impossible by construction.
+    g_fails += mr_mpar_contract();
     if (!quick) {
         // Every dispatch case the launcher's switch can take.
         for (int m = 1; m <= 8; ++m)

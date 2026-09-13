@@ -912,17 +912,33 @@ __global__ void engram_hash_kernel(const int32_t* __restrict__ token_map,
 
 // Gather `n_cols` rows per token from the rank's fp8 table shard, dequantise
 // with the per-row 32-wide ue8m0 scales and write [rows, n_cols*head_dim].
+//
+// ENGRAM-GATHER-MROWS (`dsv41_engram_gather_rows`, 2026-09-13): `id_stride` is
+// the CALLER's row pitch of `hash_ids`, in elements. The single-row entry below
+// passes `n_cols`, i.e. the contiguous historical layout, so its addressing is
+// the old one element for element; the batched entry passes the per-TOKEN
+// engram-layer stride, because `eng_ids_r` is
+// `[row][engram layer][n_cols]` — the m rows of ONE engram layer are `n_eng *
+// n_cols` apart, not `n_cols`, so a `rows`-fold without the stride would read
+// row 0's ids for every row. With the stride the (row, col) -> id map is
+// `hash_ids[row * id_stride + col]`: EXACTLY the id the per-row launch would
+// have read at its own base pointer, and the output slot
+// `out[(row * n_cols + col) * head_dim + j]` is the same slot the per-row
+// launch wrote (the caller's `out` rows are contiguous by construction). The
+// batched launch is therefore the concatenation of the m per-row calls, value
+// for value.
 __global__ void engram_gather_kernel(const uint8_t* __restrict__ table,
                                      const uint8_t* __restrict__ table_scale,
                                      const int64_t* __restrict__ hash_ids, float* __restrict__ out,
-                                     int rows, int n_cols, int head_dim, int64_t part_start,
-                                     int64_t part_rows) {
+                                     int rows, int n_cols, int head_dim, int id_stride,
+                                     int64_t part_start, int64_t part_rows) {
     const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     const size_t total = (size_t)rows * n_cols * head_dim;
     if (i >= total) return;
     const int j = (int)(i % head_dim);
     const size_t row_id = i / head_dim;  // (token, col)
-    const int64_t id = hash_ids[row_id];
+    const size_t stride = (id_stride > 0) ? (size_t)id_stride : (size_t)n_cols;
+    const int64_t id = hash_ids[(row_id / (size_t)n_cols) * stride + row_id % (size_t)n_cols];
     if (id < part_start || id >= part_start + part_rows) {
         out[i] = 0.f;  // owned by another rank; the caller all-reduces
         return;
@@ -941,10 +957,19 @@ __global__ void sparse_attn_kernel(const float* __restrict__ q, const float* __r
                                    const float* __restrict__ sink, const int32_t* __restrict__ idxs,
                                    float* __restrict__ out, int b, int m, int h, int d,
                                    const int* __restrict__ clen, int window, int index_topk,
-                                   float scale, const int* __restrict__ clen_rows, int idx_stride) {
+                                   float scale, const int* __restrict__ clen_rows, int idx_stride,
+                                   int row_pitch) {
     const int row = blockIdx.x;  // flattened (b, m)
     if (row >= b * m) return;
     const int bb = row / m, mm = row % m;
+    // W2-MROWS-TP (`dsv41_sparse_attn_rp`): the q/out ROW pitch, in ELEMENTS.
+    // Every caller before the TP arm passes 0 -> `h*d`, which reproduces the old
+    // `((row*h + hh)*d)` spelling exactly (same integer arithmetic, one extra
+    // multiply by 1). A `world > 1` block hands in `nh*hd` instead: the rows then
+    // live `nh` heads apart while this rank only touches its leading
+    // `nlh == h` heads. `xq`/`xsc` are NOT affected by this - they stay at the
+    // caller's compact `h*d` pitch (see `sparse_attn_orope` phase 3).
+    const size_t rp = row_pitch ? (size_t)row_pitch : (size_t)h * d;
     // n and topk used to be host arguments derived from this layer's compress_len;
     // they change per step, so a captured graph would freeze them. The counter now
     // lives on the device (the compressor's commit kernel advances it).
@@ -963,7 +988,7 @@ __global__ void sparse_attn_kernel(const float* __restrict__ q, const float* __r
     // keeps the historical `topk` pitch.
     const int32_t* irow = idxs + (size_t)(bb * m + mm) * (idx_stride ? idx_stride : topk);
     for (int hh = blockIdx.y; hh < h; hh += gridDim.y) {
-        const float* qr = q + ((size_t)(bb * m + mm) * h + hh) * d;
+        const float* qr = q + (size_t)(bb * m + mm) * rp + (size_t)hh * d;
         // acc is a COMPILE-TIME-sized array (d <= 512 and blockDim is 128 here, so
         // per-thread <= 4) indexed by the loop counter, NOT by the element index.
         // The element-to-thread mapping and the per-thread summation order are
@@ -1021,7 +1046,7 @@ __global__ void sparse_attn_kernel(const float* __restrict__ q, const float* __r
             __syncthreads();
         }
         se += expf(sink[hh] - smax);
-        float* orow = out + ((size_t)(bb * m + mm) * h + hh) * d;
+        float* orow = out + (size_t)(bb * m + mm) * rp + (size_t)hh * d;
         for (int c = threadIdx.x; c < d; c += blockDim.x) {
             // c == threadIdx.x + i * blockDim.x, so the accumulator slot is
             // (c - threadIdx.x) / blockDim.x (NOT c / blockDim.x: that is only
@@ -1047,17 +1072,19 @@ __global__ void sparse_attn_warp_kernel(const float* __restrict__ q, const float
                                         int b, int m, int h, int d,
                                         const int* __restrict__ clen, int window, int index_topk,
                                         float scale, const int* __restrict__ clen_rows,
-                                        int idx_stride) {
+                                        int idx_stride, int row_pitch) {
     const int row = blockIdx.x;  // flattened (b, m)
     if (row >= b * m) return;
     const int bb = row / m, mm = row % m;
+    // W2-MROWS-TP: q/out row pitch, 0 -> `h*d` (see `sparse_attn_kernel`).
+    const size_t rp = row_pitch ? (size_t)row_pitch : (size_t)h * d;
     // W2-MROWS (DSV41_ATTN_MROWS): per-row bound, see `sparse_attn_kernel`.
     const int cl = clen_rows ? clen_rows[mm] : *clen;
     const int n = window + cl;
     const int topk = window + ((cl < index_topk) ? cl : index_topk);
     const int32_t* irow = idxs + (size_t)(bb * m + mm) * (idx_stride ? idx_stride : topk);
     for (int hh = blockIdx.y; hh < h; hh += gridDim.y) {
-        const float* qr = q + ((size_t)(bb * m + mm) * h + hh) * d;
+        const float* qr = q + (size_t)(bb * m + mm) * rp + (size_t)hh * d;
         const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
         const int nwarp = (int)blockDim.x >> 5;
         float my_acc[kMaxPerW];
@@ -1109,7 +1136,7 @@ __global__ void sparse_attn_warp_kernel(const float* __restrict__ q, const float
         float se = 0.f;
         for (int w = 0; w < nwarp; ++w) se += sh_se[w] * wsc[w < 4 ? w : 0];
         se += expf(sink[hh] - smax);
-        float* orow = out + ((size_t)(bb * m + mm) * h + hh) * d;
+        float* orow = out + (size_t)(bb * m + mm) * rp + (size_t)hh * d;
         for (int c = threadIdx.x; c < d; c += blockDim.x) {
             float a = 0.f;
             for (int w = 0; w < nwarp && w < 4; ++w) a += sh_acc[w][c] * wsc[w];
@@ -1136,7 +1163,7 @@ __global__ void sparse_attn_pf_kernel(const float* __restrict__ q, const float* 
                                       int b, int m, int h, int d,
                                       const int* __restrict__ clen, int window, int index_topk,
                                       float scale, const int* __restrict__ clen_rows,
-                                      int idx_stride) {
+                                      int idx_stride, int row_pitch) {
 #if __CUDA_ARCH__ >= 900
     // PDL (DSV41_PDL, see dsv41_pdl_or_plain): the launcher may have launched
     // this grid with programmatic stream serialization, so the grid is already
@@ -1152,13 +1179,15 @@ __global__ void sparse_attn_pf_kernel(const float* __restrict__ q, const float* 
     const int row = blockIdx.x;
     if (row >= b * m) return;
     const int bb = row / m, mm = row % m;
+    // W2-MROWS-TP: q/out row pitch, 0 -> `h*d` (see `sparse_attn_kernel`).
+    const size_t rp = row_pitch ? (size_t)row_pitch : (size_t)h * d;
     // W2-MROWS (DSV41_ATTN_MROWS): per-row bound, see `sparse_attn_kernel`.
     const int cl = clen_rows ? clen_rows[mm] : *clen;
     const int n = window + cl;
     const int topk = window + ((cl < index_topk) ? cl : index_topk);
     const int32_t* irow = idxs + (size_t)(bb * m + mm) * (idx_stride ? idx_stride : topk);
     for (int hh = blockIdx.y; hh < h; hh += gridDim.y) {
-        const float* qr = q + ((size_t)(bb * m + mm) * h + hh) * d;
+        const float* qr = q + (size_t)(bb * m + mm) * rp + (size_t)hh * d;
         const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
         const int nwarp = (int)blockDim.x >> 5;
         // Stage the q row once: kills the per-slot re-read of qr (16 floats/lane).
@@ -1373,7 +1402,7 @@ __global__ void sparse_attn_pf_kernel(const float* __restrict__ q, const float* 
         float se = 0.f;
         for (int w = 0; w < nwarp; ++w) se += sh_se[w] * wsc[w < 4 ? w : 0];
         se += expf(sink[hh] - smax);
-        float* orow = out + ((size_t)(bb * m + mm) * h + hh) * d;
+        float* orow = out + (size_t)(bb * m + mm) * rp + (size_t)hh * d;
         for (int c = threadIdx.x; c < d; c += blockDim.x) {
             float a = 0.f;
             for (int w = 0; w < nwarp && w < 4; ++w) a += sh_acc[w][c] * wsc[w];
@@ -1508,7 +1537,8 @@ __global__ void sparse_attn_split_kernel(const float* __restrict__ q,
                                          const int32_t* __restrict__ idxs, int b, int m, int h,
                                          int d, const int* __restrict__ clen, int window,
                                          int index_topk, float scale, int C,
-                                         const int* __restrict__ clen_rows, int idx_stride) {
+                                         const int* __restrict__ clen_rows, int idx_stride,
+                                         int row_pitch) {
     const int ck = blockIdx.x;
     const int row = blockIdx.y;
     if (row >= b * m || ck >= C) return;
@@ -1521,7 +1551,11 @@ __global__ void sparse_attn_split_kernel(const float* __restrict__ q,
     const int cl = clen_rows ? clen_rows[mm] : *clen;
     const int n = window + cl;
     const int topk = window + ((cl < index_topk) ? cl : index_topk);
-    const float* qr = q + ((size_t)(bb * m + mm) * h + hh) * d;
+    // W2-MROWS-TP: q row pitch, 0 -> `h*d` (see `sparse_attn_kernel`). The split
+    // writes its partials to the GLOBAL scratch `g_attn_part[row][hh]` (row index,
+    // not a pointer), so only `q` needs the pitch here.
+    const size_t rp = row_pitch ? (size_t)row_pitch : (size_t)h * d;
+    const float* qr = q + (size_t)(bb * m + mm) * rp + (size_t)hh * d;
     const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
     const int nwarp = (int)blockDim.x >> 5;
     const int lo = (int)((long long)topk * ck / C);
@@ -1773,11 +1807,25 @@ __global__ void sparse_attn_merge_kernel(
     const float* __restrict__ sink, float* __restrict__ out, int b, int m, int h, int d, int C,
     const float* __restrict__ cos, const float* __restrict__ sin, const int* __restrict__ base,
     int rope_rd, int half, int mul, int off, int step, int inverse, uint8_t* __restrict__ xq,
-    float* __restrict__ xsc) {
+    float* __restrict__ xsc, int row_step, int row_pitch) {
     const int row = blockIdx.x;
     if (row >= b * m) return;
     const int hh = blockIdx.y;
     if (hh >= h) return;
+    // P3-LITE (`row_step`): this is the SPLIT arm of `dsv41_sparse_attn_orope`, and
+    // its `tt` has to carry the SAME per-ROW term the non-split kernel already does
+    // (`sparse_attn_orope_kernel`: `+ mm * row_step`). Without it a `b = 1, m > 1`
+    // orope call would rope EVERY row at `off` — rows 1..m-1 silently land at row
+    // 0's position (no error, just a wrong answer). `mm` is the row's index inside
+    // its batch element, exactly as in the non-split kernel.
+    // `row_step == 0` makes the term `+ 0`, i.e. this kernel's historical formula
+    // bit for bit — which is what every pre-existing caller passes (the plain
+    // `dsv41_sparse_attn` split arm), so the OFF arm is untouched.
+    const int mm = row % m;
+    // W2-MROWS-TP: `out` (the f32 attention output) row pitch, 0 -> `h*d` (see
+    // `sparse_attn_kernel`). The `xq`/`xsc` emission below keeps the `h*d` pitch:
+    // those buffers are the caller's COMPACT per-rank block, unlike `out`.
+    const size_t rp = row_pitch ? (size_t)row_pitch : (size_t)h * d;
     const float* P = &g_attn_part[row][hh][0][0];
     float smax = -1e30f;
     for (int ck = 0; ck < C; ++ck) smax = fmaxf(smax, P[(size_t)ck * kAttnStride]);
@@ -1785,7 +1833,7 @@ __global__ void sparse_attn_merge_kernel(
     for (int ck = 0; ck < C; ++ck)
         se += P[(size_t)ck * kAttnStride + 1] * expf(P[(size_t)ck * kAttnStride] - smax);
     se += expf(sink[hh] - smax);
-    float* orow = out + ((size_t)row * h + hh) * d;
+    float* orow = out + (size_t)row * rp + (size_t)hh * d;
     if (cos == nullptr && xq == nullptr) {
         // Plain split arm: unchanged (no smem, no barrier, same bytes).
         for (int c = threadIdx.x; c < d; c += blockDim.x) {
@@ -1809,7 +1857,7 @@ __global__ void sparse_attn_merge_kernel(
         // PHASE 2 (`sparse_attn_orope_kernel` :1557-1567 verbatim): inverse rope on
         // the trailing `rope_rd` columns; `hh` is this block's head, so the position
         // argument matches the single-block path's per-head loop index.
-        const int tt = (*base) * mul + off + hh * step;
+        const int tt = (*base) * mul + off + hh * step + mm * row_step;
         float* rrow = sh_row + (d - rope_rd);
         for (int i = threadIdx.x; i < half; i += blockDim.x) {
             const float cc = cos[(size_t)tt * half + i];
@@ -2062,10 +2110,15 @@ __global__ void sparse_attn_orope_kernel(
     const float* __restrict__ cos, const float* __restrict__ sin,
     const int* __restrict__ base, int rope_rd, int half, int mul, int off, int step,
     int inverse, uint8_t* __restrict__ xq, float* __restrict__ xsc,
-    const int* __restrict__ clen_rows, int idx_stride, int row_step) {
+    const int* __restrict__ clen_rows, int idx_stride, int row_step, int row_pitch) {
     const int row = blockIdx.x;
     if (row >= b * m) return;
     const int bb = row / m, mm = row % m;
+    // W2-MROWS-TP: q/out row pitch, 0 -> `h*d` (see `sparse_attn_kernel`). The
+    // `xq`/`xsc` emission below deliberately does NOT use `rp`: those two are the
+    // caller's COMPACT per-rank block (`nlh*hd` per row), so the `h*d` pitch is
+    // the correct one in both worlds.
+    const size_t rp = row_pitch ? (size_t)row_pitch : (size_t)h * d;
     // W2-MROWS (DSV41_ATTN_MROWS): per-row bound and per-row pitch, see
     // `sparse_attn_kernel`.
     const int cl = clen_rows ? clen_rows[mm] : *clen;
@@ -2076,7 +2129,7 @@ __global__ void sparse_attn_orope_kernel(
     // d <= 512 (kMaxPerW * 32) is guaranteed by the launcher.
     __shared__ float sh_row[512];
     for (int hh = blockIdx.y; hh < h; hh += gridDim.y) {
-        const float* qr = q + ((size_t)(bb * m + mm) * h + hh) * d;
+        const float* qr = q + (size_t)(bb * m + mm) * rp + (size_t)hh * d;
         const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
         const int nwarp = (int)blockDim.x >> 5;
         // Stage the q row once: kills the per-slot re-read of qr (16 floats/lane).
@@ -2323,7 +2376,7 @@ __global__ void sparse_attn_orope_kernel(
         // exactly one 32-element block and the flat block index is
         // `((row*h+hh)*d)/32 + b`.
         {
-            float* orow = out + ((size_t)(bb * m + mm) * h + hh) * d;
+            float* orow = out + (size_t)(bb * m + mm) * rp + (size_t)hh * d;
             for (int c = threadIdx.x; c < d; c += blockDim.x) orow[c] = sh_row[c];
             if (xq != nullptr) {
                 const size_t xbase = ((size_t)(bb * m + mm) * h + hh) * (size_t)d;
@@ -5550,6 +5603,173 @@ gemm_fp8_mrows_kernel(const uint8_t* __restrict__ a, const float* __restrict__ a
     }
 }
 
+// ===========================================================================
+// MPAR (DSV41_MROWS_MPAR, 2026-09-13): the M-PARALLEL form of the multi-row
+// fp8 GEMV -- `gemm_fp8_mrows_mp_kernel<M>` below. Same rows, same bytes, same
+// chain: PARALLEL in M instead of serial in M.
+// ===========================================================================
+// WHY (the root lesion; full analysis in docs/agent/mrows-mpar-design.md §1).
+// The legacy kernel's parallelism is `nt = ceil(n / nwarps)` BLOCKS and, inside
+// a block, `nwarps` WARPS -- `n`, never `M`. The M activation rows only reach
+// `float acc[M]` (ONE warp's register file) and the per-block activation
+// staging, so at the verify's m = 6 the SAME `n` warps must issue ~M times the
+// LDS/ALU work of the m = 1 program. Weight traffic is shared (1x), but at these
+// shapes (n = 144..512, k = 5120..7168, nwarps = 4) that was never the binding
+// resource: 128 blocks x 4 warps = 512 warps on a 148-SM / 9472-warp part is a
+// 5%-occupancy launch, so the added per-warp work lands on an already
+// latency-starved machine and converts ~1:1 into wall time. That is the measured
+// `verify(m = 6) = 4.45 x eager(m = 1)`, and it is why the fold_r arm (M into
+// the GRID, which does add blocks) lost 6x instead of winning: it re-staged the
+// weight row per M-group, i.e. it paid the prologue `ng` times instead of
+// amortising it.
+//
+// WHAT CHANGES. The M axis becomes a WARP axis: one warp per (output row,
+// activation row) PAIR, so the output element `out[r][row]` is computed by
+// exactly ONE warp and `acc` is a SCALAR (no `acc[M]`, no M fold at all). A
+// block owns `rpb` output rows and runs `rpb * M` warps (M warps per row, warp
+// `g` of row `rr` taking activation row `g`). The `rpb` weight rows are staged
+// into shared memory ONCE -- `rpb * k` bytes per block, i.e. still exactly
+// `n * k` bytes per launch, the SAME weight traffic the legacy kernel has -- and
+// are read by all M warps of that row.
+//
+// What this buys, in one line: warps in flight go from `n` to `n * M` (6x at
+// the verify) and the per-warp M-fold disappears, while the weight read stays
+// 1x. What it costs: the per-(row, kb) weight DECODE (`s_lut[rs[j]] * sb`) is
+// now issued by each of the M warps of the row instead of once per warp, i.e.
+// ~1.7x the instructions of the m = 1 program per output element at M = 6 --
+// which is the right trade on a launch that is at 5% occupancy and latency- not
+// issue-bound (docs/agent/mrows-mpar-design.md §2.3 has the count table, and §4
+// the micro-benchmark that settles the sign if it is wrong).
+//
+// NUMERICS -- BIT-IDENTICAL to `gemm_fp8_mrows_kernel<M>` and therefore to the
+// m = 1 launch of the same row (the legacy kernel's C1-C6):
+//   * same K walk: `kb` ascends 0..nb_k-1, `j = kb*32 + lane` (C1);
+//   * same operands, same bytes (C2): `rs[j]` is the staged `s_w[rr*k + j]` of
+//     the legacy kernel (the block's slab is the contiguous global range
+//     `w[row0*k .. (row0+rpb)*k)`, and the flat staging index maps 1:1 onto it);
+//     `ar[j]` IS the byte the legacy kernel copies into `s_a[q*k + j]` -- the
+//     staged slot is a PURE COPY of `a[(r0+q)*k + j]`, and a copy's width is not
+//     observable (C2 says so verbatim), so reading the source is the same value;
+//     `asr[kb]` IS `s_as[q*nb_k + (j>>5)]` (same source byte, same `j>>5 == kb`
+//     identity); `wsr[kb]` is the same `w_scale` word the legacy loop reads;
+//   * same accumulation: ONE serial `acc += av * wv` chain per (row, act-row)
+//     with the `#pragma unroll 32` source form (C6), no cross-row recombination
+//     and no K-split (C4/C5);
+//   * same reduction: the `shfl_xor` tree off = 16,8,4,2,1 emitted verbatim,
+//     run ONCE per (warp, row) (C3).
+// The two a32 arms (C2) are the same expression by construction -- one FMUL for
+// the operand either way -- so the single inline form below is bit-identical at
+// EITHER setting of DSV41_GEMV_A32; the gate is deliberately not re-read here.
+//
+// ABI: (a, a_scale, w, w_scale, bias, out, n, k, out_stride, rpb). Same pointers
+// as the legacy kernel; `fold_r` / `act_cp16` are properties of the
+// M-in-register fold this kernel does not have, and `a32` is a no-op (above).
+// The launcher declines unless `rpb >= 1`, `k % 32 == 0` and
+// `rpb * M * 32 <= 1024` (the block is `rpb * M` warps).
+template <int M>
+__global__ void __launch_bounds__(1024)
+gemm_fp8_mrows_mp_kernel(const uint8_t* __restrict__ a, const float* __restrict__ a_scale,
+                         const uint8_t* __restrict__ w, const uint8_t* __restrict__ w_scale,
+                         const float* __restrict__ bias, float* __restrict__ out, int n, int k,
+                         int out_stride, int rpb) {
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int nwarp = (int)(blockDim.x >> 5);  // == rpb * M
+    const int nb_k = k >> 5;
+    const int n16 = k >> 4;
+    // warp -> (which of the block's output rows, which activation row). `g` runs
+    // 0..M-1 because the block is `rpb * M` warps; the M warps with the same
+    // `rr` read the SAME staged weight row `s_w + rr*k`.
+    const int rr = warp % rpb;
+    const int g = warp / rpb;
+    const int row0 = blockIdx.x * rpb;
+    const int row = row0 + rr;
+    // smem: the `rpb` staged weight rows | the 256-entry e4m3 table. The
+    // activation rows are NOT staged here: with one warp per activation row
+    // every row is read by exactly one warp per block, so a block-wide copy
+    // would amortise nothing -- it would only re-introduce the M-proportional
+    // prologue this kernel exists to remove. The k-byte row is read straight out
+    // of L1 instead (one coalesced 32 B / warp / kb).
+    extern __shared__ uint8_t smem[];
+    uint8_t* s_w = smem;
+    float* s_lut = reinterpret_cast<float*>(s_w + (size_t)rpb * (size_t)k);
+    for (int i = threadIdx.x; i < 256; i += blockDim.x) s_lut[i] = e4m3_to_f((uint8_t)i);
+    // Weight slab: `rpb` rows of `k` bytes starting at `w + row0*k`. The model
+    // constant keeps the rows `k` apart, so the slab is ONE contiguous global
+    // range and a flat 16B-unit index maps onto it 1:1; the whole block stages
+    // it cooperatively (`nwarp` units per sweep, `nwarp` warps).
+    const int avail = min(rpb, n - row0);  // >= 1: the grid is ceil(n / rpb)
+    const uint8_t* __restrict__ wsrc = w + (size_t)row0 * (size_t)k;
+    if (dsv41_f4_ok(wsrc) && dsv41_f4_ok(s_w)) {
+        const int nflat = avail * n16;
+        for (int t = warp; t < nflat; t += nwarp)
+            dsv41_cp_async16(s_w + ((size_t)t << 4), wsrc + ((size_t)t << 4));
+        dsv41_cp_commit();
+        dsv41_cp_wait_all();
+    } else {
+        // k % 16 tail / unaligned arm: unreachable for every launcher (they all
+        // reject `k & 31`, which also makes `row0*k` and `rpb*k` 16B multiples).
+        for (int i = threadIdx.x; i < avail * k; i += blockDim.x) s_w[i] = wsrc[i];
+    }
+    // Cross-warp publication. The slab is staged FLAT -- `s_w[rr*k + ...]` is
+    // written by warps other than its reader -- so the transfer must be retired
+    // BEFORE the barrier. This is the one line that differs from the legacy
+    // prologue, where each warp staged its OWN row and deliberately overlapped
+    // the barrier with its transfer.
+    __syncthreads();
+    if (row < n) {
+        const uint8_t* __restrict__ rs = s_w + (size_t)rr * (size_t)k;
+        const uint8_t* __restrict__ wsr = w_scale + (size_t)(row >> 5) * (size_t)nb_k;
+        const uint8_t* __restrict__ ar = a + (size_t)g * (size_t)k;
+        const float* __restrict__ asr = a_scale + (size_t)g * (size_t)nb_k;
+        float acc = 0.f;
+        #pragma unroll 32
+        for (int kb = 0; kb < nb_k; ++kb) {
+            const float sb = ue8m0_to_f(wsr[kb]);
+            const int j = kb * 32 + lane;
+            const float wv = s_lut[rs[j]] * sb;
+            const float av = s_lut[ar[j]] * asr[kb];
+            acc += av * wv;
+        }
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
+        if (lane == 0) {
+            const float v = acc + (bias != nullptr ? bias[row] : 0.f);
+            out[(size_t)g * (size_t)out_stride + (size_t)row] = v;
+        }
+    }
+}
+
+// MPAR gate (DSV41_MROWS_MPAR, 2026-09-13). `=N` (N >= 1) selects the
+// M-parallel kernel with N OUTPUT ROWS per block; `=auto` (or a negative value)
+// takes the widest block that fits (`1024 / (32*M)` rows), which keeps the
+// legacy block's rows-per-block at M = 8 and widens it at small M; unset / `=0`
+// is OFF, i.e. the M-in-register program, byte for byte.
+//
+// The knob is the ROW COUNT, not the warp count, because that is the quantity
+// the two programs share: `rpb` rows per block is the legacy `nwarps`, and the
+// MPAR block is `rpb * M` warps. Sweeping it walks from "one output row per
+// block, M warps on it" (rpb = 1: the most parallelism, the most LUT-build and
+// activation-read replication) to "as many rows as fit one 1024-thread block"
+// (auto: the least replication, one block per SM at M = 6).
+//
+// Read once (static): the launcher runs a few hundred times per step.
+static const int g_mrows_mpar = [] {
+    const char* e = getenv("DSV41_MROWS_MPAR");
+    if (e == nullptr) return 0;
+    if (e[0] == 'a' || e[0] == 'A') return -1;  // "auto" -> widest block
+    return atoi(e);
+}();
+static inline int dsv41_mrows_mpar_for(int m) {
+    if (g_mrows_mpar == 0) return 0;  // OFF: today's program
+    const int mm = (m > 0) ? m : 1;
+    const int cap = 1024 / (32 * mm);  // rpb*m warps must fit ONE block
+    int rpb = (g_mrows_mpar < 0) ? cap : g_mrows_mpar;
+    if (rpb > cap) rpb = cap;
+    if (rpb < 1) rpb = 1;
+    return rpb;
+}
+
 // See the kernel header above for the layout and the bit-identity argument (C1-C6).
 // Returns 0 (launched) or 2 (declined: the caller keeps its per-row loop, whose
 // numerics are the same by construction).
@@ -5613,6 +5833,81 @@ extern "C" int dsv41_gemm_fp8_mrows(const uint8_t* a, const float* a_scale,
     // variable that nvcc rejected from device code — 8 compile errors) and
     // passed to the kernel as a plain int parameter.
     const int act_cp16 = mrows_act_cpasync_host() ? 1 : 0;
+    // MPAR (DSV41_MROWS_MPAR, 2026-09-13): the M-PARALLEL program --
+    // `gemm_fp8_mrows_mp_kernel<M>`, one warp per (output row, activation row)
+    // pair, `rpb` output rows per block, the `rpb` weight rows staged once. This
+    // is an ALTERNATIVE PROGRAM, not a knob on the legacy one: it is launched
+    // instead of it, and `mpar == 0` (the default) leaves the path below
+    // byte-for-byte what it was.
+    //
+    // It requires `fold_r == m`: the M axis is carried by the WARP LAYOUT here,
+    // so the grid must not also carry it (fold_r > 1 would stage a weight row per
+    // (i-tile, activation-row group) AND split M across warps inside each --
+    // two independent M folds, which is neither the measured-legacy behaviour
+    // nor the design in docs/agent/mrows-mpar-design.md). With the gate OFF
+    // fold_r == m always, so this only bites if both knobs are armed at once --
+    // the mpar arm then declines and the legacy arm runs (loudly, see the
+    // receipt below).
+    const int mpar = dsv41_mrows_mpar_for(m);
+    if (mpar > 0 && fold_r == m) {
+        // weight rows (rpb*k) + the e4m3 table. NO activation slab: the MPAR
+        // kernel reads each activation row from global once per kb (see the
+        // kernel header), so its smem is strictly smaller than the legacy
+        // program's at every shape -- a smaller `nwarps`-equivalent can never
+        // cross the opt-in ceiling its predecessor did not (the small-n
+        // adaptive argument, dsv41_mrows_warps_for above).
+        const size_t smem_mp = (size_t)mpar * (size_t)k + (size_t)256 * sizeof(float);
+        if (smem_mp > 48 * 1024) {
+            // Same per-kernel attribute discipline as the legacy arm below:
+            // EVERY M specialisation needs its own ceiling or the launch dies
+            // with cudaErrorInvalidValue at the m the verify actually uses.
+            cudaError_t e = cudaSuccess;
+#define FERRITE_SET_MROWS_MP_SMEM(k)                                                      \
+    do {                                                                                  \
+        cudaError_t r = cudaFuncSetAttribute(                                             \
+            gemm_fp8_mrows_mp_kernel<k>, cudaFuncAttributeMaxDynamicSharedMemorySize,     \
+            dsv41_smem_ceiling(gemm_fp8_mrows_mp_kernel<k>));                             \
+        if (r != cudaSuccess && e == cudaSuccess) e = r;                                  \
+    } while (0)
+            FERRITE_SET_MROWS_MP_SMEM(1);
+            FERRITE_SET_MROWS_MP_SMEM(2);
+            FERRITE_SET_MROWS_MP_SMEM(3);
+            FERRITE_SET_MROWS_MP_SMEM(4);
+            FERRITE_SET_MROWS_MP_SMEM(5);
+            FERRITE_SET_MROWS_MP_SMEM(6);
+            FERRITE_SET_MROWS_MP_SMEM(7);
+            FERRITE_SET_MROWS_MP_SMEM(8);
+#undef FERRITE_SET_MROWS_MP_SMEM
+            if (e != cudaSuccess) { (void)cudaGetLastError(); return (int)e; }
+        }
+        // ACTIVITY RECEIPT (the act_cp16 precedent below, same reason): the arm
+        // has its own kernel NAME, so nsys can prove it ran -- but the DECLINE
+        // branch (`mpar > 0 && fold_r != m`) has none, and this tree has been
+        // bitten by exactly that phantom-gate shape. ONE line per process, on
+        // the first ARMED launch, naming the geometry that launch resolved to.
+        {
+            static int reported = 0;
+            if (reported++ == 0)
+                fprintf(stderr,
+                        "[mrows-mpar] ARMED m=%d n=%d k=%d rpb=%d -> block=%d warps, grid=%d, "
+                        "smem=%zu\n",
+                        m, n, k, mpar, mpar * m, (n + mpar - 1) / mpar, smem_mp);
+        }
+        const dim3 grid_mp((n + mpar - 1) / mpar);
+        const int blk_mp = mpar * m * 32;
+        switch (m) {
+            case 1: gemm_fp8_mrows_mp_kernel<1><<<grid_mp, blk_mp, smem_mp, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, mpar); break;
+            case 2: gemm_fp8_mrows_mp_kernel<2><<<grid_mp, blk_mp, smem_mp, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, mpar); break;
+            case 3: gemm_fp8_mrows_mp_kernel<3><<<grid_mp, blk_mp, smem_mp, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, mpar); break;
+            case 4: gemm_fp8_mrows_mp_kernel<4><<<grid_mp, blk_mp, smem_mp, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, mpar); break;
+            case 5: gemm_fp8_mrows_mp_kernel<5><<<grid_mp, blk_mp, smem_mp, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, mpar); break;
+            case 6: gemm_fp8_mrows_mp_kernel<6><<<grid_mp, blk_mp, smem_mp, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, mpar); break;
+            case 7: gemm_fp8_mrows_mp_kernel<7><<<grid_mp, blk_mp, smem_mp, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, mpar); break;
+            case 8: gemm_fp8_mrows_mp_kernel<8><<<grid_mp, blk_mp, smem_mp, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, mpar); break;
+            default: return 2;
+        }
+        return (int)cudaGetLastError();
+    }
     // weight rows (nwarps*k) + the e4m3 table + the fold_r activation scale rows
     // + the fold_r staged activation rows. Sized by `fold_r` (<= m), so it never
     // exceeds the per-M ceiling FERRITE_SET_MROWS_SMEM sets below.
@@ -5694,6 +5989,196 @@ extern "C" int dsv41_gemm_fp8_mrows(const uint8_t* a, const float* a_scale,
         case 7: gemm_fp8_mrows_kernel<7><<<grid, nwarps * 32, smem, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, (int)g_gemv_a32, fold_r, act_cp16); break;
         case 8: gemm_fp8_mrows_kernel<8><<<grid, nwarps * 32, smem, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, (int)g_gemv_a32, fold_r, act_cp16); break;
         default: return 2;
+    }
+    return (int)cudaGetLastError();
+}
+
+// ===========================================================================
+// COMPRESSOR-PROJ-MROWS (`dsv41_gemv_f32_mrows`): the compressor's kvp/scp
+// projections, m activation rows folded into ONE pass over the weight.
+// ===========================================================================
+// The verify block (`chain_dev.rs::compress_proj_rows`, :12357) issued
+// `lin_f32_on` TWICE PER ROW per compress-source layer -- `comp_wkv` -> `kvp_r`
+// and `comp_wgate` -> `scp_r` -- i.e. 12 launches per layer at m = 6, each one
+// re-streaming the SAME 2.6 MB f32 weight (`[head_dim, dim] = [128, 5120]`).
+// `COMPRESSOR_MROWS` (`compressor_mrows()`) only covers the pool+commit HALF
+// (`dsv41_compressor_fused_mrows`); the projection half had NO gate at all, so
+// those weight reads were never amortised (the audit's "the only two
+// gate-less black holes").
+//
+// THE PROGRAM THIS FOLDS. `lin_f32_on` -> `Device::gemv_f32_on`, which is
+// `dsv41_gemv_f32_v2` whenever `gemv_f32_v2_wanted(n)` holds -- `DSV41_GEMV_F32_V2`
+// defaults ON and the compressor's `n = head_dim = 128 < GEMV_F32_V2_MAX_N`. So
+// the per-row reference is `gemv_f32_v2_kernel<WPR>` at `WPR = 8` (the
+// `n < 1024` arm of that launcher's heuristic), NOT v1: v2's K-split reorders
+// the cross-K-slice fold and is therefore a DIFFERENT summation order from v1
+// (~1e-6 f32, per its header). Transcribing v1 here would reproduce exactly the
+// dispatch-mismatch class the engram site documents as SEVERE (see
+// `chain_dev.rs::engram_apply_rows`) -- so this kernel is a TRANSCRIPTION OF V2,
+// and the launcher DECLINES when the per-row call would not be v2.
+//
+// NUMERICS -- row r of this launch is BIT-IDENTICAL to row r's own
+// `gemv_f32_v2_kernel<WPR>` launch, and that parity is a transcription, not a
+// re-derivation:
+//   * `int kper = ((k + WPR - 1) / WPR + 3) & ~3`, `k0 = kw * kper`,
+//     `k1 = min(k0 + kper, k)` -- v2's slice arithmetic, verbatim;
+//   * the lane sweep `for (c = k0 + lane*4; c + 3 < k1; c += 32*4)` -- v2's
+//     float4 walk, verbatim, with `WPR` a RUNTIME parameter (v2's template
+//     parameter enters only this integer arithmetic and the fold bound, so
+//     `template <int WPR>` vs a plain `int` argument is not part of the
+//     contract);
+//   * `acc[r] = __fmaf_rn(wv.{x,y,z,w}, xv.{x,y,z,w}, acc[r])` -- v2's FOUR
+//     explicit round-to-nearest FMAs in v2's order, one INDEPENDENT accumulator
+//     per row (nothing is ever combined across r);
+//   * the reduction is v2's `__shfl_down_sync(0xffffffffu, acc, off)` tree over
+//     v2's off = 16,8,4,2,1, applied per row;
+//   * the cross-slice fold is v2's `sum += part[(warp / WPR) * WPR + j]` over
+//     j = 0..WPR-1 ASCENDING, applied per row;
+//   * the epilogue is v2's `out[row] = ...` at lane 0 of the row's first warp.
+// The ONLY change the m-fold makes is the WEIGHT RE-READ: `wv` is hoisted out
+// of the r loop because it is a per-c value -- the IDENTICAL `float4` of the
+// IDENTICAL bytes, reused m times, which cannot change any row's value. The
+// row -> warp mapping and the grid are not part of the contract either (rows
+// are independent), so which warp computes a row cannot change it.
+//
+// `x` is [m, k] f32 (the verify's `s.xn_r`), `out` is [m, n] f32 (`s.kvp_r` /
+// `s.scp_r`, pitch `n = head_dim`). M is a template parameter so every row owns
+// a register chain; the launcher dispatches m = 1..8 and the caller keeps its
+// per-row loop above 8. Block and grid mirror `dsv41_gemv_f32_v2`'s exactly
+// (256 threads = 8 warps, `ceil(n / (8 / WPR))` blocks), so the two launches
+// differ in the row fold and nothing else.
+template <int M>
+__global__ void gemv_f32_v2_mrows_kernel(const float* __restrict__ w,
+                                         const float* __restrict__ x,
+                                         float* __restrict__ out,
+                                         int n, int k, int WPR) {
+    const int warps = blockDim.x >> 5;
+    const int rpb = warps / WPR;               // rows per block (v2's expression)
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int row = blockIdx.x * rpb + warp / WPR;
+    const int kw = warp % WPR;                 // K-slice id
+    float acc[M];
+    #pragma unroll
+    for (int r = 0; r < M; ++r) acc[r] = 0.f;
+    if (row < n) {
+        const float* wr = w + (size_t)row * (size_t)k;
+        // Slice size rounded to 4 -- v2's expression, and `k % 4 == 0` is
+        // guaranteed by the launcher (it declines otherwise, exactly as
+        // `dsv41_gemv_f32_v2` falls back to v1).
+        int kper = ((k + WPR - 1) / WPR + 3) & ~3;
+        int k0 = kw * kper;
+        int k1 = min(k0 + kper, k);
+        #pragma unroll 2
+        for (int c = k0 + lane * 4; c + 3 < k1; c += 32 * 4) {
+            // ONE load for all M rows (the hoist): the identical float4 from the
+            // identical address the single-row launch would reload per row.
+            const float4 wv = *reinterpret_cast<const float4*>(wr + c);
+            #pragma unroll
+            for (int r = 0; r < M; ++r) {
+                const float4 xv =
+                    *reinterpret_cast<const float4*>(x + (size_t)r * (size_t)k + c);
+                acc[r] = __fmaf_rn(wv.x, xv.x, acc[r]);
+                acc[r] = __fmaf_rn(wv.y, xv.y, acc[r]);
+                acc[r] = __fmaf_rn(wv.z, xv.z, acc[r]);
+                acc[r] = __fmaf_rn(wv.w, xv.w, acc[r]);
+            }
+        }
+    }
+    // v2's `__shfl_down_sync` tree, once per row. No cross-row recombination --
+    // each `a` is one row's independent chain.
+    #pragma unroll
+    for (int r = 0; r < M; ++r) {
+        float a = acc[r];
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            a += __shfl_down_sync(0xffffffffu, a, off);
+        }
+        acc[r] = a;
+    }
+    if (WPR == 1) {
+        if (lane == 0 && row < n) {
+            #pragma unroll
+            for (int r = 0; r < M; ++r) out[(size_t)r * (size_t)n + row] = acc[r];
+        }
+    } else {
+        // One slot per (row, warp); blockDim is 256 = 8 warps and WPR <= 8, so
+        // this is the M x 8 mirror of v2's single-row `part[16]`.
+        __shared__ float part[M * 8];
+        if (lane == 0) {
+            #pragma unroll
+            for (int r = 0; r < M; ++r) part[r * 8 + warp] = acc[r];
+        }
+        __syncthreads();
+        if (kw == 0 && lane == 0 && row < n) {
+            #pragma unroll
+            for (int r = 0; r < M; ++r) {
+                float sum = 0.f;
+                #pragma unroll
+                for (int j = 0; j < WPR; ++j) {
+                    sum += part[r * 8 + (warp / WPR) * WPR + j];
+                }
+                out[(size_t)r * (size_t)n + row] = sum;
+            }
+        }
+    }
+}
+
+// See the kernel header above for the bit-identity argument. Returns 0
+// (launched) or 2 (declined: the caller keeps its per-row loop, which is the
+// bit-exact reference this kernel is a transcription of).
+extern "C" int dsv41_gemv_f32_mrows(const float* w, const float* x, float* out,
+                                    int m, int n, int k, cudaStream_t s) {
+    // One-shot receipt: an armed caller must never be left guessing whether the
+    // fold ran or the per-row loop did (this tree's #1 trap). Printed on the
+    // FIRST call only, host-side, and only when the caller reached this entry
+    // at all -- the Rust gate is already ON by then.
+    static int reported = 0;
+    const bool verbose = (reported++ == 0);
+    if (m <= 0 || m > 8) {
+        if (verbose) fprintf(stderr, "[gemv-f32-mrows] DECLINED m=%d n=%d k=%d (m outside 1..8)\n", m, n, k);
+        return 2;
+    }
+    if (n <= 0 || k <= 0 || (k & 3)) {
+        if (verbose) fprintf(stderr, "[gemv-f32-mrows] DECLINED m=%d n=%d k=%d (k %% 4 != 0: the float4 body)\n", m, n, k);
+        return 2;
+    }
+    if (w == nullptr || x == nullptr || out == nullptr) {
+        if (verbose) fprintf(stderr, "[gemv-f32-mrows] DECLINED m=%d n=%d k=%d (null operand)\n", m, n, k);
+        return 2;
+    }
+    // THE PER-ROW REFERENCE MUST BE V2. `Device::gemv_f32_on` picks
+    // `dsv41_gemv_f32_v2` when `DSV41_GEMV_F32_V2` is unset/!=0 AND `n` is below
+    // the host bound (2048, `GEMV_F32_V2_MAX_N` in device.rs). With the escape
+    // hatch set, or at a larger n, the per-row call is v1's `gemv_f32_kernel` --
+    // a different summation order -- so this entry declines and the caller keeps
+    // the per-row loop. Read ONCE (static): this launcher runs on the hot path.
+    static const bool v2_off = [] {
+        const char* e = getenv("DSV41_GEMV_F32_V2");
+        return e != nullptr && e[0] == '0';
+    }();
+    if (v2_off || n >= 2048) {
+        if (verbose) fprintf(stderr, "[gemv-f32-mrows] DECLINED m=%d n=%d k=%d (per-row reference is v1, not v2)\n", m, n, k);
+        return 2;
+    }
+    // v2's WPR heuristic, verbatim (`dsv41_gemv_f32_v2`).
+    const int wpr = n >= 16384 ? 1 : (n >= 4096 ? 2 : (n >= 1024 ? 4 : 8));
+    const int rpb = 8 / wpr;
+    const dim3 grid((n + rpb - 1) / rpb);
+    const dim3 block(256);
+    switch (m) {
+        case 1: gemv_f32_v2_mrows_kernel<1><<<grid, block, 0, s>>>(w, x, out, n, k, wpr); break;
+        case 2: gemv_f32_v2_mrows_kernel<2><<<grid, block, 0, s>>>(w, x, out, n, k, wpr); break;
+        case 3: gemv_f32_v2_mrows_kernel<3><<<grid, block, 0, s>>>(w, x, out, n, k, wpr); break;
+        case 4: gemv_f32_v2_mrows_kernel<4><<<grid, block, 0, s>>>(w, x, out, n, k, wpr); break;
+        case 5: gemv_f32_v2_mrows_kernel<5><<<grid, block, 0, s>>>(w, x, out, n, k, wpr); break;
+        case 6: gemv_f32_v2_mrows_kernel<6><<<grid, block, 0, s>>>(w, x, out, n, k, wpr); break;
+        case 7: gemv_f32_v2_mrows_kernel<7><<<grid, block, 0, s>>>(w, x, out, n, k, wpr); break;
+        case 8: gemv_f32_v2_mrows_kernel<8><<<grid, block, 0, s>>>(w, x, out, n, k, wpr); break;
+        default: return 2;
+    }
+    if (verbose) {
+        fprintf(stderr, "[gemv-f32-mrows] ARMED m=%d n=%d k=%d WPR=%d -> ONE launch over %d rows (weight read once)\n",
+                m, n, k, wpr, m);
     }
     return (int)cudaGetLastError();
 }
@@ -8853,8 +9338,53 @@ extern "C" int dsv41_engram_gather(const uint8_t* table, const uint8_t* table_sc
                                    cudaStream_t s) {
     const size_t total = (size_t)rows * n_cols * head_dim;
     engram_gather_kernel<<<(unsigned)((total + 255) / 256), 256, 0, s>>>(
-        table, table_scale, hash_ids, out, rows, n_cols, head_dim, part_start, part_rows);
+        table, table_scale, hash_ids, out, rows, n_cols, head_dim, n_cols, part_start, part_rows);
     return (int)cudaGetLastError();
+}
+
+// ENGRAM-GATHER-MROWS: the `rows`-fold of the entry above for the verify's
+// multi-row engram write-back (`chain_dev.rs::engram_apply_rows`, which issued
+// ONE `dsv41_engram_gather` PER ROW — `m = 6` launches per engram layer at
+// m = 6, each a single 24-row-per-token gather). The extra `id_stride` is the
+// per-TOKEN pitch of `hash_ids`: the m rows live at `[row][engram layer][col]`,
+// so their ids for one engram layer are `n_eng * n_cols` apart. See the kernel
+// header for why this is the concatenation of the per-row calls, value for
+// value.
+//
+// Returns 0 (launched) or 2 (DECLINED — never cudaErrorInvalidValue, so a
+// decline can never read as a launch failure): `rows` outside 1..=8,
+// `id_stride < n_cols`, a non-positive/odd shape. The caller keeps its per-row
+// loop, which is the bit-exact reference. One-shot receipt on the first call,
+// so an armed run can never be mistaken for a fold (this tree's #1 trap).
+extern "C" int dsv41_engram_gather_rows(const uint8_t* table, const uint8_t* table_scale,
+                                        const int64_t* hash_ids, float* out, int rows, int n_cols,
+                                        int head_dim, int id_stride, int64_t part_start,
+                                        int64_t part_rows, cudaStream_t s) {
+    static int reported = 0;
+    const bool verbose = (reported++ == 0);
+    if (rows <= 0 || rows > 8) {
+        if (verbose)
+            fprintf(stderr, "[engram-gather-rows] DECLINED rows=%d (outside 1..8)\n", rows);
+        return 2;
+    }
+    if (n_cols <= 0 || head_dim <= 0 || (head_dim & 31) || id_stride < n_cols) {
+        if (verbose)
+            fprintf(stderr, "[engram-gather-rows] DECLINED rows=%d n_cols=%d hd=%d id_stride=%d\n",
+                    rows, n_cols, head_dim, id_stride);
+        return 2;
+    }
+    if (table == nullptr || table_scale == nullptr || hash_ids == nullptr || out == nullptr) {
+        if (verbose) fprintf(stderr, "[engram-gather-rows] DECLINED rows=%d (null operand)\n", rows);
+        return 2;
+    }
+    const size_t total = (size_t)rows * n_cols * head_dim;
+    engram_gather_kernel<<<(unsigned)((total + 255) / 256), 256, 0, s>>>(
+        table, table_scale, hash_ids, out, rows, n_cols, head_dim, id_stride, part_start, part_rows);
+    const cudaError_t e = cudaGetLastError();
+    if (verbose && e == cudaSuccess)
+        fprintf(stderr, "[engram-gather-rows] ARMED rows=%d n_cols=%d hd=%d id_stride=%d -> ONE launch\n",
+                rows, n_cols, head_dim, id_stride);
+    return (int)e;
 }
 
 // Stable argmax over f32 logits: ties resolve to the LOWEST index, matching the
@@ -9143,10 +9673,16 @@ extern "C" int dsv41_argmax_sliced_rows(
     return (int)cudaGetLastError();
 }
 
-extern "C" int dsv41_sparse_attn(const float* q, const float* kv, const float* sink,
-                                 const int32_t* idxs, float* out, int b, int m, int h, int d,
-                                 const int* clen, int window, int index_topk, float scale,
-                                 const int* clen_rows, int idx_stride, cudaStream_t s) {
+// W2-MROWS-TP: the shared body of the two entries below. `row_pitch` is the q/out
+// ROW pitch in elements; 0 means `h*d`, which is the only value every caller
+// before the TP arm passes, so those calls stay bit-identical. Add-symbol-no-ABI-
+// change (A1a precedent): the old entry keeps its exact signature and forwards 0,
+// so a loader/.so pair that predates the TP arm behaves precisely as before.
+static int dsv41_sparse_attn_impl(const float* q, const float* kv, const float* sink,
+                                  const int32_t* idxs, float* out, int b, int m, int h, int d,
+                                  const int* clen, int window, int index_topk, float scale,
+                                  const int* clen_rows, int idx_stride, int row_pitch,
+                                  cudaStream_t s) {
     if (d > 512) return (int)cudaErrorInvalidValue;  // the accumulator is d-wide per thread group
     // Flash-decode split by default; DSV41_ATTN_SEQ=1 restores the sequential
     // version for A/B. Cached in a static: this runs per attention call, and a
@@ -9175,7 +9711,7 @@ extern "C" int dsv41_sparse_attn(const float* q, const float* kv, const float* s
             // ON, so the old order would leave this arm unreachable.
             sparse_attn_warp_kernel<<<grid, 128, 0, s>>>(q, kv, sink, idxs, out, b, m, h, d, clen,
                                                          window, index_topk, scale, clen_rows,
-                                                         idx_stride);
+                                                         idx_stride, row_pitch);
         } else if (split_c > 0 && split_c <= kAttnMaxC && b * m <= kAttnMaxBM &&
                    h <= kAttnMaxH) {
             // One block per (chunk, row, head); the split writes the partials,
@@ -9186,12 +9722,12 @@ extern "C" int dsv41_sparse_attn(const float* q, const float* kv, const float* s
             sparse_attn_split_kernel<<<dim3((unsigned)split_c, (unsigned)(b * m),
                                             (unsigned)h), 128, 0, s>>>(
                 q, kv, idxs, b, m, h, d, clen, window, index_topk, scale, split_c, clen_rows,
-                idx_stride);
+                idx_stride, row_pitch);
             cudaError_t e2 = cudaGetLastError();
             if (e2 != cudaSuccess) return (int)e2;
             sparse_attn_merge_kernel<<<dim3((unsigned)(b * m), (unsigned)h), 128, 0, s>>>(
                 sink, out, b, m, h, d, split_c, nullptr, nullptr, nullptr, 0, 0, 0, 0, 0, 0,
-                nullptr, nullptr);
+                nullptr, nullptr, 0, row_pitch);
             return (int)cudaGetLastError();
         } else {
             // PDL (see dsv41_pdl_or_plain): sparse_attn_pf is the consumer of
@@ -9201,14 +9737,38 @@ extern "C" int dsv41_sparse_attn(const float* q, const float* kv, const float* s
             // reads. The split/merge and warp A/B arms deliberately stay plain.
             cudaError_t le = dsv41_pdl_or_plain(sparse_attn_pf_kernel, grid, dim3(128), 0, s, q,
                                                kv, sink, idxs, out, b, m, h, d, clen, window,
-                                               index_topk, scale, clen_rows, idx_stride);
+                                               index_topk, scale, clen_rows, idx_stride, row_pitch);
             if (le != cudaSuccess) { (void)cudaGetLastError(); return (int)le; }
         }
     } else {
         sparse_attn_kernel<<<grid, 128, 0, s>>>(q, kv, sink, idxs, out, b, m, h, d, clen, window,
-                                                index_topk, scale, clen_rows, idx_stride);
+                                                index_topk, scale, clen_rows, idx_stride, row_pitch);
     }
     return (int)cudaGetLastError();
+}
+
+// The two public entries. `dsv41_sparse_attn` is the ORIGINAL symbol, byte for
+// byte (it forwards `row_pitch = 0`), so nothing that already loads it changes.
+extern "C" int dsv41_sparse_attn(const float* q, const float* kv, const float* sink,
+                                 const int32_t* idxs, float* out, int b, int m, int h, int d,
+                                 const int* clen, int window, int index_topk, float scale,
+                                 const int* clen_rows, int idx_stride, cudaStream_t s) {
+    return dsv41_sparse_attn_impl(q, kv, sink, idxs, out, b, m, h, d, clen, window, index_topk,
+                                  scale, clen_rows, idx_stride, 0, s);
+}
+
+// W2-MROWS-TP (`DSV41_ATTN_MROWS` at `world > 1`): identical to the entry above
+// except that the `q`/`out` rows are `row_pitch` elements apart instead of `h*d`.
+// The caller passes `nh*hd` — the pitch of the UNSPLIT head axis, so row `mm` of
+// the batch lands exactly where the per-row launch (`q + r*nh*hd`) put it, and
+// each of the rank's `nlh == h` heads keeps the `hh*d` offset it always had.
+extern "C" int dsv41_sparse_attn_rp(const float* q, const float* kv, const float* sink,
+                                    const int32_t* idxs, float* out, int b, int m, int h, int d,
+                                    const int* clen, int window, int index_topk, float scale,
+                                    const int* clen_rows, int idx_stride, int row_pitch,
+                                    cudaStream_t s) {
+    return dsv41_sparse_attn_impl(q, kv, sink, idxs, out, b, m, h, d, clen, window, index_topk,
+                                  scale, clen_rows, idx_stride, row_pitch, s);
 }
 
 // P1 (DSV41_SPARSE_OROPE): sparse_attn + inverse o-rope + fp8 emission, one
@@ -9240,12 +9800,16 @@ extern "C" int dsv41_sparse_attn(const float* q, const float* kv, const float* s
 // sentinel-1 trap documented at `dsv41_apply_rope_q`). The Rust side reads
 // rc <= 3 as "decline, fall back" only for the sentinels it knows; anything
 // else is a real launch error.
-extern "C" int dsv41_sparse_attn_orope(
+// W2-MROWS-TP: the shared body of the two o-rope entries. `row_pitch` is the
+// `q`/`out` row pitch (0 = `h*d`, the pre-TP default); `xq`/`xsc` keep their
+// compact `h*d` pitch either way (they are the per-rank block, not the full head
+// axis). Add-symbol-no-ABI-change: `dsv41_sparse_attn_orope` forwards 0.
+static int dsv41_sparse_attn_orope_impl(
     const float* q, const float* kv, const float* sink, const int32_t* idxs, float* out, int b,
     int m, int h, int d, const int* clen, int window, int index_topk, float scale,
     const float* cos, const float* sin, const int* base, int rope_rd, int half, int mul, int off,
     int step, int inverse, uint8_t* xq, float* xsc, const int* clen_rows, int idx_stride,
-    int row_step, cudaStream_t s) {
+    int row_step, int row_pitch, cudaStream_t s) {
     if (b <= 0 || m <= 0 || h <= 0 || d <= 0) return 1;
     if (d > 512) return 1;              // accumulator is d-wide per thread group
     if ((d & 31) != 0) return 1;        // fp8 per-32-block index must stay head-local
@@ -9277,19 +9841,48 @@ extern "C" int dsv41_sparse_attn_orope(
         sparse_attn_split_kernel<<<dim3((unsigned)split_c, (unsigned)(b * m),
                                         (unsigned)h), 128, 0, s>>>(
             q, kv, idxs, b, m, h, d, clen, window, index_topk, scale, split_c, clen_rows,
-            idx_stride);
+            idx_stride, row_pitch);
         cudaError_t e2 = cudaGetLastError();
         if (e2 != cudaSuccess) return (int)e2;
         sparse_attn_merge_kernel<<<dim3((unsigned)(b * m), (unsigned)h), 128, 0, s>>>(
             sink, out, b, m, h, d, split_c, cos, sin, base, rope_rd, half, mul, off, step,
-            inverse, xq, xsc);
+            inverse, xq, xsc, row_step, row_pitch);
         return (int)cudaGetLastError();
     }
     if (pf_off) return 2;
     sparse_attn_orope_kernel<<<dim3(b * m, h), 128, 0, s>>>(
         q, kv, sink, idxs, out, b, m, h, d, clen, window, index_topk, scale, cos, sin, base,
-        rope_rd, half, mul, off, step, inverse, xq, xsc, clen_rows, idx_stride, row_step);
+        rope_rd, half, mul, off, step, inverse, xq, xsc, clen_rows, idx_stride, row_step,
+        row_pitch);
     return (int)cudaGetLastError();
+}
+
+// The two public entries, as in `dsv41_sparse_attn` / `dsv41_sparse_attn_rp`.
+extern "C" int dsv41_sparse_attn_orope(
+    const float* q, const float* kv, const float* sink, const int32_t* idxs, float* out, int b,
+    int m, int h, int d, const int* clen, int window, int index_topk, float scale,
+    const float* cos, const float* sin, const int* base, int rope_rd, int half, int mul, int off,
+    int step, int inverse, uint8_t* xq, float* xsc, const int* clen_rows, int idx_stride,
+    int row_step, cudaStream_t s) {
+    return dsv41_sparse_attn_orope_impl(q, kv, sink, idxs, out, b, m, h, d, clen, window,
+                                        index_topk, scale, cos, sin, base, rope_rd, half, mul, off,
+                                        step, inverse, xq, xsc, clen_rows, idx_stride, row_step, 0,
+                                        s);
+}
+
+// W2-MROWS-TP (`DSV41_ATTN_MROWS` at `world > 1`): the fused o-rope / fp8 entry
+// with an explicit `q`/`out` row pitch (see `dsv41_sparse_attn_rp`). `xq`/`xsc`
+// are unchanged by it — they are the caller's compact per-rank block.
+extern "C" int dsv41_sparse_attn_orope_rp(
+    const float* q, const float* kv, const float* sink, const int32_t* idxs, float* out, int b,
+    int m, int h, int d, const int* clen, int window, int index_topk, float scale,
+    const float* cos, const float* sin, const int* base, int rope_rd, int half, int mul, int off,
+    int step, int inverse, uint8_t* xq, float* xsc, const int* clen_rows, int idx_stride,
+    int row_step, int row_pitch, cudaStream_t s) {
+    return dsv41_sparse_attn_orope_impl(q, kv, sink, idxs, out, b, m, h, d, clen, window,
+                                        index_topk, scale, cos, sin, base, rope_rd, half, mul, off,
+                                        step, inverse, xq, xsc, clen_rows, idx_stride, row_step,
+                                        row_pitch, s);
 }
 
 extern "C" int dsv41_indexer_topk(const float* q, const float* index_k, const float* weights,

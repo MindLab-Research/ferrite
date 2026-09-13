@@ -948,6 +948,74 @@ pub(crate) fn expert_grouped_skipped_note(reason: &str, so_has_symbols: bool) {
     });
 }
 
+/// DSV41_EXPERT_GROUPED_DOWN — the ROUTED DOWN direction's expert-union
+/// de-duplication, armed in the same stack as `DSV41_EXPERT_GROUPED=1`.
+/// DEFAULT OFF, read ONCE per process (a per-call getenv is a CUDA-graph capture
+/// hazard, like every gate here).
+///
+/// WHY IT EXISTS. The down GEMV's cost is proportional to the number of
+/// (row, slot) assignments swept: `moe_rows` routes `m <= VERIFY_ROWS = 6` rows
+/// with `topk = 6`, so the down direction reads `m*topk = 36` expert weight
+/// blocks per layer while only `|active|` (measured 18-24) distinct experts are
+/// involved — a third to a half of the traffic is a re-read of an expert an
+/// earlier assignment already touched. The grouped down kernel
+/// (`expert_gemv_fp4_down_batched_grouped_kernel`, dispatched INSIDE
+/// `dsv41_expert_down_fp4_batched`) stages each live expert's weight tile once
+/// per CTA, exactly as the grouped gate/up arm
+/// (`dsv41_expert_gemm_e4m3_grouped`) does for w1/w3.
+///
+/// ⚠️ IT RETIRES `DSV41_DOWN_FUSE` FOR THE ROUTED HALF, and that is not an
+/// implementation detail — it is where the numerical contract lives. The fused
+/// kernel produces the ascending-slot sum itself (fp addition is not
+/// associative, so that order is the contract). A grouped CTA owns ONE expert,
+/// so the slots of a given output row are spread over different CTAs and can
+/// only be merged by a second pass in the fixed order, which is exactly the
+/// `(expert_down_fp4_batched, moe_down_reduce)` pair. This gate therefore
+/// selects that pair (the same the `DSV41_DOWN_FUSE=0` escape hatch selects),
+/// with the grouped kernel inside the first launch: same bits, one w2 read per
+/// live expert, plus the scratch round trip and `rows` reduce launches.
+///
+/// The kernel reads BOTH this gate and `DSV41_EXPERT_GROUPED` in the `.so`, so
+/// arming this one alone is deliberately a no-op that says so once (see
+/// [`grouped_down_skipped_note`]) rather than a half-armed configuration with
+/// no A/B arm defined for it.
+pub(crate) fn expert_grouped_down() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("DSV41_EXPERT_GROUPED_DOWN")
+            .map(|v| v.starts_with('1'))
+            .unwrap_or(false)
+    })
+}
+
+/// Both halves of the grouped-down arm. The gate exists so the `.so` and the
+/// host agree on what "armed" means; the host uses it to decide whether the
+/// routed down half takes the grouped path, and the `.so` decides internally
+/// what to launch. A stale `.so` (no grouped kernel) is NOT visible here — the
+/// kernel lives in the same translation unit as the entry point it replaces, so
+/// an `.so` that has `dsv41_expert_down_fp4_batched` at all has the dispatch;
+/// what it may not have is the grouped GATE's AND, which is why the pairing is
+/// enforced in both places.
+pub(crate) fn grouped_down_armed() -> bool {
+    expert_grouped_down() && expert_grouped()
+}
+
+/// One-shot notice for an armed-but-inert or half-armed grouped-down gate. The
+/// #1 measurement trap in this project is "a gate was exported and the OLD path
+/// answered the step", so every state in which the arm cannot do what its name
+/// says announces itself exactly once.
+pub(crate) fn grouped_down_skipped_note(reason: &str) {
+    static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    ONCE.get_or_init(|| {
+        eprintln!(
+            "warning: DSV41_EXPERT_GROUPED_DOWN is set, but the routed down direction did NOT \
+             take the grouped kernel: {reason}. The step still computes correct values — it just \
+             measures the per-(row, slot) path (an A/B arm of \"GROUPED_DOWN\" under this state \
+             is measuring the OLD path)."
+        );
+    });
+}
+
 /// DSV41_DOWN_FUSE=0 reverts the batched down direction to the two-launch
 /// (expert_down_fp4_batched + moe_down_reduce) pair. DEFAULT ON
 /// (`.unwrap_or(true)`: f3b1be1 had flipped it OFF after the round-18 corruption,
@@ -1260,6 +1328,154 @@ fn indexer_mrows() -> bool {
             .map(|v| v != "0")
             .unwrap_or(false)
     })
+}
+
+/// ENGRAM-PROJ-MROWS (`DSV41_ENGRAM_PROJ_MROWS=1`, DEFAULT OFF): the multi-row
+/// engram write-back's `wkv` projection runs as ONE `dsv41_gemm_fp8_mrows`
+/// launch for all `m` rows instead of `m` `gemm_fp8_mx` launches at `m == 1`.
+///
+/// **This is the fix to the "SEVERE" verdict, not a violation of it.** The
+/// verdict (recorded verbatim on [`Self::engram_apply_rows`]) is that the
+/// batched and lazy arms became bit-incomparable because `gemm_fp8_mx`
+/// DISPATCHES ON `m`: the `m == 1` SIMT warp-per-row GEMV
+/// (`gemm_fp8_gemv_kernel`) versus the `m > 1` 16-row tile MMA
+/// (`gemm_fp8_kernel`). The defect was therefore the DISPATCH, not the m-fold —
+/// and the correct m-fold is the one every OTHER projection in the verify
+/// already routes through: `dsv41_gemm_fp8_mrows`, the weight-stationary
+/// multi-row form of the **`m == 1` program itself** (its kernel header carries
+/// the C1-C6 bit-identity argument: same lane -> k map, same `kb`-ascending
+/// walk, same `acc += av * wv` chain, same `__shfl_xor_sync` tree, one
+/// INDEPENDENT accumulator per row, no cross-row recombination). The engram
+/// site was the one that slipped through, so it now takes the same route: one
+/// weight stream for `m` rows, and the rows are the program both arms share.
+///
+/// Strictly additive: a decline (an `.so` without the symbol, `m` outside
+/// `1..=8`, a shape the kernel's bounds reject, `DSV41_GEMV_FP8_MODE < 3`,
+/// `DSV41_NO_GEMV_FP8`) returns `Ok(false)` and leaves the per-row loop below
+/// running — never an error, never a different number.
+///
+/// Read ONCE and cached — this site runs at every engram layer inside graph
+/// capture.
+fn engram_proj_mrows() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("DSV41_ENGRAM_PROJ_MROWS")
+            .map(|v| v != "0")
+            .unwrap_or(false)
+    })
+}
+
+/// COMPRESSOR-PROJ-MROWS (`DSV41_COMPRESSOR_PROJ_MROWS=1`, DEFAULT OFF): the
+/// multi-row compressor's `comp_wkv` / `comp_wgate` projections run as ONE
+/// `dsv41_gemv_f32_mrows` launch per weight for all `m` rows, instead of two
+/// `lin_f32_on` calls per row (12 launches per compress-source layer at m = 6,
+/// each re-streaming the same `[head_dim, dim]` f32 weight).
+///
+/// **This is the half [`compressor_mrows`] does NOT cover.** `compressor_mrows`
+/// / `compress_rows_fused` fold the POOL + COMMIT pair only (see
+/// [`Self::compress_proj_rows`]: it is deliberately split out and hoisted so the
+/// projections are paid once); the projections themselves had no gate at all.
+///
+/// The per-row reference is `lin_f32_on` -> `Device::gemv_f32_on`, which is
+/// `dsv41_gemv_f32_v2` at the compressor's `n = head_dim = 128`
+/// (`gemv_f32_v2_wanted`, its own escape hatch `DSV41_GEMV_F32_V2`). The
+/// m-fold entry is a transcription of THAT program, and declines when the
+/// per-row call would not be it (see the kernel header in
+/// `kernels/cuda/dsv41_kernels.cu`) — so the rows are bit-identical to the
+/// per-row loop's, exactly as the engram route above.
+///
+/// The wiring is `Device::gemv_f32_mrows` (the stream-taking wrapper, symmetric
+/// with `gemv_f32_on`), and it is strictly additive: a decline — a stale `.so`
+/// without the symbol, `m` outside `1..=8`, `n >= 2048`, `k % 4 != 0`, the v2
+/// escape hatch `DSV41_GEMV_F32_V2=0` — returns `Ok(false)`, the per-row loop
+/// below runs, and [`compressor_proj_mrows_declined_note`] says so once, so an
+/// armed run can never be mistaken for a fold that happened.
+///
+/// Read ONCE and cached — this site runs per compress-source layer inside graph
+/// capture.
+fn compressor_proj_mrows() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("DSV41_COMPRESSOR_PROJ_MROWS")
+            .map(|v| v != "0")
+            .unwrap_or(false)
+    })
+}
+
+/// One-shot receipt for the arm above. This tree's #1 documented trap is an
+/// armed gate that silently measures the OLD path (the reason
+/// `dsv41_gemm_fp8_mrows` grew the `[mrows-act-cp16]` receipt), so an armed arm
+/// that does NOT take announces itself once instead of leaving the log to imply
+/// a fold happened. Nothing is printed with the gate unset — the shipped
+/// default.
+fn compressor_proj_mrows_declined_note() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        eprintln!(
+            "[compressor-proj-mrows] ARMED but DECLINED: no `dsv41_gemv_f32_mrows` \
+             in this build (.so / shape / mode) -> the per-row `lin_f32_on` loop \
+             runs, byte for byte. Do NOT read this run as a fold measurement."
+        );
+    });
+}
+
+/// One-shot receipt for [`engram_proj_mrows`], same trap and same discipline as
+/// the compressor note above: the gate is ON but the fold was not taken (a stale
+/// `.so`, `m` outside `1..=8`, `DSV41_GEMV_FP8_MODE < 3`, a shape the kernel's
+/// bounds reject), so the per-row loop ran.
+fn engram_proj_mrows_declined_note() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        eprintln!(
+            "[engram-proj-mrows] ARMED but DECLINED: no `dsv41_gemm_fp8_mrows` \
+             take in this build (.so / shape / mode) -> the per-row `gemm_fp8_mx` \
+             loop runs, byte for byte. Do NOT read this run as a fold measurement."
+        );
+    });
+}
+
+/// ENGRAM-GATHER-MROWS (`DSV41_ENGRAM_GATHER_MROWS=1`, DEFAULT OFF): the
+/// multi-row engram gather runs as ONE `dsv41_engram_gather_rows` launch for all
+/// `m` rows, instead of `m` one-row gathers (12 launches per verify block at
+/// m = 6: two engram layers x six rows).
+///
+/// **Why it IS batchable, and what had to be said.** The hash ids are per TOKEN,
+/// so a naive `rows = m` fold would read row 0's ids for every row — the ids are
+/// `[row][engram layer][n_cols]`, i.e. one engram layer's rows are
+/// `n_eng * n_cols` apart, not `n_cols`. That stride is the whole of the
+/// per-token semantics: the batched entry takes it as `id_stride`, and with it
+/// the (row, col) -> id map and the `out` slot are EXACTLY the ones the per-row
+/// call used. Per element the launch is the concatenation of the per-row calls,
+/// so the gather is byte-identical — it is a launch-count fold, not a numeric
+/// one. (The single-row entry keeps `id_stride = n_cols`, so nothing about the
+/// existing path changes.)
+///
+/// The ticket here is launch overhead only (~10 launches saved), NOT bandwidth:
+/// each per-row gather moves `n_cols * engram_head_dim` elements, a few
+/// thousand, so this is the smallest of the three engram/compressor arms.
+///
+/// Read ONCE and cached — this site runs at every engram layer inside graph
+/// capture.
+fn engram_gather_mrows() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("DSV41_ENGRAM_GATHER_MROWS")
+            .map(|v| v != "0")
+            .unwrap_or(false)
+    })
+}
+
+/// One-shot receipt for [`engram_gather_mrows`], same discipline as the two
+/// notes above.
+fn engram_gather_mrows_declined_note() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        eprintln!(
+            "[engram-gather-mrows] ARMED but DECLINED: no `dsv41_engram_gather_rows` \
+             in this build (.so / shape) -> the per-row gather loop runs, byte for \
+             byte. Do NOT read this run as a fold measurement."
+        );
+    });
 }
 
 /// NORM-MROWS (`DSV41_NORM_MROWS=1`, DEFAULT OFF): the verify path's block norms
@@ -2596,8 +2812,12 @@ const ATT_MROWS_MAX_BM: usize = 8;
 /// block-final value — row 0's compressed half would include the latents rows
 /// 1..m-1 committed AFTER it (its own future) while losing the oldest group it
 /// should still have seen. That is exactly audit defect #1 (see the comment at
-/// the head of the row loop), which is what `clen_rows[r]` removes: row `r`
-/// binds to its own count, the value its per-row launch read.
+/// the head of the row loop). The arm answers it with the **device** per-row
+/// snapshot, `clen_rows_r[owner][r]` (the counter after row r's commit, written
+/// by the hoisted compressor — or, when no compressor was hoisted, no snapshot
+/// is needed because nothing moves the counter; see the gate in
+/// `attention_rows`). Earlier revisions staged a host array here and passed
+/// `as_ptr()` into the kernel, which never produced a valid bound.
 ///
 /// **Two hard preconditions, both checked at the call site** (this gate alone is
 /// not enough, and getting them wrong is silent corruption):
@@ -2615,18 +2835,19 @@ const ATT_MROWS_MAX_BM: usize = 8;
 ///    therefore taken only while `pos + m - 1 < window`; the long-context case
 ///    needs the ring/window halves fused into the row-ascending kernel first
 ///    (design §3.4(b)), which is NOT part of W2.
-/// 2. **Row pitch = `h*d`.** The kernels index the query/output rows as
-///    `(row*h + hh)*d`. The verify call's rows live in the full `[m, nh*hd]`
-///    buffers, i.e. at pitch `nh*hd`, which equals `h*d` only at `world == 1`
-///    (`h = nlh = nh/world`). Batching at `world > 1` therefore needs a
-///    `row_pitch` tail parameter on the five attention kernels AND the merge
-///    kernel (the split arm is the default) — a follow-up ABI addition, not a
-///    silent assumption. Until it exists the arm is taken at `world == 1` only,
-///    which is where the parity harness runs it.
+/// 2. **Row pitch = `nh*hd` at `world > 1`.** The kernels index the query/output
+///    rows from an explicit pitch. `dsv41_sparse_attn_rp` /
+///    `dsv41_sparse_attn_orope_rp` take it as a tail argument, the call site
+///    passes `nh*hd` (the pitch the per-row launches used, `q_r + r*nh*hd`), and
+///    `world == 1` passes 0 (`h*d`, `nlh == nh`) so that path is byte-identical
+///    to the kernel it has always run. `xq_r`/`xsc_r` are NOT involved — they
+///    stay the per-rank compact `nlh*hd` block. An `.so` without the `_rp`
+///    symbols keeps the old behaviour: the arm declines at `world > 1` and the
+///    per-row loop runs.
 ///
 /// With the gate OFF (or either precondition unmet) nothing changes: the per-row
-/// loop runs exactly as before, and the per-row call passes `nullptr/0` for the
-/// new parameters, so the emitted bytes are the pre-W2 ones byte-for-byte.
+/// loop runs exactly as before, and the per-row calls are untouched, so the
+/// emitted bytes are the pre-W2 ones byte-for-byte.
 fn attn_mrows() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *F.get_or_init(|| {
@@ -11245,20 +11466,35 @@ impl<'a> DevChain<'a> {
         // ON-but-declined announces itself once (the bring-up failure mode this
         // project keeps re-hitting is a gate that is ON and changes nothing).
         let mrows_attn = if attn_mrows() && m > 1 && m <= ATT_MROWS_MAX_BM {
-            if mrows_own_owner {
-                // COMPRESSOR-MROWS fence: the block-wide attention call bounds every row
-                // with `clen_rows[mm]`, which THIS arm hand-builds from the host mirror
-                // and passes as a HOST pointer (a separate, pre-existing defect of the
-                // `DSV41_ATTN_MROWS` arm). Under the compressor hoist the live counter
-                // is block-final as well, so taking both would read row r's future with
-                // no snapshot that a device kernel can use — refuse rather than corrupt.
+            // W2-MROWS-TP preconditions, in the order that keeps the cheapest and
+            // the most structural first. The two former declines are GONE:
+            //   * `world != 1` no longer refuses — `dsv41_sparse_attn_rp` /
+            //     `dsv41_sparse_attn_orope_rp` take the q/out `row_pitch` the ABI
+            //     was missing, and the arm passes `nh*hd`;
+            //   * the COMPRESSOR-MROWS fence no longer refuses — the hoisted
+            //     compressor's per-row snapshots are in DEVICE memory
+            //     (`clen_rows_r[owner]`), which is exactly the buffer the m-row
+            //     launch now reads (`attn_clen` below), so the "no snapshot a
+            //     device kernel can use" objection no longer holds.
+            if !self.dev.supports_sparse_attn_rp() && world != 1 {
                 attn_mrows_decline(
-                    "COMPRESSOR-MROWS hoisted this block's compressor: its per-row \
-                     counter snapshots live on the device, the W2-MROWS read has none",
+                    "world > 1 and the `.so` has no `dsv41_sparse_attn_rp`: the kernels \
+                     index the q/out rows as `h*d`, this block's rows are `nh*hd` apart",
                 );
                 false
-            } else if world != 1 {
-                attn_mrows_decline("world != 1: the row pitch is nh*hd, the kernels index h*d");
+            } else if is_comp_src && comp_proj && !mrows_own_owner {
+                // The one surviving stop: THIS layer's compressor ran the per-row
+                // path, so its commits advanced the live counter row by row and no
+                // device snapshot of the intermediate values exists (`clen_rows_r`
+                // is written by the hoisted launch only). An m-row launch reads ONE
+                // counter for every row, which would bound rows `0..m-2` with the
+                // block-FINAL count — their own future. Refuse; the per-row loop
+                // stays exact.
+                attn_mrows_decline(
+                    "this block's compressor commits per row and left no device \
+                     snapshot: an m-row launch would bound every row with the \
+                     block-final counter",
+                );
                 false
             } else if (pos_base as i64) + (m as i64) - 1 >= win as i64 {
                 attn_mrows_decline(
@@ -11272,10 +11508,31 @@ impl<'a> DevChain<'a> {
         } else {
             false
         };
-        // Row `r`'s bound for that launch — filled by the loop below with the SAME
-        // per-row value the per-row call read (`comp_len`, the host mirror the
-        // selection is already bounded by), never the block-final counter.
-        let mut clen_rows = [0i32; VERIFY_ROWS];
+        // Row `r`'s bound for that launch. `mrows_own_owner` (this layer's or its
+        // owner's hoisted compressor) hands the DEVICE snapshot the hoisted launch
+        // wrote — `clen_rows_r[owner][r]` = the counter after row r's commit, i.e.
+        // the per-row value the interleave below also passes as each row's own
+        // `clen`. Otherwise `null`, and the kernel reads the OWNER's live counter:
+        // that is the same value the per-row calls read (a consumer's owner has
+        // already finished its whole block, so its counter is constant here, and a
+        // layer that commits nothing never moves it — see the gate above for the
+        // one case that would break this).
+        //
+        // ⚠️ The old arm built a HOST array and passed `as_ptr()` into a device
+        // kernel — a pre-existing defect of `DSV41_ATTN_MROWS` that never produced
+        // a valid row bound. It is gone.
+        let attn_clen: *const std::os::raw::c_int = if mrows_own_owner {
+            (self.s.clen_rows_r.ptr as *const std::os::raw::c_int)
+                .wrapping_add(owner * VERIFY_ROWS)
+        } else {
+            std::ptr::null()
+        };
+        // W2-MROWS-TP: the q/out row pitch (elements). `world == 1` passes 0, the
+        // exact old spelling `h*d` (`nlh == nh`), so that path is byte-identical to
+        // the kernel it has always run; `world > 1` passes `nh*hd`, the pitch the
+        // per-row calls used (`q_r + r*nh*hd`, `o_r + r*nh*hd`). `xq_r`/`xsc_r` are
+        // NOT affected — they are this rank's compact `nlh*hd` block in both worlds.
+        let attn_row_pitch: i32 = if world == 1 { 0 } else { (nh * hd) as i32 };
         for r in 0..m {
             // ---- 1) ring append + THIS row's causal window ----
             // (audit defect #2: the window half.) `window_idxs(r)` must run after
@@ -11409,9 +11666,11 @@ impl<'a> DevChain<'a> {
             // side wrong was the BLOCK-FINAL `*clen` and the BLOCK-FIRST appends,
             // and both are answered (the snapshot here, the non-wrapped-ring
             // precondition at the gate).
-            if mrows_attn {
-                clen_rows[r] = comp_len as i32;
-            } else {
+            // W2-MROWS-TP: this arm no longer stages anything per row — the m-row
+            // launch reads `attn_clen` (the device snapshot, or the owner's live
+            // counter) instead of a host array, so all that is left here is the
+            // per-row launch it replaces.
+            if !mrows_attn {
                 //
                 // P1v (DSV41_VERIFY_OROPE): the EAGER path runs the FUSED launch
                 // (`sparse_attn_orope`: the inverse o-rope and the fp8 emission of the
@@ -11493,23 +11752,26 @@ impl<'a> DevChain<'a> {
         }
 
         // ---- W2-MROWS: the block's ONE sparse-attention launch ----
-        // Only reached when BOTH preconditions held (see the gate above), i.e. the
+        // Only reached when EVERY precondition held (see the gate above), i.e. the
         // block's appends cannot have clobbered any slot a row's window reads, so
-        // each row sees the ring image its per-row call saw, and the row pitch is
-        // `h*d`, so `q_r`/`o_r`/`xq_r`/`xsc_r` are indexed exactly as the per-row
-        // calls indexed them (row `mm` of the block is `q_r + mm*nh*hd`, the same
-        // address the loop above passed). `clen_rows[mm]` gives row `mm` its own
-        // `topk`, and `idx_stride = ist` is the `idxs_r` row pitch — NOT `topk`,
-        // which is per-row now that `clen` is (`ist = win + index_topk` is the
-        // block's fixed pitch; a row with `clen < index_topk` has the smaller
-        // `topk`, so the historical `(bb*m+mm)*topk` base would alias the next
-        // row's block).
+        // each row sees the ring image its per-row call saw, and the q/out row
+        // pitch is the one the per-row calls used (`attn_row_pitch`: 0 = `h*d` at
+        // `world == 1`, `nh*hd` otherwise — row `mm` of the block is
+        // `q_r + mm*nh*hd`, the same address the loop above passed; `xq_r`/`xsc_r`
+        // keep their compact `nlh*hd` pitch either way, which is what the kernel's
+        // `h*d` emission already computes). `attn_clen[mm]` gives row `mm` its own
+        // `topk` (the hoisted compressor's device snapshot, or null when nothing
+        // moves the counter), and `idx_stride = ist` is the `idxs_r` row pitch —
+        // NOT `topk`, which is per-row now that `clen` is (`ist = win +
+        // index_topk` is the block's fixed pitch; a row with `clen < index_topk`
+        // has the smaller `topk`, so the historical `(bb*m+mm)*topk` base would
+        // alias the next row's block).
         if mrows_attn {
             // The fused form when the row loop would have taken it. A decline is
             // all-or-nothing (it is a property of the call SHAPE and the env, not
             // of a row), which is what lets `orope_rows` be filled uniformly below.
             let oroped = vo
-                && self.dev.sparse_attn_orope(
+                && self.dev.sparse_attn_orope_pitched(
                     self.s.q_r.ptr as *const f32,
                     ring_ptr as *const f32,
                     ld.attn_sink.as_ref().unwrap().as_f32(),
@@ -11534,14 +11796,15 @@ impl<'a> DevChain<'a> {
                     true,
                     self.s.xq_r.ptr as *mut u8,
                     self.s.xsc_r.ptr as *mut f32,
-                    clen_rows.as_ptr(),
+                    attn_clen,
                     ist as i32,
                     // `row_step = 1`: `tt = pos_ctr + mm`, the per-row call's
                     // `off = r` — each row ropes at its own position.
                     1,
+                    attn_row_pitch,
                 )?;
             if !oroped {
-                self.dev.sparse_attn(
+                self.dev.sparse_attn_pitched(
                     self.s.q_r.ptr as *const f32,
                     ring_ptr as *const f32,
                     ld.attn_sink.as_ref().unwrap().as_f32(),
@@ -11555,8 +11818,9 @@ impl<'a> DevChain<'a> {
                     win as i32,
                     cfg.index_topk as i32,
                     scale,
-                    clen_rows.as_ptr(),
+                    attn_clen,
                     ist as i32,
+                    attn_row_pitch,
                 )?;
             }
             if vo {
@@ -12354,25 +12618,73 @@ impl<'a> DevChain<'a> {
         let (Some(wkv), Some(_)) = (ld.comp_wkv.as_ref(), ld.comp_norm.as_ref()) else {
             return Ok(false);
         };
-        for r in 0..m {
-            let xr = (self.s.xn_r.ptr as *const f32).wrapping_add(r * dim);
-            self.lin_f32_on(
-                xr,
-                dim as i32,
-                wkv,
+        // COMPRESSOR-PROJ-MROWS (`DSV41_COMPRESSOR_PROJ_MROWS=1`, DEFAULT OFF):
+        // the m rows' `comp_wkv` (and `comp_wgate`) projection as ONE
+        // `dsv41_gemv_f32_mrows` launch per weight, instead of the LOOP BELOW's
+        // 2 launches per row (12 per layer at m = 6, each re-streaming the same
+        // `[head_dim, dim]` f32 weight). This is the PROJECTION half —
+        // `compressor_mrows` / `compress_rows_fused` fold the pool+commit half
+        // only, so this site had no gate of any kind.
+        //
+        // The per-row reference is `lin_f32_on` -> `Device::gemv_f32_on`, which
+        // is `dsv41_gemv_f32_v2` at the compressor's `n = head_dim = 128`
+        // (`gemv_f32_v2_wanted`); the m-fold entry is a transcription of THAT
+        // program and declines when the per-row call would not be it, so each
+        // row stays bit-identical to the loop's.
+        //
+        // WHY A DECLINE FALLS BACK TO THE WHOLE LOOP. The two weights are the
+        // same shape (`[head_dim, dim]`), so the entry's decline criteria
+        // (pointers, `1..=8`, `k % 4`, `n >= 2048`, the v2 gate) are the same
+        // for both: a partial fold is not reachable through them. If one were to
+        // happen anyway, re-running the loop is safe by the same bit-identity —
+        // it rewrites the folded rows with the identical bytes.
+        let mut folded = false;
+        if compressor_proj_mrows() {
+            folded = self.dev.gemv_f32_mrows(
+                wkv.ptr() as *const f32,
+                self.s.xn_r.ptr as *const f32,
+                self.s.kvp_r.ptr as *mut f32,
+                m as i32,
                 hd as i32,
-                (self.s.kvp_r.ptr as *mut f32).wrapping_add(r * hd),
+                dim as i32,
                 st,
             )?;
-            if let Some(wg) = ld.comp_wgate.as_ref() {
+            if let (true, Some(wg)) = (folded, ld.comp_wgate.as_ref()) {
+                folded = self.dev.gemv_f32_mrows(
+                    wg.ptr() as *const f32,
+                    self.s.xn_r.ptr as *const f32,
+                    self.s.scp_r.ptr as *mut f32,
+                    m as i32,
+                    hd as i32,
+                    dim as i32,
+                    st,
+                )?;
+            }
+            if !folded {
+                compressor_proj_mrows_declined_note();
+            }
+        }
+        if !folded {
+            for r in 0..m {
+                let xr = (self.s.xn_r.ptr as *const f32).wrapping_add(r * dim);
                 self.lin_f32_on(
                     xr,
                     dim as i32,
-                    wg,
+                    wkv,
                     hd as i32,
-                    (self.s.scp_r.ptr as *mut f32).wrapping_add(r * hd),
+                    (self.s.kvp_r.ptr as *mut f32).wrapping_add(r * hd),
                     st,
                 )?;
+                if let Some(wg) = ld.comp_wgate.as_ref() {
+                    self.lin_f32_on(
+                        xr,
+                        dim as i32,
+                        wg,
+                        hd as i32,
+                        (self.s.scp_r.ptr as *mut f32).wrapping_add(r * hd),
+                        st,
+                    )?;
+                }
             }
         }
         if ld.comp_wgate.is_none() {
@@ -12629,19 +12941,46 @@ impl<'a> DevChain<'a> {
             .map(|l| l.layers.len())
             .unwrap_or(1)
             .max(1);
-        for r in 0..m {
-            let ids = (self.s.eng_ids_r.ptr as *const i64).wrapping_add((r * n_eng + li) * n_cols);
-            self.dev.engram_gather(
+        // ENGRAM-GATHER-MROWS (`DSV41_ENGRAM_GATHER_MROWS=1`, DEFAULT OFF): ONE
+        // `dsv41_engram_gather_rows` for all m rows. The per-TOKEN semantics are
+        // the id STRIDE: `eng_ids_r` is `[row][engram layer][col]`, so one engram
+        // layer's rows sit `n_eng * n_cols` apart — `id_stride` below — and with
+        // it row r's ids and output slots are exactly the ones the per-row call
+        // used (its base `(r * n_eng + li) * n_cols` == `li * n_cols + r *
+        // id_stride`, and its `out` pointer step `n_cols * ehd` is the
+        // contiguous row pitch of `eng_rows_r`). Per element the batched launch
+        // is the concatenation of the per-row calls.
+        let gathered = engram_gather_mrows()
+            && self.dev.engram_gather_rows(
                 table.ptr() as *const u8,
                 tsc.ptr() as *const u8,
-                ids,
-                (self.s.eng_rows_r.ptr as *mut f32).wrapping_add(r * n_cols * ehd),
-                1,
+                (self.s.eng_ids_r.ptr as *const i64).wrapping_add(li * n_cols),
+                self.s.eng_rows_r.ptr as *mut f32,
+                m as i32,
                 n_cols as i32,
                 ehd as i32,
+                (n_eng * n_cols) as i32,
                 (rank * per) as i64,
                 per as i64,
             )?;
+        if !gathered {
+            if engram_gather_mrows() {
+                engram_gather_mrows_declined_note();
+            }
+            for r in 0..m {
+                let ids = (self.s.eng_ids_r.ptr as *const i64).wrapping_add((r * n_eng + li) * n_cols);
+                self.dev.engram_gather(
+                    table.ptr() as *const u8,
+                    tsc.ptr() as *const u8,
+                    ids,
+                    (self.s.eng_rows_r.ptr as *mut f32).wrapping_add(r * n_cols * ehd),
+                    1,
+                    n_cols as i32,
+                    ehd as i32,
+                    (rank * per) as i64,
+                    per as i64,
+                )?;
+            }
         }
         // rows another rank owns arrived as 0, so the sum yields the real row
         if let Some(c) = self.comm.clone() {
@@ -12662,30 +13001,66 @@ impl<'a> DevChain<'a> {
             32,
             true,
         )?;
-        // (lazy-text-degradation's SEVERE verdict): `gemm_fp8_mx` dispatches on
-        // `m` between two different programs — SIMT warp-per-row GEMV at m==1
-        // and a 16-row tile MMA at m>1 — so the batched (m=6) and lazy (m=1)
-        // arms compute the engram projection through DIFFERENT summation
-        // orders, making the two arms' residual streams bit-incomparable (the
-        // Bristol/burdens/oqua divergence). Every other m-row projection in
-        // the verify already routes through proj_mrows/gemm_fp8_mrows to avoid
-        // this exact dispatch; engram was the one that slipped through. Fix:
-        // m individual m==1 calls (the canonical program both arms share).
+        // (lazy-text-degradation's SEVERE verdict) — the DISPATCH, not the fold.
+        // `gemm_fp8_mx` switches programs on `m`: the `m == 1` SIMT warp-per-row
+        // GEMV (`gemm_fp8_gemv_kernel`) versus a 16-row tile MMA
+        // (`gemm_fp8_kernel`). So ANY `gemm_fp8_mx` call at `m > 1` — which is
+        // what the batched arm used to issue — computes the engram projection
+        // through the TILE program's summation order, and that is what made the
+        // batched and lazy arms' residual streams bit-incomparable (the
+        // Bristol/burdens/oqua divergence). Every other m-row projection in the
+        // verify already routes through `proj_mrows`/`gemm_fp8_mrows` to avoid
+        // this exact dispatch; engram was the one that slipped through. So the
+        // correct m-fold is that SAME entry — `dsv41_gemm_fp8_mrows`, the
+        // weight-stationary multi-row form of the `m == 1` program itself (its
+        // kernel header's C1-C6 argument: same lane -> k map, same
+        // `kb`-ascending walk, same `acc += av * wv` chain, same shfl tree, one
+        // independent accumulator per row), which IS the canonical program both
+        // arms share — and NOT the `m == 1` per-row loop the interim fix fell
+        // back to.
+        //
+        // ENGRAM-PROJ-MROWS (`DSV41_ENGRAM_PROJ_MROWS=1`, DEFAULT OFF): all m
+        // rows in ONE launch, the `wkv` weight streamed ONCE instead of m times.
+        // With the gate off (the shipped default) or on a decline (an `.so`
+        // without the symbol, a shape outside the kernel's bounds,
+        // `DSV41_GEMV_FP8_MODE < 3`, `DSV41_NO_GEMV_FP8`) the per-row loop below
+        // runs — the previous code, byte for byte.
         let st = self.dev.stream();
         let k_cols = (n_cols * ehd) as i32;
-        for r in 0..m {
-            self.dev.gemm_fp8_mx_on(
-                (self.s.eng_xq_r.ptr as *const u8).wrapping_add(r * n_cols * ehd),
-                (self.s.eng_xsc_r.ptr as *const f32).wrapping_add(r * (n_cols * ehd / 32)),
+        let n_kv = ((hc + 1) * dim) as i32;
+        let proj_mrows = engram_proj_mrows()
+            && self.dev.gemm_fp8_mrows(
+                self.s.eng_xq_r.ptr as *const u8,
+                self.s.eng_xsc_r.ptr as *const f32,
                 wkv.ptr() as *const u8,
                 wsc.ptr() as *const u8,
                 std::ptr::null(),
-                (self.s.eng_kv_r.ptr as *mut f32).wrapping_add(r * (hc + 1) * dim),
-                1,
-                ((hc + 1) * dim) as i32,
+                self.s.eng_kv_r.ptr as *mut f32,
+                m as i32,
+                n_kv,
                 k_cols,
-                st,
+                // out_stride: the `eng_kv_r` row pitch, which the per-row loop
+                // below spells as the per-row pointer step `(hc + 1) * dim`.
+                n_kv,
             )?;
+        if !proj_mrows {
+            if engram_proj_mrows() {
+                engram_proj_mrows_declined_note();
+            }
+            for r in 0..m {
+                self.dev.gemm_fp8_mx_on(
+                    (self.s.eng_xq_r.ptr as *const u8).wrapping_add(r * n_cols * ehd),
+                    (self.s.eng_xsc_r.ptr as *const f32).wrapping_add(r * (n_cols * ehd / 32)),
+                    wkv.ptr() as *const u8,
+                    wsc.ptr() as *const u8,
+                    std::ptr::null(),
+                    (self.s.eng_kv_r.ptr as *mut f32).wrapping_add(r * (hc + 1) * dim),
+                    1,
+                    n_kv,
+                    k_cols,
+                    st,
+                )?;
+            }
         }
         // gated write-back into the residual stream (in place), all m rows
         self.dev.engram_apply(
@@ -13470,7 +13845,45 @@ impl<'a> DevChain<'a> {
                     topk as i32,
                 )?;
             }
-            if down_fuse() && self.dev.supports_down_fuse() {
+            // ---- GROUPED DOWN (DSV41_EXPERT_GROUPED_DOWN + DSV41_EXPERT_GROUPED)
+            // The grouped kernel stages each live expert's w2 tile once and
+            // answers every assignment routed to it, so the down weight traffic
+            // becomes `|active| x dim x inter/2` instead of `m*topk x dim x
+            // inter/2`. It is dispatched INSIDE `dsv41_expert_down_fp4_batched`
+            // (no new symbol / ABI / binding), and it produces the per-(row,
+            // slot) partials the per-row `moe_down_reduce` loop below merges in
+            // the FIXED ascending-slot order — which is why arming this arm
+            // ROUTES THE DOWN DIRECTION AROUND the fused kernel: the fused one
+            // owns the merge itself and cannot host a CTA that sees only one
+            // expert's slots. Same bits either way; the arm trades the scratch
+            // round trip + `rows` reduce launches for the expert-union saving.
+            //
+            // Denying the arm here (rather than letting the `.so` decide) is the
+            // point: with the gate ON and the fused call left in place, this
+            // launch would never reach the grouped entry point at all and the A/B
+            // would silently measure the OLD path — the #1 trap in this project.
+            // The halves that CAN be missing are handled loudly:
+            //   * `DSV41_EXPERT_GROUPED` off -> the `.so` ANDs the two gates and
+            //     would decline, so the host keeps the fused path and says so;
+            //   * no `expert_down_fp4_batched` / `moe_down_reduce` in the `.so`
+            //     -> the non-fused pair cannot run, so the host keeps the fused
+            //     path and says so.
+            let grouped_down = grouped_down_armed();
+            if expert_grouped_down() && !grouped_down {
+                grouped_down_skipped_note(
+                    "DSV41_EXPERT_GROUPED is off (the .so requires BOTH gates), so the arm was \
+                     not dispatched",
+                );
+            }
+            let grouped_down_ok = grouped_down && self.dev.supports_moe_batch();
+            if grouped_down && !grouped_down_ok {
+                grouped_down_skipped_note(
+                    "the loaded .so has no `dsv41_expert_down_fp4_batched` / `dsv41_moe_down_reduce` \
+                     pair (rebuild kernels/cuda: bash build.sh 103a), so the grouped down kernel \
+                     has no entry point to be dispatched from",
+                );
+            }
+            if down_fuse() && self.dev.supports_down_fuse() && !grouped_down_ok {
                 // ONE rows = m launch: the fused down+reduce kernel's grid is
                 // (dim/warps, 1, rows) and it derives act_row =
                 // act_base + arow*slots*act_stride, out_row = out + arow*n_total

@@ -291,6 +291,23 @@ struct Kernels {
         *const u8, *const u8, *const i64, *mut f32,
         c_int, c_int, c_int, i64, i64, CuStream,
     ) -> c_int,
+    // ENGRAM-GATHER-MROWS, from dsv41_kernels.cu (`dsv41_engram_gather_rows`):
+    // the `rows`-fold of `engram_gather` above, for the verify's multi-row
+    // engram write-back (`chain_dev.rs::engram_apply_rows` issued ONE gather per
+    // row). `id_stride` is the per-TOKEN pitch of `hash_ids` in elements —
+    // `eng_ids_r` is `[row][engram layer][n_cols]`, so one engram layer's rows
+    // are `n_eng * n_cols` apart; the single-row entry passes `n_cols`, i.e. it
+    // keeps the contiguous historical addressing exactly.
+    //
+    // Optional (a stale .so keeps the per-row loop, the bit-exact reference).
+    // ABI: (table, table_scale, hash_ids, out, rows, n_cols, head_dim, id_stride,
+    //       part_start, part_rows, s) -> 0 launched, 2 DECLINED.
+    engram_gather_rows: Option<
+        unsafe extern "C" fn(
+            *const u8, *const u8, *const i64, *mut f32,
+            c_int, c_int, c_int, c_int, i64, i64, CuStream,
+        ) -> c_int,
+    >,
     sparse_attn: unsafe extern "C" fn(
         *const f32, *const f32, *const f32, *const i32, *mut f32,
         c_int, c_int, c_int, c_int, *const c_int, c_int, c_int, f32,
@@ -319,6 +336,24 @@ struct Kernels {
         // (`tt = base*mul + off + hh*step + mm*row_step`, 0 = the old formula), so
         // an m-row launch ropes row `mm` at `pos_base + mm`.
         *const c_int, c_int, c_int, CuStream,
+    ) -> c_int>,
+    // W2-MROWS-TP (`DSV41_ATTN_MROWS` at `world > 1`): the same two launches with
+    // an explicit `q`/`out` ROW PITCH in elements. Add-symbol-no-ABI-change: the
+    // symbols above are untouched (they forward pitch 0), so an `.so` that predates
+    // the TP arm still loads and behaves exactly as before — these are `Option`,
+    // and their absence simply declines the `world > 1` batch (the old behaviour).
+    // `xq`/`xsc` are NOT affected by the pitch (see the C launchers).
+    sparse_attn_rp: Option<unsafe extern "C" fn(
+        *const f32, *const f32, *const f32, *const i32, *mut f32,
+        c_int, c_int, c_int, c_int, *const c_int, c_int, c_int, f32,
+        *const c_int, c_int, c_int, CuStream,
+    ) -> c_int>,
+    sparse_attn_orope_rp: Option<unsafe extern "C" fn(
+        *const f32, *const f32, *const f32, *const i32, *mut f32,
+        c_int, c_int, c_int, c_int, *const c_int, c_int, c_int, f32,
+        *const f32, *const f32, *const c_int, c_int, c_int, c_int, c_int, c_int, c_int,
+        *mut u8, *mut f32,
+        *const c_int, c_int, c_int, c_int, CuStream,
     ) -> c_int>,
     indexer_topk: unsafe extern "C" fn(
         *const f32, *const f32, *const f32, *const u8, *const i32, *mut i32,
@@ -718,6 +753,29 @@ struct Kernels {
     // Optional: an older .so without the symbol keeps the v1 kernel above.
     // Same ABI as v1: (w, x, out, n=out_f, k=in_f, s).
     gemv_f32_v2: Option<unsafe extern "C" fn(*const f32, *const f32, *mut f32, c_int, c_int, CuStream) -> c_int>,
+    // COMPRESSOR-PROJ-MROWS, from dsv41_kernels.cu (`dsv41_gemv_f32_mrows`): the
+    // MULTI-ROW form of the v2 f32 GEMV above — `m` activation rows folded into
+    // ONE pass over the weight, one INDEPENDENT accumulator per row. It is a
+    // transcription of `gemv_f32_v2_kernel<WPR>` (same `kper` slice arithmetic,
+    // same `float4` walk, same `__fmaf_rn` chain, same `__shfl_down_sync` tree,
+    // same cross-slice fold), and the ONLY change the fold makes is hoisting the
+    // weight `float4` out of the row loop — the identical bytes, reused, which
+    // cannot change any row's value. So each row is bit-identical to that row's
+    // own `m = 1` launch, which is what makes this the fix for the verify's
+    // per-row compressor projections (`chain_dev.rs::compress_proj_rows`: two
+    // `lin_f32_on` calls per row per compress-source layer at m = 6) rather than
+    // a different program.
+    //
+    // The entry DECLINES (returns 2, never cudaErrorInvalidValue) when the
+    // per-row reference would not be v2 (that gate off, `n >= 2048`), when
+    // `m` is outside 1..=8, when `k % 4 != 0` or a pointer is null.
+    //
+    // Optional: a stale .so without the symbol keeps the per-row loop, which is
+    // the bit-exact reference the kernel was transcribed from.
+    // ABI: (w, x, out, m, n, k, s).
+    gemv_f32_mrows: Option<
+        unsafe extern "C" fn(*const f32, *const f32, *mut f32, c_int, c_int, c_int, CuStream) -> c_int,
+    >,
     argmax: Option<unsafe extern "C" fn(*const f32, *mut c_int, c_int, *mut c_int, CuStream) -> c_int>,
     window_idxs: Option<unsafe extern "C" fn(*mut i32, *const c_int, c_int, CuStream) -> c_int>,
     comp_placeholder:
@@ -1527,8 +1585,11 @@ impl Device {
             expert_down_fp4: km!(rt, "dsv41_expert_down_fp4"),
             engram_hash: km!(rt, "dsv41_engram_hash"),
             engram_gather: km!(rt, "dsv41_engram_gather"),
+            engram_gather_rows: ko!(rt, "dsv41_engram_gather_rows"),
             sparse_attn: km!(rt, "dsv41_sparse_attn"),
             sparse_attn_orope: ko!(rt, "dsv41_sparse_attn_orope"),
+            sparse_attn_rp: ko!(rt, "dsv41_sparse_attn_rp"),
+            sparse_attn_orope_rp: ko!(rt, "dsv41_sparse_attn_orope_rp"),
             indexer_topk: km!(rt, "dsv41_indexer_topk"),
             candidate_blocks: km!(rt, "dsv41_candidate_blocks"),
             compressor: km!(rt, "dsv41_compressor"),
@@ -1562,6 +1623,7 @@ impl Device {
             gemv_bf16_v2_mrows_route: ko!(rt, "ferrite_gemv_bf16_v2_mrows_route"),
             gemv_f32: ko!(rt, "dsv41_gemv_f32"),
             gemv_f32_v2: ko!(rt, "dsv41_gemv_f32_v2"),
+            gemv_f32_mrows: ko!(rt, "dsv41_gemv_f32_mrows"),
             head_gemv_bf16_mrows: ko!(rt, "dsv41_head_gemv_bf16_mrows"),
             gemv_bf16_v1_mrows: ko!(rt, "dsv41_gemv_bf16_v1_mrows"),
             bf16_roundtrip: ko!(rt, "dsv41_bf16_roundtrip"),
@@ -2994,8 +3056,81 @@ impl Device {
         self.kerr(rc, "dsv41_engram_gather")
     }
 
+    /// ENGRAM-GATHER-MROWS (`DSV41_ENGRAM_GATHER_MROWS`): the multi-row engram
+    /// gather — `rows` tokens' `n_cols` hash rows each, gathered in ONE launch.
+    /// `id_stride` is the per-TOKEN pitch of `hash_ids` (in elements); the
+    /// caller passes the engram-layer stride `n_eng * n_cols` that its
+    /// `[row][engram layer][col]` id layout implies. Per element this is the
+    /// same id, the same table lookup and the same `out` slot as the per-row
+    /// `engram_gather` calls it replaces, so the rows are bit-identical.
+    ///
+    /// `Ok(true)` = launched. `Ok(false)` = NOT performed (a stale `.so` without
+    /// the symbol, `rows` outside `1..=8`, `id_stride < n_cols`, a bad shape);
+    /// the caller keeps its per-row loop, which is the bit-exact reference.
+    /// Never an error, exactly as [`Self::gemm_fp8_mrows`] documents.
+    #[allow(clippy::too_many_arguments)]
+    pub fn engram_gather_rows(
+        &self,
+        table: *const u8,
+        table_scale: *const u8,
+        hash_ids: *const i64,
+        out: *mut f32,
+        rows: i32,
+        n_cols: i32,
+        head_dim: i32,
+        id_stride: i32,
+        part_start: i64,
+        part_rows: i64,
+    ) -> Result<bool> {
+        let Some(f) = self.kernels.engram_gather_rows else {
+            return Ok(false);
+        };
+        if !(1..=8).contains(&rows) || id_stride < n_cols {
+            return Ok(false);
+        }
+        let rc = unsafe {
+            f(
+                table, table_scale, hash_ids, out, rows, n_cols, head_dim, id_stride, part_start,
+                part_rows, self.stream,
+            )
+        };
+        // 2 = the entry's "declined" (shape), the caller falls back.
+        if rc == 2 {
+            return Ok(false);
+        }
+        self.kerr(rc, "dsv41_engram_gather_rows")?;
+        Ok(true)
+    }
+
+    /// W2-MROWS-TP: the pre-TP entry, kept with its EXACT signature so every
+    /// existing caller (the per-row loop here, the eager arm, `dspark_dev.rs`) is
+    /// untouched. `row_pitch = 0` means `h*d`, the only spelling there was.
     #[allow(clippy::too_many_arguments)]
     pub fn sparse_attn(
+        &self,
+        q: *const f32,
+        kv: *const f32,
+        sink: *const f32,
+        idxs: *const i32,
+        out: *mut f32,
+        b: i32,
+        m: i32,
+        h: i32,
+        d: i32,
+        clen: *const c_int,
+        window: i32,
+        index_topk: i32,
+        scale: f32,
+        clen_rows: *const c_int,
+        idx_stride: i32,
+    ) -> Result<()> {
+        self.sparse_attn_pitched(q, kv, sink, idxs, out, b, m, h, d, clen, window, index_topk,
+                                 scale, clen_rows, idx_stride, 0)
+    }
+
+    /// W2-MROWS-TP: [`Self::sparse_attn`] with an explicit `q`/`out` row pitch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sparse_attn_pitched(
         &self,
         q: *const f32,
         kv: *const f32,
@@ -3016,7 +3151,26 @@ impl Device {
         // byte-for-byte identical to the pre-W2 launcher.
         clen_rows: *const c_int,
         idx_stride: i32,
+        // W2-MROWS-TP: the `q`/`out` row pitch in elements (`0` = `h*d`, the
+        // pre-TP default, and the only value a `world == 1` call passes). Non-zero
+        // is the `world > 1` batch and dispatches to `dsv41_sparse_attn_rp`; the
+        // caller gates that arm on [`Self::supports_sparse_attn_rp`], so a missing
+        // symbol here is a caller bug and reports as one rather than silently
+        // launching the `h*d` kernel.
+        row_pitch: i32,
     ) -> Result<()> {
+        if row_pitch != 0 {
+            let Some(f) = self.kernels.sparse_attn_rp else {
+                return Err(FerriteError::Config(
+                    "dsv41_sparse_attn_rp missing: the TP row-pitch arm needs it".into(),
+                ));
+            };
+            let rc = unsafe {
+                f(q, kv, sink, idxs, out, b, m, h, d, clen, window, index_topk, scale, clen_rows,
+                  idx_stride, row_pitch, self.stream)
+            };
+            return self.kerr(rc, "dsv41_sparse_attn_rp");
+        }
         let rc = unsafe {
             (self.kernels.sparse_attn)(
                 q, kv, sink, idxs, out, b, m, h, d, clen, window, index_topk, scale, clen_rows,
@@ -3035,8 +3189,47 @@ impl Device {
     /// `Ok(false)` means "fall back" (symbol absent, or the C launcher's shape
     /// decline returned 1/2/3). `Ok(true)` means this launch produced both the
     /// roped `out` row and the fp8 `xq`/`xsc` of it.
+    /// W2-MROWS-TP: the pre-TP entry (see [`Self::sparse_attn`]) — same exact
+    /// signature and `row_pitch = 0`.
     #[allow(clippy::too_many_arguments)]
     pub fn sparse_attn_orope(
+        &self,
+        q: *const f32,
+        kv: *const f32,
+        sink: *const f32,
+        idxs: *const i32,
+        out: *mut f32,
+        b: i32,
+        m: i32,
+        h: i32,
+        d: i32,
+        clen: *const c_int,
+        window: i32,
+        index_topk: i32,
+        scale: f32,
+        cos: *const f32,
+        sin: *const f32,
+        base: *const c_int,
+        rope_rd: i32,
+        half: i32,
+        mul: i32,
+        off: i32,
+        step: i32,
+        inverse: bool,
+        xq: *mut u8,
+        xsc: *mut f32,
+        clen_rows: *const c_int,
+        idx_stride: i32,
+        row_step: i32,
+    ) -> Result<bool> {
+        self.sparse_attn_orope_pitched(q, kv, sink, idxs, out, b, m, h, d, clen, window, index_topk,
+                                       scale, cos, sin, base, rope_rd, half, mul, off, step,
+                                       inverse, xq, xsc, clen_rows, idx_stride, row_step, 0)
+    }
+
+    /// W2-MROWS-TP: [`Self::sparse_attn_orope`] with an explicit `q`/`out` row pitch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sparse_attn_orope_pitched(
         &self,
         q: *const f32,
         kv: *const f32,
@@ -3068,23 +3261,55 @@ impl Device {
         clen_rows: *const c_int,
         idx_stride: i32,
         row_step: i32,
+        // W2-MROWS-TP: the `q`/`out` row pitch as in [`Self::sparse_attn`].
+        // Non-zero dispatches to `dsv41_sparse_attn_orope_rp`; an `.so` without
+        // that symbol simply declines (`Ok(false)`), which the caller's m-row arm
+        // answers by falling back to the plain `sparse_attn` entry.
+        row_pitch: i32,
     ) -> Result<bool> {
-        let f = match self.kernels.sparse_attn_orope {
-            Some(f) => f,
-            None => return Ok(false),
-        };
-        let rc = unsafe {
-            f(q, kv, sink, idxs, out, b, m, h, d, clen, window, index_topk, scale, cos, sin, base,
-              rope_rd, half, mul, off, step, inverse as i32, xq, xsc, clen_rows, idx_stride,
-              row_step, self.stream)
+        // The two symbols have DIFFERENT signatures (the `_rp` one carries the
+        // pitch), so they cannot share a `match`; dispatch on the pitch first.
+        let (rc, what) = if row_pitch != 0 {
+            let Some(f) = self.kernels.sparse_attn_orope_rp else {
+                return Ok(false);
+            };
+            (
+                unsafe {
+                    f(q, kv, sink, idxs, out, b, m, h, d, clen, window, index_topk, scale, cos,
+                      sin, base, rope_rd, half, mul, off, step, inverse as i32, xq, xsc,
+                      clen_rows, idx_stride, row_step, row_pitch, self.stream)
+                },
+                "dsv41_sparse_attn_orope_rp",
+            )
+        } else {
+            let Some(f) = self.kernels.sparse_attn_orope else {
+                return Ok(false);
+            };
+            (
+                unsafe {
+                    f(q, kv, sink, idxs, out, b, m, h, d, clen, window, index_topk, scale, cos,
+                      sin, base, rope_rd, half, mul, off, step, inverse as i32, xq, xsc,
+                      clen_rows, idx_stride, row_step, self.stream)
+                },
+                "dsv41_sparse_attn_orope",
+            )
         };
         // 1/2/3 are the decline sentinels (see the C launcher); anything else is
         // a real launch error.
         if (1..=3).contains(&rc) {
             return Ok(false);
         }
-        self.kerr(rc, "dsv41_sparse_attn_orope")?;
+        self.kerr(rc, what)?;
         Ok(true)
+    }
+
+    /// W2-MROWS-TP: whether the loaded `.so` carries `dsv41_sparse_attn_rp`, the
+    /// explicit-row-pitch entry an `m`-row batch needs at `world > 1`. The
+    /// attention gate asks this and declines the arm when it is absent, so an
+    /// `.so` that predates the TP work keeps the per-row launch sequence
+    /// (the pre-TP behaviour) instead of failing.
+    pub fn supports_sparse_attn_rp(&self) -> bool {
+        self.kernels.sparse_attn_rp.is_some()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5718,6 +5943,54 @@ impl Device {
         let f = self.need(self.kernels.gemv_f32, "dsv41_gemv_f32")?;
         let rc = unsafe { f(w, x, out, n, k, s) };
         self.kerr(rc, "dsv41_gemv_f32")
+    }
+
+    /// COMPRESSOR-PROJ-MROWS (`DSV41_COMPRESSOR_PROJ_MROWS`): the multi-row f32
+    /// GEMV — `m` activation rows of `x` [`[m, k]`, row r at `+r*k`] projected
+    /// against the ONE f32 weight `w` [`[n, k]`] into `out` [`[m, n]`, row r at
+    /// `+r*n`], in ONE launch that streams the weight ONCE. This is the fold of
+    /// the verify's per-row `lin_f32_on` loop (`chain_dev.rs::compress_proj_rows`:
+    /// `comp_wkv` + `comp_wgate`, 2 launches per row per compress-source layer).
+    ///
+    /// `Ok(true)` = launched. `Ok(false)` = NOT performed (a stale `.so` without
+    /// the symbol, `m` outside `1..=8`, or the C entry's decline — the per-row
+    /// reference not being v2, `n >= 2048`, `k % 4 != 0`); the caller keeps its
+    /// per-row loop, which is the bit-exact reference this kernel was transcribed
+    /// from. Never an error: a decline is a property of the shape/mode, exactly
+    /// as [`Self::gemm_fp8_mrows`] documents.
+    ///
+    /// Stream-taking on purpose, like [`Self::gemv_f32_on`]: the compressor's
+    /// projections run on the side stream `DSV41_COMPRESS_SIDE` selects.
+    pub fn gemv_f32_mrows(
+        &self,
+        w: *const f32,
+        x: *const f32,
+        out: *mut f32,
+        rows: i32,
+        n: i32,
+        k: i32,
+        s: CuStream,
+    ) -> Result<bool> {
+        let Some(f) = self.kernels.gemv_f32_mrows else {
+            return Ok(false);
+        };
+        if !(1..=8).contains(&rows) {
+            return Ok(false);
+        }
+        let rc = unsafe { f(w, x, out, rows, n, k, s) };
+        if rc == 2 {
+            return Ok(false);
+        }
+        self.kerr(rc, "dsv41_gemv_f32_mrows")?;
+        Ok(true)
+    }
+
+    /// True when the loaded `.so` carries the multi-row f32 GEMV
+    /// (`dsv41_gemv_f32_mrows`). A stale `.so` leaves the compressor's
+    /// projections on their per-row loop, which is the bit-exact reference they
+    /// were verified against.
+    pub fn supports_gemv_f32_mrows(&self) -> bool {
+        self.kernels.gemv_f32_mrows.is_some()
     }
 
     /// Indirect expert gate/up: the weights come from the per-layer pools plus the

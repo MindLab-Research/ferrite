@@ -477,6 +477,80 @@ fn draft_p3b() -> DraftP3b {
     })
 }
 
+/// The three `DSV41_DRAFT_P3LITE` folds of the draft's ATTENTION half, resolved
+/// once (see [`draft_p3lite`]).
+#[derive(Clone, Copy)]
+struct DraftP3Lite {
+    /// l1 (seed): the seed's `rmsnorm(mk)` + `apply_rope(mk)` as ONE
+    /// `dsv41_rmsnorm_rope` launch.
+    seed_norm_rope: bool,
+    /// l2 (kv): the block's `rmsnorm(kv)` + `apply_rope(kv)` as ONE
+    /// `dsv41_rmsnorm_rope` launch.
+    kv_norm_rope: bool,
+    /// l3 (attention output): `sparse_attn` + `apply_rope_inv(o)` x bs +
+    /// `quant1(o)` as ONE `dsv41_sparse_attn_orope` call.
+    attn_orope: bool,
+}
+
+/// `DSV41_DRAFT_P3LITE=1` (**DEFAULT OFF**) — the draft chain's **P3-lite**
+/// folds: the ATTENTION half's *same-program* launch fusions from
+/// `docs/agent/draft-p3lite-segment-fusion.md` §2.3/§2.4.
+///
+/// | item | override | fold | launches saved |
+/// |---|---|---|---|
+/// | l1 | `DSV41_P3LITE_SEED_NORM_ROPE` | seed: `rmsnorm(mk)` + `apply_rope(mk)` -> `dsv41_rmsnorm_rope` | 1/block |
+/// | l2 | `DSV41_P3LITE_KV_NORM_ROPE` | kv: `rmsnorm(kv)` + `apply_rope(kv)` -> `dsv41_rmsnorm_rope` | 1/block |
+/// | l3 | `DSV41_P3LITE_ATTN_OROPE` | `sparse_attn` + `rope_inv(o)` x bs + `quant1(o)` -> `dsv41_sparse_attn_orope` | 6/block |
+///
+/// A per-item override, when SET, wins over the master (`=0` turns that one fold
+/// off for an A/B that isolates it; any other value turns it on). An unset
+/// override follows the master. **One env per fold is deliberate** (rule R5 of
+/// the design doc): P3b was condemned as part of a four-way arm and never
+/// isolated by a single-variable cut, so each fold here must be cuttable alone.
+///
+/// **P3-LITE'S FIVE RULES** (the design doc's §3.3 — each one closes a hole the
+/// P3b post-mortem found). 1) *same-program*: only launches running the SAME
+/// contraction program may merge — which is why the q chain's `gemm_fp8_mx@m=bs`
+/// (the 16-row TILE MMA) is NOT folded here: `K2`/`mrows` is a different program
+/// and swapping it is a numerical change, not a launch saving. 2) *all-or-nothing
+/// at the LAUNCH level*: every fold below is ONE launch taking over the whole
+/// phase chain, never "try N launches, fall back at the Nth". 3) *no clobbered
+/// fallback*: the fallback never reads a buffer the attempt wrote. 4) anything
+/// feeding a discrete consumer (argmax / the top-k router) needs a parity receipt
+/// at the CONSUMER's granularity. 5) one env per fold.
+///
+/// **WHAT IS NOT HERE, and why.** The q chain's `rmsnorm(qr) + quant(qr) +
+/// gemm(wq_b) + rope` fold (`dsv41_gemm_fp8_mrows_rope_norm`, "K2") is the
+/// biggest single win (-7 launches/block), but it necessarily moves the draft's
+/// `wq_b` off the m=bs TILE program onto the verify's `mrows` GEMV program. That
+/// is the SAME claim `DSV41_ATTN_PROJ_ALIGN` makes, so K2 must be enabled
+/// together with that gate and A/B'd in the same arm (rule R1) — not bolted on
+/// here as a third independent fold. `wo_a/wo_b`'s `quant1(wo)` fold is
+/// `gemm_fp8_mrows_f32` (gate `WOB_MROWS_F32`, already in tree): it is a
+/// DIFFERENT quantiser program and therefore not bit-identical, so it stays out
+/// of P3-lite by decision, not by oversight.
+///
+/// **WHY IT SHIPS OFF.** The house rule for a new path, plus: every fold here is
+/// a bit-identity CLAIM carried by the kernel headers (`dsv41_rmsnorm_rope`'s
+/// same-tree argument, `dsv41_sparse_attn_orope`'s split/merge/epilogue
+/// transcription) that has to be confirmed on the real draft shape (bs = 5) by
+/// the parity suite AND a same-binary serve A/B. Read once and cached.
+fn draft_p3lite() -> DraftP3Lite {
+    static F: std::sync::OnceLock<DraftP3Lite> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        let master = std::env::var("DSV41_DRAFT_P3LITE").map(|v| v != "0").unwrap_or(false);
+        let item = |name: &str| match std::env::var(name) {
+            Ok(v) => v != "0",
+            Err(_) => master,
+        };
+        DraftP3Lite {
+            seed_norm_rope: item("DSV41_P3LITE_SEED_NORM_ROPE"),
+            kv_norm_rope: item("DSV41_P3LITE_KV_NORM_ROPE"),
+            attn_orope: item("DSV41_P3LITE_ATTN_OROPE"),
+        }
+    })
+}
+
 /// `DSV41_MARKOV_SLICED=1` (DEFAULT OFF — the house rule: a new path ships as an
 /// A/B arm) cuts the draft's Markov head across the ranks the same way
 /// `DSV41_VERIFY_HEAD_SLICED` cuts the verify's head: rank `r` walks only its
@@ -1954,14 +2028,6 @@ impl<'a> DsparkDev<'a> {
                 dim as i32,
             )?;
         }
-        self.dev.rmsnorm(
-            self.kv.ptr as *const f32,
-            kv_norm.as_f32(),
-            self.kv.ptr as *mut f32,
-            bs as i32,
-            hd as i32,
-            cfg.norm_eps,
-        )?;
         // The draft rows sit at pos + 1 + r, one row per step — the SAME
         // per-row positions as the queries (the sglang arbitration; the host
         // comment's `seqlen` is the sequence length, not the block size). The
@@ -1976,14 +2042,64 @@ impl<'a> DsparkDev<'a> {
         // forbids (exactly one KV per position). Off the gate the historical
         // `pos + r` base is untouched, bit for bit.
         let kv_pos = if seed_pos_fix() { pos + 1 } else { pos };
-        self.rope_at(
-            self.kv.ptr as *mut f32,
-            bs as i32,
-            hd as i32,
-            1,
-            kv_pos as i32,
-            false,
-        )?;
+        // P3-lite l2 (`DSV41_DRAFT_P3LITE`, `draft-p3lite-segment-fusion.md`
+        // §2.3): the kv half's `rmsnorm(kv)` + `apply_rope(kv)` as ONE
+        // `dsv41_rmsnorm_rope` launch. Bit-identical to the pair for the same
+        // reason as the seed's l1 above — phase 1 is `ferrite_rmsnorm`'s program
+        // at the same blockDim (1024), phase 2 rotates the SAME trailing `rd`
+        // columns with no reduction — and the per-row position is carried by the
+        // kernel's own `row_i * step` term: `t = pos_dev + (kv_pos - pos_dev) + r`
+        // is exactly the `kv_pos + r` the per-row `rope_at` below computes, with
+        // the same `mul = 1, step = 1` the `off`-relative spelling used.
+        //
+        // ⚠️ THE SYMBOL PROBE COMES FIRST (see the seed site): a stale `.so`
+        // without `dsv41_rmsnorm_rope` makes the call impossible, but the
+        // `rope_len <= 0` path would do the NORM ONLY and return — a caller that
+        // did not check would silently lose the kv half's RoPE.
+        let mut kv_fused = false;
+        if draft_p3lite().kv_norm_rope {
+            let pos_dev = self.pos_dev.ok_or_else(|| {
+                FerriteError::Config(
+                    "dspark: rmsnorm_rope before ensure_pos_dev (no RoPE base on the device)"
+                        .into(),
+                )
+            })?;
+            kv_fused = self.dev.rmsnorm_rope(
+                self.kv.ptr as *const f32,
+                kv_norm.as_f32(),
+                self.kv.ptr as *mut f32,
+                self.cos.unwrap(),
+                self.sin.unwrap(),
+                bs as i32,
+                hd as i32,
+                cfg.rope_head_dim as i32,
+                (cfg.rope_head_dim / 2) as i32,
+                self.pos_base.ptr as *const std::os::raw::c_int,
+                1,
+                kv_pos as i32 - pos_dev,
+                1,
+                false,
+                cfg.norm_eps,
+            )?;
+        }
+        if !kv_fused {
+            self.dev.rmsnorm(
+                self.kv.ptr as *const f32,
+                kv_norm.as_f32(),
+                self.kv.ptr as *mut f32,
+                bs as i32,
+                hd as i32,
+                cfg.norm_eps,
+            )?;
+            self.rope_at(
+                self.kv.ptr as *mut f32,
+                bs as i32,
+                hd as i32,
+                1,
+                kv_pos as i32,
+                false,
+            )?;
+        }
 
         // ---- the ring's window rows, then the draft block, contiguous ----
         // COMPACT layout: only the n_win LIVE window rows are copied, so the
@@ -2052,32 +2168,116 @@ impl<'a> DsparkDev<'a> {
         //   — so `pos` is STILL covered exactly once, and no block row repeats a
         //   window position.
 
-        self.dev.sparse_attn(
-            self.q.as_f32(),
-            self.all_kv.ptr as *const f32,
-            attn_sink.as_f32(),
-            self.idxs.as_i32(),
-            self.o.ptr as *mut f32,
-            1,
-            bs as i32,
-            nh as i32,
-            hd as i32,
-            self.clen.ptr as *const std::os::raw::c_int,
-            n_win as i32,
-            bs as i32,
-            (hd as f32).powf(-0.5),
-            // W2-MROWS: the draft block's counter is one value for the whole
-            // block (it is passed in as `self.clen`, not advanced per draft row),
-            // so the scalar read stays - and `self.idxs` is the draft's own
-            // [bs, ...] pitch (`topk` = n_win + bs here, so `idx_stride = 0`
-            // reproduces the historical `topk` pitch).
-            std::ptr::null(),
-            0,
-        )?;
-        // inverse RoPE, same per-query positions
-        // S1: `rope_pos` (NOT `pos`) — keeps o in lockstep with q and kv under
-        // the SEED_POS arm (see the definition above).
-        self.rope_queries_inv(self.o.ptr as *mut f32, rope_pos)?;
+        // P3-lite l3 (`DSV41_DRAFT_P3LITE`, `draft-p3lite-segment-fusion.md`
+        // §2.4): `sparse_attn` + `apply_rope_inv(o)` x bs + `quant1(o)` as ONE
+        // `dsv41_sparse_attn_orope` call (two launches: split + merge).
+        //
+        // BIT-IDENTITY, segment by segment. The split launch is the SAME
+        // `sparse_attn_split_kernel` with the same operands the plain entry
+        // issues (the orope entry's arm resolver mirrors the plain launcher's
+        // order so the two can never pick different kernels for one shape). The
+        // merge launch gets the rope / fp8 epilogue instead of the plain
+        // normalise: its rope region is `sh_row + (d - rope_rd)` — the SAME
+        // trailing `rope_rd` columns `apply_rope(o + r*nh*hd, nh, hd, rd)` writes
+        // — at `t = (*base)*mul + off + hh*step + mm*row_step`, and with
+        // `b = 1, mul = 1, off = rope_pos - pos_dev, step = 0, row_step = 1` that
+        // is `pos_dev + (rope_pos - pos_dev) + 0 + r = rope_pos + r` — exactly
+        // the integer `rope_queries_inv` passes per row (row r's `nh` heads share
+        // one position, which is the `hh*step == 0` term). The rotation and the
+        // `inverse ? -1 : 1` on `sin` are `apply_rope_kernel`'s, verbatim.
+        //
+        // ⚠️ `row_step` IS LOAD-BEARING, and it is why this call is safe: the
+        // draft's `b*m = 5 <= kAttnMaxBM = 8` makes the SPLIT arm the one taken,
+        // and `sparse_attn_merge_kernel`'s `tt` only gained its `mm * row_step`
+        // term with this change. Without it every row would rope at `rope_pos`
+        // (rows 1..bs-1 silently mis-roped, no error) — the exact class of
+        // silent wrong answer the design doc's §2.4 records.
+        //
+        // The fp8 pair the merge emits is the SAME `quant1(o)` bytes: the
+        // emission indexes the flat element by `((row*h + hh)*d)` and its scales
+        // by that index `>> 5`, which for `d % 32 == 0` is exactly the
+        // contiguous `[bs, nh*hd]` layout `quant1(o, bs*nh*hd)` produced, so the
+        // downstream `wo_a_grouped_fp8` reads the same `xq`/`xsc` it always did.
+        //
+        // Ok(false) = a stale `.so` (no symbol) or a shape decline (sentinel
+        // 1..3), and then the three-launch sequence below is the reference. The
+        // fallback is complete, not partial: `sparse_attn` REWRITES `o`,
+        // `rope_queries_inv` rewrites `o` again and `quant1(o)` rewrites
+        // `xq`/`xsc` — nothing it reads was left in a half-written state by the
+        // attempt (rule R3; contrast P3b's b1, whose fallback read an `xq` the
+        // fused arm had already clobbered).
+        //
+        // `DSV41_DRAFT_BF16_DOMAIN` is refused on this arm on purpose: it rounds
+        // `o` to bf16 BEFORE the quantiser, i.e. inside the interval this call
+        // now owns, and `bf16_roundtrip` is a host-issued launch that the fold
+        // has already removed the slot for.
+        let mut orope_fused = false;
+        if draft_p3lite().attn_orope && !draft_bf16_domain() {
+            let pos_dev = self.pos_dev.ok_or_else(|| {
+                FerriteError::Config(
+                    "dspark: sparse_attn_orope before ensure_pos_dev (no RoPE base on the device)"
+                        .into(),
+                )
+            })?;
+            let rd = cfg.rope_head_dim;
+            orope_fused = self.dev.sparse_attn_orope(
+                self.q.as_f32(),
+                self.all_kv.ptr as *const f32,
+                attn_sink.as_f32(),
+                self.idxs.as_i32(),
+                self.o.ptr as *mut f32,
+                1,
+                bs as i32,
+                nh as i32,
+                hd as i32,
+                self.clen.ptr as *const std::os::raw::c_int,
+                n_win as i32,
+                bs as i32,
+                (hd as f32).powf(-0.5),
+                self.cos.unwrap(),
+                self.sin.unwrap(),
+                self.pos_base.ptr as *const std::os::raw::c_int,
+                rd as i32,
+                (rd / 2) as i32,
+                1,
+                rope_pos as i32 - pos_dev,
+                0,
+                true,
+                self.xq.ptr as *mut u8,
+                self.xsc.ptr as *mut f32,
+                std::ptr::null(),
+                0,
+                1,
+            )?;
+        }
+        if !orope_fused {
+            self.dev.sparse_attn(
+                self.q.as_f32(),
+                self.all_kv.ptr as *const f32,
+                attn_sink.as_f32(),
+                self.idxs.as_i32(),
+                self.o.ptr as *mut f32,
+                1,
+                bs as i32,
+                nh as i32,
+                hd as i32,
+                self.clen.ptr as *const std::os::raw::c_int,
+                n_win as i32,
+                bs as i32,
+                (hd as f32).powf(-0.5),
+                // W2-MROWS: the draft block's counter is one value for the whole
+                // block (it is passed in as `self.clen`, not advanced per draft row),
+                // so the scalar read stays - and `self.idxs` is the draft's own
+                // [bs, ...] pitch (`topk` = n_win + bs here, so `idx_stride = 0`
+                // reproduces the historical `topk` pitch).
+                std::ptr::null(),
+                0,
+            )?;
+            // inverse RoPE, same per-query positions
+            // S1: `rope_pos` (NOT `pos`) — keeps o in lockstep with q and kv under
+            // the SEED_POS arm (see the definition above).
+            self.rope_queries_inv(self.o.ptr as *mut f32, rope_pos)?;
+        }
 
         // ---- grouped low-rank output projection ----
         // The reference's `grp` reshape is the IDENTITY (o is already
@@ -3350,15 +3550,58 @@ impl<'a> DsparkDev<'a> {
             hd as i32,
             dim as i32,
         )?;
-        self.dev.rmsnorm(
-            self.mk.ptr as *const f32,
-            kv_norm.as_f32(),
-            self.mk.ptr as *mut f32,
-            1,
-            hd as i32,
-            cfg.norm_eps,
-        )?;
-        self.rope_at(self.mk.ptr as *mut f32, 1, hd as i32, 1, pos as i32, false)?;
+        // P3-lite l1 (`DSV41_DRAFT_P3LITE`, `draft-p3lite-segment-fusion.md`
+        // §2.3): the seed's `rmsnorm(mk)` and its RoPE as ONE
+        // `dsv41_rmsnorm_rope` launch. Bit-identical to the pair: phase 1 is
+        // `ferrite_rmsnorm`'s program at the same blockDim (1024, so the
+        // `red[32]` cross-warp fold is the same sum in the same order), phase 2
+        // is `apply_rope_kernel`'s rotation of the SAME trailing `rd` columns at
+        // the SAME integer (`mul = 1, off = pos - pos_dev, step = 1` ->
+        // `t = pos`), and phase 2 has no reduction so its thread mapping cannot
+        // move a value — the only addition is the barrier between the phases.
+        //
+        // ⚠️ THE PROBE MUST COME FIRST. `rmsnorm_rope_kernel` has no "declined"
+        // sentinel, and its `rope_len <= 0` path does the NORM ONLY and returns:
+        // a caller that issued the call without checking the symbol would
+        // silently lose the seed's RoPE on a stale `.so`. `Ok(false)` here means
+        // "no symbol" and the two-launch pair below is the untouched reference.
+        let mut seed_fused = false;
+        if draft_p3lite().seed_norm_rope {
+            let pos_dev = self.pos_dev.ok_or_else(|| {
+                FerriteError::Config(
+                    "dspark: rmsnorm_rope before ensure_pos_dev (no RoPE base on the device)"
+                        .into(),
+                )
+            })?;
+            seed_fused = self.dev.rmsnorm_rope(
+                self.mk.ptr as *const f32,
+                kv_norm.as_f32(),
+                self.mk.ptr as *mut f32,
+                self.cos.unwrap(),
+                self.sin.unwrap(),
+                1,
+                hd as i32,
+                rd as i32,
+                (rd / 2) as i32,
+                self.pos_base.ptr as *const std::os::raw::c_int,
+                1,
+                pos as i32 - pos_dev,
+                1,
+                false,
+                cfg.norm_eps,
+            )?;
+        }
+        if !seed_fused {
+            self.dev.rmsnorm(
+                self.mk.ptr as *const f32,
+                kv_norm.as_f32(),
+                self.mk.ptr as *mut f32,
+                1,
+                hd as i32,
+                cfg.norm_eps,
+            )?;
+            self.rope_at(self.mk.ptr as *mut f32, 1, hd as i32, 1, pos as i32, false)?;
+        }
         debug_assert!(rd > 0);
 
         if slot_dev {

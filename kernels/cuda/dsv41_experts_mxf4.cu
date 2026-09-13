@@ -2525,6 +2525,407 @@ __global__ void expert_gemv_fp4_down_reduce_kernel(
     }
 }
 
+// ============================================================================
+// GROUPED DOWN (DSV41_EXPERT_GROUPED_DOWN, default OFF) — the down direction's
+// expert-union de-duplication.
+// ============================================================================
+// WHY THIS EXISTS. The down GEMV's cost is ∝ the number of (row, slot)
+// assignments swept: `expert_gemv_fp4_batched_kernel` derives ONE expert per
+// (activation row, slot) and reads that expert's whole w2 block, so
+// m x topk = 36 assignments read 36 x (dim x inter/2) bytes even though only
+// |active| experts are involved. The measured |active| at the production
+// routing is 18-24, i.e. one third to one half of the down weight traffic is a
+// RE-READ of an expert an earlier assignment already touched (the MoE lesion
+// audit's "6x sweep identity" is exactly this: the cost is ∝ n_assign, and the
+// only lever is making it ∝ |active|). This kernel is the down twin of
+// `tc5::e4x`'s `e4m3_gemm_grouped_kernel`: ONE CTA per (live expert, output-row
+// tile), that expert's weight tile staged ONCE in shared memory, and EVERY
+// assignment that routes to it computed against the staged copy.
+//
+// THE EXPERT-UNION ELECTION runs IN-KERNEL over `ids` (the same
+// `route_idx_r[m][topk]` the per-(row, slot) launch reads) rather than over the
+// grouped router's `active`/`counts`/`starts` tables. blockIdx.z IS the flat
+// assignment index `a = arow*slots + slot`, so the CTA that owns the FIRST
+// occurrence of expert `e` in `ids[0..n_assign)` serves all of e's assignments
+// and every later CTA with the same expert exits immediately. Two reasons:
+//   1. it needs NO new ABI — the launcher below IS the existing
+//      `dsv41_expert_down_fp4_batched`, whose argument list already carries
+//      every operand this kernel uses (the grouped layout is not an input: the
+//      assignment that routes to each expert is read from `ids`, exactly as the
+//      per-(row, slot) kernel reads it);
+//   2. it cannot go stale: there is no second copy of the routing that a
+//      re-route (or a graph replay) could desynchronise from `ids`.
+// The election scan is O(n_assign) = 36 over L1/L2-resident data, and the
+// no-op CTAs are a small fraction of the grid (see the `kGdRows` note below).
+//
+// NUMERIC CONTRACT — BIT-IDENTICAL, by construction, to the per-(row, slot)
+// launch it replaces: every (assignment, output row) dot runs through
+// `dsv41_down_row_dot`, the VERBATIM source of
+// `expert_gemv_fp4_batched_kernel`'s down branch (same K order, same lane ->
+// element map for the SAME `vec` = DSV41_DOWN_VEC4 lane map, same
+// one-scale-multiply-per-group shape, same fma chains), followed by the same
+// butterfly shuffle and the same epilogue (`x = acc; x *= rw[0]`), and it lands
+// in the same cell: `out[a * out_slot_stride + row]`, which is exactly the
+// pointer the per-slot launch derived as `out + (slot0 + slot) *
+// out_slot_stride`. Only WHICH CTA runs which dot, and in what order, differs —
+// and no two (assignment, output row) pairs share an output element, an
+// accumulator or a staging buffer. So the per-slot partials left in the
+// caller's scratch are bit-identical, and the caller's fixed ascending-slot
+// `dsv41_moe_down_reduce` then produces the same final row as the fused and
+// sequential arms.
+//
+// WHY THE CALLER MUST STILL RUN THE REDUCE. The fused `..._down_reduce_...`
+// entry produces the ascending-slot sum itself (that order is the numerical
+// contract, fp addition is not associative), but it cannot host a grouped pass:
+// a CTA here owns ONE expert, so the slots of a given output row are spread
+// over different CTAs, and merging them would need either an atomic (a
+// nondeterministic order — forbidden) or a second pass. The grouped arm
+// therefore lives on the (batched down + reduce) side of DSV41_DOWN_FUSE: the
+// Rust side keeps DSV41_DOWN_FUSE on the fused kernel unless
+// DSV41_EXPERT_GROUPED_DOWN is armed, and the per-row reduce loop it already
+// has is the contract-preserving merge. The extra cost is the scratch round
+// trip + `rows` reduce launches; the win is one w2 read per LIVE expert.
+//
+// kGdRows = 32 output rows per CTA (4 per warp at nwarps = 8). It is not free
+// to shrink: the number of CTAs is (dim/kGdRows) x n_assign, so a smaller tile
+// multiplies the CTA count (each of them pays the election scan and the weight
+// staging's fixed cost) while the TOTAL weight traffic is dim x |active| x k/2
+// at any tile size — the tile only decides how much of the fixed per-CTA cost
+// the saving has to pay for. 32 keeps the grid at (dim/32) x 36 = 8064 CTAs,
+// i.e. the same order as the per-(row, slot) launch's (dim/8) x 6 = 5376, with
+// each working CTA covering 32 rows x its expert's assignments.
+constexpr int kGdRows = 32;
+// Upper bound on rows*slots for the in-kernel election scan (grid.z). The
+// production shape is 6*6 = 36; the cap is a belt-and-braces bound so a
+// mis-shaped call cannot turn the O(n_assign) scan into a long serial loop.
+constexpr int kGdMaxAssign = 64;
+
+// Dynamic-smem layout of the grouped down kernel — ONE definition, used by the
+// kernel AND by the launcher that sizes the allocation (a drift between the two
+// is a silent out-of-bounds shared-memory write, the failure mode this repo has
+// already paid for once with the P4 prefetch buffer).
+//   [0 .. w_off)              : the expert's e8m0 scale rows, [kGdRows][ksc]
+//   [w_off .. a_off)          : the expert's weight rows,     [kGdRows][wrs]
+//   [a_off .. a_off + 4k)     : the staged activation,        [k] floats
+//   then                      : the 256-entry e2m1 LUT        [256] float2
+// `wrs` pads each weight row to 16 bytes so every `uint4`/`uint32_t` read a
+// body makes at `brow + <multiple of 2/4>` stays aligned for the fast path of
+// ld_uint32_a4 / (for vec==1,2) the LUT's `uint32_t` weight reads.
+__host__ __device__ __forceinline__ size_t gd_smem_layout(int k, int* s_off, int* w_off,
+                                                          int* a_off, int* wrs_out) {
+    const int kbytes = k >> 1;
+    const int ksc = k >> 5;
+    const int wrs = (kbytes + 15) & ~15;
+    const int so = 0;
+    const int wo = (kGdRows * ksc + 15) & ~15;
+    const int ao = (wo + kGdRows * wrs + 15) & ~15;
+    if (s_off != nullptr) *s_off = so;
+    if (w_off != nullptr) *w_off = wo;
+    if (a_off != nullptr) *a_off = ao;
+    if (wrs_out != nullptr) *wrs_out = wrs;
+    return (size_t)ao + (size_t)k * sizeof(float) + 256 * sizeof(float2);
+}
+
+// The DOWN dot of ONE output row of ONE expert. VERBATIM mirror of
+// `expert_gemv_fp4_batched_kernel`'s split-body (`b_split < 0` / `hi == false`)
+// branch, which is itself the verbatim mirror of
+// `expert_gemv_fp4_down_reduce_kernel`'s row body: the THREE carriers read the
+// same `g_down_fp4_mode` lane map, so mode 3's lane map has to change in all
+// three at once (a change in one alone silently drops the bit-parity between
+// the fused, the unfused and this grouped arm — the same note the batched
+// kernel carries).
+//
+// `brow`/`srow` are the weight row and its e8m0 scale row of this output row,
+// and they may live in SHARED memory (here) or in GLOBAL (the other two
+// carriers): every read below is byte-granular at an offset that is the same
+// expression in all three, so the helper is shareable without changing a single
+// rounding step. `s_act` is read-only (staged by the caller; the other two
+// carriers pass their own staged row).
+__device__ __forceinline__ float dsv41_down_row_dot(const float* __restrict__ s_act,
+                                                    const float2* __restrict__ s_lut2,
+                                                    const uint8_t* __restrict__ brow,
+                                                    const uint8_t* __restrict__ srow, int k,
+                                                    int lane, int vec) {
+    float acc = 0.f;
+    if (vec == 2) {
+        // Same 256-values-per-group shape as the vectorised branch, but the
+        // unpack is a shared lookup and the accumulation is split four ways so
+        // the dependency chain is forty fmas deep instead of a hundred and sixty.
+        const int nv2 = k >> 9;
+        const int off2 = lane << 3;                  // 16 values = 8 bytes per lane
+        float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+#pragma unroll 2
+        for (int g = 0; g < nv2; ++g) {
+            const int j = (g << 9) + (lane << 4);
+            const float sc = __uint_as_float(((uint32_t)srow[j >> 5]) << 23);
+            const uint8_t* bp = brow + (g << 8) + off2;
+            const uint32_t w0 = ld_uint32_a4(bp);
+            const uint32_t w1 = ld_uint32_a4(bp + 4);
+            float p0 = 0.f, p1 = 0.f, p2 = 0.f, p3 = 0.f;
+            const float2 t0 = s_lut2[w0 & 0xFFu];
+            const float2 t1 = s_lut2[(w0 >> 8) & 0xFFu];
+            const float2 t2 = s_lut2[(w0 >> 16) & 0xFFu];
+            const float2 t3 = s_lut2[(w0 >> 24) & 0xFFu];
+            p0 = fmaf(s_act[j + 0], t0.x, p0);
+            p1 = fmaf(s_act[j + 1], t0.y, p1);
+            p2 = fmaf(s_act[j + 2], t1.x, p2);
+            p3 = fmaf(s_act[j + 3], t1.y, p3);
+            p0 = fmaf(s_act[j + 4], t2.x, p0);
+            p1 = fmaf(s_act[j + 5], t2.y, p1);
+            p2 = fmaf(s_act[j + 6], t3.x, p2);
+            p3 = fmaf(s_act[j + 7], t3.y, p3);
+            const float2 u0 = s_lut2[w1 & 0xFFu];
+            const float2 u1 = s_lut2[(w1 >> 8) & 0xFFu];
+            const float2 u2 = s_lut2[(w1 >> 16) & 0xFFu];
+            const float2 u3 = s_lut2[(w1 >> 24) & 0xFFu];
+            p0 = fmaf(s_act[j + 8], u0.x, p0);
+            p1 = fmaf(s_act[j + 9], u0.y, p1);
+            p2 = fmaf(s_act[j + 10], u1.x, p2);
+            p3 = fmaf(s_act[j + 11], u1.y, p3);
+            p0 = fmaf(s_act[j + 12], u2.x, p0);
+            p1 = fmaf(s_act[j + 13], u2.y, p1);
+            p2 = fmaf(s_act[j + 14], u3.x, p2);
+            p3 = fmaf(s_act[j + 15], u3.y, p3);
+            a0 = fmaf(sc, p0, a0);
+            a1 = fmaf(sc, p1, a1);
+            a2 = fmaf(sc, p2, a2);
+            a3 = fmaf(sc, p3, a3);
+        }
+        acc = (a0 + a1) + (a2 + a3);
+        for (int j = (nv2 << 9) + lane * 2; j < k; j += 64) {
+            const uint8_t byte = brow[j >> 1];
+            const float sc = __uint_as_float(((uint32_t)srow[j >> 5]) << 23);
+            const float2 t = s_lut2[byte];
+            acc += s_act[j] * (t.x * sc);
+            acc += s_act[j + 1] * (t.y * sc);
+        }
+    } else if (vec == 3) {
+        // 4 values per lane for k < 512, where the vec==2 main loop above cannot
+        // run at all (nv2 = k >> 9 = 0 at the production k = inter_local = 320).
+        const int nv4 = k >> 7;
+        float a0 = 0.f, a1 = 0.f;
+        for (int g = 0; g < nv4; ++g) {
+            const int j = (g << 7) + (lane << 2);
+            const float sc = __uint_as_float(((uint32_t)srow[j >> 5]) << 23);
+            const uint16_t w = ld_uint16_a2(brow + (g << 6) + (lane << 1));
+            const float4 av = *reinterpret_cast<const float4*>(s_act + j);
+            const float2 t0 = s_lut2[w & 0xFFu];
+            const float2 t1 = s_lut2[(w >> 8) & 0xFFu];
+            float p0 = av.x * t0.x;
+            p0 = fmaf(av.y, t0.y, p0);
+            float p1 = av.z * t1.x;
+            p1 = fmaf(av.w, t1.y, p1);
+            a0 = fmaf(sc, p0, a0);
+            a1 = fmaf(sc, p1, a1);
+        }
+        acc = a0 + a1;
+        for (int j = (nv4 << 7) + lane * 2; j < k; j += 64) {
+            const uint8_t byte = brow[j >> 1];
+            const float sc = __uint_as_float(((uint32_t)srow[j >> 5]) << 23);
+            const float2 t = s_lut2[byte];
+            acc += s_act[j] * (t.x * sc);
+            acc += s_act[j + 1] * (t.y * sc);
+        }
+    } else if (vec) {
+        // 32 lanes * 8 values = 256 values per iteration, four scale blocks.
+        const int nv = k >> 8;              // full 256-value iterations
+        const int off = lane << 2;          // byte offset of this lane's uint32
+        for (int g = 0; g < nv; ++g) {
+            const int j = (g << 8) + (lane << 3);
+            const float sc = __uint_as_float(((uint32_t)srow[j >> 5]) << 23);
+            const uint32_t word = ld_uint32_a4(brow + (g << 7) + off);
+            acc += s_act[j + 0] * (dsv41_e2m1_to_f((uint8_t)(word & 0xFu)) * sc);
+            acc += s_act[j + 1] * (dsv41_e2m1_to_f((uint8_t)((word >> 4) & 0xFu)) * sc);
+            acc += s_act[j + 2] * (dsv41_e2m1_to_f((uint8_t)((word >> 8) & 0xFu)) * sc);
+            acc += s_act[j + 3] * (dsv41_e2m1_to_f((uint8_t)((word >> 12) & 0xFu)) * sc);
+            acc += s_act[j + 4] * (dsv41_e2m1_to_f((uint8_t)((word >> 16) & 0xFu)) * sc);
+            acc += s_act[j + 5] * (dsv41_e2m1_to_f((uint8_t)((word >> 20) & 0xFu)) * sc);
+            acc += s_act[j + 6] * (dsv41_e2m1_to_f((uint8_t)((word >> 24) & 0xFu)) * sc);
+            acc += s_act[j + 7] * (dsv41_e2m1_to_f((uint8_t)((word >> 28) & 0xFu)) * sc);
+        }
+        for (int j = (nv << 8) + lane * 2; j < k; j += 64) {
+            const uint8_t byte = brow[j >> 1];
+            const float sc = __uint_as_float(((uint32_t)srow[j >> 5]) << 23);
+            acc += s_act[j] * (dsv41_e2m1_to_f(byte & 0xFu) * sc);
+            acc += s_act[j + 1] * (dsv41_e2m1_to_f((uint8_t)(byte >> 4)) * sc);
+        }
+    } else {
+        for (int j = lane * 2; j < k; j += 64) {
+            const uint8_t byte = brow[j >> 1];
+            const float sc = __uint_as_float(((uint32_t)srow[j >> 5]) << 23);
+            const float w0 = dsv41_e2m1_to_f(byte & 0xFu) * sc;
+            const float w1 = dsv41_e2m1_to_f((uint8_t)(byte >> 4)) * sc;
+            acc += s_act[j] * w0;
+            acc += s_act[j + 1] * w1;
+        }
+    }
+    return acc;
+}
+
+// Grid = (ceil(n_total / kGdRows), 1, rows*slots). blockIdx.z = the FLAT
+// assignment index a = arow*slots + slot (the same index the per-slot kernel
+// derived from blockIdx.y/blockIdx.z), so `ids[a]` is this CTA's expert and
+// `act_base + a*act_stride` / `row_weight + a*rw_stride` are this assignment's
+// activation slice and routing weight — NO gathered copy of either is needed.
+//
+// __launch_bounds__(256, 6): the same block shape as the fused down kernel
+// (which is pinned at (256,6) after the +38% regression the 4-blocks/SM
+// configuration cost at this shape family). A/B knob, not a measurement here.
+__global__ void __launch_bounds__(256, 6)
+expert_gemv_fp4_down_batched_grouped_kernel(
+    const float* __restrict__ act_base, long act_stride, float* __restrict__ out,
+    long out_slot_stride, int n_total, int k, const float* __restrict__ row_weight, long rw_stride,
+    const uint8_t* __restrict__ w2_base, long w2_stride, const uint8_t* __restrict__ w2s_base,
+    long w2s_stride, int w2s_pitch, const int* __restrict__ ids, int vec) {
+    const int z = (int)blockIdx.z;
+    const int n_assign = (int)gridDim.z;   // = rows * slots (the launcher's grid.z)
+    const int e = ids[z];
+    if (e < 0) return;   // poison entry (route_group's convention): nothing to sum
+    // Expert election — only the CTA owning the FIRST occurrence of `e` in
+    // `ids[0..n_assign)` computes, and it computes ALL of e's assignments (the
+    // loop below). The others return without touching memory beyond `ids`.
+    // `ids` is read identically by every thread of the block, so both this test
+    // and the assignment loop's `continue` are block-uniform — every
+    // __syncthreads() below is reached by the whole block.
+    for (int j = 0; j < z; ++j)
+        if (ids[j] == e) return;
+
+    const int kbytes = k >> 1;   // packed fp4 weight bytes per row
+    const int ksc = k >> 5;      // LOGICAL e8m0 scales per row
+    int s_off, w_off, a_off, wrs;
+    (void)gd_smem_layout(k, &s_off, &w_off, &a_off, &wrs);
+    extern __shared__ uint8_t s_gd[];
+    uint8_t* s_s = s_gd + s_off;
+    uint8_t* s_w = s_gd + w_off;
+    float* s_act = reinterpret_cast<float*>(s_gd + a_off);
+    float2* s_lut2 = reinterpret_cast<float2*>(s_act + k);
+
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int nwarps = (int)((blockDim.x + 31) >> 5);
+    const int row0 = (int)blockIdx.x * kGdRows;
+
+    // The 256-entry byte -> float2 LUT, the same builder the batched kernel
+    // uses (stride form: a CTA smaller than 256 threads still fills every
+    // entry). Published to the block by the __syncthreads() below.
+    for (int t = threadIdx.x; t < 256; t += blockDim.x)
+        s_lut2[t] = make_float2(dsv41_e2m1_to_f((uint8_t)(t & 0xF)),
+                                dsv41_e2m1_to_f((uint8_t)(t >> 4)));
+
+    // Per-expert planes, derived exactly as the per-(row, slot) kernel derives
+    // them (`base + ids[slot] * stride`).
+    const uint8_t* w2_use = w2_base + (size_t)e * (size_t)w2_stride;
+    const uint8_t* w2s_use = w2s_base + (size_t)e * (size_t)w2s_stride;
+
+    // ---- stage this expert's weight tile ONCE -----------------------------
+    // THIS is the saving: the per-(row, slot) path reads these bytes once per
+    // assignment, this kernel once per (expert, row-tile). The row bound is
+    // loop-index-uniform, so the `break` is block-uniform. `kbytes % 16 == 0`
+    // is a launcher precondition, so the copy is whole uint4s.
+    for (int r = 0; r < kGdRows; ++r) {
+        const int row = row0 + r;
+        if (row >= n_total) break;
+        const uint8_t* src = w2_use + (size_t)row * (size_t)kbytes;
+        uint8_t* dst = s_w + (size_t)r * (size_t)wrs;
+        for (int i = threadIdx.x; i < (kbytes >> 4); i += blockDim.x)
+            *reinterpret_cast<uint4*>(dst + ((size_t)i << 4)) = ld_uint4_a16(src + ((size_t)i << 4));
+        // The e8m0 plane's PHYSICAL row stride is w2s_pitch (16 for the padded
+        // plane, ksc for the escape hatch); only the first ksc columns are read
+        // by the dot's `srow[j >> 5]`, so only they are staged.
+        const uint8_t* ssrc = w2s_use + (size_t)row * (size_t)w2s_pitch;
+        for (int c = threadIdx.x; c < ksc; c += blockDim.x) s_s[(size_t)r * ksc + c] = ssrc[c];
+    }
+    __syncthreads();   // publishes the weight tile AND the LUT
+
+    // PDL (DSV41_PDL, default OFF, see dsv41_experts_pdl_or_plain): the launcher
+    // may have launched this grid with programmatic stream serialization, so the
+    // grid can be resident before the producer retires. The producer is the
+    // gate/up launch that wrote the swiglu'd `act_base` — this kernel READS it,
+    // so the wait is REQUIRED here (unlike the w2 L2 prewarm kernel, which the
+    // file notes may legitimately race because it touches only `ids` and the
+    // weight pools). It sits AFTER the weight staging on purpose: `ids`, the w2
+    // pool and the e8m0 plane are router/weight data several kernels upstream,
+    // so the whole election + weight staging is producer-INDEPENDENT work spent
+    // in the gate/up ramp-down, and only the activation staging below is gated.
+    // The CTAs that returned in the election never touch the producer, so they
+    // do not need the wait.
+#if __CUDA_ARCH__ >= 900
+    cudaGridDependencySynchronize();
+#endif
+
+    // ---- every assignment that routes to THIS expert ----------------------
+    // Ascending `a`, i.e. ascending (row, slot) in the same order the original
+    // per-slot launches were issued. The order is irrelevant to the result (the
+    // pairs share nothing); it is kept only because it makes the scratch
+    // writes land in the order a reviewer expects.
+    for (int a = 0; a < n_assign; ++a) {
+        if (ids[a] != e) continue;   // block-uniform (see the election note)
+        // Barrier BEFORE the overwrite: the previous assignment's readers (all
+        // nwarps of them) must be done with s_act. Outside the loop this is the
+        // no-op that keeps the first iteration's staging ordered after the
+        // weight-staging barrier above.
+        __syncthreads();
+        const float* asrc = act_base + (size_t)a * (size_t)act_stride;
+        // Same two staging shapes as the batched kernel: float4 when the slice
+        // is 16-byte aligned and k % 4 == 0, scalar otherwise. Same bytes.
+        if ((k & 3) == 0 && ((reinterpret_cast<uintptr_t>(asrc) & 15u) == 0)) {
+            const int nf4 = k >> 2;
+            for (int f4 = threadIdx.x; f4 < nf4; f4 += blockDim.x) {
+                const float4 v = *reinterpret_cast<const float4*>(asrc + (size_t)f4 * 4);
+                float* dst = s_act + (size_t)f4 * 4;
+                dst[0] = v.x;
+                dst[1] = v.y;
+                dst[2] = v.z;
+                dst[3] = v.w;
+            }
+        } else {
+            for (int j = threadIdx.x; j < k; j += blockDim.x) s_act[j] = asrc[j];
+        }
+        __syncthreads();   // publishes s_act
+        const float rwv =
+            (row_weight != nullptr) ? row_weight[(size_t)a * (size_t)rw_stride] : 1.f;
+        // This CTA's output rows, strided by nwarps exactly as the per-slot
+        // kernel strides its rows by gridDim.x*rows_per_cta.
+        for (int row = row0 + warp; row < row0 + kGdRows && row < n_total; row += nwarps) {
+            const int rl = row - row0;
+            float acc = dsv41_down_row_dot(s_act, s_lut2, s_w + (size_t)rl * (size_t)wrs,
+                                           s_s + (size_t)rl * (size_t)ksc, k, lane, vec);
+            for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
+            if (lane == 0) {
+                float x = acc;
+                if (row_weight != nullptr) x *= rwv;
+                out[(size_t)a * (size_t)out_slot_stride + (size_t)row] = x;
+            }
+        }
+    }
+}
+
+// One-shot notice for an armed-but-declined grouped down arm. The repo's first
+// measurement trap is "a gate was armed and the OLD path silently ran", so
+// every decline of an armed arm says so once; an unarmed arm says nothing.
+static void gd_declined_note(int rows, int dim, int inter, int slots, size_t smem) {
+    static bool said = false;
+    if (said) return;
+    said = true;
+    fprintf(stderr,
+            "dsv41: DSV41_EXPERT_GROUPED_DOWN armed but the grouped down kernel declined "
+            "(rows=%d dim=%d inter=%d slots=%d smem=%zu) and the per-(row, slot) down GEMV ran "
+            "instead — it needs inter %% 32 == 0, rows*slots in [1, %d] and smem <= 48KB\n",
+            rows, dim, inter, slots, smem, kGdMaxAssign);
+}
+
+// DSV41_EXPERT_GROUPED_DOWN — the grouped down arm. Read ONCE per process,
+// strict first-char '1', default OFF (a per-call getenv is a CUDA-graph capture
+// hazard, the same rule every gate in this file follows). ANDed with
+// DSV41_EXPERT_GROUPED on purpose: the arm is defined as part of the grouped
+// (permuted-routing) stack, so arming it alone would silently measure a mixed
+// configuration that no A/B arm is specified for.
+static const int g_grouped_down = [] {
+    const char* g = getenv("DSV41_EXPERT_GROUPED_DOWN");
+    const char* h = getenv("DSV41_EXPERT_GROUPED");
+    return (g != nullptr && g[0] == '1' && h != nullptr && h[0] == '1') ? 1 : 0;
+}();
+
 // --------------------------------------------------------------- launchers
 inline cudaError_t launch_mxf4(const uint8_t* a, const float* a_scale, const float* a_f32,
                                const uint8_t* b, const uint8_t* b_scale, const uint8_t* b_hi,
@@ -2960,6 +3361,35 @@ extern "C" int dsv41_expert_down_fp4_batched(
     long w2_stride, const uint8_t* w2s_base, long w2s_stride, const int* ids, cudaStream_t stream) {
     if (rows <= 0 || dim <= 0 || inter <= 0 || slots <= 0) return (int)cudaErrorInvalidValue;
     const int warps = 8;
+    // ---- GROUPED DOWN (DSV41_EXPERT_GROUPED_DOWN + DSV41_EXPERT_GROUPED) ----
+    // The drop-in replacement for the per-(row, slot) launch below: same
+    // arguments, same output cells, bit-identical bytes (see the kernel header's
+    // NUMERIC CONTRACT). It is dispatched HERE, inside the existing entry point,
+    // so the arm needs no new symbol, no new ABI and no new Rust-side binding -
+    // the only thing the caller does differently is keep DSV41_DOWN_FUSE off, so
+    // that its per-row ascending-slot `dsv41_moe_down_reduce` performs the
+    // merge. Arming the pair while the shape is outside the kernel's contract
+    // declines LOUDLY once and runs the proven launch (never silently).
+    if (g_grouped_down) {
+        const long n_assign_l = (long)rows * (long)slots;
+        int so, wo, ao, wrs;
+        const size_t smem = gd_smem_layout(inter, &so, &wo, &ao, &wrs);
+        const bool shape_ok = (inter % 32) == 0 &&   // kbytes % 16 == 0: whole-uint4 staging
+                              n_assign_l > 0 && n_assign_l <= (long)kGdMaxAssign &&
+                              smem <= (size_t)48 * 1024;
+        if (shape_ok) {
+            const dim3 ggrid((unsigned)((dim + kGdRows - 1) / kGdRows), 1u,
+                             (unsigned)n_assign_l);
+            const cudaError_t gle = dsv41_experts_pdl_or_plain(
+                expert_gemv_fp4_down_batched_grouped_kernel, ggrid, dim3(warps * 32), smem, stream,
+                act_base, act_stride, out, out_slot_stride, dim, inter, row_weight, rw_stride,
+                w2_base, w2_stride, w2s_base, w2s_stride, dsv41_sf_pitch(inter), ids,
+                g_down_fp4_mode);
+            if (gle != cudaSuccess) { (void)cudaGetLastError(); return (int)gle; }
+            return (int)cudaGetLastError();
+        }
+        gd_declined_note(rows, dim, inter, slots, smem);
+    }
     // blockIdx.z = the activation row (the multi-row dim, same contract as the
     // gate/up launcher: `act`/`row_weight`/`ids`/`out` are [rows][slot][...]).
     // rows == 1 reproduces the previous grid exactly.
