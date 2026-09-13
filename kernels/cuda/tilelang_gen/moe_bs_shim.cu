@@ -733,6 +733,17 @@ bool tl_bs_init() {
         (void)cudaGetLastError();
         fprintf(stderr, "[moe-bs] sf byte order reversed = %d\n", sr);
     }
+    // g_sfst: SF→TMEM delivery path (0 = production transpose+tcgen05.cp, 1 = the isolated
+    // instrument's tcgen05.st register path). The production chain has never been validated
+    // on its own; this gate decides whether it is the defect.
+    if (ok) {
+        int fs = 0;
+        const char* e = getenv("DSV41_MOE_BS_SFST");
+        if (e != nullptr && e[0] == '1') fs = 1;
+        (void)cudaMemcpyToSymbol(g_sfst, &fs, sizeof(int));
+        (void)cudaGetLastError();
+        fprintf(stderr, "[moe-bs] SF delivery via tcgen05.st = %d\n", fs);
+    }
     // g_swapab: operand orientation (0 = A=activation/B=weight, 1 = A=weight/B=activation)
     if (ok) {
         int sw = 0;

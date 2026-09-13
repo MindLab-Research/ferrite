@@ -57,6 +57,7 @@ __device__ int g_sfrev = 0;
 // 16 smem bytes; the descriptor that the vendor's own W operand uses is
 // lbo=1 (16 B) / sbo=64 (1024 B) / layout_type=2 (SWIZZLE_128B). See
 // docs/agent/moe-bs-crash-investigation.md §29-§31.
+__device__ int g_sfst = 0;     // 1 = deliver the SF with tcgen05.st (isolated-instrument path)
 __device__ int g_packed = 1;   // DEFAULT ON: the MEASURED-correct layout (hw_pack_sw128)
 // Escape hatch for reference only: DSV41_MOE_BS_UNPACKED=1 restores the measured-WRONG
 // unpacked staging (relerr 1.491) that this whole investigation started from.
@@ -236,6 +237,21 @@ __device__ __forceinline__ void hw_sf_transpose(uint32_t *smem_ptr) {
     __syncwarp();
     for (uint32_t i = 0; i < 4; ++i)
         smem_ptr[lane * 4 + (i ^ (lane >> 3))] = values[i];
+}
+
+// SF 写 TMEM 的**寄存器路径**（`tcgen05.st`）—— 与隔离仪器 `tests_bs_impulse.cu` 用的同一条
+// （那里 PASS 过 const/sfprobe/random_sf）。默认不使用：生产走"smesh→转置→tcgen05.cp"，
+// 而**那条链从未被独立验证过**（两份审计独立指出）。`DSV41_MOE_BS_SFST=1` 切到本路径，用来
+// 一次性判定"SF 投递链是不是缺陷"：仪器布局 = 第 (32j+l) 行的字放在 (lane l, column j)，
+// 四个 partition 内容相同（`tcgen05.st` 每个 warp 只能写自己那 32 条 lane）。
+__device__ __forceinline__ void hw_tc_st_x4(uint32_t taddr, uint32_t w0, uint32_t w1,
+                                           uint32_t w2, uint32_t w3) {
+    asm volatile("tcgen05.st.sync.aligned.32x32b.x4.b32 [%0], {%1, %2, %3, %4};" ::"r"(taddr),
+                 "r"(w0), "r"(w1), "r"(w2), "r"(w3)
+                 : "memory");
+}
+__device__ __forceinline__ void hw_tc_wait_st() {
+    asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
 }
 
 // SF copy to TMEM（从 TileLang tcgen05_cp 复制——32x128b.warpx4 shape）
@@ -799,8 +815,23 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
         // exact same single barrier that used to follow the LDG/STS loops.
         __syncthreads();
 
-        // (4) warp 2: SF 转置（tcgen05_cp 需要的 smem 布局）
-        if (warp == 2) {
+        // (4) SF → TMEM，两条路：
+        //   默认（g_sfst=0）：warp 2 转置 staged 字，再由 warp 1 lane 0 用 tcgen05.cp 搬进 TMEM
+        //                     —— 生产链，**从未被独立验证过**；
+        //   g_sfst=1        ：每个 warp 用 tcgen05.st 把自己那 32 条 lane 的字直接写进 TMEM，
+        //                     布局 = 隔离仪器 PASS 过的那一种（第 32j+l 行的字 → lane l, column j，
+        //                     四个 partition 内容相同）。DSV41_MOE_BS_SFST=1，默认 OFF。
+        if (g_sfst) {
+            uint32_t wa[4], wb[4];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                wa[j] = SFA_s[32 * j + lane];
+                wb[j] = SFB_s[32 * j + lane];
+            }
+            hw_tc_st_x4(((uint32_t)(warp * 32) << 16) | (SF_tmem + 0), wa[0], wa[1], wa[2], wa[3]);
+            hw_tc_st_x4(((uint32_t)(warp * 32) << 16) | (SF_tmem + 4), wb[0], wb[1], wb[2], wb[3]);
+            hw_tc_wait_st();
+        } else if (warp == 2) {
             hw_sf_transpose(SFA_s);
             hw_sf_transpose(SFB_s);
         }
@@ -830,8 +861,10 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
             // SF copy: SFA → SF_tmem+0, SFB → SF_tmem+4
             // (elect_one_sync: single thread issues the copy)
             if (lane == 0) {
-                hw_tc_cp(hw_make_sf_desc(SFA_s), SF_tmem + 0);
-                hw_tc_cp(hw_make_sf_desc(SFB_s), SF_tmem + 4);
+                if (!g_sfst) {
+                    hw_tc_cp(hw_make_sf_desc(SFA_s), SF_tmem + 0);
+                    hw_tc_cp(hw_make_sf_desc(SFB_s), SF_tmem + 4);
+                }
             }
 
             // MMA: 4 sub-MMAs (ki=0-3, each covers 32 K elements)
