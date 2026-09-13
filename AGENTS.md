@@ -107,12 +107,13 @@ LD_LIBRARY_PATH=$HOME/ferrite/kernels/cuda ./target/release/ferrite-serve --back
 - serve 卡住/日志 mtime 停滞 = 挂了（查 `stat -c %y` + pgrep，别等）。
 - 加载错防线（三道 runtime + 三道编译期 + git hooks）见 `docs/agent/` 的加载防线文档。
 
-## 当前状态与下一步（2026-09-14 下午——变量拆分完成：crash 是结构性的，判别实验在跑）
+## 当前状态与下一步（2026-09-14 晚——🎉 根因定谳：TileLang pipeline 是 m>1 crash 触发器，手写 kernel 0 errors）
 
-**核心发现（变量拆分测试）**：**crash 不是数据依赖的——是结构性的！**
-- ZERO_SF / ZERO_A / ZERO_EID 全部仍 crash（数据不是触发器）
-- MMA kernel 在 m=1（eager）正常、m>1（verify）crash，与输入数据无关
-- 触发器是**执行上下文的结构性差异**
+**🎉 重大突破**：手写 kernel（验证过的 tcgen05 原语 + 顺序执行 + 直接 global load + __syncthreads）**不 crash**（0 errors vs TileLang 的 10 errors）。
+- **根因**：TileLang kernel 的 pipeline 结构（TMA + mbarrier + 3-stage）在 m>1（verify）场景下触发 illegal instruction
+- tcgen05 MMA 指令、数据加载、SF 处理全部正确
+- Gate: `DSV41_MOE_BS_HANDWRITTEN=1`（默认 OFF）
+- 修复 cudaFuncSetAttribute 缺失（smem 65536 > 48KB 默认）后正在验证输出质量
 
 **判别实验（在跑）**：
 1. no-swallow（DSV41_SWALLOW_STEP=0）：verify 用 m=5（legacy arm）而非 m=6（swallowed arm）
