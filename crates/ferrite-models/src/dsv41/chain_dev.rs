@@ -1961,6 +1961,37 @@ impl<'a> DevChain<'a> {
         )
     }
 
+    /// Diagnostic per-layer residual dump: the mHC h stream at a layer's INPUT
+    /// (`[hc][dim]` f32), file convention [u64 step][u64 layer][f32 × hc*dim]
+    /// appended, rank 0 only. For the layer-level bisection against the
+    /// official reference. The D2H makes it ILLEGAL inside a captured
+    /// step_body — the diagnostic run must carry DSV41_GRAPH_STEP=0.
+    fn gt_dump_h(&self, path: &str, layer: usize) -> Result<()> {
+        if self.comm.as_ref().map(|c| c.rank).unwrap_or(0) != 0 {
+            return Ok(());
+        }
+        let n = self.cfg.hc_mult * self.cfg.dim;
+        let mut v = vec![0f32; n];
+        let b = Device::view(self.s.h.ptr, n * 4);
+        self.dev.download_f32(&b, &mut v)?;
+        let sc = self.step_count as u64;
+        let ly = layer as u64;
+        let io = (|| -> std::io::Result<()> {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+            f.write_all(&sc.to_le_bytes())?;
+            f.write_all(&ly.to_le_bytes())?;
+            for x in &v {
+                f.write_all(&x.to_le_bytes())?;
+            }
+            Ok(())
+        })();
+        if io.is_err() {
+            return Err(FerriteError::Config(format!("DSV41_GT_HDUMP: {io:?}")));
+        }
+        Ok(())
+    }
+
     /// One ground-truth DSpark spec step at block base `pos` with anchor
     /// `token`. Returns the committed tokens (1..=6 of them), which are exactly
     /// the tokens the eager stream would emit at positions pos+1..=pos+k+1.
@@ -2240,6 +2271,13 @@ impl<'a> DevChain<'a> {
             // the engram writes into the residual stream BEFORE the block runs
             if let Some(&(_, li)) = eng_layer_of.iter().find(|(l, _)| *l == layer) {
                 self.engram_apply(layer, li)?;
+            }
+            // Diagnostic per-layer residual dump: the INPUT h of this layer
+            // (post-engram), matching the official reference's pre-hook
+            // semantics exactly. D2H inside step_body ⇒ the run MUST carry
+            // DSV41_GRAPH_STEP=0 (a capture would record nothing).
+            if let Ok(p) = std::env::var("DSV41_GT_HDUMP") {
+                self.gt_dump_h(&p, layer)?;
             }
             let _ta = std::time::Instant::now();
             premix_slot_idx = self.layer(layer, pos, premix_slot_idx)?;
