@@ -1653,3 +1653,31 @@ eid[SEG_CAP]    : i32 -- 该段的 expert id（**pad 段任意，取 0**）
 
 **⇒ 行动**：新开三条实现线（各自隔离 worktree、默认 OFF、带 DBG 探针、CPU 可 `cargo check` 验证），
 分别补齐 A2 / A3 / A4 三个缺失量化；GPU 验收与 env 裁决由主 agent 独占执行。
+
+## §62 🎯【已修】swapAB 输出打包缺陷：修复前 **640 个输出里有 512 个位置错**（80%）
+
+### 缺陷（已修，`moe_bs_handwritten.cu` epilogue）
+scatter（`moe_bs_shim.cu:583-586`）按 **每个 n_tile 128 列** 解读中间 scratch：
+```c
+bx = col / 128;  j = col - bx*128;
+n = (j < 64) ? (bx*64 + j) : (320 + bx*64 + (j - 64));   // 前 64 列 = gate、后 64 列 = up
+```
+- **非 swapAB 分支**：`col = n_tile*128 + c`（c = W 行，0..63 = W1/gate、64..127 = W3/up）⇒ **正好匹配** ✓
+- **swapAB 分支（缺陷）**：`col = n_tile*64 + r`（gate 全打包进 [0,320)、up 全进 [320,640)）
+  ⇒ 与 scatter 的解读**不符** ✗
+
+### 纯算术核验（不依赖 GPU）
+| | 覆盖列数 | scatter 能否还原出正确 n |
+|---|---|---|
+| **修复后**（`col = n_tile*128 + r`） | **640**（恰铺满 [0,640)） | **640/640 全部正确**（0 处不匹配）✓ |
+| **修复前**（gate/up 各打包 320） | 640 | **仅 128/640 正确 ⇒ 512 个位置错** ✗ |
+
+⇒ 这是一个**决定性的接线缺陷**（80% 输出错位），完全解释了"kernel 语义已精确、e2e 输出仍是结构化错文本"
+这一现象。修复 = 让 swapAB 分支改用与非 swapAB **相同的列公式**，只交换行/列角色
+（`r` = 权重行、`c` = token），即：
+```c
+C[(int64_t)(seg * HW_BM + c) * HW_NUP + n_tile * HW_BN + r] = C_sh[r * HW_BN + c];
+```
+### 注意（下一个待查项）
+**非 swapAB 分支经同一核验是"匹配 scatter"的** ⇒ 因此 **F2 臂（非 swapAB）仍然错，必是另一个缺陷**，
+且该缺陷**在两条朝向共用**。待 `bs-wiring-audit` / `old-new-diff-audit` 两条审计线报告。
