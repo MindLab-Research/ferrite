@@ -1332,7 +1332,7 @@ static void tl_bs_numcheck(const uint8_t* xq4, const float* xsc4, const uint8_t*
     static uint32_t sf3[2][40 * 320];
     static uint8_t wr[2560];
     static float gc[512 * 640];
-    if (cudaMemcpy(gc, g_c, sizeof(gc), cudaMemcpyDeviceToHost) != cudaSuccess) return;
+    if (cudaMemcpy(gc, g_c, sizeof(gc), cudaMemcpyDeviceToHost) != cudaSuccess) { fprintf(stderr, "[moe-bs] ABORT: cudaMemcpy failed (see line above)\n"); return; }
     double worst = 0.0; int wi = -1, ws = -1;
     for (int seg = 0; seg < NSEG_PROBE; ++seg) {
         const int e = eid_h[seg];
@@ -1346,12 +1346,12 @@ static void tl_bs_numcheck(const uint8_t* xq4, const float* xsc4, const uint8_t*
             bool have = false;
             for (int c = 0; c < ncache; ++c) if (cached[c] == t) have = true;
             if (have) continue;
-            if (cudaMemcpy(act[t], xq4 + (size_t)t * 5120, 5120, cudaMemcpyDeviceToHost) != cudaSuccess) return;
-            if (cudaMemcpy(asc[t], xsc4 + (size_t)t * 160, 160 * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) return;
+            if (cudaMemcpy(act[t], xq4 + (size_t)t * 5120, 5120, cudaMemcpyDeviceToHost) != cudaSuccess) { fprintf(stderr, "[moe-bs] ABORT: cudaMemcpy failed (see line above)\n"); return; }
+            if (cudaMemcpy(asc[t], xsc4 + (size_t)t * 160, 160 * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) { fprintf(stderr, "[moe-bs] ABORT: cudaMemcpy failed (see line above)\n"); return; }
             cached[ncache++] = t;
         }
-        if (cudaMemcpy(sf1[seg % 2], sfw1 + (size_t)e * 40 * 320, 40 * 320 * sizeof(uint32_t), cudaMemcpyDeviceToHost) != cudaSuccess) return;
-        if (cudaMemcpy(sf3[seg % 2], sfw3 + (size_t)e * 40 * 320, 40 * 320 * sizeof(uint32_t), cudaMemcpyDeviceToHost) != cudaSuccess) return;
+        if (cudaMemcpy(sf1[seg % 2], sfw1 + (size_t)e * 40 * 320, 40 * 320 * sizeof(uint32_t), cudaMemcpyDeviceToHost) != cudaSuccess) { fprintf(stderr, "[moe-bs] ABORT: cudaMemcpy failed (see line above)\n"); return; }
+        if (cudaMemcpy(sf3[seg % 2], sfw3 + (size_t)e * 40 * 320, 40 * 320 * sizeof(uint32_t), cudaMemcpyDeviceToHost) != cudaSuccess) { fprintf(stderr, "[moe-bs] ABORT: cudaMemcpy failed (see line above)\n"); return; }
         for (int p = 0; p < npr; ++p) {
             const int r = pr[p].r, col = pr[p].col;
             const int t = tok_of_row[r];
@@ -1362,7 +1362,7 @@ static void tl_bs_numcheck(const uint8_t* xq4, const float* xsc4, const uint8_t*
             const uint8_t* wbase = is_up ? w3 : w1;
             const uint32_t* sfb = is_up ? sf3[seg % 2] : sf1[seg % 2];
             if (cudaMemcpy(wr, wbase + (size_t)e * (size_t)w_stride + (size_t)wrow * 2560,
-                           2560, cudaMemcpyDeviceToHost) != cudaSuccess) return;
+                           2560, cudaMemcpyDeviceToHost) != cudaSuccess) { fprintf(stderr, "[moe-bs] ABORT: cudaMemcpy failed (see line above)\n"); return; }
             double acc = 0.0;
             for (int k = 0; k < 5120; ++k) {
                 const unsigned byte = wr[k >> 1];
