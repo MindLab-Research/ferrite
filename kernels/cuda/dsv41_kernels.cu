@@ -7439,7 +7439,7 @@ wo_a_grouped_gemv_kernel(const uint8_t* __restrict__ a,
                                          const uint8_t* __restrict__ w_scale,
                                          const float* __restrict__ bias,
                                          float* __restrict__ out, int n, int k,
-                                         int a_stride, int out_stride) {
+                                         int a_stride, int out_stride, int act_cp16) {
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
     const int nwarps = (blockDim.x + 31) >> 5;
@@ -7512,6 +7512,45 @@ wo_a_grouped_gemv_kernel(const uint8_t* __restrict__ a,
     __syncthreads();
     dsv41_cp_wait_all();
     __syncwarp();
+    // ② ACTIVATION STAGING cp.async16 (`DSV41_WO_A_CPASYNC`, default OFF).
+    //
+    // WHAT IT REPLACES. The activation row `s_a` below is staged by the
+    // byte-per-lane walk
+    //     for (i = threadIdx.x; i < k; i += blockDim.x) s_a[i] = ar[i];
+    // i.e. 1 B per thread per issue -- 16 issues at k = 4096 on a 256-thread
+    // block -- while the WEIGHT row of this very kernel (above), the m=1 gemv
+    // prologue and the `gemm_fp8_mrows_kernel` sibling all move their bytes 16 B
+    // at a time (`dsv41_cp_async16`, 512 B per warp-issue). SIXTEEN times the
+    // instructions for identically the same transfer. The `l4-mgrid-first-step-
+    // design.md` §4.2 note ("the WO_A activation staging") is the same finding;
+    // this is that arm for this kernel -- the "strongest next lever" of the
+    // wo-a-opt delivery note.
+    //
+    // NUMERICS -- a pure copy is not an arithmetic change. The staged slot holds
+    // the SAME bytes from the SAME global address as the scalar loop wrote
+    // (`s_a[i] = ar[i]`, no arithmetic), and the consume loop reads only that
+    // slot. The K walk (`kb` ascending, `j = kb*32 + lane`), the `s_lut[s_a[j]] *
+    // s_as[j>>5]` term, the `#pragma unroll 32` serial `acc` chain and the
+    // `shfl_xor` tree are untouched, so every output bit -- and hence the
+    // kernel's bit-identity with the m=1 `dsv41_gemm_fp8_mx` decode it replaces
+    // (C1-C6 in the header) -- is preserved by construction.
+    //
+    // ALIGNMENT (`dsv41_cp_async16` needs a 16B-aligned global+smem pair). The
+    // launcher below rejects `k & 31` and `a_stride & 31`, so every row offset
+    // `r*a_stride + g*k` is a multiple of 32 BYTES -> 16B-aligned off `a`, and
+    // `dsv41_f4_ok(a)` covers the base; `s_a = s_as + nb_k` with `nb_k = k/32`
+    // floats (= k/8 bytes, a multiple of 4) off a 16B-aligned base. Both sides
+    // are re-checked at runtime (`dsv41_f4_ok`) and the scalar loop is kept as
+    // the fallback, so an exotic shape stages by the old rule instead of
+    // faulting (the err-716 trap the weight-side guard already documents).
+    //
+    // SYNC. The activation stage is BLOCK-wide -- every active warp's consume
+    // loop reads `s_a[j]` for its own lane's j, bytes staged by OTHER warps -- so
+    // the group is retired by `wait_all` BEFORE the `__syncthreads()` that
+    // publishes `s_a` (the `gemm_fp8_mrows_kernel` a16 precedent: a wait placed
+    // after that barrier would be a data race on this slot). The weight group was
+    // already retired above, so this `wait_all` only covers the activation group.
+    const bool a16 = (act_cp16 != 0) && dsv41_f4_ok(a) && dsv41_f4_ok(s_a);
     for (int r = 0; r < M; ++r) {
         // Row r's activation: the group's k-element segment `a_stride` bytes
         // after the previous row's, with its own f32 scale row.
@@ -7522,7 +7561,20 @@ wo_a_grouped_gemv_kernel(const uint8_t* __restrict__ a,
         // is staged once per block instead of re-read by each of the `nwarps`
         // warps (the mode-3-vs-4 argument the gemv carries).
         for (int i = threadIdx.x; i < nb_k; i += blockDim.x) s_as[i] = asr[i];
-        for (int i = threadIdx.x; i < k; i += blockDim.x) s_a[i] = ar[i];
+        if (a16) {
+            const int n16 = k >> 4;
+            for (int i = threadIdx.x; i < n16; i += blockDim.x)
+                dsv41_cp_async16(s_a + (i << 4), ar + (i << 4));
+            // k % 16 tail: unreachable for every launcher (all reject `k & 31`),
+            // kept so the row is staged by exactly the rule the weight row uses.
+            for (int i = (n16 << 4) + threadIdx.x; i < k; i += blockDim.x) s_a[i] = ar[i];
+            dsv41_cp_commit();
+            // Retire the activation group BEFORE the publishing barrier (see
+            // SYNC above): `s_a` is read by every warp of the block.
+            dsv41_cp_wait_all();
+        } else {
+            for (int i = threadIdx.x; i < k; i += blockDim.x) s_a[i] = ar[i];
+        }
         __syncthreads();
         float acc = 0.f;
         #pragma unroll 32
@@ -7604,14 +7656,14 @@ extern "C" int dsv41_wo_a_grouped_fp8(const uint8_t* a, const float* a_scale,
     const dim3 grid(n / nwarps, groups);
     const dim3 block(nwarps * 32);
     switch (rows) {
-        case 1: wo_a_grouped_gemv_kernel<1><<<grid, block, smem, s>>>(a, a_scale, w, w_scale, bias, out, n, k, a_stride, out_stride); break;
-        case 2: wo_a_grouped_gemv_kernel<2><<<grid, block, smem, s>>>(a, a_scale, w, w_scale, bias, out, n, k, a_stride, out_stride); break;
-        case 3: wo_a_grouped_gemv_kernel<3><<<grid, block, smem, s>>>(a, a_scale, w, w_scale, bias, out, n, k, a_stride, out_stride); break;
-        case 4: wo_a_grouped_gemv_kernel<4><<<grid, block, smem, s>>>(a, a_scale, w, w_scale, bias, out, n, k, a_stride, out_stride); break;
-        case 5: wo_a_grouped_gemv_kernel<5><<<grid, block, smem, s>>>(a, a_scale, w, w_scale, bias, out, n, k, a_stride, out_stride); break;
-        case 6: wo_a_grouped_gemv_kernel<6><<<grid, block, smem, s>>>(a, a_scale, w, w_scale, bias, out, n, k, a_stride, out_stride); break;
-        case 7: wo_a_grouped_gemv_kernel<7><<<grid, block, smem, s>>>(a, a_scale, w, w_scale, bias, out, n, k, a_stride, out_stride); break;
-        case 8: wo_a_grouped_gemv_kernel<8><<<grid, block, smem, s>>>(a, a_scale, w, w_scale, bias, out, n, k, a_stride, out_stride); break;
+        case 1: wo_a_grouped_gemv_kernel<1><<<grid, block, smem, s>>>(a, a_scale, w, w_scale, bias, out, n, k, a_stride, out_stride, act_cp16); break;
+        case 2: wo_a_grouped_gemv_kernel<2><<<grid, block, smem, s>>>(a, a_scale, w, w_scale, bias, out, n, k, a_stride, out_stride, act_cp16); break;
+        case 3: wo_a_grouped_gemv_kernel<3><<<grid, block, smem, s>>>(a, a_scale, w, w_scale, bias, out, n, k, a_stride, out_stride, act_cp16); break;
+        case 4: wo_a_grouped_gemv_kernel<4><<<grid, block, smem, s>>>(a, a_scale, w, w_scale, bias, out, n, k, a_stride, out_stride, act_cp16); break;
+        case 5: wo_a_grouped_gemv_kernel<5><<<grid, block, smem, s>>>(a, a_scale, w, w_scale, bias, out, n, k, a_stride, out_stride, act_cp16); break;
+        case 6: wo_a_grouped_gemv_kernel<6><<<grid, block, smem, s>>>(a, a_scale, w, w_scale, bias, out, n, k, a_stride, out_stride, act_cp16); break;
+        case 7: wo_a_grouped_gemv_kernel<7><<<grid, block, smem, s>>>(a, a_scale, w, w_scale, bias, out, n, k, a_stride, out_stride, act_cp16); break;
+        case 8: wo_a_grouped_gemv_kernel<8><<<grid, block, smem, s>>>(a, a_scale, w, w_scale, bias, out, n, k, a_stride, out_stride, act_cp16); break;
         default: return 2;
     }
     return (int)cudaGetLastError();
