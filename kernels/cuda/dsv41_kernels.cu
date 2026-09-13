@@ -7653,6 +7653,39 @@ extern "C" int dsv41_wo_a_grouped_fp8(const uint8_t* a, const float* a_scale,
     const size_t smem = (size_t)nwarps * (size_t)k + (size_t)256 * sizeof(float) +
                         (size_t)(k >> 5) * sizeof(float) + (size_t)k;
     if (smem > 48 * 1024) return 2;
+    // ② DSV41_WO_A_CPASYNC (default OFF): stage the activation row with
+    // `dsv41_cp_async16` instead of the byte-per-lane loop. Read on the HOST
+    // (the gate cannot live in device scope -- the `DSV41_MROWS_ACT_CPASYNC`
+    // compile fix) and passed to the kernel as a plain int.
+    static const int wo_a_cpasync_env = [] {
+        const char* v = getenv("DSV41_WO_A_CPASYNC");
+        if (v == nullptr || v[0] == '\0') return 0;
+        return atoi(v) != 0 ? 1 : 0;
+    }();
+    // ACTIVITY RECEIPT (the `[mrows-act-cp16]` precedent): ONE line per process
+    // on the first armed launch, naming the geometry that launch resolved to and
+    // which staging rule actually ran. The device's own guard also tests
+    // `dsv41_f4_ok(a)`/`dsv41_f4_ok(s_a)`; the host cannot take the address of
+    // the dynamic smem block, so the smem side is reported from the very
+    // arithmetic that places `s_a` (the dynamic-smem base is 16B-aligned, which
+    // is what the device-side guard re-checks). With the gate unset (the shipped
+    // default) nothing is printed.
+    if (wo_a_cpasync_env != 0) {
+        static int reported = 0;
+        if (reported++ == 0) {
+            const size_t s_a_off = (size_t)nwarps * (size_t)k +
+                                   (size_t)256 * sizeof(float) + (size_t)(k >> 5) * sizeof(float);
+            const bool aligned = (((uintptr_t)a & 0xF) == 0) && ((s_a_off & 0xF) == 0);
+            fprintf(stderr,
+                    "[wo-a-cp16] ARMED rows=%d groups=%d n=%d k=%d nwarps=%d smem=%zu "
+                    "-> activation staging = %s\n",
+                    rows, groups, n, k, nwarps, smem,
+                    aligned ? "cp.async16 (16B per lane per issue)"
+                            : "scalar loop (the 16B guard DECLINED this shape: the arm is INERT "
+                              "here -- the weight-side err-716 guard)");
+        }
+    }
+    const int act_cp16 = wo_a_cpasync_env;
     const dim3 grid(n / nwarps, groups);
     const dim3 block(nwarps * 32);
     switch (rows) {

@@ -23,6 +23,8 @@
 #include <cuda_fp8.h>
 #include <cuda_bf16.h>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 
 namespace {
 
@@ -460,6 +462,161 @@ __global__ void gemv_bf16_v1_mrows_kernel(const __nv_bfloat16* __restrict__ w,
         }
         // v1's `__shfl_xor_sync(0xFFFFFFFFu, acc, off)` tree, once per row. No
         // cross-row recombination — each `a` is one row's independent chain.
+        #pragma unroll
+        for (int r = 0; r < M; ++r) {
+            float a = acc[r];
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                a += __shfl_xor_sync(0xFFFFFFFFu, a, off);
+            }
+            if (lane == 0) out[(size_t)r * (size_t)n + row] = a;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ① `DSV41_HEAD_ACT_F32VEC` (default OFF): the SAME v1-order m-row fold, with the
+// f32 activation READ PATH staged through shared memory.
+// ---------------------------------------------------------------------------
+// THE LESION (proj-head verdict, docs/agent/verify-amortization-lesion-audit.md
+// §10.2). The kernel above folds the m activation rows into one pass over the
+// weight, which removes the m-fold WEIGHT re-read -- but the ACTIVATION is still
+// re-read: every output row's warp walks all k columns of all M activation rows,
+// so a block of `nwarp` warps reads the same M*k f32 values `nwarp` times. The
+// activation is f32 (4 B) against the weight's bf16 (2 B), so per output row the
+// activation stream is 2*M times the weight stream: at the draft head's
+// (m = 6, k = 5120) one block moves 8*6*5120*4 = 960 KB of activation against
+// 8*5120*2 = 80 KB of weight. The fold's amortisation is therefore paid for on
+// the activation side, which is what the "摊薄失效" measurement sees.
+//
+// THE FIX (bit-safe by construction -- read path only, no value arithmetic). The
+// block copies a K-chunk of the M activation rows into shared memory ONCE (a
+// pure copy, `sx[r][i] = x[r*k + base + i]`, no arithmetic of any kind), lands a
+// barrier, and every warp computes its own output row from the staged bytes. Per
+// (block, chunk) the activation now moves M*kt values instead of nwarp*M*kt,
+// i.e. the global/L2 activation traffic falls by `nwarp` = 8x, and the per-lane
+// reads it replaced (L1-resident at best, constantly evicted by the weight
+// stream) become LDS.
+//
+// WHAT IS *NOT* CHANGED -- the parity contract of the kernel above survives
+// verbatim:
+//   * the per-lane element sequence is v1's EXACT sequence. The legacy loop is
+//     `for (c = lane; c < k; c += 32)`, i.e. lane L accumulates over
+//     {L, L+32, L+64, ...} ascending. The chunked loop below walks
+//     `c = base + lane; c < base + kt; c += 32` with `base` ascending in units of
+//     KT = 1024 (a multiple of 32), so the SET and the ORDER of the c values a
+//     lane sees are identical to the legacy loop's;
+//   * `wv = __bfloat162float(wr[c])` is the same decode of the same bytes at the
+//     same position, still hoisted out of the r loop;
+//   * `acc[r] += wv * <the value of x[r*k + c]>` is the same single-chain FMA per
+//     row -- one independent accumulator per row, nothing combined across r;
+//   * the reduction is the same `__shfl_xor_sync(0xFFFFFFFFu, a, off)` tree over
+//     the same off = 16,8,4,2,1 sequence, and the epilogue is the same
+//     `if (lane == 0) out[r*n + row] = a` (no bias, as before);
+//   * the row -> warp mapping and the grid are not part of the contract (rows are
+//     independent -- the header above states this), and the strided row walk
+//     below reproduces the legacy `row = blockIdx.x*nwarp + wid; row +=
+//     gridDim.x*nwarp` mapping exactly.
+// The staged slot holds the same bytes from the same global address as the
+// legacy `x[(size_t)r*k + c]` load, so no value can move by a bit: the only
+// difference is the memory the identical bytes are read from.
+//
+// ⚠️ NO float4 FMA BODY. Vectorising the *consume* loop (four consecutive c per
+// lane) would change which lane owns which c and therefore every partial sum --
+// that is `gemv_bf16_nt_kernel`'s v2 program, the lookalike that failed the
+// verify (see the note on `gemv_bf16_v1_mrows_kernel` above). The vectorisation
+// here is confined to the COPY width: a float4 load/store of the same f32 bytes
+// into the same slots, with a scalar fallback for shapes (or pointers) that are
+// not 16B-aligned.
+//
+// GEOMETRY / BARRIER SAFETY. The staging is BLOCK-wide, so every `__syncthreads`
+// below must be reached by every thread of the block: the row indices and the
+// trip counts are computed from block-uniform values (`row0`, `stride`, `iters`)
+// and the per-warp `row < n` predicate guards ONLY the consume and the store,
+// never a barrier. One row per warp per iteration, exactly as the legacy kernel.
+//
+// SMEM: `M * KT * 4` B = 32 KB at the largest M, so the launch stays under the
+// 48 KB default dynamic limit -- NO `cudaFuncSetAttribute` dance and no occupancy
+// cliff. (The alternative of staging the WHOLE M*k slab is 120 KB at
+// (m = 6, k = 5120), which pins one block per SM; `gemv_bf16_kernel` above
+// records the 2.3x regression a per-block activation-stage cost this family
+// once already, which is why this arm chunks.)
+__device__ __forceinline__ bool gl_f4_ok(const void* p) {
+    return (reinterpret_cast<unsigned long long>(p) & 15ull) == 0ull;
+}
+
+template <int M>
+__global__ void gemv_bf16_v1_mrows_act_kernel(const __nv_bfloat16* __restrict__ w,
+                                              const float* __restrict__ x,
+                                              float* __restrict__ out, int n, int k,
+                                              int act_vec) {
+    constexpr int KT = 1024;       // K-chunk, in f32 elements (multiple of 32)
+    extern __shared__ float sx[];  // [M][KT]
+    const int lane = threadIdx.x & 31;
+    const int wid = threadIdx.x >> 5;
+    const int nwarp = (blockDim.x + 31) >> 5;
+    // Block-uniform geometry: every warp of the block carries the same trip
+    // counts, so every thread reaches every `__syncthreads()` below. `iters` is
+    // the legacy strided walk's trip count for THIS block (`row0` is the block's
+    // first row), rounded up so a warp whose `row >= n` simply takes the
+    // predicate's false side through the whole body.
+    const int stride = (int)gridDim.x * nwarp;
+    const int row0 = (int)blockIdx.x * nwarp;
+    const int iters = (row0 < n) ? ((n - row0 + stride - 1) / stride) : 0;
+    const int nchunk = (k + KT - 1) / KT;
+    // 16B copies need `k % 4 == 0` (row pitch in floats) and a 16B-aligned `x`;
+    // the smem tile is a multiple of KT floats off the (16B-aligned) dynamic
+    // base. Uniform across the block, and the scalar loop stays as the fallback.
+    const bool v16 = (act_vec != 0) && ((k & 3) == 0) && gl_f4_ok(x);
+    for (int it = 0; it < iters; ++it) {
+        const int row = row0 + wid + it * stride;
+        const bool act = row < n;
+        float acc[M];
+        #pragma unroll
+        for (int r = 0; r < M; ++r) acc[r] = 0.f;
+        for (int ch = 0; ch < nchunk; ++ch) {
+            const int base = ch * KT;
+            const int kt = (k - base < KT) ? (k - base) : KT;
+            // ---- staging: a PURE COPY of this chunk's activation bytes ------
+            #pragma unroll
+            for (int r = 0; r < M; ++r) {
+                float* __restrict__ sr = sx + (size_t)r * (size_t)KT;
+                const float* __restrict__ xr = x + (size_t)r * (size_t)k + (size_t)base;
+                if (v16) {
+                    const int n4 = kt >> 2;
+                    for (int i = threadIdx.x; i < n4; i += blockDim.x)
+                        reinterpret_cast<float4*>(sr)[i] =
+                            reinterpret_cast<const float4*>(xr)[i];
+                    // kt % 4 tail: unreachable while `v16` holds (k and base are
+                    // both multiples of 4), kept so the tile is filled by exactly
+                    // one rule.
+                    for (int i = (n4 << 2) + threadIdx.x; i < kt; i += blockDim.x) sr[i] = xr[i];
+                } else {
+                    for (int i = threadIdx.x; i < kt; i += blockDim.x) sr[i] = xr[i];
+                }
+            }
+            __syncthreads();
+            // ---- consume: v1's loop, `x[r*k + c]` now read from the tile -----
+            if (act) {
+                const __nv_bfloat16* __restrict__ wr = w + (size_t)row * (size_t)k;
+                // v1's loop VERBATIM (including its NO-#pragma-unroll choice --
+                // unrolling would hand the compiler's fast-math reassociation the
+                // contraction the two kernels must share). `wv` is the one
+                // hoisted value: same decode, same bytes, reused by every row.
+                for (int c = base + lane; c < base + kt; c += 32) {
+                    float wv = __bfloat162float(wr[c]);
+                    #pragma unroll
+                    for (int r = 0; r < M; ++r)
+                        acc[r] += wv * sx[(size_t)r * (size_t)KT + (size_t)(c - base)];
+                }
+            }
+            // No warp may re-stage the tile before every reader is done with it.
+            __syncthreads();
+        }
+        if (!act) continue;
+        // v1's `__shfl_xor_sync(0xFFFFFFFFu, acc, off)` tree, once per row, and
+        // v1's `if (lane == 0) out[row] = a` epilogue. No cross-row
+        // recombination -- each `a` is one row's independent chain.
         #pragma unroll
         for (int r = 0; r < M; ++r) {
             float a = acc[r];
@@ -1256,6 +1413,57 @@ extern "C" int dsv41_gemv_bf16_v1_mrows(const void* w, const float* x, float* ou
     unsigned blocks = (unsigned)((n + 7) / 8);
     if (blocks > 4096) blocks = 4096;
     const __nv_bfloat16* wb = (const __nv_bfloat16*)w;
+    // ① DSV41_HEAD_ACT_F32VEC (default OFF): the smem-staged activation read
+    // path (`gemv_bf16_v1_mrows_act_kernel` above). The gate is read on the HOST
+    // (it cannot live in device scope -- the `DSV41_MROWS_ACT_CPASYNC` compile
+    // fix) and passed to the kernel as a plain int; the 16B-copy guard is
+    // device-side (`gl_f4_ok`), where the pointers actually are.
+    static const int head_act_f32vec_env = [] {
+        const char* v = getenv("DSV41_HEAD_ACT_F32VEC");
+        if (v == nullptr || v[0] == '\0') return 0;
+        return atoi(v) != 0 ? 1 : 0;
+    }();
+    if (head_act_f32vec_env != 0) {
+        // M rows x KT = 1024 floats: 32 KB at the largest M, i.e. UNDER the 48 KB
+        // default dynamic limit -- no `cudaFuncSetAttribute` dance and no
+        // occupancy cliff (see the kernel header for why the whole M*k slab is
+        // not staged). The check below is belt-and-braces for a future KT change.
+        const size_t smem = (size_t)m * 1024 * sizeof(float);
+        if (smem <= 48 * 1024) {
+            // ACTIVITY RECEIPT (the `[mrows-act-cp16]` precedent): this arm has
+            // its own kernel NAME, so a kernel-name check already proves it ran;
+            // the ONE line per process names the geometry it resolved to. The
+            // DECLINE arm below is named for the same reason -- an armed run with
+            // no receipt means the launcher never got here. With the gate unset
+            // (the shipped default) nothing is printed.
+            static int reported = 0;
+            if (reported++ == 0)
+                fprintf(stderr,
+                        "[head-act-f32vec] ARMED m=%d n=%d k=%d blocks=%u x 256 threads, "
+                        "KT=1024, smem=%zu B -> activation read path = smem staging (staged "
+                        "once per block per K-chunk, shared by all 8 warps x M rows; float4 "
+                        "copy where 16B-aligned, scalar otherwise)\n",
+                        m, n, k, blocks, smem);
+            switch (m) {
+                case 1: gemv_bf16_v1_mrows_act_kernel<1><<<blocks, 256, smem, s>>>(wb, x, out, n, k, head_act_f32vec_env); break;
+                case 2: gemv_bf16_v1_mrows_act_kernel<2><<<blocks, 256, smem, s>>>(wb, x, out, n, k, head_act_f32vec_env); break;
+                case 3: gemv_bf16_v1_mrows_act_kernel<3><<<blocks, 256, smem, s>>>(wb, x, out, n, k, head_act_f32vec_env); break;
+                case 4: gemv_bf16_v1_mrows_act_kernel<4><<<blocks, 256, smem, s>>>(wb, x, out, n, k, head_act_f32vec_env); break;
+                case 5: gemv_bf16_v1_mrows_act_kernel<5><<<blocks, 256, smem, s>>>(wb, x, out, n, k, head_act_f32vec_env); break;
+                case 6: gemv_bf16_v1_mrows_act_kernel<6><<<blocks, 256, smem, s>>>(wb, x, out, n, k, head_act_f32vec_env); break;
+                case 7: gemv_bf16_v1_mrows_act_kernel<7><<<blocks, 256, smem, s>>>(wb, x, out, n, k, head_act_f32vec_env); break;
+                case 8: gemv_bf16_v1_mrows_act_kernel<8><<<blocks, 256, smem, s>>>(wb, x, out, n, k, head_act_f32vec_env); break;
+                default: return (int)cudaErrorInvalidValue;
+            }
+            return (int)cudaGetLastError();
+        }
+        static int reported_decline = 0;
+        if (reported_decline++ == 0)
+            fprintf(stderr,
+                    "[head-act-f32vec] ARMED but DECLINED m=%d k=%d: smem=%zu B > 48KB -> the "
+                    "legacy read path (x read straight from global) runs instead\n",
+                    m, k, smem);
+    }
     switch (m) {
         case 1: gemv_bf16_v1_mrows_kernel<1><<<blocks, 256, 0, s>>>(wb, x, out, n, k); break;
         case 2: gemv_bf16_v1_mrows_kernel<2><<<blocks, 256, 0, s>>>(wb, x, out, n, k); break;

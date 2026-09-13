@@ -195,10 +195,21 @@ struct Buf {
 bool dp_upload(Buf& d, const void* h, size_t n) {
     return d.alloc(n) && cudaMemcpy(d.p, h, n, cudaMemcpyHostToDevice) == cudaSuccess;
 }
+// A failed D2H is NOT silent. `resize` value-initialises, so a copy that fails
+// (e.g. after an illegal access poisoned the context) leaves a ZERO vector and
+// the caller's raw-bits compare then reports a FALSE "identical" — which is how
+// an arm can print OK while the kernel it measured never ran. The copy's status
+// is the arm's real read-back point, so it is reported here.
 template <typename T>
 bool dp_download(std::vector<T>& h, const Buf& d, size_t bytes) {
-    h.resize(bytes / sizeof(T));
-    return cudaMemcpy(h.data(), d.p, bytes, cudaMemcpyDeviceToHost) == cudaSuccess;
+    h.assign(bytes / sizeof(T), T{});
+    const cudaError_t e = cudaMemcpy(h.data(), d.p, bytes, cudaMemcpyDeviceToHost);
+    if (e != cudaSuccess) {
+        printf("    FAIL dp_download(%zu bytes): %s\n", bytes, cudaGetErrorString(e));
+        ++g_fails;
+        return false;
+    }
+    return true;
 }
 
 // Enough free device memory? (do not fight a co-tenant serve: SKIP, not FAIL)
@@ -443,7 +454,8 @@ int dp_arm_p3a_a3() {
 // Arm P3A a4 — `dsv41_apply_rope_mrows`  vs  `bs` per-row `apply_rope`
 //
 // ON : apply_rope_mrows(x, ..., m=bs, rows=nh, row_stride=rstride, t=pos_rows[r])
-// OFF: for r: apply_rope(x + r*rstride, ..., rows=nh, base, mul=1, off=P0+r, step=0)
+// OFF: for r: apply_rope(x + r*rstride, ..., rows=nh, base=pos_base, mul=1, off=r,
+//      step=0)  ->  t = pos_base + r
 // Both rotate the trailing `rd` columns of every head row; the position is the
 // same integer (pos_rows[r] = P0 + r). Forward and inverse arms.
 // =====================================================================
@@ -459,7 +471,13 @@ int dp_arm_p3a_a4() {
     for (int r = 0; r < m; ++r) vpos[r] = kP0 + r;
 
     Buf dx_on, dx_off, dcos, dsin, dpos, dbase;
-    std::vector<float> hbase(1, (float)kP0);
+    // `base` is an INT device counter, NOT a float: every rope kernel reads it as
+    // `const int* base` and computes `t = (*base)*mul + off + row*step`
+    // (`apply_rope_kernel:1991`, `dsv41_rmsnorm_rope`, the `sparse_attn_orope`
+    // merge). Uploading the float 100.0f put the BIT PATTERN 0x42C80000
+    // (= 1120403456) into that slot, so `cos[(size_t)t*half + i]` indexed the
+    // 64 KiB table ~133 GiB out of bounds => illegal memory access.
+    std::vector<int> hbase(1, kP0);
     bool ok = dp_upload(dx_on, vx.data(), xn * 4) && dp_upload(dx_off, vx.data(), xn * 4) &&
               dp_upload(dcos, cos.data(), cos.size() * 4) &&
               dp_upload(dsin, sin.data(), sin.size() * 4) && dp_upload(dpos, vpos.data(), m * 4) &&
@@ -478,9 +496,12 @@ int dp_arm_p3a_a4() {
                                               kHalf, (const int*)dpos.p, inv, nullptr);
         DP_CHECK(rc == 0, "[%s/inv=%d] apply_rope_mrows rc=%d", tag, inv, rc);
         for (int r = 0; r < m; ++r) {
+            // `t = (*base)*mul + off + row*step` = kP0 + r with `off = r` — the
+            // identical integer `pos_rows[r]` the fused arm's row r reads (the
+            // production per-row form is `off = r, step = 0` off the counter).
             const int rc1 = dsv41_apply_rope((float*)dx_off.p + (size_t)r * rstride,
                                              (const float*)dcos.p, (const float*)dsin.p, rows,
-                                             row_len, kRd, kHalf, (const int*)dbase.p, 1, kP0 + r, 0,
+                                             row_len, kRd, kHalf, (const int*)dbase.p, 1, r, 0,
                                              inv, nullptr);
             DP_CHECK(rc1 == 0, "[%s/inv=%d] apply_rope(r=%d) rc=%d", tag, inv, r, rc1);
         }
@@ -522,7 +543,7 @@ int dp_arm_p3lite_norm_rope(const char* tag, int n, int off, int step) {
     dp_fill(vw, 0.4f, 1.6f);
 
     Buf dx_on, dx_off, dw, dcos, dsin, dbase;
-    std::vector<float> hbase(1, (float)kPos);   // base = pos_dev
+    std::vector<int> hbase(1, kPos);   // base = pos_dev (INT counter, see the a4 arm)
     bool ok = dp_upload(dx_on, vx.data(), vx.size() * 4) && dp_upload(dx_off, vx.data(), vx.size() * 4) &&
               dp_upload(dw, vw.data(), vw.size() * 4) && dp_upload(dcos, cos.data(), cos.size() * 4) &&
               dp_upload(dsin, sin.data(), sin.size() * 4) && dp_upload(dbase, hbase.data(), 4);
@@ -595,7 +616,7 @@ int dp_arm_p3lite_l4() {
     for (int r = 0; r < m; ++r) vpos[r] = kP0 + r;
 
     Buf dqr_on, dqr_off, dqrw, dw, dws, dq_on, dq_off, dxq, dxsc, dcos, dsin, dpos, dbase;
-    std::vector<float> hbase(1, (float)kP0);
+    std::vector<int> hbase(1, kP0);   // INT counter (see the a4 arm)
     const size_t xq_bytes = (size_t)m * k;                 // fp8, one byte per value
     const size_t xsc_bytes = (size_t)m * nb_k * 4;
     bool ok = dp_upload(dqr_on, vqr.data(), vqr.size() * 4) &&
@@ -636,9 +657,12 @@ int dp_arm_p3lite_l4() {
                                         (float*)dq_off.p, m, n, k, out_stride, nullptr);
     DP_CHECK(gm == 0, "[%s] gemm_fp8_mrows rc=%d", tag, gm);
     for (int r = 0; r < m; ++r) {
+        // `off = r` (NOT kP0 + r): `t = kP0 + r` is `pos_rows[r]`, the integer the
+        // fused arm's row r reads. `kP0 + r` double-counted the anchor and would
+        // rope this row at 2*kP0 + r — a value mismatch, not the fold's fault.
         const int rr = dsv41_apply_rope((float*)dq_off.p + (size_t)r * out_stride,
                                         (const float*)dcos.p, (const float*)dsin.p, kNh, kHd, kRd,
-                                        kHalf, (const int*)dbase.p, 1, kP0 + r, 0, 0, nullptr);
+                                        kHalf, (const int*)dbase.p, 1, r, 0, 0, nullptr);
         DP_CHECK(rr == 0, "[%s] apply_rope(r=%d) rc=%d", tag, r, rr);
     }
 
@@ -696,7 +720,7 @@ int dp_arm_p3lite_l3() {
     const size_t xsc_bytes = ((size_t)b * m * h * d) / 32;
 
     Buf dq, dkv, dsink, didxs, dou_on, dou_off, dclen, dcos, dsin, dbase, dxq, dxsc;
-    std::vector<float> hbase(1, (float)kPos);
+    std::vector<int> hbase(1, kPos);   // base = pos_dev, INT counter (see the a4 arm)
     std::vector<int> hclen(1, cl);
     bool ok = dp_upload(dq, q.data(), q.size() * 4) && dp_upload(dkv, kv.data(), kv.size() * 4) &&
               dp_upload(dsink, sink.data(), sink.size() * 4) &&
@@ -737,9 +761,12 @@ int dp_arm_p3lite_l3() {
                                      nullptr);
     DP_CHECK(rs == 0, "[%s] sparse_attn rc=%d", tag, rs);
     for (int r = 0; r < b * m; ++r) {
+        // `off = r`: `t = kPos + r` is the merge's `tt = base*1 + off(0) +
+        // mm*row_step(1)` for `mm = r` (see the arm header), i.e. the fused ON
+        // path's own position for this row. `kPos + r` double-counted the anchor.
         const int rr = dsv41_apply_rope((float*)dou_off.p + (size_t)r * h * d, (const float*)dcos.p,
                                         (const float*)dsin.p, h, d, kRd, kHalf, (const int*)dbase.p, 1,
-                                        kPos + r, 0, 1, nullptr);
+                                        r, 0, 1, nullptr);
         DP_CHECK(rr == 0, "[%s] apply_rope(r=%d) rc=%d", tag, r, rr);
     }
     const int qn = dsv41_quant_fp8((const float*)dou_off.p, (uint8_t*)dxq_off.p,
