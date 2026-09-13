@@ -216,7 +216,12 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
         hw_tc_alloc(&hw_SF_tmem, 32);    // 32 columns for SF
         hw_tc_relinquish();
     }
+    // tcgen05.alloc writes the allocated TMEM base into smem; the generic read of
+    // hw_C_tmem/hw_SF_tmem below must be ordered against it — TileLang wraps exactly
+    // this barrier with the tcgen05 thread-sync fence pair (moe_bs_up_tl.cu:79/81).
+    asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
     __syncthreads();
+    asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
     const uint32_t C_tmem = hw_C_tmem;
     const uint32_t SF_tmem = hw_SF_tmem;
 
@@ -224,9 +229,13 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
     if (tid == 0) {
         asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;"
                      :: "r"((uint32_t)__cvta_generic_to_shared(mma_bar)));
+        // mbarrier-init visibility uses the DEDICATED fence and must come BEFORE the
+        // first barrier (TileLang: moe_bs_up_tl.cu:63 tl::fence_barrier_init() is
+        // emitted ahead of tl:65's __syncthreads).
+        asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
     __syncthreads();
-    asm volatile("fence.proxy.async.shared::cta;");  // make mbarrier init visible
+    asm volatile("fence.proxy.async.shared::cta;");  // async-proxy view of the smem operands
 
     // ---- K-loop (sequential, no pipeline) ----
     for (int k = 0; k < HW_KITER; ++k) {
@@ -311,6 +320,11 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
         // with uniform test data (stale == current) and produces garbage on real data.
         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
         __syncthreads();
+        // Highest-suspicion gap: this is the ONLY tcgen05 fence TileLang places on the
+        // "thread sync -> subsequent async tcgen05 op" direction (moe_bs_up_tl.cu:107,
+        // right after the loaded/sf_full waits and before the cp/mma issue). Our kernel
+        // went straight from the barrier to tcgen05.cp / tcgen05.mma.
+        asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
         // (5) warp 1: SF copy to TMEM + MMA
         if (warp == 1) {
