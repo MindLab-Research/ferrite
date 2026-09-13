@@ -62,13 +62,11 @@ echo "################ 2. ac69b054 (the golden's commit) ################"
 git checkout -q ac69b054 -- kernels crates
 echo "kernels/crates now at: $(git log -1 --format='%h %ad %s' --date=format:%H:%M ac69b054 | cut -c1-90)"
 echo "--- FORCED rebuild (the stamp cannot be trusted after a partial checkout) ---"
-rm -f "$HOME/.ferrite_cu_stamp"
 (cd kernels/cuda && bash build.sh 103a 2>&1 | tail -1) || { echo "BUILD_SH FAILED at ac69b054"; }
 (source "$HOME/.cargo/env" && cargo build --release 2>&1 | tail -1) || { echo "CARGO FAILED at ac69b054"; }
 run_arm GEP_AC69
 
 echo "################ restore origin/main + same-source rebuild ################"
 git checkout -q origin/main -- kernels crates
-rm -f "$HOME/.ferrite_cu_stamp"
 bash "$HOME/ensure_built.sh" || echo "RESTORE BUILD FAILED"
 echo "=== golden_endpoint DONE ==="

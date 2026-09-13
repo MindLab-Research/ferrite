@@ -21,7 +21,6 @@ echo "=== current trunk ==="
 git checkout -q origin/main -- kernels crates 2>/dev/null
 git log --oneline -1
 echo "=== same-source rebuild (mandatory after any partial checkout) ==="
-rm -f "$HOME/.ferrite_cu_stamp"
 bash "$HOME/ensure_built.sh" || { echo "BUILD GATE FAILED"; exit 1; }
 
 pkill -9 -x ferrite-serve 2>/dev/null
