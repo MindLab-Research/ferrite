@@ -17631,17 +17631,26 @@ impl<'a> DevChain<'a> {
     ///
     /// Returns `Ok(None)` when the routing cannot be expressed as segments (see
     /// [`moe_align_host`]) — the caller then keeps the proven launches.
+    ///
+    /// `ids` is the routing table THIS call's path actually produced, with
+    /// `ids_bytes` of capacity: the eager single-row path fills `route_idx`
+    /// (`[topk]`) while `moe_rows` fills `route_idx_r` (`[m][topk]`). Reading a
+    /// fixed buffer here is what made the eager arm build its tables from a
+    /// never-written `route_idx_r` (all-zero ids ⇒ one segment for expert 0).
     fn moe_tilelang_tables_host(
         &self,
+        ids: *const i32,
+        ids_bytes: usize,
         m: usize,
         topk: usize,
     ) -> Result<Option<(Vec<i32>, Vec<i32>, Vec<i32>, usize)>> {
         let n = m * topk;
-        if n == 0 || n * 4 > self.s.route_idx_r.bytes {
+        if n == 0 || n * 4 > ids_bytes {
             return Ok(None);
         }
         let mut bytes = vec![0u8; n * 4];
-        self.dev.download_u8(&self.s.route_idx_r, &mut bytes)?;
+        let view = Device::view(ids as *mut c_void, n * 4);
+        self.dev.download_u8(&view, &mut bytes)?;
         let idx: Vec<i32> = bytes
             .chunks_exact(4)
             .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -17675,17 +17684,30 @@ impl<'a> DevChain<'a> {
     /// `.so` lacks either half: the caller keeps the proven launches (one-shot
     /// notice). `DSV41_MOE_TL_HOST_ALIGN=1` additionally memcmp's the device
     /// tables against the host ones and FAILS the step on any difference.
-    fn moe_tilelang_tables_dev(&mut self, m: usize, topk: usize, n_routed: usize) -> Result<bool> {
+    ///
+    /// `ids`/`ids_bytes` are the routing table THE CALLER'S PATH produced:
+    /// `route_idx_r` on the multi-row (`moe_rows`) path, `route_idx` on the
+    /// eager single-row path (which never writes `route_idx_r`). See
+    /// [`Self::moe_tilelang_tables_host`] for the failure this parameter fixes.
+    fn moe_tilelang_tables_dev(
+        &mut self,
+        ids: *const i32,
+        ids_bytes: usize,
+        m: usize,
+        topk: usize,
+        n_routed: usize,
+    ) -> Result<bool> {
         let n_assign = m * topk;
         if n_assign == 0
             || n_assign > TILELANG_SEG_CAP
             || n_assign * 4 > self.s.grp_src.bytes
+            || n_assign * 4 > ids_bytes
             || TILELANG_SEG_CAP * 4 > self.s.grp_counts.bytes
         {
             return Ok(false); // the tables could not be expressed anyway
         }
         let built = self.dev.route_group(
-            self.s.route_idx_r.ptr as *const i32,
+            ids,
             self.s.grp_counts.ptr as *mut i32,
             self.s.grp_starts.ptr as *mut i32,
             self.s.grp_rows.ptr as *mut i32,
@@ -17719,7 +17741,7 @@ impl<'a> DevChain<'a> {
             return Ok(false);
         }
         if moe_tl_host_align() {
-            self.moe_tilelang_tables_parity(m, topk)?;
+            self.moe_tilelang_tables_parity(ids, ids_bytes, m, topk)?;
         }
         Ok(true)
     }
@@ -17740,18 +17762,27 @@ impl<'a> DevChain<'a> {
     ///
     /// Returns `Ok(false)` under the same conditions as the bf16 builder: the routing
     /// cannot be expressed as segments or the `.so` lacks either half (the caller keeps
-    /// the proven launches).
-    fn moe_bs_tables_dev(&mut self, m: usize, topk: usize, n_routed: usize) -> Result<bool> {
+    /// the proven launches). `ids`/`ids_bytes` are the routing table the CALLER's
+    /// path produced (see [`Self::moe_tilelang_tables_host`]).
+    fn moe_bs_tables_dev(
+        &mut self,
+        ids: *const i32,
+        ids_bytes: usize,
+        m: usize,
+        topk: usize,
+        n_routed: usize,
+    ) -> Result<bool> {
         let n_assign = m * topk;
         if n_assign == 0
             || n_assign > TILELANG_SEG_CAP
             || n_assign * 4 > self.s.grp_src.bytes
+            || n_assign * 4 > ids_bytes
             || TILELANG_SEG_CAP * 4 > self.s.grp_counts.bytes
         {
             return Ok(false); // the tables could not be expressed anyway
         }
         let built = self.dev.route_group(
-            self.s.route_idx_r.ptr as *const i32,
+            ids,
             self.s.grp_counts.ptr as *mut i32,
             self.s.grp_starts.ptr as *mut i32,
             self.s.grp_rows.ptr as *mut i32,
@@ -17785,7 +17816,78 @@ impl<'a> DevChain<'a> {
             TILELANG_SEG_CAP as i32,
             TILELANG_BS_BM as i32,
         )?;
+        // ---------------------------------------------------------------------
+        // `DSV41_MOE_BS_TABLE_DUMP=1` (one-shot, opt-in): print the routing ids the
+        // caller's path produced, the grouping `route_group` derived, and the BS
+        // segment tables `moe_align_from_group` wrote — at the same instant, so a
+        // table that does not match its routing is visible directly instead of
+        // being inferred from garbage output. This is the observation that found
+        // the eager-path `route_idx_r` mixup (all-zero ids ⇒ nseg=1 with eid[0]=0).
+        // ⚠️ D2H on the decode path ⇒ diagnostic arms only, never a performance arm.
+        // A failure here is reported, never propagated: a diagnostic must not kill
+        // a step that has already committed its routing.
+        if std::env::var("DSV41_MOE_BS_TABLE_DUMP")
+            .map(|v| v != "0")
+            .unwrap_or(false)
+        {
+            static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            if ONCE.set(()).is_ok() {
+                match self.moe_bs_table_snapshot(ids, ids_bytes, m, topk, aligned) {
+                    Ok(line) => eprintln!("{line}"),
+                    Err(e) => eprintln!("[moe-bs-tbl] dump failed: {e}"),
+                }
+            }
+        }
         Ok(aligned)
+    }
+
+    /// The `DSV41_MOE_BS_TABLE_DUMP` payload: routing ids, `route_group` output and
+    /// the BS tables, read back in one go. See the call site for why it exists.
+    fn moe_bs_table_snapshot(
+        &self,
+        ids: *const i32,
+        ids_bytes: usize,
+        m: usize,
+        topk: usize,
+        aligned: bool,
+    ) -> Result<String> {
+        let n_assign = m * topk;
+        let mut out = format!(
+            "[moe-bs-tbl] m={m} topk={topk} n_assign={n_assign} aligned={aligned} ids_bytes={ids_bytes}"
+        );
+        if n_assign * 4 <= ids_bytes {
+            let ids_h = self.download_i32_ptr(ids, n_assign)?;
+            out.push_str(&format!(" ids={ids_h:?}"));
+        }
+        let na = self.download_i32(&self.s.grp_nactive, 1)?[0];
+        let na = na.clamp(0, TILELANG_SEG_CAP as i32) as usize;
+        out.push_str(&format!(
+            " n_active={na} active={:?} counts_by_e[0..8]={:?}",
+            self.download_i32(&self.s.grp_active, na)?,
+            self.download_i32(&self.s.grp_counts, 8)?,
+        ));
+        let nseg = self.download_i32(&self.s.bs_nseg, 1)?[0].clamp(0, TILELANG_SEG_CAP as i32)
+            as usize;
+        out.push_str(&format!(
+            " nseg={nseg} eid={:?} counts_seg={:?} order[0..{n_assign}]={:?}",
+            self.download_i32(&self.s.bs_eid, nseg)?,
+            self.download_i32(&self.s.bs_counts, nseg)?,
+            self.download_i32(&self.s.bs_order, n_assign)?,
+        ));
+        Ok(out)
+    }
+
+    /// `n` i32 from a RAW device pointer (the [`Self::download_i32`] twin). Needed
+    /// where the buffer is passed by address (the routed ids, which live in one of
+    /// two buffers depending on the path).
+    fn download_i32_ptr(&self, p: *const i32, n: usize) -> Result<Vec<i32>> {
+        let mut bytes = vec![0u8; n * 4];
+        let view = Device::view(p as *mut c_void, n * 4);
+        self.dev.download_u8(&view, &mut bytes)?;
+        Ok(bytes
+            .chunks_exact(4)
+            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect())
     }
 
     /// `DSV41_MOE_TL_HOST_ALIGN=1` diagnostic: rebuild the tables on the host and
@@ -17795,7 +17897,13 @@ impl<'a> DevChain<'a> {
     ///
     /// Refused (with a notice) while a capture is in flight: `download_u8` is
     /// illegal there, and this is a diagnostic, not a path.
-    fn moe_tilelang_tables_parity(&self, m: usize, topk: usize) -> Result<()> {
+    fn moe_tilelang_tables_parity(
+        &self,
+        ids: *const i32,
+        ids_bytes: usize,
+        m: usize,
+        topk: usize,
+    ) -> Result<()> {
         if self.dev.capturing() {
             static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
             if ONCE.set(()).is_ok() {
@@ -17806,7 +17914,8 @@ impl<'a> DevChain<'a> {
             }
             return Ok(());
         }
-        let Some((h_order, h_counts, h_eid, h_nseg)) = self.moe_tilelang_tables_host(m, topk)?
+        let Some((h_order, h_counts, h_eid, h_nseg)) =
+            self.moe_tilelang_tables_host(ids, ids_bytes, m, topk)?
         else {
             static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
             if ONCE.set(()).is_ok() {
@@ -18538,7 +18647,13 @@ impl<'a> DevChain<'a> {
                 // `dsv41_moe_align_from_group`), so this works inside a capture:
                 // no D2H read, no H2D upload. See `moe_bs_tables_dev` — the BS arm
                 // needs its OWN BM=128 tables, not the bf16 arm's BM=16 ones.
-                let bs_tbl = self.moe_bs_tables_dev(m, topk, n_routed)?;
+                let bs_tbl = self.moe_bs_tables_dev(
+                    self.s.route_idx_r.ptr as *const i32,
+                    self.s.route_idx_r.bytes,
+                    m,
+                    topk,
+                    n_routed,
+                )?;
                 let bs_w = Self::moe_bs_weights(ld, dim, inter_local);
                 if bs_tbl {
                     if let Some(w) = bs_w {
@@ -18623,7 +18738,13 @@ impl<'a> DevChain<'a> {
                 // The tables come from the DEVICE (`dsv41_route_group` +
                 // `dsv41_moe_align_from_group`), so this works inside a capture:
                 // no D2H read, no H2D upload. See `moe_tilelang_tables_dev`.
-                tl_tbl = self.moe_tilelang_tables_dev(m, topk, n_routed)?;
+                tl_tbl = self.moe_tilelang_tables_dev(
+                    self.s.route_idx_r.ptr as *const i32,
+                    self.s.route_idx_r.bytes,
+                    m,
+                    topk,
+                    n_routed,
+                )?;
                 tl_w = Self::moe_tilelang_weights(ld, dim, inter_local);
                 if tl_tbl && tl_w.is_some() {
                     tl_gu = self.dev.moe_tilelang_gate_up_bf16_dev(
@@ -23425,7 +23546,19 @@ fn oracle_tap() -> bool {
                     // `dsv41_moe_align_from_group`), so this works inside a capture
                     // too: no D2H read, no H2D upload. See `moe_bs_tables_dev` — the
                     // BS arm needs its OWN BM=128 tables, not the bf16 arm's BM=16 ones.
-                    let bs_tbl = self.moe_bs_tables_dev(1, topk, ne)?;
+                    // ⚠️ The eager path's routing lives in `route_idx` ([topk], written
+                    // by the router above); `route_idx_r` is written only by the
+                    // multi-row `route_topk` in `moe_rows`, so reading it here built
+                    // every table from a never-written buffer (all-zero ids ⇒ ONE
+                    // segment for expert 0, i.e. every assignment computed with expert
+                    // 0's weights). Pass THIS path's buffer.
+                    let bs_tbl = self.moe_bs_tables_dev(
+                        self.s.route_idx.ptr as *const i32,
+                        self.s.route_idx.bytes,
+                        1,
+                        topk,
+                        ne,
+                    )?;
                     let bs_w = Self::moe_bs_weights(ld, dim, inter_local);
                     if bs_tbl {
                         if let Some(w) = bs_w {
@@ -23505,7 +23638,13 @@ fn oracle_tap() -> bool {
                         true,
                     );
                 } else if tl_ready {
-                    tl_tbl = self.moe_tilelang_tables_dev(1, topk, ne)?;
+                    tl_tbl = self.moe_tilelang_tables_dev(
+                        self.s.route_idx.ptr as *const i32,
+                        self.s.route_idx.bytes,
+                        1,
+                        topk,
+                        ne,
+                    )?;
                     tl_w = Self::moe_tilelang_weights(ld, dim, inter_local);
                     if tl_tbl && tl_w.is_some() {
                         tl_gu = self.dev.moe_tilelang_gate_up_bf16_dev(
