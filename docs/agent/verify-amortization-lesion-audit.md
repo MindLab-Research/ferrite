@@ -182,6 +182,12 @@ B1 系三臂的断崖都在 line 52（1..51 正确然后跳 62）+ mean-k 0.64-0
 
 **步时优化的战略判定**：四个新交付项三负一无——**剩余有效路径**：①tap 修复（+0.78 acc = +33% 吞吐——最大杠杆，TAP_PARITY/COMP_PARITY 护栏已交付待跑）②MoE grouped（−1.5-2.5ms，716 修复中）③mrows 摊薄的真解 = tensor core 路线（m=6 fp8 mma——设计进行中）④draft 减肥（p3lite 全套——tap 修复后重测）。
 
+**§10.10 S1 修复验证（2026-09-13 04:10，Fix A 默认 ON，6f6f513）**：
+- **mean-k = 2.240**（vs 污染基线 1.34 ⇒ **+0.90**，超过 lazy 的 2.120——SWALLOW 成为 acc 最优栈）；计数 first-51 OK、verify 26.67ms（+2.2 噪声/acc 形态变化）。
+- **吞吐 ≈ 104 tok/s**（3.24 tok/step ÷ 31.3ms 全步）——+27% vs 修复前。
+- **根因链完整闭环**：hc_collapse per-row pre 契约 vs m-row hook 单行 4-float 越界（r≥1 污染 tap 行 1..k_emit）→ Fix A（pre_mean_r [VERIFY_ROWS][hc] 全 1/hc 复制，零成本 bit 等价）→ acc 恢复并超越 lazy。
+- **400 的 acc 半边落地**：acc 2-3 达标（2.24）；余下 = step 31→8ms（3.9×：MoE grouped −2 + tensor core −4~6 + draft p3lite −2 + misc）。
+
 **静态逐项比对（`compress_replay`+`compress_replay_row` :10331/:10386 vs `compress_row` :13675）——S2 分叉候选清单**：
 
 | # | 候选点 | 位置（file:line） | 判定 |
