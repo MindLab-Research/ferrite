@@ -3144,6 +3144,15 @@ fn hc_tail_split() -> bool {
                 self.s.qr.ptr as *mut f32,
             )?;
         }
+        // op-level diagnostic: the post-GEMM kv (pre-norm, pre-rope, pre-RT)
+        // at layer 0 — kind 6 — splits the fp8 GEMM {quant + codes + weight
+        // scales} from the fused norm+rope. Runs on the MAIN stream before the
+        // dual fork, so the side-stream write race cannot occur.
+        if let Ok(xdp) = std::env::var("DSV41_GT_XDUMP") {
+            if layer == 0 {
+                self.gt_dump_vec(&xdp, 6, self.s.kv.ptr, hd)?;
+            }
+        }
         // DUAL_CHAIN (DSV41_DUAL_CHAIN, default ON): fork the kv half onto the
         // runtime's second side stream HERE, so its kv norm + rope runs while the
         // q chain below (NORM_FUSE/lin_rope + wq_b gemv + rope, ~13.5us/layer)
