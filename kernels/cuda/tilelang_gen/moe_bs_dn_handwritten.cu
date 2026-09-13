@@ -302,8 +302,14 @@ constexpr int DN_SF_BYTES = DN_BM * 4;    // 128 个 group-major u32
 // 单 stage = A(16384) + B(16384) + SFA(512) + SFB(512) = 33792
 constexpr int DN_STAGE_BYTES = 2 * DN_SPAN_BYTES + 2 * DN_SF_BYTES;
 // NS=1 -> 33800 B（含 mbar 8）；NS=2 -> 67592 B。3 CTA/SM：202776 B < 227 KiB ✓
-constexpr size_t DN_SMEM_SINGLE = DN_STAGE_BYTES + 8;
-constexpr size_t DN_SMEM_DOUBLE = 2 * DN_STAGE_BYTES + 8;
+// The MMA-completion mbarrier lives immediately after the operand+SF region, i.e. at exactly that
+// region's end: with the double-buffered layout it occupied the very last valid 8 bytes and ANY
+// addition (a ring slot, a per-stage array, a drain barrier) would have run past the end and written
+// into a neighbouring CTA's smem. Give it an explicit margin, as the gate/up arm now does
+// (kHwMbarExtra) — the two kernels must not differ on this.
+constexpr size_t DN_MBAR_EXTRA = 512;
+constexpr size_t DN_SMEM_SINGLE = DN_STAGE_BYTES + 8 + DN_MBAR_EXTRA;
+constexpr size_t DN_SMEM_DOUBLE = 2 * DN_STAGE_BYTES + 8 + DN_MBAR_EXTRA;
 
 // =============================================================================
 // §6 一个 K-span 的 staging（顺序版；cp.async 版见 dn_issue_span）
