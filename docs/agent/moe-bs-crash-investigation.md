@@ -152,3 +152,31 @@
 **二分步骤 3（备用）：DEV 入口表复制**
 - 让 DEV 入口 D2D 复制调用方表到 shim scratch
 - 测试是否调用方表指针有问题
+
+## 完整代码审查（2026-09-14 晚——用户警告"低级失误"后的全面检查）
+
+**moe_bs_weights 返回值验证** ✓：
+- `w.0 = a.w1.ptr()` — expert 0 的 W1（gate 权重面基址）
+- `w.1 = a.w3.ptr()` — expert 0 的 W3（up 权重面基址）**不是** expert 1 的 W1
+- `w.2 = s1.ptr()` — SF_W1 pool 基址（segregated pool 第一段起点）
+- `w.3 = t1.ptr()` — SF_W3 pool 基址（segregated pool 第二段起点）
+- `w.4 = w_stride` — 相邻 expert 的 block stride（实测 2,641,920）
+
+**shim 参数映射** ✓：
+- `w1` → W1 TMA descriptor base（expert 0 的 W1）
+- `w3` → W3 TMA descriptor base（expert 0 的 W3）
+- `sfw1` → SFW1 TMA descriptor base（SF_W1 pool）
+- `sfw3` → SFW3 TMA descriptor base（SF_W3 pool）
+- `w_stride` → TMA gstride[1]（expert stride）
+
+**SFW pool 布局验证** ✓：
+- Segregated: [E×plane WSF1][E×plane WSF3]
+- SFW1 at pool base + 0；SFW3 at pool base + 19,660,800
+- SF plane = sf_words × NP = 40 × 320 = 12,800 uint32 = 51,200 bytes
+- TMA gdim=(12800, 384), gstride[0]=51200（每 expert），box=(64, 1)
+
+**ex_act_r 输出缓冲验证** ✓：
+- 分配：VERIFY_ROWS × topk × 2 × max(inter, dim) = 6×6×2×5120 = 368,640 floats
+- scatter 最大写：(5×6+5)×640+639 = 23,039 floats（远小于分配）
+
+**结论：无低级错误。代码路径完整正确。**
