@@ -37,3 +37,21 @@ A2 `WINDOW_KV_QUANT`(`:2320`)、A3 `COMPRESS_LATENT_QUANT`(`:1471`)、A4 `INDEXE
 加上已接线的 `DSV41_ACTQ_FLOOR`（把量化下限放到 **amax**，官方 `kernel.py:76` 位置 ✓）。
 **转正流程**：`~/promote_precision.sh "<GATE=1> [DBG=1]"`（DBG 五点回读逐元素差 0 → `wq_check.py` 文本红线 → 快速臂无回归）✓，**逐项、一次一个变量** ✓。
 ⚠️ 我们 8 个 `quant_fp8` 调用点**全部 `round_scale=true`** ⇒ 标度恒为 2 的幂 ✓ ⇒ **不存在** SGLang PR 39289 那种"非 2 的幂标度 + UE8M0 位重解释"的静默错值 ✓（唯一退化角落：全 0 block ⇒ `fmaxf(s,1e-30)` 得非幂次，`ACTQ_FLOOR=1` 即闭环）。
+
+## ⚠️ 读数口径（`verify-accept-audit` 纠正，必读——我曾读错）
+
+1. **`step pos=N: X ms (Y tok/s)` 里的 `Y` 恒等于 `1/X`** ✗（`serve.rs:796` 打印的是
+   `1.0/dt`，即"步/秒"；非 spec 单步解码下恰好等于 token/s，**spec 下不是**）⇒
+   `Y × X ≡ 1.0` 对任何步都成立，**零信息量** ✗。**不要用它推断 accept** ✗。
+2. **真正的 tok/步在另一行**：`[dspark] steps=… mean-k=… tok/step=…`（`serve.rs:681-692`）✓，
+   其中 **`tok/step = mean-k + 1`**（`emitted.len() = k_acc + 1`，`chain_dev.rs:11925-11927`）✓。
+3. **位置增量法**：`DecodeRun` 里 `p += step_len`（`serve.rs:796`），而 `step_time` 打的是**步前**的 `p`
+   ⇒ **相邻 `step pos=` 的差值 = 上一步的 emitted 长度** ✓ ⇒ 多 token 步直接可见 ✓。
+4. **已记录的 accept（从旧日志）**：参考基线 `ab_dac`/`ab_old` = **mean-k 2.240** ✓（= 用户口径的 2.2 ✓）；
+   `ab_m2/m4/rwf/s1on` = 1.310；`ab_hzone` 0.485；`ab_best2` 0.660；
+   **`ab_tl2` 0.005 / `ab_mma1` 0.015 = 已判死的"单侧换程序"臂** ✗
+   （`docs/agent/proj-mma-verdict.md` 原文：verify 侧单独换程序 ⇒ **mean-k 2.240 → 0.020，accept 崩 99%**）✗。
+   ⇒ **accept 崩的根因是"换成了非逐位等价的第三个程序"，不是"m 行结构"** ✓。
+5. `DSV41_DIFF_EAGER` 只验 **verify 的 emitted 值**（它们全部来自 `verify_out`/`next`）⇒ **不验 draft** ✗；
+   若 accept 问题出在 draft 侧，这个工具是空转的 ✓（历史 55 行里 54 行 `first_mismatch=none` ✓）。
+
