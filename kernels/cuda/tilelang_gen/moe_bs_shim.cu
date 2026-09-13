@@ -889,6 +889,27 @@ extern "C" int dsv41_moe_tilelang_gate_up_bs_dev(
     // 表已在 device 上 ⇒ 没有 (0) 元数据上行这一步。
 
     // (1) gather + 激活 SF pack：fp4 nibble + f32 标度 -> ue8m0 group-major u32
+    // BINARY-SEARCH STEP 3: D2D copy caller's tables to shim scratch
+    // (tests if the caller's device table POINTERS are the issue vs shim's own scratch)
+    static const bool g_dev_table_copy = []() {
+        const char* v = getenv("DSV41_MOE_BS_DEV_TABLE_COPY");
+        return v != nullptr && v[0] != '0';
+    }();
+    if (g_dev_table_copy) {
+        static bool noted3 = false;
+        if (!noted3) {
+            noted3 = true;
+            fprintf(stderr, "[moe-bs] DEV-TABLE-COPY active — D2D copy caller tables to shim scratch\n");
+        }
+        cudaMemcpyAsync(g_eid, eid_dev, kSegCap * sizeof(int), cudaMemcpyDeviceToDevice, s);
+        cudaMemcpyAsync(g_order, order_dev, kSegCap * kBm * sizeof(int), cudaMemcpyDeviceToDevice, s);
+        cudaMemcpyAsync(g_counts, counts_dev, kSegCap * sizeof(int), cudaMemcpyDeviceToDevice, s);
+        cudaMemcpyAsync(g_nseg, nseg_dev, sizeof(int), cudaMemcpyDeviceToDevice, s);
+        eid_dev = g_eid;
+        order_dev = g_order;
+        counts_dev = g_counts;
+        nseg_dev = g_nseg;
+    }
     tl_moe_bs_gather_kernel<<<dim3((unsigned)kBm, (unsigned)kSegCap), kMovThreads, 0, s>>>(
         xq4, xsc4, g_a, g_sfa, order_dev, counts_dev, kDim, kDim / 32, kSfWords, (int)topk, nseg_dev);
     cudaError_t e = cudaGetLastError();
