@@ -780,3 +780,26 @@ vs binary build_id=…-dirty+cuf683f43bb06c66f5. Rebuild both from the same chec
    多 subagent 并发时，**先让写代码/写测试的 subagent 收尾**再重编，或把它们的产物放在 `/tmp`/`~/` 而非仓库里。
 3. `arm_run.sh` 的 `SERVE_FAILED` 分支要用 `tail` 显示日志尾部（本次 `tail -26` 恰好截掉了关键行，是靠事后
    手动 `tail ~/armrun_A_ng.log` 才看到 build-id 那行）——**判读 e2e 失败时永远先看 serve 日志尾部**。
+
+## §26 idesc 位域全貌核实 + 两处独立交叉验算（已确认无误）
+
+`moe_bs_handwritten.cu` 的 `hw_make_idesc(m, n, a_fmt, b_fmt, sf_id)` 完整构造：
+
+```c
+d |= (sf_id & 3) << 4;        // b_sf_id   [4,6)    ← §10 修的那个漏 <<4 的 bug
+d |= (a_fmt & 7) << 7;        // a_format  [7,10)   0 = E4M3
+d |= (b_fmt & 7) << 10;       // b_format  [10,13)  5 = E2M1
+d |= ((n >> 3) & 63) << 17;   // n_dim     [17,23)  N/8
+d |= 1u << 23;                // scale_format = UE8M0
+d |= ((m >> 4) & 31) << 24;   // m_dim     [24,29)  M/16
+d |= (sf_id & 3) << 29;       // a_sf_id   [29,31)
+```
+
+**关键**：`a_sf_id` 与 `b_sf_id` 是**两个独立字段，但都取自同一个 `sf_id` 形参** ⇒ §19 的 SFREV 一行改动
+（`sf_id = 3-ki`）**同时覆盖 A、B 两侧**（这正是它优雅的原因）。
+
+**两处独立交叉验算（均吻合，可复算）**：
+| 配置 | 我们的值 | 独立来源 | 结论 |
+|---|---|---|---|
+| swapAB（a_fmt=5,b_fmt=0,M=N=128,sf=0） | `0x08A00280` = 144,704,128 | 树内已验证探针 `0x08820280`（M=128,N=8）+ `n_dim` 差（N=8→128 ⇒ `15<<17` = 1,966,080） | **逐位吻合** ✓ |
+| 非 swapAB（a_fmt=0,b_fmt=5,0x0A01400 结构） | `0x08A01400` | TileLang 生成码常量（`moe_bs_up_tl.cu`） | **逐位吻合** ✓ |
