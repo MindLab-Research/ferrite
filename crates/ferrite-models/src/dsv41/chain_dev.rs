@@ -10667,6 +10667,7 @@ impl<'a> DevChain<'a> {
                 false,
             )?
         } else {
+            Self::hc_front_note("hc_front_rows() off -> raw hc_mixes (gate)", m);
             self.dev.hc_mixes(
                 self.s.h_r.ptr as *const f32,
                 ld.hc_attn_fn.as_ref().unwrap().as_f32(),
@@ -10740,6 +10741,7 @@ impl<'a> DevChain<'a> {
                 false,
             )?
         } else {
+            Self::hc_front_note("hc_front_rows() off -> raw hc_mixes (gate)", m);
             self.dev.hc_mixes(
                 self.s.h_r.ptr as *const f32,
                 ld.hc_ffn_fn.as_ref().unwrap().as_f32(),
@@ -14504,8 +14506,20 @@ impl<'a> DevChain<'a> {
         // Stage-C persistent forms, both default OFF and both selected only when
         // the .so carries the symbol. `_MB` (multi-block) is tried first: same
         // one-launch phase structure, but the dots are spread instead of pinned
-        // to one SM. The fallback chain is
-        // (persist_mb -> persist -> two-launch -> hc_mixes), each step silent.
+        // to one SM.
+        //
+        // THE FALLBACK IS A CHAIN, NOT A PICK (2026-09-13, the rows = m fix).
+        // The comment here used to claim "(persist_mb -> persist -> two-launch ->
+        // hc_mixes), each step silent", but the code did NOT implement that: `if /
+        // else if / else` picks exactly ONE arm, so a tail split that was SELECTED
+        // and then DECLINED skipped the rest of the chain and fell straight to the
+        // raw `hc_mixes` below. For `rows = m` that is the whole verify regression,
+        // because BOTH `persist` arms are `rows == 1` and the two-launch
+        // `hc_front` — which is rows-agnostic and needs neither the side stream nor
+        // the events — was therefore unreachable: the verify's ONLY fused route was
+        // the split, and one declined split per layer dropped 2 launches/layer to
+        // the one-SM-per-row `hc_mixes_kernel`. The split arm now degrades to
+        // `hc_front` explicitly; only a declined `hc_front` reaches raw.
         let fused = if Self::hc_tail_split()
             && self.dev.supports_hc_tail_split()
             && !norm_w.is_null()
@@ -14530,7 +14544,7 @@ impl<'a> DevChain<'a> {
             // and the fold's `hc_res` write clobbers) stop being safe to touch.
             // The post-AR join in `layer` stays for the un-folded path (a no-op
             // once the early join has consumed the armed flag).
-            self.dev.hc_front_split(
+            let split_ran = self.dev.hc_front_split(
                 x,
                 hc_fn,
                 hc_scale,
@@ -14550,7 +14564,38 @@ impl<'a> DevChain<'a> {
                 xq,
                 xsc,
                 truncate,
-            )?
+            )?;
+            // Declined split: chain to the two-launch `hc_front` instead of
+            // dropping to the raw chain below. Same three kernels as the split
+            // (EARLY collapse+norm+fp8, the dots, the LATE half), same operands,
+            // bit-identical — only the side stream / event fork is gone, and that
+            // is exactly what the verify path can do without.
+            if split_ran {
+                true
+            } else {
+                Self::hc_front_note("hc_front_split declined -> hc_front (two-launch)", rows);
+                self.dev.hc_front(
+                    x,
+                    hc_fn,
+                    hc_scale,
+                    hc_base,
+                    norm_w,
+                    pre_collapse,
+                    pre_out,
+                    post_out,
+                    comb_out,
+                    out,
+                    rows as i32,
+                    hc as i32,
+                    dim as i32,
+                    sinkhorn_iters,
+                    eps,
+                    eps_norm,
+                    xq,
+                    xsc,
+                    truncate,
+                )?
+            }
         } else if rows == 1 && Self::hc_persist_mb() && self.dev.supports_hc_persist_mb() {
             self.dev.hc_front_persist_mb(
                 x,
@@ -14761,6 +14806,39 @@ fn verify_ar_fold() -> bool {
 fn hc_front_rows() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *F.get_or_init(|| std::env::var("DSV41_HC_FRONT_ROWS").map(|v| v != "0").unwrap_or(false))
+}
+
+/// `DSV41_HC_DEBUG=1`: one line per hc-front arm decision, off by default.
+///
+/// WHY. Every arm of this dispatch declines SILENTLY, and the raw 40-launch
+/// chain is a LEGAL-LOOKING outcome of four different situations: the gate is
+/// off (`hc_front_rows()`), the `.so` has no `dsv41_hc_front_split`, the runtime
+/// has no side stream / event, or the split entry returned InvalidValue. An A/B
+/// that reads only step time — or an output equality, since every arm is
+/// bit-identical — cannot tell them apart, which is how "gate on but the raw
+/// kernel still runs" became indistinguishable from "gate off". One line per
+/// distinct `(note, rows)` makes the next run self-explaining.
+fn hc_front_debug() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_HC_DEBUG").map(|v| v != "0").unwrap_or(false))
+}
+
+fn hc_front_note(note: &str, rows: usize) {
+    if !Self::hc_front_debug() {
+        return;
+    }
+    // Once per (note, rows): the chain is entered ~80x/step, so an un-deduped
+    // print would be a hot-path getenv-free but still costly line per call.
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
+    static SEEN: OnceLock<Mutex<HashSet<(String, usize)>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+    if let Ok(mut s) = seen.lock() {
+        if s.insert((note.to_string(), rows)) {
+            eprintln!("[hc-front] {note} (rows={rows})");
+        }
+    }
 }
 
 /// Segment-C AR fold (P1 of the persistent roadmap): `hc_post_inplace` moved
