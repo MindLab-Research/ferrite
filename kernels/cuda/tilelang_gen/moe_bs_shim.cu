@@ -11,8 +11,12 @@
 // 它替代的是什么
 // =============================================================================
 // `moe_rows` / `moe` 的 routed gate/up 那一步（`dsv41_expert_gate_up_fp4_batched`，SIMT
-// FMA-issue bound，36 sweep）。本 shim 用 **B300 原生 block-scaled MMA 直接吃 fp4**：
-// e2m1 数据 + ue8m0 标度进 tensor core，**零 dequant、零 bf16 副本**。
+// FMA-issue bound，36 sweep）。本 shim 用 **B300 原生 block-scaled MMA 直接吃 fp4 权重**：
+// **e4m3 激活 × e2m1 权重** + ue8m0 标度进 tensor core，**零 dequant、零 bf16 副本**。
+// ⚠️ 激活是 **fp8 e4m3**（1 B/value），不是 packed fp4 —— D2 精度修复（2026-09-13）：
+// 官方 DeepSeek-V4.1 的 routed 激活是 `act_quant(fp8_block_size=32, ue8m0)`。设计记录
+// `docs/agent/moe-bs-e4m3-activation-design.md`；`dsv41_moe_bs_act_e4m3_cap` 是它的
+// 能力符号（旧 .so 会把这个语义变化静默当 fp4 读，见 §8）。
 //   * 与 bf16 臂（`dsv41_moe_tilelang_gate_up_bf16`）的关系：**互斥**。bf16 臂的前提是
 //     装载期把专家权重展开成 bf16 常驻（`DSV41_MOE_BF16_DEQUANT`，
 //     PROVENANCE §7.5 实测 **+105~113 GiB/rank**）；本臂读原生 fp4 池，那笔显存**不花**。
@@ -32,6 +36,9 @@
 //   int dsv41_moe_bs_pack_wsf(...)             -- **装载期**：w1/w3 的 ue8m0 面
 //                                                 row-major [NP, K/32] -> group-major
 //                                                 packed uint32 [sf_words*NP]（每 expert）
+//   int dsv41_moe_bs_act_e4m3_cap(void)        -- **能力符号**：本 `.so` 的 A operand 是
+//                                                 e4m3 激活（1 B/value）。旧 `.so` 没有它
+//                                                 ⇒ Rust 的 bs 臂不 arm（见 §8）
 //
 // rc 契约（与 wkv / bf16 shim / proj_mma 完全一致）：
 //   * `0` = 已发射；
@@ -46,9 +53,10 @@
 //  1. **TMA 描述符 ABI**：TileLang 默认 lowering 把参与 TMA 搬运的 6 个操作数变成
 //     `__grid_constant__ const CUtensorMap` 形参（A/W1/W3/SFA/SFW1/SFW3），C 是 TMA
 //     store，也是描述符。**host 必须 `cuTensorMapEncodeTiled`**。裸指针 ABI 在这条路上
-//     **走不通**：blockscaled 的 A/B smem 必须是 `float4_e2m1_unpacked`（packed smem
+//     **走不通**：blockscaled 的 **B** smem 必须是 `float4_e2m1_unpacked`（packed smem
 //     静默错值 err=3.0，原型 §4.1），而 packed-global → unpacked-smem 只有 TMA 的
-//     tensor 形式能做（`copy_analysis.cc:539`）。
+//     tensor 形式能做（`copy_analysis.cc:539`）。A 侧是 e4m3，天然 1 B/元素 ⇒ 那条
+//     「展开」对 A 不存在，但 B 仍需要它 ⇒ 本约束与 TMA 形态一概不变。
 //     ⚠️ **build.sh 不链 `-lcuda`** ⇒ 本文件**不直接引用** driver 符号，而是 `dlopen`
 //     `libcuda.so.1` + `dlsym("cuTensorMapEncodeTiled")`。这保持了「编译期无条件编译
 //     进来、运行期门控」的既有契约（build.sh 一行不改、BUILD_ID 不变）。
@@ -62,11 +70,14 @@
 // =============================================================================
 // 布局契约（生成物 bake 死的东西，host 必须对齐）
 // =============================================================================
-//   A   : [SEG_CAP*BM, K/2] u8   -- **已 gather + 每段 pad 到 BM 行**的 fp4 激活。
-//                                  e2m1 打包规则与 ferrite 一致：低 4 位 = 偶 k。
-//                                  **pad 行必须真的全 0**（内核不做 mask）。
+//   A   : [SEG_CAP*BM, K] u8   -- **已 gather + 每段 pad 到 BM 行**的 **e4m3** 激活
+//                                  （1 B/value）。pad 行必须真的全 0（内核不做 mask；
+//                                  0x00 = +0.0，SFA=0 ⇒ 贡献恰为 0）。
 //   W1  : [E, NP, K/2]      u8   -- gate 面（ferrite 池里的 w1.weight，面内 K 连续）
 //   W3  : [E, NP, K/2]      u8   -- up 面（w3.weight）
+//   ⚠️ 激活的字节布局变了（packed fp4 半字节 → e4m3 直排），但 C ABI 形状**没变**
+//      ⇒ 旧 .so 会把 5120 B 的行当 2560 B 的 fp4 读，是**静默错值**。这就是
+//      `dsv41_moe_bs_act_e4m3_cap`（§8）存在的唯一理由。
 //   ⚠️ expert 之间的步长是**调用方测量的 block stride**（`w_stride` 形参），**不是**
 //      `NP*K/2`：ferrite 的池是「每 expert 一个 128 B 对齐的 6 面 block」布局。
 //      面内行距 = K/2 不变（一个面内部是干净的 [NP, K/2] 连续块）。
@@ -114,12 +125,13 @@
 // ⚠️⚠️ 唯一需要人工转写的地方：`moe_bs_encode_tmaps()`（本文件 §3）
 // =============================================================================
 // 描述符的 dims / strides / box / swizzle 是 **TileLang 内部决定**的（它按 smem layout
-// 推断选 swizzle，且 fp4 的 sub-byte 展开方式只有它的 lowering 知道）。**不许猜**：
+// 推断选 swizzle，且 **W** 侧 fp4 的 sub-byte 展开方式只有它的 lowering 知道）。**不许猜**：
 // 权威配方是 `moe_bs_up_tl_host.cu`（生成器同时 dump 的 TileLang 自己的 host launcher，
 // 里面有它对每个张量调 `cuTensorMapEncodeTiled` 的完整实参）。
 // 本文件的 §3 已把「所有能钉死的部分」钉死（rank/dtype/interleave/oob/l2、以及
-// 由几何推出的 gdim/gstride/box），只有 **swizzle 枚举**与 **fp4 的 box 首维是否按
-// 字节数**这两处需要拿 dump 一次比对。运行期 `DSV41_MOE_BS_DEBUG=1` 会把本文件实际
+// 由几何推出的 gdim/gstride/box），只有 **swizzle 枚举**与 **W 的 box 首维是否按
+// 字节数（BK/2）** 这两处需要拿 dump 一次比对（A 是 e4m3 ⇒ 字节数 == 元素数，
+// 那条二义性在 A 上已经消解）。运行期 `DSV41_MOE_BS_DEBUG=1` 会把本文件实际
 // 用的 spec 打出来，和 host source 一对一 diff 即可。
 // **参数序错误不会静默**：形参里描述符 / `float*` / `int*` 是不同类型，任何错位都是
 // 编译错误（见 §5 的 `static_assert`）——这正是本 ABI 唯一的救赎。
@@ -212,7 +224,7 @@ constexpr size_t kSmem = 202752;
 constexpr size_t kSfPlaneBytes = (size_t)kSfWords * kNp * 4;  // 51200 B/面/expert
 
 // ---- 常驻 scratch（INIT 期分配一次，进程生命周期内复用）--------------------
-uint8_t* g_a = nullptr;         // [SEG_CAP*BM, dim/2] u8 packed fp4
+uint8_t* g_a = nullptr;         // [SEG_CAP*BM, dim] u8 e4m3（1 B/value）
 uint32_t* g_sfa = nullptr;      // [kSfWords * SEG_CAP*BM] u32 group-major
 float* g_c = nullptr;           // [SEG_CAP*BM, 2*NP] f32
 int* g_eid = nullptr;           // [SEG_CAP]
@@ -266,11 +278,16 @@ struct TmapSpec {
     const char* what;
 };
 
-// fp4 的「逻辑元素」是 4 bit。TMA **没有** sub-byte 的 data type，所以全局张量按
-// **打包后的字节**描述：dim0 = K/2 个 UINT8。smem 侧必须是 unpacked（1 B/元素）。
-// ⚠️ VERIFY #1：box 首维是按**字节（K/2）**还是按**元素（K）**给。按字节时
-//    box[0] = kBk/2 = 64；若 dump 给的是 128，说明 lowering 用了别的形态（见 wiring §4）。
-constexpr cuuint32_t kABox = (cuuint32_t)(kBk / 2);
+// A 的「元素」是 **e4m3，1 元素 = 1 字节** ⇒ **没有 sub-byte 二义性**（旧的 VERIFY #1
+// 「box 首维按字节还是按元素」在 A 上从此消解：两者相等）。
+// W 的「逻辑元素」仍是 4 bit：TMA **没有** sub-byte 的 data type，所以权重按**打包后的
+// 字节**描述：dim0 = K/2 个 UINT8（smem 侧仍是 unpacked，1 B/元素）。
+// ⇒ A 与 W 的 box 首维从此**分家**。
+// ⚠️ VERIFY #1（仅剩 W 一侧）：box 首维是按**字节（K/2）**还是按**元素（K）**给。按字节
+//    时 box[0] = kBk/2 = 64；若新 dump 的 W 侧给的是 128，说明 lowering 用了别的形态
+//    （见 wiring §4）。
+constexpr cuuint32_t kABoxA = (cuuint32_t)kBk;        // A: BK 字节（= BK 个 e4m3）
+constexpr cuuint32_t kABoxW = (cuuint32_t)(kBk / 2);  // W: BK/2 字节（packed e2m1）
 
 // ⚠️ VERIFY #2：swizzle。A_sh / B_sh 的 smem 行 = BK 字节 = 128 B（unpacked fp4）
 //    ⇒ CU_TENSOR_MAP_SWIZZLE_128B 是预期值。C_sh 的行 = BN*4 = 512 B（f32）⇒ 也可能
@@ -279,22 +296,22 @@ constexpr CUtensorMapSwizzle kSwzAB = CU_TENSOR_MAP_SWIZZLE_128B;
 constexpr CUtensorMapSwizzle kSwzC = CU_TENSOR_MAP_SWIZZLE_128B;
 
 // ---- 各操作数 --------------------------------------------------------------
-// A: [M, K] fp4 packed ⇒ UINT8 [M, K/2]，M = SEG_CAP*BM
+// A: [M, K] e4m3 ⇒ UINT8 [M, K]（1 B/value），M = SEG_CAP*BM
 TmapSpec spec_a(const void* a) {
     TmapSpec s{};
     s.dtype = CU_TENSOR_MAP_DATA_TYPE_UINT8;
     s.rank = 2;
     s.addr = a;
-    s.gdim[0] = (cuuint64_t)(kDim / 2);
+    s.gdim[0] = (cuuint64_t)kDim;
     s.gdim[1] = (cuuint64_t)(kSegCap * kBm);
-    s.gstride[0] = (cuuint64_t)(kDim / 2);  // 行距 = K/2 字节（连续，无 pad）
-    s.box[0] = kABox;
+    s.gstride[0] = (cuuint64_t)kDim;  // 行距 = K 字节（1 B/value，连续，无 pad）
+    s.box[0] = kABoxA;
     s.box[1] = (cuuint32_t)kBm;
     s.ilv = CU_TENSOR_MAP_INTERLEAVE_NONE;
     s.swz = kSwzAB;
     s.l2 = CU_TENSOR_MAP_L2_PROMOTION_L2_128B;
     s.oob = CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE;
-    s.what = "A[SEG*BM, K/2] u8";
+    s.what = "A[SEG*BM, K] u8 e4m3";
     return s;
 }
 
@@ -316,7 +333,7 @@ TmapSpec spec_w(const void* w, int64_t w_stride, const char* what) {
     s.gdim[2] = (cuuint64_t)kE;
     s.gstride[0] = (cuuint64_t)(kDim / 2);              // 行距（K 连续）
     s.gstride[1] = (cuuint64_t)w_stride;                // expert 面 stride = block stride
-    s.box[0] = kABox;
+    s.box[0] = kABoxW;
     s.box[1] = (cuuint32_t)kNh;                         // 半块：64 行
     s.box[2] = 1;
     s.ilv = CU_TENSOR_MAP_INTERLEAVE_NONE;
@@ -462,14 +479,14 @@ __device__ __forceinline__ uint8_t tl_bs_f_pow2_to_ue8m0(float s) {
 }
 
 // ---------------------------------------------------------------------------
-// gather（每调用）：把 assignment 的 fp4 nibble 与 f32 标度搬进段缓冲，并**顺带 pack
-// 成 group-major uint32**。
-//   A[seg*BM + r][0 .. dim/2)   = xq4[assign][0 .. dim/2)      （pad 行写 0）
+// gather（每调用）：把 assignment 的 **e4m3 激活字节**与 f32 标度搬进段缓冲，并**顺带
+// pack 成 group-major uint32**。
+//   A[seg*BM + r][0 .. dim)     = xq4[assign][0 .. dim)        （pad 行写 0）
 //   SFA[g*M + seg*BM + r]       = u32(四字节 ue8m0 for k ∈ [g*128, g*128+128))
 //                                 其中第 b 字节覆盖 k ∈ [g*128 + b*32, ..+32)
 //                                 = tl_bs_f_pow2_to_ue8m0(xsc4[assign][g*4 + b])
-// 一个 block = (段, 段内行)；kThreads 个线程覆盖 dim/2 = 2560 字节 + 40 个字。
-// pad 行的 nibble 与标度都写 0（内核无 mask，脏字节会进 MMA）。
+// 一个 block = (段, 段内行)；kThreads 个线程覆盖 dim = 5120 字节 + 40 个字。
+// pad 行的 e4m3 字节（0x00 = +0.0）与标度都写 0（内核无 mask，脏字节会进 MMA）。
 //
 // `nseg` 是**指针**：host-table 入口传常驻 scratch `g_nseg`（上行一次），
 // device-table 入口直接传调用方由 `dsv41_moe_align_from_group` 写出的 `tl_nseg`。
@@ -479,7 +496,7 @@ __global__ void tl_moe_bs_gather_kernel(const uint8_t* __restrict__ xq4,
                                         const float* __restrict__ xsc4,
                                         uint8_t* __restrict__ a, uint32_t* __restrict__ sfa,
                                         const int* __restrict__ order,
-                                        const int* __restrict__ counts, int k2, int nsc,
+                                        const int* __restrict__ counts, int abytes, int nsc,
                                         int sf_words, const int* nseg) {
     const int seg = blockIdx.y;
     if (seg >= *nseg) return;
@@ -489,13 +506,13 @@ __global__ void tl_moe_bs_gather_kernel(const uint8_t* __restrict__ xq4,
     const int live = counts[seg];
     const int idx = (r < live) ? order[seg * kBm + r] : -1;
 
-    // (a) fp4 nibble（2 值/字节，与 ferrite 的打包逐字节同构 ⇒ 纯 memcpy 语义）
-    uint8_t* adst = a + (int64_t)row * k2;
+    // (a) e4m3 直读（1 B/value ⇒ `abytes == dim`，纯 memcpy 语义）
+    uint8_t* adst = a + (int64_t)row * abytes;
     if (idx < 0) {
-        for (int i = threadIdx.x; i < k2; i += kMovThreads) adst[i] = 0;
+        for (int i = threadIdx.x; i < abytes; i += kMovThreads) adst[i] = 0;
     } else {
-        const uint8_t* asrc = xq4 + (int64_t)idx * k2;
-        for (int i = threadIdx.x; i < k2; i += kMovThreads) adst[i] = asrc[i];
+        const uint8_t* asrc = xq4 + (int64_t)idx * abytes;
+        for (int i = threadIdx.x; i < abytes; i += kMovThreads) adst[i] = asrc[i];
     }
     // (b) 标度：f32 -> ue8m0，4 字节装一个字；group-major（字 g 覆盖 128 个 K）
     for (int g = threadIdx.x; g < sf_words; g += kMovThreads) {
@@ -586,7 +603,7 @@ bool tl_bs_init() {
 
     // (b) 常驻 scratch
     if (ok) {
-        ok = cudaMalloc(&g_a, (size_t)kSegCap * kBm * (kDim / 2)) == cudaSuccess &&
+        ok = cudaMalloc(&g_a, (size_t)kSegCap * kBm * kDim) == cudaSuccess &&
              cudaMalloc(&g_sfa, (size_t)kSfWords * kSegCap * kBm * 4) == cudaSuccess &&
              cudaMalloc(&g_c, (size_t)kSegCap * kBm * kNup * 4) == cudaSuccess &&
              cudaMalloc(&g_eid, kSegCap * sizeof(int)) == cudaSuccess &&
@@ -633,7 +650,7 @@ void bs_init_failed_note(int rows, int dim, int inter) {
 // 本臂不接受 `DSV41_EXPERT_ILV`（交错布局把 w1/w3 混在一个区域里，w1 指针不再是一个
 // 干净的 [NP, K/2] 面）—— 交错时由调用方 decline（见 wiring §5，与 bf16 臂同一条互斥）。
 extern "C" int dsv41_moe_tilelang_gate_up_bs(
-    const uint8_t* xq4,      // [rows*topk][dim/2] u8 —— routed 的 fp4 打包激活（行距 dim/2）
+    const uint8_t* xq4,      // [rows*topk][dim] u8 —— routed 的 **e4m3** 激活（行距 dim）
     const float* xsc4,       // [rows*topk][dim/32] f32 —— routed 的 per-(row,32) 标度
     float* out,              // [rows][topk][2*inter] f32（RAW gate‖up；swiglu 仍走既有 pass）
     const void* w1,          // u8 [E, NP, K/2]（expert 0 的面；expert e 在 base + e*w_stride）
@@ -714,7 +731,7 @@ extern "C" int dsv41_moe_tilelang_gate_up_bs(
 
     // (1) gather + 激活 SF pack：fp4 nibble + f32 标度 -> ue8m0 group-major u32
     tl_moe_bs_gather_kernel<<<dim3((unsigned)kBm, (unsigned)kSegCap), kMovThreads, 0, s>>>(
-        xq4, xsc4, g_a, g_sfa, g_order, g_counts, kDim / 2, kDim / 32, kSfWords, g_nseg);
+        xq4, xsc4, g_a, g_sfa, g_order, g_counts, kDim, kDim / 32, kSfWords, g_nseg);
     e = cudaGetLastError();
     if (e != cudaSuccess) return (int)e;
 
@@ -765,7 +782,7 @@ extern "C" int dsv41_moe_tilelang_gate_up_bs(
 // 旧入口保留为 A/B 基线：同一 `ARMED` 回执格式，便于逐行对比两条臂。
 // ===========================================================================
 extern "C" int dsv41_moe_tilelang_gate_up_bs_dev(
-    const uint8_t* xq4,      // [rows*topk][dim/2] u8 —— routed 的 fp4 打包激活（行距 dim/2）
+    const uint8_t* xq4,      // [rows*topk][dim] u8 —— routed 的 **e4m3** 激活（行距 dim）
     const float* xsc4,       // [rows*topk][dim/32] f32 —— routed 的 per-(row,32) 标度
     float* out,              // [rows][topk][2*inter] f32（RAW gate‖up；swiglu 仍走既有 pass）
     const void* w1,          // u8 [E, NP, K/2]（expert 0 的面；expert e 在 base + e*w_stride）
@@ -837,7 +854,7 @@ extern "C" int dsv41_moe_tilelang_gate_up_bs_dev(
 
     // (1) gather + 激活 SF pack：fp4 nibble + f32 标度 -> ue8m0 group-major u32
     tl_moe_bs_gather_kernel<<<dim3((unsigned)kBm, (unsigned)kSegCap), kMovThreads, 0, s>>>(
-        xq4, xsc4, g_a, g_sfa, order_dev, counts_dev, kDim / 2, kDim / 32, kSfWords, nseg_dev);
+        xq4, xsc4, g_a, g_sfa, order_dev, counts_dev, kDim, kDim / 32, kSfWords, nseg_dev);
     cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) return (int)e;
 
@@ -873,5 +890,20 @@ extern "C" int dsv41_moe_bs_pack_wsf(const void* src, void* dst, int rows, int k
         reinterpret_cast<const uint8_t*>(src), reinterpret_cast<uint32_t*>(dst), rows, nsc,
         sf_words);
     return (int)cudaGetLastError();
+}
+
+// ===========================================================================
+// §8 导出符号 3：能力符号 —— A operand = **e4m3 激活**
+// ===========================================================================
+// D2 修复把 `xq4` 的**语义**从「packed fp4 半字节（dim/2 B/行）」改成「e4m3
+// （dim B/行）」，但 **C ABI 的形状没变**（还是 `const uint8_t*` + 同样的形参序）
+// ⇒ 旧 `.so` 会**静默**把 5120 B 的行当 2560 B 的 fp4 读（错值，不是报错）。
+// Rust 侧用一个能力探针把这个语义版本钉死（先例：`dsv41_expert_act_e4m3_cap`）：
+//   * 带本符号的 `.so` ⇒ 激活按 e4m3 喂（Rust 的 `supports_moe_bs_act_e4m3`）；
+//   * 不带 ⇒ 探针为 None，`DSV41_MOE_TILELANG_BS` 臂**不 arm**（报一声），
+//     而不会把 e4m3 字节喂给一个 fp4 内核。
+// 没有这一条，D2 就是一个静默错值面。
+extern "C" int dsv41_moe_bs_act_e4m3_cap(void) {
+    return 1;  // A operand = e4m3 激活（1 B/value）
 }
 #endif

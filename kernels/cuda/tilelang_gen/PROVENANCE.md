@@ -481,6 +481,28 @@ scp ubuntu@43.202.208.136:'~/tl_bs/aot_gen/*' kernels/cuda/tilelang_gen/
 运行期 `dsv41_moe_tilelang_gate_up_bs` 会在 tensormap 编码处 decline（返回 2 ⇒ 安全回退
 老路径，**不是**错值）。
 
+---
+
+### 9.5 D2 精度修复：A operand e2m1 → **e4m3**（2026-09-13，工部）
+
+> 设计 + 逐项改动：`docs/agent/moe-bs-e4m3-activation-design.md`。
+> 重生成/验收命令清单：本目录 `REGEN-E4M3.md`（**给主 agent 的远端执行清单**）。
+> 红线：官方 DeepSeek-V4.1 的 routed 激活是 `act_quant(fp8_block_size=32, ue8m0)` 的
+> **e4m3**，权重才是 MXFP4 e2m1；本臂此前把两侧都当 e2m1，**激活少 4 bit 位宽**。
+
+| 文件 | 性质 | 改了什么 |
+|---|---|---|
+| `kernels/tilelang/gen_moe_bs_aot.py` | 手改 | `A: T.Tensor((M,K), T.float8_e4m3fn)`；`A_sh = alloc_shared(..., T.float8_e4m3fn)`（不再是 `float4_e2m1_unpacked`）；config 增 D2 审计段（idesc/tx/模板/行距） |
+| `moe_bs_up_tl.cu` + `_host.cu` + `moe_bs_tl_config.txt` | **生成物（待重生成）** | 预期 diff 见 §2.2 的 5 项审计清单；`idesc 144709248 → 144708608` |
+| `moe_bs_shim.cu` | 手改 | `kABox` 分家（`kABoxA = BK` / `kABoxW = BK/2`）；`spec_a` 的 `gdim[0]=gstride[0]=K`、`box[0]=BK`；gather 的 `k2 → abytes`（e4m3 直读）；`g_a = SEG_CAP*BM*K`（23.6 MB）；**新增能力符号 `dsv41_moe_bs_act_e4m3_cap`** |
+| `crates/ferrite-models/src/dsv41/device.rs` | 手改 | `moe_bs_act_e4m3_cap` 字段 + `ko!` 注册；`supports_moe_tilelang_bs()` 纳入该 cap；新增 `supports_moe_bs_act_e4m3()`；`xq4` 文档改 e4m3 |
+| `crates/ferrite-models/src/dsv41/chain_dev.rs` | 手改 | `moe_tilelang_bs_ready`：`!(e4m3 && cap)` → **`e4m3 && caps`**（臂现在**要求** e4m3 激活）；REFUSED 文案同步 |
+
+**不许改的**：W1/W3/SFW 的读取与 pack（权重仍是 packed e2m1 + ue8m0）、SFA/SFW 布局、
+`gran`、BM/BN/BK/stages/threads/grid、`kSmem=202752`、down（w2）臂。
+**旧 `.so` 的静默错值面**由 `dsv41_moe_bs_act_e4m3_cap` 关掉（`xq4` 的语义变了但 C ABI
+形状没变 ⇒ 没有这个符号就**不 arm** 该臂）。
+
 
 
 

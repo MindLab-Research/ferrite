@@ -1499,17 +1499,22 @@ struct Kernels {
     moe_tilelang_down_bf16_dev: Option<
         unsafe extern "C" fn(*const f32, *mut f32, *const c_void, *const c_int, *const c_int, *const c_int, *const c_int, c_int, c_int, c_int, c_int, c_int, CuStream) -> c_int,
     >,
-    /// TILELANG MoE block-scaled arm — the **native fp4** up (gate‖up) grouped GEMM
-    /// (`DSV41_MOE_TILELANG_BS`, default OFF; mutually exclusive with
+    /// TILELANG MoE block-scaled arm — the **native fp4 weights** up (gate‖up) grouped
+    /// GEMM (`DSV41_MOE_TILELANG_BS`, default OFF; mutually exclusive with
     /// `DSV41_MOE_TILELANG`). Unlike the bf16 arm this one reads the loader's fp4
     /// pool and its e8m0 scales **as-is** (zero dequant, zero bf16 copy), which is
     /// the whole point: it does not need `DSV41_MOE_BF16_DEQUANT` and its
     /// `+105 GiB/rank` bf16 mirror. Args:
     /// `(xq4, xsc4, out, w1, w3, sfw1, sfw3, eid, order, counts, nseg, w_stride,
-    ///   rows, dim, inter, topk, stream)` — `xq4`/`xsc4` are the routed fp4
-    /// activations (`[rows*topk][dim/2]` packed e2m1 and `[rows*topk][dim/32]` f32
-    /// scales), `w1`/`w3` the expert pool's gate/up planes, `sfw1`/`sfw3` the
-    /// LOAD-TIME group-major packed scale words (see [`Self::moe_bs_pack_wsf`]).
+    ///   rows, dim, inter, topk, stream)` — ⚠️ `xq4` is the **e4m3** activation
+    /// (`[rows*topk][dim]`, ONE byte per value — the official DeepSeek-V4.1
+    /// `act_quant(fp8_block_size=32)` form the D2 fix adopted; it was packed e2m1
+    /// `[dim/2]` before 2026-09-13) and `xsc4` its `[rows*topk][dim/32]` f32
+    /// scales. `w1`/`w3` the expert pool's gate/up planes (still packed fp4),
+    /// `sfw1`/`sfw3` the LOAD-TIME group-major packed scale words (see
+    /// [`Self::moe_bs_pack_wsf`]). The activation's byte layout is versioned by
+    /// the `dsv41_moe_bs_act_e4m3_cap` symbol (see
+    /// [`Self::supports_moe_bs_act_e4m3`]) because the C ABI shape did not change.
     /// `w_stride` is the **measured per-expert block stride** in bytes (the pool
     /// packs each expert as one 128 B aligned six-plane block, so consecutive
     /// experts' `w1` are a whole block apart — NOT `NP*K/2`); it becomes the
@@ -1579,6 +1584,15 @@ struct Kernels {
     /// `2 * n_routed` times per layer at load (see `load.rs`).
     moe_bs_pack_wsf:
         Option<unsafe extern "C" fn(*const c_void, *mut c_void, c_int, c_int, CuStream) -> c_int>,
+    /// Capability marker for the block-scaled arm's **e4m3 A operand**
+    /// (`dsv41_moe_bs_act_e4m3_cap`, `tilelang_gen/moe_bs_shim.cu` §8). The D2 fix
+    /// (2026-09-13) changed `xq4`'s MEANING from packed fp4 nibbles (`dim/2` B/row)
+    /// to e4m3 (`dim` B/row) **without changing its C ABI shape**, so a stale `.so`
+    /// would silently decode 5120 B rows as 2560 B of fp4 — a wrong answer, not a
+    /// fault. OPTIONAL on the same terms as `expert_act_e4m3_cap`: only the
+    /// e4m3-activation build exports it, so a stale `.so` keeps the arm OFF
+    /// (reported once) instead of feeding e4m3 bytes to an fp4 kernel.
+    moe_bs_act_e4m3_cap: Option<unsafe extern "C" fn() -> c_int>,
     moe_down_reduce: Option<unsafe extern "C" fn(*const f32, *mut f32, c_int, c_int, CuStream) -> c_int>,
     /// `dsv41_moe_down_reduce_st` (A1a): the same fixed-order sum, whose epilogue
     /// also copies `out` into every peer's staging slot (carries the following
@@ -2252,6 +2266,7 @@ impl Device {
             moe_tilelang_gate_up_bs: ko!(rt, "dsv41_moe_tilelang_gate_up_bs"),
             moe_tilelang_gate_up_bs_dev: ko!(rt, "dsv41_moe_tilelang_gate_up_bs_dev"),
             moe_bs_pack_wsf: ko!(rt, "dsv41_moe_bs_pack_wsf"),
+            moe_bs_act_e4m3_cap: ko!(rt, "dsv41_moe_bs_act_e4m3_cap"),
             w2_l2_prewarm: ko!(rt, "dsv41_w2_l2_prewarm"),
             swiglu_limit_batched: ko!(rt, "dsv41_swiglu_limit_batched"),
             ar_reduce: ko!(rt, "dsv41_ar_reduce"),
@@ -7793,20 +7808,24 @@ impl Device {
         Ok(true)
     }
 
-    /// TILELANG MoE block-scaled arm — up (gate‖up), the **native fp4** path
+    /// TILELANG MoE block-scaled arm — up (gate‖up), the **native fp4 weights** path
     /// (`DSV41_MOE_TILELANG_BS`; mutually exclusive with `DSV41_MOE_TILELANG`).
     ///
-    /// Fires the shim's three-launch sequence (gather fp4 + pack the activation SF →
-    /// block-scaled grouped MMA → scatter) and writes the **RAW gate‖up**
+    /// Fires the shim's three-launch sequence (gather the e4m3 activation + pack its
+    /// SF → block-scaled grouped MMA → scatter) and writes the **RAW gate‖up**
     /// `[rows][topk][2*inter]` layout into `out`, exactly the layout
     /// `dsv41_expert_gate_up_fp4_batched` writes when swiglu is NOT fused, so the
     /// existing separate swiglu pass still applies.
     ///
     /// `xq4`/`xsc4` are the **already-quantised** routed activations (`[rows*topk]`
-    /// slots of `dim/2` packed e2m1 bytes and `dim/32` f32 scales — the same buffers
-    /// the proven batched launch reads), `w1`/`w3` are the expert pool's gate/up
-    /// planes and `sfw1`/`sfw3` the load-time packed group-major scale words. No
-    /// bf16 copy is involved, so `DSV41_MOE_BF16_DEQUANT` is NOT a precondition.
+    /// slots of `dim` **e4m3** bytes — one byte per value, the official
+    /// `act_quant(fp8_block_size=32)` form — and `dim/32` f32 scales; the same
+    /// buffers the proven batched launch reads when `DSV41_EXPERT_ACT_E4M3=1`),
+    /// `w1`/`w3` are the expert pool's gate/up planes (still packed fp4) and
+    /// `sfw1`/`sfw3` the load-time packed group-major scale words. No bf16 copy is
+    /// involved, so `DSV41_MOE_BF16_DEQUANT` is NOT a precondition. The activation
+    /// format is versioned by `dsv41_moe_bs_act_e4m3_cap` — see
+    /// [`Self::supports_moe_bs_act_e4m3`].
     ///
     /// Returns `Ok(false)` on `rc == 2` (DECLINED) so the caller keeps the proven
     /// SIMT launch, and an `Err` on any other non-zero rc.
@@ -7868,6 +7887,10 @@ impl Device {
     ///
     /// `Ok(false)` on `rc == 2` (declined: shape/alignment, TMA init failure, or
     /// INIT not done); `Err` on any other rc.
+    ///
+    /// The operand contract is identical, including the activation format
+    /// (`xq4` = `[rows*topk][dim]` u8 **e4m3**, one byte per value) — see
+    /// [`Self::moe_tilelang_gate_up_bs`].
     ///
     /// `w_stride` is the measured per-expert **block stride** in bytes — the
     /// `gstride[1]` of the W1/W3 TMA descriptors, same contract as
@@ -7952,11 +7975,33 @@ impl Device {
             && self.kernels.moe_tilelang_down_bf16_dev.is_some()
     }
 
-    /// True when the `.so` carries the block-scaled (native fp4) MoE arm AND its
-    /// load-time SF repack. `DSV41_MOE_TILELANG_BS` must stay OFF (and be reported)
-    /// without both — the same build-vs-runtime split as every other arm here.
+    /// True when the `.so` carries the block-scaled (native fp4 weights) MoE arm,
+    /// its load-time SF repack **and** the e4m3-activation capability marker
+    /// ([`Self::supports_moe_bs_act_e4m3`]). `DSV41_MOE_TILELANG_BS` must stay OFF
+    /// (and be reported) without all three — the same build-vs-runtime split as
+    /// every other arm here. The capability marker is part of the SET on purpose:
+    /// the arm's `xq4` argument changed meaning (packed fp4 → e4m3) without
+    /// changing its ABI shape, so a `.so` predating the D2 fix would read e4m3
+    /// bytes as fp4 nibbles — a SILENT wrong answer. Probing it here keeps the arm
+    /// off instead of measuring garbage.
     pub fn supports_moe_tilelang_bs(&self) -> bool {
-        self.kernels.moe_tilelang_gate_up_bs.is_some() && self.kernels.moe_bs_pack_wsf.is_some()
+        self.kernels.moe_tilelang_gate_up_bs.is_some()
+            && self.kernels.moe_bs_pack_wsf.is_some()
+            && self.kernels.moe_bs_act_e4m3_cap.is_some()
+    }
+
+    /// True when the block-scaled shim's A operand is the **e4m3** activation
+    /// (`dsv41_moe_bs_act_e4m3_cap`, `tilelang_gen/moe_bs_shim.cu` §8).
+    ///
+    /// The D2 fix (2026-09-13) changed `xq4`'s semantics from packed fp4 nibbles
+    /// (`dim/2` B/row) to e4m3 (`dim` B/row) while leaving the C ABI shape (a
+    /// `const uint8_t*` in the same position) untouched, so a stale `.so` would
+    /// silently decode 5120 B rows as 2560 B of fp4. This probe is the same
+    /// device-vs-runtime gate as [`Self::supports_expert_act_e4m3`]; it is exposed
+    /// separately so an arm that declines can name WHICH half is missing. The set
+    /// probe [`Self::supports_moe_tilelang_bs`] includes it too.
+    pub fn supports_moe_bs_act_e4m3(&self) -> bool {
+        self.kernels.moe_bs_act_e4m3_cap.is_some()
     }
 
     /// True when the block-scaled arm's **device-table** set is present: the

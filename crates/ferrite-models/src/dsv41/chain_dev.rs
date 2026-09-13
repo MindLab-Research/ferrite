@@ -16450,9 +16450,14 @@ impl<'a> DevChain<'a> {
     ///     doubled interleaved region, so `w1` is not a clean `[NP, K/2]` gate plane
     ///     and the shim would read interleaved bytes as one — a SILENT wrong answer,
     ///     not a fault (the loader refuses to build the SF pool then either);
-    ///   * the activation must be PACKED fp4: the shim's gather reads `xq4`/`xsc4`
-    ///     as e2m1 nibbles + per-32 f32 scales, so an `DSV41_EXPERT_ACT_E4M3`
-    ///     activation (one byte per value) would be decoded as fp4 — again silent;
+    ///   * the activation must be **e4m3** (`DSV41_EXPERT_ACT_E4M3=1`, one byte per
+    ///     value): since the D2 fix the shim's gather reads `xq4`/`xsc4` as e4m3
+    ///     bytes + per-32 f32 scales, so the two directions of the mismatch are
+    ///     both silent (e4m3 bytes decoded as fp4 nibbles, or vice versa) and both
+    ///     are gated here — `expert_act_e4m3()`/`supports_expert_act_e4m3()` for the
+    ///     producer, and the shim's `dsv41_moe_bs_act_e4m3_cap` probe
+    ///     ([`Dev::supports_moe_bs_act_e4m3`] via [`Dev::supports_moe_tilelang_bs`])
+    ///     for the consumer's A-operand format;
     ///   * the **device-table set** must be present
     ///     ([`Dev::supports_moe_tilelang_bs_dev`]: the device-side `moe_align` plus
     ///     `dsv41_moe_tilelang_gate_up_bs_dev`). The arm consumes the device tables
@@ -16492,7 +16497,15 @@ impl<'a> DevChain<'a> {
             && self.dev.supports_moe_tilelang_bs()
             && self.dev.supports_moe_tilelang_bs_dev()
             && !ld.experts_ilv
-            && !(expert_act_e4m3() && self.dev.supports_expert_act_e4m3())
+            // D2 (2026-09-13): the shim's A operand is **e4m3** now, so the arm
+            // REQUIRES the e4m3 activation (the pre-D2 arm required the opposite).
+            // The producer side is `expert_act_e4m3()` + its capability symbol; the
+            // consumer side is the shim's own format marker — already inside
+            // `supports_moe_tilelang_bs()`, and repeated here so a decline names
+            // which half of the format is missing.
+            && expert_act_e4m3()
+            && self.dev.supports_expert_act_e4m3()
+            && self.dev.supports_moe_bs_act_e4m3()
             && n_routed == 384
             && dim == 5120
             && inter_local == 320
@@ -16980,9 +16993,11 @@ impl<'a> DevChain<'a> {
             let mut bs_gu = false;
             if crate::dsv41::weights::moe_tilelang_bs() && !bs_ready {
                 Self::moe_bs_skipped_note(
-                    "the step is outside the arm's domain (an INTERLEAVED pool, an e4m3 \
-                     activation, a frozen-shape mismatch, or the .so lacks the blockscaled shim / \
-                     its load-time SF pack / the device-table set)",
+                    "the step is outside the arm's domain (an INTERLEAVED pool, an activation \
+                     that is not e4m3 — `DSV41_EXPERT_ACT_E4M3=1` is the arm's precondition \
+                     since the D2 fix, a frozen-shape mismatch, or the .so lacks the \
+                     blockscaled shim / its load-time SF pack / its e4m3-A-operand marker \
+                     (dsv41_moe_bs_act_e4m3_cap) / the device-table set)",
                     true,
                 );
             } else if bs_ready && !grp_gu {
@@ -20750,9 +20765,10 @@ fn oracle_tap() -> bool {
                 // ---- TILELANG BLOCK-SCALED (DSV41_MOE_TILELANG_BS), eager side -----
                 // The `rows == 1` twin of the arm in `moe_rows`: the SAME gate, the
                 // SAME device tables (`dsv41_route_group` + `dsv41_moe_align_from_group`)
-                // and the SAME `_dev` shim. It reads the single row's packed fp4
-                // activation (`xq4`/`xsc4`) and the experts' native fp4 planes plus their
-                // load-time packed ue8m0 words, and writes the RAW gate‖up layout into
+                // and the SAME `_dev` shim. It reads the single row's **e4m3**
+                // activation (`xq4`/`xsc4`, 1 B/value) and the experts' native fp4
+                // planes plus their load-time packed ue8m0 words, and writes the RAW
+                // gate‖up layout into
                 // `ex_act_b` — exactly the `rows == 1` instance of the multi-row
                 // layout, so the two call sites are bit-for-bit the same computation.
                 // Mutually exclusive with the bf16 arm below; this one WINS when both
@@ -20761,9 +20777,11 @@ fn oracle_tap() -> bool {
                 let mut bs_gu = false;
                 if crate::dsv41::weights::moe_tilelang_bs() && !bs_ready {
                     Self::moe_bs_skipped_note(
-                        "the step is outside the arm's domain (an INTERLEAVED pool, an e4m3 \
-                         activation, a frozen-shape mismatch, or the .so lacks the blockscaled \
-                         shim / its load-time SF pack / the device-table set)",
+                        "the step is outside the arm's domain (an INTERLEAVED pool, an activation \
+                         that is not e4m3 — `DSV41_EXPERT_ACT_E4M3=1` is the arm's precondition \
+                         since the D2 fix, a frozen-shape mismatch, or the .so lacks the \
+                         blockscaled shim / its load-time SF pack / its e4m3-A-operand marker \
+                         (dsv41_moe_bs_act_e4m3_cap) / the device-table set)",
                         true,
                     );
                 } else if bs_ready {

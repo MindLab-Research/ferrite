@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-# gen_moe_bs_aot.py — 从 tcgen05 BLOCK-SCALED（mxfp4: e2m1 + ue8m0）MoE-up 原型
+# gen_moe_bs_aot.py — 从 tcgen05 BLOCK-SCALED（A = fp8 e4m3 激活 × B = fp4 e2m1 权重，
+# ue8m0 per-32 标度）MoE-up 原型
 # 冻结出 ferrite 生产可链接的 AOT CUDA 源码，供
 # `kernels/cuda/tilelang_gen/moe_bs_shim.cu` 合入 ferrite 的 nvcc 构建。
 #
@@ -37,10 +38,18 @@
 #    * 激活 SF：**每次调用**在 shim 的 gather kernel 里 pack（`SFA: [sf_words*M]`），
 #      因为它每步都变（`xsc4_r` 是 f32 幂次标度，gather 顺带做 f32→ue8m0 的位转换）。
 # 4. **ABI 是 TMA 描述符形态**（TileLang 默认 lowering，见 §3）。裸指针 ABI
-#    （`TL_DISABLE_TMA_LOWER`）**走不通**：blockscaled 的 A/B smem 必须是
+#    （`TL_DISABLE_TMA_LOWER`）**走不通**：blockscaled 的 **B** smem 必须是
 #    `float4_e2m1_unpacked`（packed smem 静默错值，原型 §4.1），而
 #    packed-global → unpacked-smem 这个「展开」只有 TMA 的 tensor 形式能做
 #    （`copy_analysis.cc:539`）。⇒ host 必须 `cuTensorMapEncodeTiled`。
+#    （A 侧自 D2 修复起是 e4m3，天然 1 B/元素 ⇒ 这条「展开」对 A 整体消失；
+#      B 仍需要它，所以 TMA 形态与 `cuTensorMapEncodeTiled` 一概不变。）
+# 5. **A operand 是 fp8 e4m3**（D2 精度修复，2026-09-13）：官方 DeepSeek-V4.1 的
+#    routed 激活是 `act_quant(fp8_block_size=32, ue8m0)` 的 **e4m3**，权重才是
+#    MXFP4 e2m1；本臂此前把两侧都当 e2m1，激活整整少 4 bit 位宽。设计记录：
+#    `docs/agent/moe-bs-e4m3-activation-design.md`。**W1/W3/SFW 一字未改**
+#    （权重仍是 packed fp4 + ue8m0）。副产物：A 的 `VERIFY #1`（box 首维字节 vs
+#    元素）在 A 上**自动消解**（1 元素 = 1 字节），只剩 W 那一侧仍是 packed 字节视图。
 #
 # =============================================================================
 # 1. 为什么 B_sh 要拆两半（ferrite 池布局的硬约束）
@@ -80,7 +89,7 @@
 #   目标：`[E, sf_words * NP]` uint32，`word[g*NP + row] = u32(src[row*160 + g*4 .. +4])`。
 #   一次转换、逐字节搬运、不解释数值 ⇒ **无损且与原型逐位一致**。
 # 激活 pack（**每调用**，shim 的 gather kernel）：
-#   源：`xq4_r`（[m, dim/2] u8 打包 e2m1）与 `xsc4_r`（[m, dim/32] **f32** 标度）；
+#   源：`xq4_r`（[m, dim] u8 **e4m3**，1 B/value）与 `xsc4_r`（[m, dim/32] **f32** 标度）；
 #   目标：`SFA[g*M + seg*BM + r]`，`u32 = b0 | b1<<8 | b2<<16 | b3<<24`，其中
 #       `bb = f_pow2_to_ue8m0(xsc4_r[assign, g*4 + j])`
 #       = `(bits(x) >> 23) - 127 + 127`（`fast_round_scale6` 的输出是 2 的幂，
@@ -237,11 +246,11 @@ STAGES_DEFAULT = 6    # 原型实测最优（stg=8 超 228KB smem）
 @tilelang.jit(out_idx=[-1])
 def moe_bs_up(NSEG, BM, NP_, K, E_, BN, BK, NH, threads=THREADS, stages=STAGES_DEFAULT,
               gran=GRAN):
-    """grouped block-scaled fp4 (e2m1+ue8m0) up-GEMM，tcgen05 1-CTA，显式 async。
+    """grouped block-scaled (A e4m3 / B e2m1, ue8m0) up-GEMM，tcgen05 1-CTA，显式 async。
 
     grid (N_UP/BN, NSEG)；每个 CTA 认领一个 (expert 段, N-tile)。
 
-    A   : [NSEG*BM, K]        float4_e2m1fn  packed，段内行已 gather + BM-padding
+    A   : [NSEG*BM, K]        float8_e4m3fn  段内行已 gather + BM-padding（行距 K 字节）
     W1  : [E_, NP_, K]        float4_e2m1fn  gate 面（K 连续，行距 K/2）
     W3  : [E_, NP_, K]        float4_e2m1fn  up 面
     SFA : [sf_words * NSEG*BM] uint32        每调用 pack（group-major）
@@ -281,7 +290,7 @@ def moe_bs_up(NSEG, BM, NP_, K, E_, BN, BK, NH, threads=THREADS, stages=STAGES_D
     # 收到一个 **PrimFunc 对象**而不是 Python 函数 ⇒
     # `TypeError: ... is not a callable object`。原型的 `k_up_bs` 就是这个形态。
     @T.prim_func
-    def main(A: T.Tensor((M, K), T.float4_e2m1fn),
+    def main(A: T.Tensor((M, K), T.float8_e4m3fn),
              W1: T.Tensor((E_, NP_, K), T.float4_e2m1fn),
              W3: T.Tensor((E_, NP_, K), T.float4_e2m1fn),
              SFA: T.Tensor((sf_words * M,), T.uint32),
@@ -290,8 +299,9 @@ def moe_bs_up(NSEG, BM, NP_, K, E_, BN, BK, NH, threads=THREADS, stages=STAGES_D
              Eid: T.Tensor((NSEG,), "int32"),
              C: T.Tensor((M, 2 * NP_), "float32")):
         with T.Kernel(GRID_X, NSEG, threads=threads) as (bx, by):
-            # smem dtype 必须是 unpacked（packed 会静默错值，原型 §4.1）
-            A_sh = T.alloc_shared((stages, BM, BK), T.float4_e2m1_unpacked)
+            # smem dtype：B 必须是 unpacked（packed 会静默错值，原型 §4.1）；
+            # A 是 e4m3 ⇒ 天然 1 B/元素，不需要（也没有）`_unpacked` 形态。
+            A_sh = T.alloc_shared((stages, BM, BK), T.float8_e4m3fn)
             B_sh = T.alloc_shared((stages, BN, BK), T.float4_e2m1_unpacked)
             SFA_sh = T.alloc_shared((stages, BM), "uint32")
             SFW_sh = T.alloc_shared((stages, BN), "uint32")
@@ -454,11 +464,12 @@ def main():
     with open(f"{args.outdir}/moe_bs_up_tl.banner", "w") as f:
         f.write(_banner("moe_bs_up_tl.cu", sha, len(src)))
 
-    # smem 预算（unpacked fp4 = 1 B/元素；C_sh 与 TMA 缓冲共享生命周期，按峰值估）
-    smem_fp4 = ST * (BM * BK + BN * BK)
+    # smem 预算（A = e4m3、B = unpacked e2m1，两者都是 1 B/元素 ⇒ A/B 同名同量；
+    # C_sh 与 TMA 缓冲共享生命周期，按峰值估）
+    smem_ab = ST * (BM * BK + BN * BK)
     smem_sf = ST * (BM + BN) * 4
     smem_c = BM * BN * 4
-    smem_total = smem_fp4 + smem_sf + smem_c
+    smem_total = smem_ab + smem_sf + smem_c
     host_src_note = (
         "moe_bs_up_tl_host.cu"
         if host
@@ -466,7 +477,7 @@ def main():
     )
     sig = [l for l in src.splitlines() if "main_kernel" in l and "__global__" in l]
     lines = [
-        "# MoE tcgen05 block-scaled (mxfp4: e2m1 + ue8m0) up-GEMM AOT config",
+        "# MoE tcgen05 block-scaled (A e4m3 / B e2m1, ue8m0) up-GEMM AOT config",
         "# GENERATED by gen_moe_bs_aot.py — the shim's constants are read off THIS file.",
         f"is_tcgen05_fix=verified-in-source ({reason})",
         f"E={E} DIM={DIM} INTER={INTER} NP={NP} N_UP={N_UP} SEG_CAP={SEG_CAP} "
@@ -474,7 +485,7 @@ def main():
         f"BM={BM} BN={BN} BK={BK} NH={NH} threads={THREADS} stages={ST} gran={gran}",
         f"sf_words={sf_words} sf_period={gran * 4 // BK} k_iters={DIM // BK}",
         f"grid=({grid_x}, {SEG_CAP})",
-        f"smem_bytes={smem_total} (fp4 {smem_fp4} + sf {smem_sf} + c {smem_c})",
+        f"smem_bytes={smem_total} (ab {smem_ab} + sf {smem_sf} + c {smem_c})",
         f"raw_sha256(up)={sha}",
         f"up_cu_bytes={len(src)}",
         f"host_source={host_src_note}",
@@ -484,14 +495,21 @@ def main():
         "",
         "# ---- tensormap operands (authoritative recipe = moe_bs_up_tl_host.cu) ----",
         "# kind=tma tensors, in the order TileLang will pass them:",
-        "#   A     [M, K]            fp4 packed (row stride K/2 B)  swizzle from the dump",
-        "#   W1    [E, NP, K]        fp4 packed (row stride K/2 B, expert stride NP*K/2)",
+        "#   A     [M, K]            e4m3 (row stride K B = 5120, 1 B/value)  swizzle from the dump",
+        "#   W1    [E, NP, K]        fp4 packed (row stride K/2 B, expert stride = measured block)",
         "#   W3    [E, NP, K]        same",
         "#   SFA   [sf_words*M]      uint32 (1-D)",
         "#   SFW1  [E, sf_words*NP]  uint32 (2-D: expert x word)",
         "#   SFW3  [E, sf_words*NP]  uint32 (2-D)",
         "#   Eid   [NSEG]            int32  (plain, no TMA)",
         "#   C     [M, 2*NP]         f32    (TMA store; row stride 2*NP*4 B)",
+        "",
+        "# ---- D2 (A=e4m3) audit values -- mechanically compare with the NEW dump ----",
+        "#   idesc_blockscaled=144708608 (0x08A01400): a_format=0 E4M3, b_format=5 E2M1, K32, E8M0",
+        "#     (was 144709248 / 0x08A01680 = a_format=5 E2M1 with the old packed-fp4 A)",
+        "#   a_tma_bytes_per_k_iter=16384 (BM*BK*1 B; was 8192 = BM*BK/2 with the packed fp4 A)",
+        "#   mma_template=tcgen05mma_blockscaled_ss<tl::DataType::kFloat8_e4m3,false>",
+        "#   a_row_stride_bytes=5120 (= DIM, 1 B/value; was 2560 = DIM/2)",
         "",
         "# ---- host-side layout contract (frozen in the POOL, not in this dump) ----",
         f"#   w1 plane: [{NP}, {DIM // 2}] u8   row pitch {DIM // 2} B (continuous, 16B ok)",
