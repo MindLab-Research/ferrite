@@ -43,6 +43,14 @@ import tilelang.language.gemm_op as _gemm_op
 # The body is otherwise correct; re-exec it with the one missing annotation.
 # (Upstream main has the identical omission -- verified against
 #  raw.githubusercontent.com/tile-ai/tilelang/{v0.1.14,main}/tilelang/language/gemm_op.py.)
+#
+# ⚠️ HISTORICAL (2026-09-13). The re-exec below is the PROTOTYPE's original
+# workaround and is kept only because this file is the research artifact the
+# certified numbers came from. It is **superseded**: the production path fixes
+# the library SOURCE instead (kernels/tilelang/vendor/, idempotent applier +
+# AST verification), and kernels/tilelang/gen_moe_bs_aot.py no longer injects
+# anything -- it refuses to run until the installed tilelang carries the fix.
+# User verdict: no hacks, no runtime patching.
 # ---------------------------------------------------------------------------
 _SRC = textwrap.dedent(inspect.getsource(_gemm_op.tcgen05_gemm_blockscaled))
 _NEEDLE = 'ann["sf_b_granularity_k"] = int(sf_b_granularity_k)'

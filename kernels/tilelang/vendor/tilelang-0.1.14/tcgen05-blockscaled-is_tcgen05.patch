@@ -1,0 +1,44 @@
+Upstream fix: `T.tcgen05_gemm_blockscaled()` never sets `ann["is_tcgen05"] = 1`.
+
+Without it `cuda::Gemm::SelectInst` (tilelang `src/cuda/op/gemm.cc`, the
+`isTcgen05_` branch) never fires, so a blockscaled GEMM whose SFA/SFB regions
+are defined falls through to the "SFA/SFB present => this must be the SM120
+NVF4 `mma.sync` path" branch and hard-fails on every Blackwell tcgen05 target:
+
+    InternalError: T.mma_gemm_blockscaled() requires an SM120 CUDA target,
+        but got target={..., "arch":"sm_103a"}
+
+`T.tcgen05_gemm()` sets the same annotation three lines above the omission
+(gemm_op.py:278 in v0.1.14), so this is a one-line omission, not a design
+difference. The function body is otherwise correct.
+
+Target:   tilelang v0.1.14 `tilelang/language/gemm_op.py`
+          pristine sha256 = c775813d5635e39a81df4b45a074f890895032f54d8b696b94b016d50e6426fa
+          (627 lines, from https://raw.githubusercontent.com/tile-ai/tilelang/v0.1.14/tilelang/language/gemm_op.py)
+Status:   NOT fixed upstream as of `main` either — verified against
+          https://raw.githubusercontent.com/tile-ai/tilelang/main/tilelang/language/gemm_op.py
+          (that revision also has `ann["is_tcgen05"] = 1` in `tcgen05_gemm()` only).
+Apply:    kernels/tilelang/vendor/apply_tilelang_patch.py   (idempotent; AST-verified)
+          or, by hand, from the tilelang package root's parent:
+              patch -p1 --forward < .../tcgen05-blockscaled-is_tcgen05.patch
+
+Post-fix sha256 of the patched v0.1.14 file (patch route, 635 lines):
+    9736412fa6191d021e093c7de47487c51d02971a68c9b5bc11224d2cffe016a7
+
+--- a/tilelang/language/gemm_op.py
++++ b/tilelang/language/gemm_op.py
+@@ -355,6 +355,14 @@
+     ann["sf_a_granularity_k"] = int(sf_a_granularity_k)
+     ann["sf_b_granularity_k"] = int(sf_b_granularity_k)
+ 
++    # Request the TCGEN05 lowering explicitly. `T.tcgen05_gemm()` sets this
++    # annotation; this entry point must too, otherwise `cuda::Gemm::SelectInst`
++    # never sees `isTcgen05_` and falls through to the "SFA/SFB are present =>
++    # NVF4 mma.sync" branch, which hard-fails with
++    #   "T.mma_gemm_blockscaled() requires an SM120 CUDA target"
++    # on every Blackwell tcgen05 target (sm_100a / sm_103a).
++    ann["is_tcgen05"] = 1
++
+     # Re-read normalized regions below after let legalization.
+ 
+     def legalize(arg):

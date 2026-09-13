@@ -7,6 +7,11 @@
 # 接线设计与验证手册：docs/agent/tilelang-moe-bs-wiring.md。
 #
 # 用法（远端 B300，tilelang 0.1.14）：
+#   # STEP 0（前置，幂等）：把 vendored 的源码补丁打到**远端**已安装的 tilelang 上
+#   scp -r kernels/tilelang/vendor ubuntu@43.202.208.136:~/tl_bs/vendor
+#   ssh ubuntu@43.202.208.136 \
+#     'cd ~/tl_bs && /opt/dlami/nvme/dsv41_venv/bin/python vendor/apply_tilelang_patch.py'
+#   # STEP 1（本脚本）：lowering + codegen + dump 源码。库里没修 ⇒ 直接 RuntimeError。
 #   scp kernels/tilelang/gen_moe_bs_aot.py ubuntu@43.202.208.136:~/tl_bs/
 #   ssh ubuntu@43.202.208.136 \
 #     'cd ~/tl_bs && /opt/dlami/nvme/dsv41_venv/bin/python gen_moe_bs_aot.py aot_gen'
@@ -91,9 +96,11 @@
 # 生成的 host launcher，里面有它构造每个 CUtensorMap 的全套参数）——shim 的
 # `moe_bs_encode_tmaps()` 就是那份配方的转写。**不要凭猜测写 descriptor。**
 #
-# ⚠️ 0.1.14 上游 bug（§4）修掉之前，本 kernel 连 lowering 都过不去。
+# ⚠️ 0.1.14 上游 bug（§4）修掉之前，本 kernel 连 lowering 都过不去 —— 修法是
+# kernels/tilelang/vendor/ 里的**源码补丁**（不是运行时注入），见该目录 README。
 
 import argparse
+import ast
 import hashlib
 import inspect
 import sys
@@ -104,52 +111,66 @@ import tilelang.language as T
 import tilelang.language.gemm_op as _gemm_op
 
 # =============================================================================
-# 4. TileLang 0.1.14 上游 bug 的固化 shim
+# 4. TileLang 0.1.14 上游缺陷的**前置校验**（本脚本不再注入任何东西）
 # =============================================================================
 # `T.tcgen05_gemm_blockscaled()` 只写了 `sf_a_granularity_k` / `sf_b_granularity_k`
 # 两个注解，**漏写 `ann["is_tcgen05"] = 1`**（`T.tcgen05_gemm()` 有）。于是
-# `cuda::Gemm::SelectInst`（src/cuda/op/gemm.cc:363）跳过 `isTcgen05_` 分支，落到
+# `cuda::Gemm::SelectInst`（src/cuda/op/gemm.cc）跳过 `isTcgen05_` 分支，落到
 # 「SFA/SFB region 已定义 ⇒ 这一定是 SM120 的 NVF4 mma.sync 路径」并 FATAL：
 #
 #     InternalError: T.mma_gemm_blockscaled() requires an SM120 CUDA target,
 #         but got target={..., "arch":"sm_103a"}
 #
-# 函数体其余部分完全正确，所以最小 workaround = **把函数体重新 exec 一次并注入
-# 那一行注解**，不改动任何其它逻辑。已比对 v0.1.14 与 main 的
-# `tilelang/language/gemm_op.py` + `src/cuda/op/gemm.cc`：**两个版本都缺**（main 也未修）。
+# 正确修法是**改库的源码**（vendored 补丁 + 幂等施补器，见
+# `kernels/tilelang/vendor/README.md`）——不是在本进程里重新 exec 函数体把那一行
+# 注入进去。用户裁决：**不允许任何 hack**。所以本脚本**只做校验**：
 #
-# 本函数把原型顶部那段脚本级 codegen 固化成命名函数，并补了两件事：
-#   * **幂等**：先探测上游是否已经修了（`is_tcgen05` 已在源码里）⇒ 修了就什么都不做；
-#   * **可审计**：返回 (patched, reason)，由 main() 打印，避免「以为打了补丁其实没打」。
-_BSC_NEEDLE = 'ann["sf_b_granularity_k"] = int(sf_b_granularity_k)'
+#   * 库里没修 ⇒ 立刻 `RuntimeError`，并把施补命令原文打出来（不猜、不降级）；
+#   * 库里修好了 ⇒ 返回一句可审计的 reason，由 main() 打进 config 文件。
+#
+# 用 AST 判定而不是字符串搜索：`is_tcgen05` 在隔壁 `tcgen05_gemm()` 里也有，全文
+# grep 会把「隔壁函数有」误判成「这个函数有」——那正是这个 bug 的形状。
+def blockscaled_fix_state():
+    """`("fixed"|"missing"|"unknown", detail)` —— 只读库的源码，不注入。"""
+    fn = getattr(_gemm_op, "tcgen05_gemm_blockscaled", None)
+    if fn is None:
+        return "unknown", "tilelang.language.gemm_op has no tcgen05_gemm_blockscaled"
+    try:
+        src = textwrap.dedent(inspect.getsource(fn))  # 只取目标函数本身
+    except (OSError, TypeError) as e:  # 源码不可得（纯 .pyc 安装）
+        return "unknown", f"inspect.getsource failed: {type(e).__name__}: {e}"
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            t = node.targets[0]
+            if (
+                isinstance(t, ast.Subscript)
+                and isinstance(t.slice, ast.Constant)
+                and t.slice.value == "is_tcgen05"
+            ):
+                return "fixed", "ann['is_tcgen05'] = 1 present in gemm_op.py"
+    return "missing", "tcgen05_gemm_blockscaled() does not set ann['is_tcgen05']"
 
 
-def install_blockscaled_fix():
-    """把 0.1.14 缺的 `ann["is_tcgen05"] = 1` 补进 `tcgen05_gemm_blockscaled`。
-
-    返回 `(patched: bool, reason: str)`。`patched=False` 且 reason 是 "upstream-fixed"
-    时表示上游自己修好了（注入变成幂等冗余，不必再打）。
-    """
-    fn = _gemm_op.tcgen05_gemm_blockscaled
-    src = textwrap.dedent(inspect.getsource(fn))
-    if 'is_tcgen05' in src:
-        # 上游已修（或已被本进程打过一次）：直接用库里的版本。
-        return False, "upstream-fixed (ann['is_tcgen05'] already present in gemm_op.py)"
-    if _BSC_NEEDLE not in src:
-        # 依赖点消失了：不要猜，直接炸，让人重新推导（原型 §8 的同一条警告）。
-        raise RuntimeError(
-            "gemm_op.py changed: the injection anchor\n    "
-            + _BSC_NEEDLE
-            + "\nis gone from tcgen05_gemm_blockscaled(); re-derive the shim "
-            "(see kernels/tilelang/moe_bs_proto.py and tcgen05-blockscaled-proto.md §1.2)"
-        )
-    ns = dict(_gemm_op.__dict__)
-    exec(src.replace(_BSC_NEEDLE, _BSC_NEEDLE + '\n    ann["is_tcgen05"] = 1'), ns)
-    patched = ns["tcgen05_gemm_blockscaled"]
-    # 幂等：进程内重复调用同一对象即可。
-    T.tcgen05_gemm_blockscaled = patched
-    _gemm_op.tcgen05_gemm_blockscaled = patched
-    return True, "0.1.14 is_tcgen05 omission patched (re-exec + injected annotation)"
+def verify_blockscaled_fix():
+    """库没修就炸 —— 这是 AOT 生成的前置条件，不是可选检查。"""
+    state, detail = blockscaled_fix_state()
+    if state == "fixed":
+        return detail
+    cmd = "python3 kernels/tilelang/vendor/apply_tilelang_patch.py"
+    raise RuntimeError(
+        "TileLang's T.tcgen05_gemm_blockscaled() is UNFIXED "
+        f"({detail}).\n"
+        "  The 0.1.14 (and upstream main) omission of ann['is_tcgen05'] = 1 makes\n"
+        "  cuda::Gemm::SelectInst fall through to the SM120 NVF4 branch and hard-fail\n"
+        "  on sm_103a. Fix the INSTALLED tilelang SOURCE first (no monkey-patching):\n\n"
+        "      scp -r kernels/tilelang/vendor ubuntu@<b300>:~/tl_bs/vendor\n"
+        "      ssh ubuntu@<b300> 'cd ~/tl_bs && "
+        "/opt/dlami/nvme/dsv41_venv/bin/python vendor/apply_tilelang_patch.py'\n\n"
+        "  or, locally, with the interpreter that owns that tilelang:\n\n"
+        f"      {cmd}\n\n"
+        "  See kernels/tilelang/vendor/README.md §2/§3 for the pristine sha256 and the\n"
+        "  expected 'tcgen05_gemm_blockscaled.is_tcgen05 : fixed' verdict."
+    )
 
 
 # ---- 冻结几何（照 tcgen05-blockscaled-proto.md §2 与 ferrite 的池布局）--------
@@ -359,8 +380,8 @@ def main():
     ap.add_argument("--gran", type=int, default=GRAN)
     args = ap.parse_args()
 
-    patched, reason = install_blockscaled_fix()
-    print(f"[shim] is_tcgen05 fix: {reason}")
+    reason = verify_blockscaled_fix()
+    print(f"[vendor] tilelang fix verified: {reason}")
 
     BM, BN, BK, ST = args.bm, args.bn, args.bk, args.stages
     gran = args.gran
@@ -392,7 +413,7 @@ def main():
     lines = [
         "# MoE tcgen05 block-scaled (mxfp4: e2m1 + ue8m0) up-GEMM AOT config",
         "# GENERATED by gen_moe_bs_aot.py — the shim's constants are read off THIS file.",
-        f"is_tcgen05_fix_patched={int(patched)} reason={reason}",
+        f"is_tcgen05_fix=verified-in-source ({reason})",
         f"E={E} DIM={DIM} INTER={INTER} NP={NP} N_UP={N_UP} SEG_CAP={SEG_CAP} "
         f"VERIFY_ROWS={VERIFY_ROWS} TOPK_MAX={TOPK_MAX}",
         f"BM={BM} BN={BN} BK={BK} NH={NH} threads={THREADS} stages={ST} gran={gran}",
