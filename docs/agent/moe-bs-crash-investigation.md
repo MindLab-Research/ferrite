@@ -246,3 +246,37 @@ for k in 0..40:
 - buf1: A[35K,51K) B[51K,67K) SF[67K,69K)
 - mbar: [34K, 34K+8)
 - C staging: 覆盖 buf1（所有 MMA 完成后写入，此时 buf1 不再需要）
+
+## 🎯 K-block Descriptor Advance 根因（2026-09-14 深夜——数学确认）
+
+**根因**：手写 kernel 的 K-block descriptor 前进量用了 TileLang 的 `ki*32`，但 core matrix 布局需要 `ki*16`。
+
+**数学分析**：
+- Core matrix 布局：每个 K-block（32 元素）跨 2 个 K-atom
+- 每个 K-atom = 8行 × 16B = 128B
+- K-block ki 起始位置 = ki × 2 × 128B = ki × 256B
+- Descriptor 单位 = 16B
+- 正确前进量 = ki × 256/16 = **ki × 16**
+
+**旧值 ki×32 的影响**：
+| ki | 正确位置 | 旧值读取位置 | 结果 |
+|----|---------|------------|------|
+| 0 | 0B | 0B | ✓ 正确 |
+| 1 | 256B | 512B | ✗ 读 K-block 2！|
+| 2 | 512B | 1024B | ✗ 读下一 M-atom！|
+| 3 | 768B | 1536B | ✗ 完全错误 |
+
+**75% 的 K-blocks 读错误数据 → 垃圾输出**
+
+**为什么合成数据测试没发现**：
+- 合成数据（全 0x22 权重）中，读错位置 = 读对位置（所有字节相同）
+- bit-exact 验证通过因为错数据 = 对数据
+- 真实数据（变化权重）中，错位置读错数据 → 垃圾
+
+**修复链**：
+1. TileLang m>1 crash → 手写 kernel（验证过的原语）
+2. 输出乱码 → core matrix 布局修复（8行×16B 原子格式）
+3. 仍乱码 → K-block advance 修复（ki*32 → ki*16）
+4. （测试中）正确输出？
+
+**验证**：gather verify MATCH（数据流正确）+ kernel bit-exact（合成数据自洽但错）
