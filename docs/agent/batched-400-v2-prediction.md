@@ -90,7 +90,7 @@ batched 是 6 行一次权重读但激活侧 ×m，而 **mrows 的权重共享�
 
 ### 3.1 m=6 形状池 capture —— 机制没问题，但三态必须分清
 - `VERIFY_ROWS = 6`（`chain_dev.rs:84`），**m=6 恰好是上限**，不是超限。
-- 池是 **per-shape 槽**（`VERIFY_GRAPH_SLOTS = 3`，:107；`verify_slot` :5340，`verify_graph_gate` :5349）：
+- 池是 **per-shape 槽**（`VERIFY_GRAPH_SLOTS = 3`，`chain_dev.rs:107`；`verify_slot` :9788，`verify_graph_arm_local` :9802，`verify_graph_gate` :9909）：
   m=5（首轮 legacy bootstrap）与 m=6（之后 swallow）各自独立 DRY→CAPTURE→REPLAY，**不需要重建池**。
 - **三态分辨**（脚本 :353-372）：① 无 `[verify_graph]` 行 = gate 没开；② `capture FAILED (m=6)` = 设计内降级（带原因）；③ `captured verify_graph_m6` = 真接上。
 - **前置**（:5349-5363）：`pos_base >= 1`、`!eng_host && !stats_dbg && !phase_dbg`、`compress_branch_steady`（所有 compressor 层 `compress_len > 0`，**早期步不满足**）、`supports_dspark_snapshot`、`supports_memset_async`、`comm.none || ar_v5()`。脚本没设 `STATS/PHASE/ENG_HOST`，这几项应过。

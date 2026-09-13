@@ -4265,7 +4265,7 @@ self.dev.gemm_fp8_mx_rope_norm(
 - 镜像分叉的三个后果：(1) indexer_topk 的 n_pos 错 → cl 被 min() 夹小 → 只看旧 group；(2) n_pos 超限 → cudaErrorInvalidValue → 整请求毒化；(3) inv_compress_len 默认关 → 无告警
 
 **D2【严重·静默】形状池饥饿**：
-- 池 VERIFY_GRAPH_SLOTS=2；首轮 legacy 是 m=5，batched 是 m=6，lazy 是 m=1
+- 池 VERIFY_GRAPH_SLOTS=**3**（`chain_dev.rs:107`，池字段 `verify_graphs` :5829）；首轮 legacy 是 m=5，batched 是 m=6，lazy 是 m=1
 - **路由在 lazy 前先访问过 batched → m=1 形状拿不到池槽 → 整个请求全程 DIRECT！**
 - 与 D1 联合：全程 DIRECT + 每块双计 = 镜像彻底跑飞 → "重置到 12"！
 
