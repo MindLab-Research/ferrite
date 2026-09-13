@@ -16530,11 +16530,23 @@ impl<'a> DevChain<'a> {
         let w_expect = (inter_local * (dim / 2)) as i64;
         let sf_expect =
             (crate::dsv41::weights::moe_bs_sf_words(dim) * inter_local * 4) as i64;
+        // [DIAG-W] one-shot: print actual strides to identify which pool check fails
+        static DIAGW: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        let w_stride = (w3 as i64) - (w1 as i64);
+        let u_stride = (u3 as i64) - (u1 as i64);
+        let s_stride = (s3.ptr() as i64) - (s1.ptr() as i64);
+        let t_stride = (t3.ptr() as i64) - (t1.ptr() as i64);
+        let _ = DIAGW.get_or_init(|| {
+            eprintln!(
+                "[moe-bs-w] w_stride={} (want {}) u_stride={} (want {}) sf1_stride={} (want {}) sf3_stride={} (want {})",
+                w_stride, w_expect, u_stride, w_expect, s_stride, sf_expect, t_stride, sf_expect
+            );
+        });
         if sf_expect == 0
-            || (w3 as i64) - (w1 as i64) != w_expect
-            || (u3 as i64) - (u1 as i64) != w_expect
-            || (s3.ptr() as i64) - (s1.ptr() as i64) != sf_expect
-            || (t3.ptr() as i64) - (t1.ptr() as i64) != sf_expect
+            || w_stride != w_expect
+            || u_stride != w_expect
+            || s_stride != sf_expect
+            || t_stride != sf_expect
         {
             return None;
         }
