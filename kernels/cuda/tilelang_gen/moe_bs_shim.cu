@@ -514,6 +514,7 @@ __global__ void tl_moe_bs_pack_wsf_kernel(const uint8_t* __restrict__ src,
 // ===========================================================================
 // §5 INIT（懒初始化；SetAttribute / cudaMalloc / dlopen 全部只在这里）
 // ===========================================================================
+#ifndef FERRITE_MOE_BS_TL_MISSING
 
 bool tl_bs_init() {
     static int state = 0;  // 0 = 未初始化, 1 = 已就绪, -1 = 失败
@@ -680,3 +681,4 @@ extern "C" int dsv41_moe_bs_pack_wsf(const void* src, void* dst, int rows, int k
         sf_words);
     return (int)cudaGetLastError();
 }
+#endif
