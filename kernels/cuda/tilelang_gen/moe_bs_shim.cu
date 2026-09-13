@@ -142,6 +142,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>  // std::max_element (Eid DIAG)
 #include <dlfcn.h>
 #include <tuple>
 #include <type_traits>
@@ -874,6 +875,34 @@ extern "C" int dsv41_moe_tilelang_gate_up_bs_dev(
     // (2) block-scaled grouped GEMM（生成物）。ABI 与 host-table 入口一字不差 ——
     //     权威配方见那里的长注释（C 是描述符、SFA 是裸指针、W 排在最后）。
     //     唯一的变化：Eid 直接用调用方的 device 表（`eid_dev`），不再是常驻 scratch。
+    // ⚠️ DIAG (2026-09-14): one-shot Eid bounds check — copy Eid[0..SEG_CAP) to
+    // host and verify all values are valid LOCAL expert IDs (< kE_local). An
+    // out-of-range Eid (e.g., a GLOBAL id like 336-383 for rank 7 in TP8) would
+    // make the TMA read at global_id * w_stride from a pool that only holds
+    // kE_local experts — massive OOB → illegal memory access. This check runs
+    // ONCE (first call) and prints all values for visual inspection.
+    static bool g_eid_diag_done = false;
+    if (!g_eid_diag_done) {
+        g_eid_diag_done = true;
+        int eid_host[kSegCap];
+        cudaError_t ec = cudaMemcpyAsync(eid_host, eid_dev, kSegCap * sizeof(int),
+                                         cudaMemcpyDeviceToHost, s);
+        if (ec == cudaSuccess) ec = cudaStreamSynchronize(s);
+        if (ec == cudaSuccess) {
+            int bad = -1;
+            for (int i = 0; i < (int)kSegCap; ++i) {
+                if (eid_host[i] < 0 || eid_host[i] >= (int)kE) { bad = i; break; }
+            }
+            fprintf(stderr, "[moe-bs][DIAG] Eid[0..%d):", (int)kSegCap);
+            for (int i = 0; i < (int)kSegCap && i < 12; ++i) fprintf(stderr, " %d", eid_host[i]);
+            fprintf(stderr, "%s | max=%d | %s\n",
+                    kSegCap > 12 ? " ..." : "",
+                    *std::max_element(eid_host, eid_host + kSegCap),
+                    bad >= 0 ? "OUT-OF-RANGE!" : "all-in-range");
+        } else {
+            fprintf(stderr, "[moe-bs][DIAG] Eid copy failed: %s\n", cudaGetErrorString(ec));
+        }
+    }
     moe_bs_up_tl_kernel<<<dim3((unsigned)kGridX, (unsigned)kSegCap), kThreads, kSmem, s>>>(
         g_tmap_a, g_tmap_c, eid_dev, g_sfa, g_tmap_sfw1, g_tmap_sfw3, g_tmap_w1, g_tmap_w3);
     e = cudaGetLastError();
