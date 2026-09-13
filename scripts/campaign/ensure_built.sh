@@ -19,7 +19,15 @@ NEW=$(cat kernels/cuda/*.cu kernels/cuda/tilelang_gen/*.cu kernels/cuda/tilelang
 OLD=$(cat "$STAMP" 2>/dev/null || echo none)
 if [ "$NEW" != "$OLD" ] || [ ! -f kernels/cuda/libferrite_kernels.so ]; then
   echo "=== kernel sources changed ($OLD -> $NEW): rebuilding .so (full build.sh) ==="
-  (cd kernels/cuda && set -o pipefail; bash build.sh 103a 2>&1 | tail -2; echo KERNEL_RC=${PIPESTATUS[0]})
+  set -o pipefail
+  (cd kernels/cuda && bash build.sh 103a) 2>&1 | tail -2
+  rc=$?
+  echo "KERNEL_RC=$rc"
+  if [ "$rc" != 0 ]; then
+    echo "KERNEL BUILD FAILED — aborting: a stale .so must never be measured (this exact lapse let a"
+    echo "arm run against the previous .so while the freshly changed TU failed to compile)."
+    exit 1
+  fi
   echo "$NEW" > "$STAMP"
 else
   echo "=== kernel sources unchanged ($NEW): skipping build.sh ==="
@@ -28,7 +36,11 @@ source "$HOME/.cargo/env"
 if [ ! -f target/release/ferrite-serve ] ||
    [ -n "$(find crates -name '*.rs' -newer target/release/ferrite-serve -print -quit 2>/dev/null)" ]; then
   echo "=== Rust sources changed: cargo build --release ==="
-  (set -o pipefail; cargo build --release 2>&1 | tail -2; echo CARGO_RC=${PIPESTATUS[0]})
+  set -o pipefail
+  cargo build --release 2>&1 | tail -2
+  rc=$?
+  echo "CARGO_RC=$rc"
+  if [ "$rc" != 0 ]; then echo "CARGO BUILD FAILED — aborting"; exit 1; fi
 else
   echo "=== Rust sources unchanged: skipping cargo build ==="
 fi
