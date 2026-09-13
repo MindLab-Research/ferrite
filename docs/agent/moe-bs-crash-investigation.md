@@ -3287,3 +3287,36 @@ serve: running
   且症状**看起来像"模型/内核卡住"** ✗ ⇒ 见到 `0 step + ar5-hang 刷屏` 先怀疑探针 ✓；
 - **harness 自身的 bug 会伪装成"系统故障"**：本轮先后修掉 5 个我自造的 harness bug（§110/§111/§117/§119 + 探针缺 `LD_LIBRARY_PATH`）
   ⇒ **改 harness 必须用真实最小用例验证**（`bash -n` 不够）✓。
+
+## §130 【行为纪律·用户批评后立即生效】只用**已被证明能跑通**的那条路径；不再现场造 harness
+
+用户原话（2026-09-14）：**"每次都有bug，每次都有，等我要死的时候还有bug，每个bug都是最后一个"**
+⇒ 这条批评必须转成**可执行的行为约束**，而不是道歉：
+
+**本轮 5 个 bug 全部是我自己写的 harness 造成的**（✗ 且每一个都"看起来像系统故障"）：
+| # | 自造 bug | 伪装成什么 |
+|---|---|---|
+| 1 | `sed "$d"`（双引号让 `$d` 被展开，`set -u` 下致命） | "OUT 永远为空" ⇒ 以为模型/内核问题 |
+| 2 | `GRAPH_OFF` 跨行拼接被拆断 | "图门没生效" ⇒ 以为探针/捕获问题 |
+| 3 | 花括号污染 python 引号（`-c {'`） | "每一轮都拿不到文本" |
+| 4 | 看门狗阈值写 `>100`（实际 56 条） | "看门狗不触发" ⇒ 以为没卡 |
+| 5 | 我手写的探针 serve **缺 `LD_LIBRARY_PATH`** | "serve 起不来" ⇒ 以为端口/环境问题 |
+
+**⇒ 行为约束（立即生效，写进 AGENTS.md）**：
+1. **优先复用已被证明能跑通的路径**：`arm_run.sh`（诊断）/ `arm_run_fast.sh`（性能）——
+   它们在本轮被实证能跑出 48 step + 0 `ar5-hang` ✓；
+2. **不新建/不现场改 harness**，除非满足：**改完立刻用"真实最小执行"验证**（`bash -n` 不够 ✗）；
+3. 派发 GPU 任务时，**环境只从一个来源派生**（避免"探针一套 env、arm 又一套 env"⇒ 两者不可比 ✗ / 其中一个根本起不来 ✗）；
+4. **任何"服务起不来/输出为空/看门狗不触发"的第一嫌疑永远是 harness 自身** ✗，再往下查模型/内核 ✓。
+
+**随后的分阶段计划（只用上述已证路径）**：
+```bash
+bash ~/staged_verify.sh arm1     # swapAB 朝向：wq_check 文本判据 + 计数器（arm_run ✓ 已证路径）
+bash ~/staged_verify.sh arm2     # 默认朝向：同上
+bash ~/staged_verify.sh cpasync  # 性能门：逐位一致 + p50（用 arm_run_fast ✓）
+bash ~/staged_verify.sh promote_nodbg   # 五门：零回读风险（§124）
+bash ~/staged_verify.sh spec     # spec 两侧门（§104，已隔离 GEMM_TILELANG）
+bash ~/staged_verify.sh bench    # 博客口径（random 4k/1k、固定 1024 输出）
+```
+⚠️ `bench`/`probe` 两个 stage 目前**自己拼 serve 环境**（就是缺 `LD_LIBRARY_PATH` 的那条 ✗）⇒
+在它们改用 `arm_run` 派生环境之前，**只依赖 arm1/arm2/cpasync/promote_nodbg/spec** ✓（这五个都走已证路径 ✓）。
