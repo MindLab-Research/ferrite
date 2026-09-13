@@ -3470,3 +3470,15 @@ BSLBO=8  BSSBO=16  BSLAY=0  BSKBS=4096   ← 这是 "MEASURED canonical packed" 
 ```
 ⇒ **执行前请先对照 `tests_bs_impulse.cu` 里 staging 分支的判据**（它支持 `BSLAYOUT=1`=SW128 ✓），
 把与我们 kernel 同构的那组 env 记下来（这是**一次性**的，之后复用 ✓）。
+
+### §138 补：仪器里"与我们同构"的那一档 = **`BSPACK=4` + `BSLAYOUT=1`**
+`tests_bs_impulse.cu:319` 实测：`(bspack == 4) ? hw_pack_sw128_idx(n, kp) : hw_pack_idx(n, 2*kp)`
+⇒ **`BSPACK=4`** 正是"packed + SW128 容器"（即我们 kernel 的 `hw_pack_sw128` ✓），
+配合 **`BSLAYOUT=1`**（SW128 ✓）即为与我们同构的一档 ✓。
+**下一臂的确切命令（GPU 一空出即执行，一次性记住后复用）**：
+```bash
+CUDA_VISIBLE_DEVICES=<gpu> BSPACK=4 BSLAYOUT=1 /tmp/bsimp const     # 稠密/常量判据：应 relerr≈0 [PASS]
+CUDA_VISIBLE_DEVICES=<gpu> BSPACK=4 BSLAYOUT=1 BSB=0x22 /tmp/bsimp sweep   # 冲激判据
+```
+⇒ 若这两条 **PASS** ⇒ **kernel 内部无罪** ⇒ 缺陷在**接线/取数**（gather / SF 表 / eid / order / pitch）✗；
+若 **FAIL** ⇒ kernel 自身在此构建下退化 ⇒ 回 kernel 层 ✓。（一次 1–2 分钟 ✓，比静态推断省时 ✓。）
