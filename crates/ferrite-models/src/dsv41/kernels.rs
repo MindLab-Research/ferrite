@@ -570,11 +570,16 @@ extern "C" {
     /// SwiGLU with the training clamps: `out[i] = silu(min(gate, limit)) *
     /// clamp(up, -limit, limit)`, applied in place over `[rows, inter]` for each
     /// half of the fused gate_up buffer.
+    ///
+    /// `exact` (DSV41_SEQ_ALIGN #13): 1 = the official's correctly rounded silu
+    /// pair (`__fdiv_rn` + an accurately rounded expf); 0 = the fast-math pair
+    /// the pre-gate kernel evaluated. Tail position (before the stream).
     pub fn dsv41_swiglu_limit(
         gate_up: *mut f32,
         rows: i32,
         inter: i32,
         limit: f32,
+        exact: i32,
         stream: CuStream,
     ) -> i32;
 
@@ -586,6 +591,7 @@ extern "C" {
         rows: i32,
         inter: i32,
         limit: f32,
+        exact: i32,
         xq: *mut u8,
         xsc: *mut f32,
         stream: CuStream,
@@ -625,6 +631,8 @@ extern "C" {
         w3s_stride: i64,
         ids: *const i32,
         ilv: i32,
+        act_e4m3: i32,
+        seq_align: i32,
         stream: CuStream,
     ) -> i32;
 
@@ -672,6 +680,22 @@ extern "C" {
         stream: CuStream,
     ) -> i32;
 
+    /// DSV41_SEQ_ALIGN (#5) variant of `dsv41_moe_down_reduce`: the same fixed
+    /// sum, but with the slot order replaced by the ascending-EXPERT-ID
+    /// permutation when `seq_align != 0` (`ids` = this row's `[slots]` router
+    /// output). A SEPARATE SYMBOL on purpose — a `.so` predating the gate has
+    /// only the 5-argument `dsv41_moe_down_reduce`, so an armed gate must be able
+    /// to tell "no such symbol" from "the old order answered".
+    pub fn dsv41_moe_down_reduce_seq(
+        part: *const f32,
+        out: *mut f32,
+        n: i32,
+        slots: i32,
+        ids: *const i32,
+        seq_align: i32,
+        stream: CuStream,
+    ) -> i32;
+
     /// down + reduce FUSED (DSV41_DOWN_FUSE, default ON): ONE launch computes
     /// every slot's fp4 down GEMV and sums the per-slot contributions in
     /// ASCENDING slot order into `out` (OVERWRITE). Bit-identical to
@@ -695,6 +719,7 @@ extern "C" {
         w2s_base: *const u8,
         w2s_stride: i64,
         ids: *const i32,
+        seq_align: i32,
         stream: CuStream,
     ) -> i32;
 
@@ -728,6 +753,7 @@ extern "C" {
         limit: f32,
         slot_stride: i64,
         slots: i32,
+        exact: i32,
         stream: CuStream,
     ) -> i32;
 

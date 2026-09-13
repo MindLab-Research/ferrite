@@ -1339,6 +1339,43 @@ static inline cudaError_t dsv41_experts_pdl_or_plain(K kern, dim3 grid, dim3 blo
 // the body still implements the ring for any PDEPTH, so re-enabling a depth is a
 // matter of restoring the launcher's cascade + the smem opt-in, not of rewriting
 // this kernel (see dsv41_gateup_pipeline for why depth >1 is not worth it).
+// ===========================================================================
+// DSV41_SEQ_ALIGN (#13): silu in the OFFICIAL's ROUNDING (see the long note on
+// the same helper in dsv41_glue.cu — this file is a separate translation unit
+// and compiled with the same `--use_fast_math`, so it needs its own copy).
+// The official is `ref_inference/model.py:848` -> PyTorch's ActivationSiluKernel
+// for float32: `x / (1 + expf(-x))` with the accurate libdevice expf and a
+// correctly rounded divide. The algebra below is already identical; what the
+// flag restores is the ROUNDING (fast math turns the divide into an approximate
+// reciprocal and expf into __expf).
+// ===========================================================================
+#ifndef DSV41_SEQ_ALIGN_EXPF
+#define DSV41_SEQ_ALIGN_EXPF 1
+#endif
+// Upper bound on `slots` for which the DSV41_SEQ_ALIGN (#5) reduce kernels build
+// the expert-id permutation (a fixed local array in moe_down_reduce_kernel).
+// Production top-k is 8; above this the scratch reduce keeps the legacy slot
+// order and the caller says so (Device::moe_down_reduce_seq).
+#ifndef DSV41_SEQ_ALIGN_MAX_SLOTS
+#define DSV41_SEQ_ALIGN_MAX_SLOTS 64
+#endif
+#if DSV41_SEQ_ALIGN_EXPF >= 2
+extern "C" __device__ float __nv_expf(float);
+#endif
+
+__device__ __forceinline__ float dsv41_seq_align_expf(float x) {
+#if DSV41_SEQ_ALIGN_EXPF >= 2
+    return __nv_expf(x);
+#else
+    return (float)exp((double)x);
+#endif
+}
+
+__device__ __forceinline__ float dsv41_seq_align_silu(float g, int exact) {
+    if (exact) return __fdiv_rn(g, 1.f + dsv41_seq_align_expf(-g));
+    return g / (1.f + expf(-g));
+}
+
 template <bool ILV, int PDEPTH>
 __launch_bounds__(1024)
 __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, long act_stride,
@@ -1354,7 +1391,7 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
                                                long bh_stride, const uint8_t* __restrict__ bhs_base,
                                                long bhs_stride, const int* __restrict__ ids,
                                                int vec, int fuse_swiglu, int ksplit, int pf,
-                                               int act_e4m3) {
+                                               int act_e4m3, int seq_align) {
     const int slot = (int)blockIdx.y;
     // ---- ACTIVATION ROW (grid.z): the MULTI-ROW dimension ------------------
     // `rows` is now the launcher's THIRD grid dimension (it used to be
@@ -1945,7 +1982,10 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
                     u = fminf(fmaxf(u, -limit), limit);      // up clamp
                 }
                 if (fuse_swiglu) {
-                    out[(size_t)row] = (g / (1.f + expf(-g))) * u;   // silu(gate) * up
+                    // silu(gate) * up — DSV41_SEQ_ALIGN (#13): `seq_align != 0`
+                    // swaps in the official's correctly rounded silu pair, see
+                    // dsv41_seq_align_silu below.
+                    out[(size_t)row] = dsv41_seq_align_silu(g, seq_align) * u;
                 } else {
                     // RAW pair epilogue (the unfused [2*inter] layout): gate in
                     // the low half, up in the high half - the SAME convention the
@@ -2165,10 +2205,37 @@ __global__ void moe_down_reduce_kernel(const float* __restrict__ part, float* __
                                        int n, int slots,
                                        float* const* __restrict__ ar_stg = nullptr,
                                        const unsigned* __restrict__ ar_epoch = nullptr,
-                                       int ar_world = 0, int ar_rank = 0, int ar_stride = 0) {
+                                       int ar_world = 0, int ar_rank = 0, int ar_stride = 0,
+                                       const int* __restrict__ ids = nullptr, int seq_align = 0) {
+    // ---- DSV41_SEQ_ALIGN (#5) ----------------------------------------------
+    // `seq_align != 0` replaces the ascending-SLOT walk below with the
+    // ascending-EXPERT-ID walk the official's `MoE.forward` performs
+    // (`ref_inference/model.py:895-900`: `for i in range(start,end): y[idx] +=
+    // expert(...)`). The permutation depends only on the row's router output, so
+    // it is computed ONCE per thread (the rank of each slot = how many slots
+    // carry a smaller id, slot index breaking ties) instead of per element.
+    // `ids` is that row's [slots] vector (the caller passes `ids + row*slots`).
+    // OFF (or a missing/oversized `ids`) leaves the loop below textually
+    // unchanged -- same two instructions, same order, same bits.
+    const bool ordered = (seq_align != 0) && (ids != nullptr) && slots > 0 &&
+                         slots <= DSV41_SEQ_ALIGN_MAX_SLOTS;
+    int perm[DSV41_SEQ_ALIGN_MAX_SLOTS];
+    if (ordered) {
+        for (int t = 0; t < slots; ++t) {
+            int rank = 0;
+            for (int q = 0; q < slots; ++q) {
+                rank += ((ids[q] < ids[t]) || (ids[q] == ids[t] && q < t)) ? 1 : 0;
+            }
+            perm[rank] = t;
+        }
+    }
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
         float acc = 0.f;
-        for (int s = 0; s < slots; ++s) acc += part[(size_t)s * n + i];
+        if (ordered) {
+            for (int t = 0; t < slots; ++t) acc += part[(size_t)perm[t] * n + i];
+        } else {
+            for (int s = 0; s < slots; ++s) acc += part[(size_t)s * n + i];
+        }
         out[i] = acc;
         if (ar_stg != nullptr)
             dsv41_ar5_store_elem(ar_stg,
@@ -2259,7 +2326,7 @@ __global__ void expert_gemv_fp4_down_reduce_kernel(
     const float* __restrict__ act_base, long act_stride, float* __restrict__ out, int n_total,
     int k, int slots, const float* __restrict__ row_weight, long rw_stride,
     const uint8_t* __restrict__ w2_base, long w2_stride, const uint8_t* __restrict__ w2s_base,
-    long w2s_stride, int w2s_pitch, const int* __restrict__ ids, int vec) {
+    long w2s_stride, int w2s_pitch, const int* __restrict__ ids, int vec, int seq_align) {
     // STAGED: s_smem is [slots][k] slot-major (slot s starts at s_smem + s*k) and
     // the 256-entry LUT follows it. Fallback: the LUT alone lives in smem and
     // each slot's activation is read straight from global - same numbers, more
@@ -2313,6 +2380,40 @@ __global__ void expert_gemv_fp4_down_reduce_kernel(
     const size_t slot0 = (size_t)arow * (size_t)slots;            // this row's slot-0 index
     const float* act_row = act_base + slot0 * (size_t)act_stride;  // this row's slot-0 slice
     float* out_row = out + (size_t)arow * (size_t)n_total;
+    // ---- DSV41_SEQ_ALIGN (#5): the OFFICIAL's summation order ---------------
+    // WHAT THE OFFICIAL DOES (`ref_inference/model.py:895-900`):
+    //     for i in range(self.experts_start_idx, self.experts_end_idx):
+    //         idx, top = torch.where(indices == i)
+    //         y[idx] += expert(x[idx], weights[idx, top, None])
+    // i.e. a row's top-k contributions enter its f32 accumulator in ASCENDING
+    // EXPERT-ID order, one rounded bf16 `+=` at a time. This kernel's loop is
+    // ascending SLOT order — the router's top-k rank, which is descending
+    // routing weight — so the two sides add the same terms in a different
+    // sequence and fp addition is not associative: the low bits differ.
+    //
+    // `seq_align != 0` builds the ascending-expert-id permutation of [0,slots)
+    // into the smem tail (the launcher adds `slots * sizeof(int)` bytes, and
+    // ONLY when the gate is on, so the OFF path's smem budget is untouched) and
+    // the serial slot loop below walks it. The loop stays SERIAL IN ONE WARP
+    // with its explicitly rounded product/add pair, i.e. only the ORDER of the
+    // same two instructions changes — nothing about the parallel structure, the
+    // K loop, the shuffle tree or the rounding is touched.
+    //
+    // Ties: `ids` within one row's top-k are distinct by construction (topk
+    // over distinct indices), so the slot-index tie-break below is inert; it is
+    // there to make the permutation a total order regardless of `ids`.
+    int* s_perm = reinterpret_cast<int*>(s_lut2 + 256);
+    if (seq_align) {
+        for (int t = (int)threadIdx.x; t < slots; t += (int)blockDim.x) {
+            const int ev = ids[slot0 + (size_t)t];
+            int rank = 0;
+            for (int q = 0; q < slots; ++q) {
+                const int eq = ids[slot0 + (size_t)q];
+                rank += ((eq < ev) || (eq == ev && q < t)) ? 1 : 0;
+            }
+            s_perm[rank] = t;
+        }
+    }
     if (STAGED) {
         // ONE cooperative pass stages every slot's activation. `act_stride` is
         // the caller's slice pitch and only the first `k` floats of each slice
@@ -2338,7 +2439,12 @@ __global__ void expert_gemv_fp4_down_reduce_kernel(
     for (int row = blockIdx.x * nwarps + warp; row < n_total; row += gridDim.x * nwarps) {
         float tot = 0.f;
         // Ascending slot loop, never parallel: see the contract above.
-        for (int slot = 0; slot < slots; ++slot) {
+        // DSV41_SEQ_ALIGN (#5): with the gate ON, `t` walks the
+        // ascending-EXPERT-ID permutation (s_perm, built above) instead of the
+        // top-k rank, reproducing the official's `for i in range(...)` order.
+        // OFF: `slot == t` and this is the identical ascending-slot walk.
+        for (int t = 0; t < slots; ++t) {
+            const int slot = seq_align ? s_perm[t] : t;
             const float* s_act = STAGED ? (s_smem + (size_t)slot * (size_t)k)
                                         : (act_row + (size_t)slot * (size_t)act_stride);
             // Per-slot derivation identical to expert_gemv_fp4_batched_kernel,
@@ -3525,7 +3631,7 @@ extern "C" int dsv41_expert_gate_up_fp4_batched(
     int inter, float limit, int slots, const uint8_t* w1_base, long w1_stride,
     const uint8_t* w1s_base, long w1s_stride, const uint8_t* w3_base, long w3_stride,
     const uint8_t* w3s_base, long w3s_stride, const int* ids, int ilv, int act_e4m3,
-    cudaStream_t stream) {
+    int seq_align, cudaStream_t stream) {
     if (rows <= 0 || dim <= 0 || inter <= 0 || slots <= 0) return (int)cudaErrorInvalidValue;
     // rows per CTA == warps per CTA (one warp owns one row). 8 = today's shape;
     // DSV41_GATEUP_ROWS=4/2/1 re-packs the SAME warps into more, smaller CTAs -
@@ -3702,7 +3808,7 @@ extern "C" int dsv41_expert_gate_up_fp4_batched(
                                           dsv41_sf_pitch(dim), inter, 1, limit, nullptr, 0, w1_base,
                                           w1_stride, w1s_base, w1s_stride, w3_base, w3_stride,
                                           w3s_base, w3s_stride, ids, g_expert_fp4_mode, fuse,
-                                          ksplit, pf, act_e4m3);
+                                          ksplit, pf, act_e4m3, seq_align);
     };
     cudaError_t le;
     // ONE depth (1) x 2 ILV instantiations. The former 5-way depth cascade
@@ -3779,7 +3885,7 @@ extern "C" int dsv41_expert_down_fp4_batched(
         nullptr, out, out_slot_stride, dim, inter, dsv41_sf_pitch(inter), -1, 2, 0.f, row_weight,
         rw_stride, w2_base, w2_stride, w2s_base, w2s_stride, w2_base, w2_stride, w2s_base,
         w2s_stride, ids, g_down_fp4_mode, /*fuse_swiglu=*/0, /*ksplit=*/1, /*pf=*/0,
-        /*act_e4m3=*/0);
+        /*act_e4m3=*/0, /*seq_align=*/0);
     if (le != cudaSuccess) { (void)cudaGetLastError(); return (int)le; }
     return (int)cudaGetLastError();
 }
@@ -3791,6 +3897,30 @@ extern "C" int dsv41_moe_down_reduce(const float* part, float* out, int n, int s
     if (n <= 0 || slots <= 0) return (int)cudaErrorInvalidValue;
     const unsigned blocks = (unsigned)((n + 255) / 256);
     moe_down_reduce_kernel<<<blocks, 256, 0, stream>>>(part, out, n, slots);
+    return (int)cudaGetLastError();
+}
+
+// DSV41_SEQ_ALIGN (#5) variant of `dsv41_moe_down_reduce`: the same fixed sum,
+// but with the slot order REPLACED by the ascending-EXPERT-ID permutation when
+// `seq_align != 0` (and `slots <= DSV41_SEQ_ALIGN_MAX_SLOTS`). `ids` is this
+// row's [slots] router output.
+//
+// WHY A SEPARATE SYMBOL RATHER THAN TWO MORE ARGUMENTS ON THE EXISTING ONE: this
+// project's #1 measurement trap is "the gate was armed and the old path answered
+// the call". A `.so` built before this change has the 5-argument
+// `dsv41_moe_down_reduce`, and the ABI would silently swallow the extra
+// arguments, so an armed gate would measure nothing and say nothing. The
+// Runtime probes THIS name (`Device::moe_down_reduce_seq`) and, when the gate is
+// on but the symbol is missing, it says so once and keeps the legacy order.
+//
+// `seq_align == 0` is the byte-identical legacy sum (the kernel takes the same
+// `else` branch as `dsv41_moe_down_reduce` does).
+extern "C" int dsv41_moe_down_reduce_seq(const float* part, float* out, int n, int slots,
+                                         const int* ids, int seq_align, cudaStream_t stream) {
+    if (n <= 0 || slots <= 0) return (int)cudaErrorInvalidValue;
+    const unsigned blocks = (unsigned)((n + 255) / 256);
+    moe_down_reduce_kernel<<<blocks, 256, 0, stream>>>(part, out, n, slots, nullptr, nullptr, 0, 0,
+                                                       0, ids, seq_align);
     return (int)cudaGetLastError();
 }
 
@@ -3833,10 +3963,16 @@ extern "C" int dsv41_moe_down_reduce_st(const float* part, float* out, int n, in
 extern "C" int dsv41_expert_down_reduce_fp4_batched(
     const float* act_base, long act_stride, float* out, int rows, int dim, int inter,
     const float* row_weight, long rw_stride, int slots, const uint8_t* w2_base, long w2_stride,
-    const uint8_t* w2s_base, long w2s_stride, const int* ids, cudaStream_t stream) {
+    const uint8_t* w2s_base, long w2s_stride, const int* ids, int seq_align,
+    cudaStream_t stream) {
     if (rows <= 0 || dim <= 0 || inter <= 0 || slots <= 0) return (int)cudaErrorInvalidValue;
     const int warps = 8;
     const size_t lut_bytes = 256 * sizeof(float2);
+    // DSV41_SEQ_ALIGN (#5): the kernel's expert-id permutation lives in the smem
+    // tail, right after the 256-entry LUT, and the launcher adds those bytes ONLY
+    // when the gate is on -- the OFF path's smem budget (and therefore the
+    // STAGED/fallback decision and the occupancy it was tuned for) is unchanged.
+    const size_t perm_bytes = (seq_align != 0) ? (size_t)slots * sizeof(int) : (size_t)0;
     // cudaFuncSetAttribute is PER-CONTEXT (per device) - the carve-out bug
     // documented in ferrite_kernels.cu: a one-shot set on whichever device
     // happened to be current left 7 of 8 ranks at the 48KB default. Probe every
@@ -3857,7 +3993,8 @@ extern "C" int dsv41_expert_down_reduce_fp4_batched(
             dev_optin[dev] = optin;
         }
     }
-    const size_t staged_bytes = (size_t)slots * (size_t)inter * sizeof(float) + lut_bytes;
+    const size_t staged_bytes =
+        (size_t)slots * (size_t)inter * sizeof(float) + lut_bytes + perm_bytes;
     const size_t cap = (dev >= 0 && dev < 64) ? (size_t)dev_optin[dev] : (size_t)0;
     // blockIdx.z = the activation row (the multi-row dim). The stage buffer is
     // per ROW (each grid.z CTA stages only its own row's [slots][k] slices), so
@@ -3875,12 +4012,13 @@ extern "C" int dsv41_expert_down_reduce_fp4_batched(
         le = dsv41_experts_pdl_or_plain(
             expert_gemv_fp4_down_reduce_kernel<true>, grid, dim3(warps * 32), staged_bytes, stream,
             act_base, act_stride, out, dim, inter, slots, row_weight, rw_stride, w2_base,
-            w2_stride, w2s_base, w2s_stride, w2s_pitch, ids, g_down_fp4_mode);
+            w2_stride, w2s_base, w2s_stride, w2s_pitch, ids, g_down_fp4_mode, seq_align);
     } else {
         le = dsv41_experts_pdl_or_plain(
-            expert_gemv_fp4_down_reduce_kernel<false>, grid, dim3(warps * 32), lut_bytes, stream,
-            act_base, act_stride, out, dim, inter, slots, row_weight, rw_stride, w2_base,
-            w2_stride, w2s_base, w2s_stride, w2s_pitch, ids, g_down_fp4_mode);
+            expert_gemv_fp4_down_reduce_kernel<false>, grid, dim3(warps * 32),
+            lut_bytes + perm_bytes, stream, act_base, act_stride, out, dim, inter, slots, row_weight,
+            rw_stride, w2_base, w2_stride, w2s_base, w2s_stride, w2s_pitch, ids, g_down_fp4_mode,
+            seq_align);
     }
     if (le != cudaSuccess) { (void)cudaGetLastError(); return (int)le; }
     return (int)cudaGetLastError();

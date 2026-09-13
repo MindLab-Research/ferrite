@@ -168,6 +168,57 @@ __global__ void engram_apply_kernel(float* __restrict__ x, const float* __restri
 // SwiGLU with the training clamps  (fused gate_up [rows, 2*inter])
 // ===========================================================================
 
+// ===========================================================================
+// DSV41_SEQ_ALIGN (#13): silu in the OFFICIAL's ROUNDING, not just its algebra
+// ===========================================================================
+// The official's `F.silu` (`ref_inference/model.py:848`) is PyTorch's
+// ActivationSiluKernel.cu for float32, i.e. `x / (1 + expf(-x))` with
+// `c10::cuda::compat::exp` == the ACCURATE libdevice expf and a correctly
+// rounded divide (`div.rn.f32`). The ALGEBRA here is already that expression
+// verbatim (`g / (1.f + expf(-g))`, this file's three swiglu kernels) — what
+// differs is the ROUNDING, because build.sh compiles this TU with
+// `--use_fast_math` (DEFAULT ON, see build.sh): the flag degrades both
+// operations of the official's expression
+//   * `-prec-div=false` -> `/` becomes an approximate reciprocal (~2^-22
+//     relative), against the official's correctly rounded divide;
+//   * `expf` -> `__expf` = `ex2.approx.f32(x * log2e)` (~2^-21 relative, NOT
+//     the ~2 ulp libdevice expf the official calls).
+// With `exact != 0` the pair is replaced by `__fdiv_rn` + an accurately rounded
+// exponential, i.e. the value the official's own expression evaluates to.
+//
+// WHY THE EXPONENTIAL GOES THROUGH DOUBLE. `__nv_expf` (the accurate libdevice
+// entry point `::expf` resolves to WITHOUT fast math) is not declared by any
+// CUDA header, and `--use_fast_math` substitutes the NAME `expf` at compile
+// time, so there is no declared float function that means "the accurate
+// exponential". The double-precision one is never substituted (the fast-math
+// intrinsic list is single-precision only), so `(float)exp((double)x)` is an
+// accurately rounded f32 exponential by construction. Cost is one FP64 op per
+// element and only with the gate ON; `-DDSV41_SEQ_ALIGN_EXPF=2` calls
+// `__nv_expf` instead for anyone who wants the exact libdevice function and
+// accepts depending on that symbol.
+#ifndef DSV41_SEQ_ALIGN_EXPF
+#define DSV41_SEQ_ALIGN_EXPF 1
+#endif
+#if DSV41_SEQ_ALIGN_EXPF >= 2
+extern "C" __device__ float __nv_expf(float);
+#endif
+
+__device__ __forceinline__ float dsv41_seq_align_expf(float x) {
+#if DSV41_SEQ_ALIGN_EXPF >= 2
+    return __nv_expf(x);
+#else
+    return (float)exp((double)x);
+#endif
+}
+
+// `exact == 0` is the pre-existing expression VERBATIM (the gate's OFF path, so
+// a build with DSV41_SEQ_ALIGN unset is byte-for-byte the old kernel);
+// `exact != 0` is the official's correctly rounded pair.
+__device__ __forceinline__ float dsv41_seq_align_silu(float g, int exact) {
+    if (exact) return __fdiv_rn(g, 1.f + dsv41_seq_align_expf(-g));
+    return g / (1.f + expf(-g));
+}
+
 // For i < inter, reading g = gate_up[r, i] and u = gate_up[r, inter + i]:
 //   g = min(g, limit), u = clamp(u, -limit, limit)   (limit > 0 only)
 //   gate_up[r, i] = silu(g) * u
@@ -175,7 +226,7 @@ __global__ void engram_apply_kernel(float* __restrict__ x, const float* __restri
 // disables the clamps. This is the epilogue of dsv41_expert_gate_up_fp4's
 // output layout (gate first, up second), silu = g / (1 + exp(-g)).
 __global__ void swiglu_limit_kernel(float* __restrict__ gate_up, int rows, int inter,
-                                    float limit) {
+                                    float limit, int exact) {
     const size_t total = (size_t)rows * inter;
     for (size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x; t < total;
          t += (size_t)gridDim.x * blockDim.x) {
@@ -188,7 +239,7 @@ __global__ void swiglu_limit_kernel(float* __restrict__ gate_up, int rows, int i
             g = fminf(g, limit);
             u = fminf(fmaxf(u, -limit), limit);
         }
-        row[i] = (g / (1.f + expf(-g))) * u;
+        row[i] = dsv41_seq_align_silu(g, exact) * u;
     }
 }
 
@@ -219,7 +270,7 @@ __device__ __forceinline__ float glue_fast_round_scale(float amax, float max_inv
 }
 
 __global__ void swiglu_limit_q_kernel(float* __restrict__ gate_up, int rows, int inter,
-                                      float limit, uint8_t* __restrict__ xq,
+                                      float limit, int exact, uint8_t* __restrict__ xq,
                                       float* __restrict__ xsc) {
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
@@ -237,7 +288,7 @@ __global__ void swiglu_limit_q_kernel(float* __restrict__ gate_up, int rows, int
             g = fminf(g, limit);
             u = fminf(fmaxf(u, -limit), limit);
         }
-        const float v = (g / (1.f + expf(-g))) * u;   // identical to swiglu_limit_kernel
+        const float v = dsv41_seq_align_silu(g, exact) * u;  // identical to swiglu_limit_kernel
         row[i] = v;                                   // f32 write-back, unchanged
         float a = fabsf(v);
         for (int off = 16; off > 0; off >>= 1)
@@ -1493,12 +1544,12 @@ extern "C" int dsv41_engram_apply(float* x, const float* kv, const float* q_weig
     return (int)cudaGetLastError();
 }
 
-extern "C" int dsv41_swiglu_limit(float* gate_up, int rows, int inter, float limit,
+extern "C" int dsv41_swiglu_limit(float* gate_up, int rows, int inter, float limit, int exact,
                                   cudaStream_t s) {
     if (rows <= 0 || inter <= 0) return (int)cudaSuccess;
     const size_t total = (size_t)rows * inter;
     const unsigned blocks = (unsigned)((total + 255) / 256);
-    swiglu_limit_kernel<<<blocks, 256, 0, s>>>(gate_up, rows, inter, limit);
+    swiglu_limit_kernel<<<blocks, 256, 0, s>>>(gate_up, rows, inter, limit, exact);
     return (int)cudaGetLastError();
 }
 
@@ -1511,13 +1562,13 @@ extern "C" int dsv41_swiglu_limit(float* gate_up, int rows, int inter, float lim
 // (incl. the trailing cudaGetLastError()) is indistinguishable from the decline
 // and `Device::swiglu_limit_q_on` (rc == 1) swallows it as a fallback. Kept as-is
 // per the rounds 37-41 freeze; migrate to decline == 2 if re-touched. M=1 row is the shared expert's down path.
-extern "C" int dsv41_swiglu_limit_q(float* gate_up, int rows, int inter, float limit,
+extern "C" int dsv41_swiglu_limit_q(float* gate_up, int rows, int inter, float limit, int exact,
                                     uint8_t* xq, float* xsc, cudaStream_t s) {
     if (rows <= 0 || inter <= 0 || (inter & 31) || xq == nullptr || xsc == nullptr) return 1;
     const int wpb = 8;   // 256 threads = 8 warps, one 32-element scale block each
     const unsigned blocks =
         (unsigned)(((size_t)rows * (size_t)(inter >> 5) + wpb - 1) / wpb);
-    swiglu_limit_q_kernel<<<blocks, wpb * 32, 0, s>>>(gate_up, rows, inter, limit, xq, xsc);
+    swiglu_limit_q_kernel<<<blocks, wpb * 32, 0, s>>>(gate_up, rows, inter, limit, exact, xq, xsc);
     return (int)cudaGetLastError();
 }
 
@@ -1543,7 +1594,7 @@ extern "C" int dsv41_swiglu_limit_q(float* gate_up, int rows, int inter, float l
 // called with rows == 1 (chain_dev.rs:8030 and dspark_dev.rs:1396), where the
 // two interpretations coincide, so every existing call is bit-identical.
 __global__ void swiglu_limit_batched_kernel(float* __restrict__ gate_up, int rows, int inter,
-                                            float limit, long slot_stride) {
+                                            float limit, long slot_stride, int exact) {
     float* base = gate_up + (size_t)blockIdx.z * (size_t)gridDim.y * (size_t)slot_stride +
                   (size_t)blockIdx.y * (size_t)slot_stride;
     const size_t total = (size_t)inter;
@@ -1557,16 +1608,17 @@ __global__ void swiglu_limit_batched_kernel(float* __restrict__ gate_up, int row
             g = fminf(g, limit);
             u = fminf(fmaxf(u, -limit), limit);
         }
-        row[i] = (g / (1.f + expf(-g))) * u;
+        row[i] = dsv41_seq_align_silu(g, exact) * u;
     }
 }
 
 extern "C" int dsv41_swiglu_limit_batched(float* gate_up, int rows, int inter, float limit,
-                                          long slot_stride, int slots, cudaStream_t s) {
+                                          long slot_stride, int slots, int exact, cudaStream_t s) {
     if (rows <= 0 || inter <= 0 || slots <= 0) return (int)cudaSuccess;
     const size_t total = (size_t)inter;
     dim3 grid((unsigned)((total + 255) / 256), (unsigned)slots, (unsigned)rows);
-    swiglu_limit_batched_kernel<<<grid, 256, 0, s>>>(gate_up, rows, inter, limit, slot_stride);
+    swiglu_limit_batched_kernel<<<grid, 256, 0, s>>>(gate_up, rows, inter, limit, slot_stride,
+                                                     exact);
     return (int)cudaGetLastError();
 }
 
