@@ -7185,6 +7185,14 @@ impl<'a> DevChain<'a> {
                 (n_cols * ehd) as i32,
             )?;
         }
+        // D1 boundary — the engram's `kv = self.wkv(...)` GEMM output. The
+        // reference's `ParallelEngramEmbedding.forward` runs that projection on a
+        // bf16 weight (`Linear` -> `F.linear`, bf16) and then widens both halves
+        // (`key.float()`, `value.float()`) — so `key` and `value` are ROUNDED rows
+        // there, and both feed the gate (`dot = (h*weight*key)...`) and the
+        // write-back (`h + gate * value`) computed below. `eng_kv` holds exactly
+        // that `[key(hc*dim) | value(dim)]` pair, so one flat round trip covers it.
+        self.bf16_snap(self.s.eng_kv.ptr as *mut f32, (hc + 1) * dim)?;
         // gated write-back into h (in place)
         self.dev.engram_apply(
             self.s.h.ptr as *mut f32,
@@ -7726,6 +7734,9 @@ impl<'a> DevChain<'a> {
             hc as i32,
             dim as i32,
         )?;
+        // D1 boundary — the head's `hc_pre` collapse, the non-fused twin of the
+        // `truncate` arm above (`model.py:957-960`: `hc_pre` returns bf16).
+        self.bf16_snap(self.s.x.ptr as *mut f32, dim)?;
         self.dev.rmsnorm(
             self.s.x.ptr as *const f32,
             self.w.norm.as_ref().unwrap().as_f32(),
@@ -7735,6 +7746,24 @@ impl<'a> DevChain<'a> {
             cfg.norm_eps,
         )?;
         }
+        // D1 boundary — the HEAD's norm output. `Transformer.forward` computes
+        // `logits = self.head(self.norm(h))` (`model.py:1266-1267`) and `self.norm`
+        // is an `RMSNorm`, whose forward returns `(self.weight * x).to(dtype)` —
+        // bf16 for this bf16 default-dtype build (`model.py:288-293`). The head
+        // then widens that row with `.float()` (a lossless bf16 -> f32 upcast, so
+        // the head's OWN f32 accumulation is preserved), which means the row the
+        // 129280-way argmax is computed from is a ROUNDED one in the reference.
+        //
+        // ⚠️ This is the one boundary the previous revision deliberately skipped:
+        // the comment below records that keeping the head's activation in f32 was
+        // worth ~3 bits on a near-tie argmax. That is a real ACCURACY argument, but
+        // it is the opposite of the alignment goal — the reference does round here
+        // — so it is applied under the gate only and the default (OFF) path is
+        // untouched. It is also the highest-risk addition of this batch on the
+        // gated arm (it moves the argmax's own input), so an A/B on
+        // DSV41_BF16_TRUNCATE must re-check the zero-Latin baseline before the arm
+        // is trusted.
+        self.bf16_snap(self.s.xn.ptr as *mut f32, dim)?;
         // The head keeps the ACTIVATION in f32 (casting it to bf16 cost ~3 bits on
         // a 129280-way near-tie argmax - the reference keeps it in f32). The
         // weights now stay bf16 when the checkpoint stores them that way: the gemv
@@ -18797,6 +18826,13 @@ fn oracle_tap() -> bool {
             hc as i32,
             dim as i32,
         )?;
+        // D1 boundary — `hc_pre`'s collapse, the non-fused twin of the `truncate`
+        // arm `hc_collapse_norm` carries above: the reference's `hc_pre` returns
+        // `y.to(x.dtype)`, i.e. bf16 (`model.py:957-960`), and the norm below
+        // (plus the variance it takes) reads THAT rounded row. `bf16_snap` on the
+        // collapsed `s.x` reproduces it; the fused launch does the same thing
+        // inside its phase 1.
+        self.bf16_snap(self.s.x.ptr as *mut f32, dim)?;
         self.dev.rmsnorm(
             self.s.x.ptr as *const f32,
             ld.attn_norm.as_ref().unwrap().as_f32(),
@@ -18931,6 +18967,10 @@ fn oracle_tap() -> bool {
             hc as i32,
             dim as i32,
         )?;
+        // D1 boundary — the FFN-side `hc_pre` collapse, same as the attention
+        // side above: `hc_pre` returns bf16 (`model.py:957-960`) and `ffn_norm`
+        // reads the rounded row.
+        self.bf16_snap(self.s.x.ptr as *mut f32, dim)?;
         self.dev.rmsnorm(
             self.s.x.ptr as *const f32,
             ld.ffn_norm.as_ref().unwrap().as_f32(),
@@ -19193,6 +19233,36 @@ fn oracle_tap() -> bool {
         Ok(())
     }
 
+    /// [`Self::bf16_snap`] on an explicit stream. Every boundary that sits
+    /// inside a side-stream chain (`dual_chain`'s kv half on stream 2,
+    /// `COMPRESS_SIDE`'s compressor on stream 3, `MOE_DUAL`'s shared expert on
+    /// stream 2) MUST use this form: the main-stream variant would issue the
+    /// round trip before its producer has written, i.e. it would round the
+    /// PREVIOUS step's bytes and silently leave the boundary unapplied. The
+    /// gate, the symbol probe and the one-shot note are exactly
+    /// [`Self::bf16_snap`]'s.
+    fn bf16_snap_on(
+        &self,
+        ptr: *mut f32,
+        n: usize,
+        s: ferrite_kernel::devrt::CuStream,
+    ) -> Result<()> {
+        if !bf16_truncate() || n == 0 {
+            return Ok(());
+        }
+        if !self.dev.bf16_roundtrip_on(ptr, n as i64, s)? {
+            static NOTE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            NOTE.get_or_init(|| {
+                eprintln!(
+                    "[bf16-truncate] the loaded kernel .so has no `dsv41_bf16_roundtrip` \
+                     symbol, so DSV41_BF16_TRUNCATE degraded to OFF for every boundary \
+                     (rebuild the kernels to run the arm)"
+                );
+            });
+        }
+        Ok(())
+    }
+
     /// MLA window path + grouped output projection.
     /// Decode attention for one layer. Returns whether the segment-C hc-post was
     /// folded into this layer's attention all-reduce (see
@@ -19327,7 +19397,16 @@ fn oracle_tap() -> bool {
         let mut norm_fused = false;
         let mut q_roped = false;
         let mut idx_q_roped = false;
-        if norm_fuse() && !idx_fused && self.dev.supports_gemm_fp8_norm() {
+        // ⚠️ Declined under `DSV41_BF16_TRUNCATE` (D1 boundary: the q-norm OUTPUT).
+        // The reference materialises `qr = self.q_norm(self.wq_a(x))` as a bf16
+        // tensor (`model.py:770`; `RMSNorm.forward` returns `(...).to(dtype)`) and
+        // `wq_b` reads THAT rounded row. This launch computes the norm inside the
+        // GEMV PROLOGUE and never writes the normalised row back to memory, so the
+        // boundary has no place to land; the gate therefore takes the plain
+        // `rmsnorm` + `bf16_snap(qr)` + `lin_rope`/`lin` sequence below, which is
+        // the reference's own order. Costs one launch + one node per layer on the
+        // gated arm only (the fusion is bit-identical, so this is latency only).
+        if norm_fuse() && !bf16_truncate() && !idx_fused && self.dev.supports_gemm_fp8_norm() {
             norm_fused = self.lin_rope_norm(
                 self.s.qr.ptr as *const f32,
                 ld.q_norm.as_ref().unwrap().as_f32(),
@@ -19356,7 +19435,14 @@ fn oracle_tap() -> bool {
             // sequence (T1's, term for term), so the emitted pair is bit-identical
             // to the launch it replaces. Falls back to the plain rmsnorm (and a
             // cleared flag) on an .so without the symbol.
+            // ⚠️ `qr_epi` is DECLINED under `DSV41_BF16_TRUNCATE`: its epilogue
+            // emits the fp8 of the norm's own output, which is still the
+            // UNROUNDED row at that point. With the gate on the plain `rmsnorm`
+            // below writes `qr` and `bf16_snap(qr)` rounds it, so the later
+            // `quant1(qr)` (wq_b's activation) takes the fp8 of the bf16 row —
+            // exactly the reference's `q_norm -> bf16 -> act_quant`.
             let qr_q = qr_epi()
+                && !bf16_truncate()
                 && self.dev.rmsnorm_q(
                     self.s.qr.ptr as *const f32,
                     ld.q_norm.as_ref().unwrap().as_f32(),
@@ -19379,6 +19465,18 @@ fn oracle_tap() -> bool {
                 )?;
             }
         }
+        // D1 boundary — the q-norm OUTPUT, the row `wq_b` (and the indexer's
+        // `idx_wq_b`) actually read. The reference's `q_norm` returns bf16
+        // (`model.py:770`; `RMSNorm.forward`'s `(...).to(dtype)`), and `wq_a`'s own
+        // output was already rounded to bf16 BEFORE the norm (`bf16_snap(qr)`
+        // above), so this pair reproduces `bf16 -> q_norm -> bf16` exactly.
+        // Placed after BOTH arms of the branch above: with `norm_fused` the row is
+        // still `wq_a`'s raw output, whose snap above already put it on the bf16
+        // grid, making this a lossless no-op (the round trip is idempotent); with
+        // the gate on, `norm_fuse` is declined so `qr` here IS the norm's output.
+        // OFF: not one instruction runs (the gate short-circuits before the
+        // launch).
+        self.bf16_snap(self.s.qr.ptr as *mut f32, ql)?;
         // DSV41_ROPE_FUSE: the same launch can ALSO rotate s.q (family 1) and
         // s.idx_q (family 2) in its epilogue, so neither gets a standalone
         // apply_rope. `q_roped`/`idx_q_roped` (declared beside `norm_fused`
@@ -19503,7 +19601,17 @@ fn oracle_tap() -> bool {
         // fused launch, bit-identical to the two (same reduction tree at
         // blockDim 1024, elementwise rope). DSV41_NR_FUSE=0 reverts, and so
         // does an .so without the symbol.
+        // ⚠️ `nr_fuse` is DECLINED under `DSV41_BF16_TRUNCATE` (D1 boundary: the
+        // kv-norm OUTPUT). The reference materialises `kv = self.kv_norm(self.wkv(x))`
+        // as bf16 (`model.py:703`; `RMSNorm.forward`) and rotates THAT rounded row in
+        // place (`apply_rotary_emb(kv[...])`), so bf16 must land between the norm and
+        // the rope — and again on the rope's own output. This launch fuses the two
+        // and never writes the normalised row, so the gate takes the plain
+        // `rmsnorm_on` / `bf16_snap_on` / `apply_rope_on` / `bf16_snap_on` sequence
+        // below (the reference's own order). The fusion is bit-identical, so this is
+        // latency only, and only on the gated arm.
         let nr_fused = nr_fuse()
+            && !bf16_truncate()
             && self.dev.rmsnorm_rope_on(
                 self.s.kv.ptr as *const f32,
                 ld.kv_norm.as_ref().unwrap().as_f32(),
@@ -19530,6 +19638,11 @@ fn oracle_tap() -> bool {
             cfg.norm_eps,
             kv_stream,
         )?;
+        // D1 boundary — the kv-norm OUTPUT (`model.py:703`: `kv_norm(read wkv)`),
+        // the row the in-place rope below rotates. Issued on `kv_stream`, not the
+        // main stream: under DUAL_CHAIN the producer above just ran on stream 2,
+        // and a main-stream round trip would race it.
+        self.bf16_snap_on(self.s.kv.ptr as *mut f32, hd, kv_stream)?;
         self.dev.apply_rope_on(
             self.s.kv.ptr as *mut f32,
             self.cos.as_f32(),
@@ -19543,6 +19656,11 @@ fn oracle_tap() -> bool {
             false,
             kv_stream,
         )?;
+        // D1 boundary — the rope's own OUTPUT. The reference rotates the bf16 row
+        // IN PLACE, so the rotated value is bf16 as well: whatever `sparse_attn`
+        // (and the ring append below) reads is a rounded row. Same stream as the
+        // rotation, for the same ordering reason.
+        self.bf16_snap_on(self.s.kv.ptr as *mut f32, hd, kv_stream)?;
         }
         // DUAL_CHAIN join: the kv half is fully issued (nothing below writes
         // `s.kv` until the ring append, which is its first consumer). Join the
@@ -20410,7 +20528,17 @@ fn oracle_tap() -> bool {
         // state) and the first step (`pos == 0`) keep the three-launch sequence
         // below — which is bit-identical, so the gate costs nothing but a branch
         // that the captured graph bakes in.
-        if compress_fuse() && ratio > 1 && pos > 0 && self.dev.supports_compress_fuse() {
+        // ⚠️ `compress_fuse` is DECLINED under `DSV41_BF16_TRUNCATE` (D1 boundary:
+        // the compressor's latent). This launch chains state-carry + pool + norm +
+        // rope + ring commit, so the reference's bf16 latent — `Compressor.forward`
+        // returns `self.norm(kv.to(dtype))` (`model.py:485`), which the in-place
+        // `apply_rotary_emb` and the fp4 `act_quant` then consume — never
+        // materialises and cannot be rounded. The gate takes the
+        // `compressor_pool_on` / `bf16_snap_on(latent)` / `compress_commit_on`
+        // sequence below, which is the reference's own order (norm -> bf16 -> rope
+        // -> quant -> ring). The three-launch form is bit-identical, so this is
+        // latency only, and only on the gated arm.
+        if compress_fuse() && !bf16_truncate() && ratio > 1 && pos > 0 && self.dev.supports_compress_fuse() {
             self.dev.compressor_fused_on(
                 cache.kvp.as_f32(),
                 cache.scp.as_f32(),
@@ -20452,6 +20580,14 @@ fn oracle_tap() -> bool {
                 cfg.norm_eps,
                 s,
             )?;
+            // D1 boundary — the compressor's LATENT, `Compressor.forward`'s
+            // `self.norm(kv.to(dtype))` (`model.py:485`), which is bf16 in the
+            // reference. The `compress_commit_on` below rotates it IN PLACE and
+            // lands it on the fp4 grid, so the rounding has to happen here, before
+            // the rope — the reference's own order. Issued on `s`, the stream the
+            // pool launch just wrote on (`COMPRESS_SIDE` passes the third side
+            // stream, the serial path the main one).
+            self.bf16_snap_on(cache.latent.ptr as *mut f32, hd, s)?;
             // FUSED COMMIT (device-side): reads out_rows on the device, ropes the
             // latent, stores it into the ring and advances this layer's device
             // counter. The old form downloaded out_rows (a sync D2H per layer per
@@ -20981,7 +21117,19 @@ fn oracle_tap() -> bool {
                         ids,
                     )?;
                 }
+                // ⚠️ DECLINED under `DSV41_BF16_TRUNCATE`: the fused epilogue writes
+                // the swiglu'd `[inter]` result straight out of the GEMV, so the
+                // reference's `gate = w1(x)` / `up = w3(x)` outputs (`Linear` ->
+                // `fp4_gemm`, bf16) never materialise and neither does the
+                // `F.silu(gate) * up` -> `.to(bf16)` step before w2
+                // (`model.py:841-849`). The gate takes the RAW gate|up epilogue
+                // (pitch `2*inter`) + the separate swiglu launch, and `bf16_snap`
+                // rounds the pair before the swiglu and its result after it. The
+                // KERNEL follows this automatically: `fuse` is bound to the caller's
+                // `out_slot_stride == inter` (dsv41_experts_mxf4.cu), so the pitch
+                // below IS the single source of truth.
                 let gateup_fused = !ran_tc
+                    && !bf16_truncate()
                     && gateup_fuse()
                     && self.dev.supports_gateup_fuse()
                     && expert_fp4_mode() == 2;
@@ -21223,13 +21371,32 @@ fn oracle_tap() -> bool {
                 // here, so we mirror the same condition. `ran_tc` forces it OFF:
                 // the tcgen05 epilogue never fuses, so its [2*inter] output needs
                 // the separate swiglu launch.
+                // ⚠️ `!bf16_truncate()` mirrors the decline above: with the gate on
+                // the pair epilogue was requested (pitch `2*inter`), so the GEMV did
+                // NOT swiglu and this separate pass MUST run.
                 let gateup_fused = !ran_tc
                     && !tl_gu
                     && !bs_gu
+                    && !bf16_truncate()
                     && gateup_fuse()
                     && self.dev.supports_gateup_fuse()
                     && expert_fp4_mode() == 2
                     && (dim as i32) % 512 == 0;
+                // D1 boundary — the routed experts' `w1`/`w3` GEMM OUTPUTS. The
+                // reference's `Linear` -> `fp4_gemm` returns the default dtype, bf16
+                // (`kernel.py:583`), and `Expert.forward` widens those rounded rows
+                // before the clamps and the silu (`model.py:841-846`) — so the pair
+                // `sparse_attn`-style raw gate|up here must be bf16 BEFORE the
+                // swiglu consumes it. ONE flat round trip covers every arm that
+                // wrote this buffer (the tcgen05 pair, the two TileLang arms, and
+                // the plain `expert_gate_up_fp4_batched`): all of them write the
+                // [topk][act_slot] raw layout, and `act_slot` is the slot pitch.
+                // OFF: not one instruction runs. Only reached with the gate on,
+                // where the fused arm was declined and `ex_act_b` holds raw gate|up.
+                self.bf16_snap(
+                    self.s.ex_act_b.ptr as *mut f32,
+                    topk * act_slot as usize,
+                )?;
                 if !gateup_fused {
                     self.dev.swiglu_limit_batched(
                         self.s.ex_act_b.ptr as *mut f32,
@@ -21240,6 +21407,16 @@ fn oracle_tap() -> bool {
                         topk as i32,
                     )?;
                 }
+                // D1 boundary — the experts' ACTIVATION, `F.silu(gate) * up`, which
+                // the reference rounds with `x.to(dtype)` before `w2` runs on it
+                // (`model.py:847-849`: `return self.w2(x.to(dtype))`). The rounded
+                // row is what the down GEMV below reads. Same flat pitch: only the
+                // first `inter` floats of each slot are live, the rest are the stale
+                // `up` half (never read again), so rounding them is inert.
+                self.bf16_snap(
+                    self.s.ex_act_b.ptr as *mut f32,
+                    topk * act_slot as usize,
+                )?;
                 // row_weight is PER SLOT here: route_w is [topk] and contiguous,
                 // so the kernel reads route_w[slot] (rw_stride = 1) — the exact
                 // scalar the sequential call passed as `route_w + slot`.
@@ -21308,7 +21485,17 @@ fn oracle_tap() -> bool {
                         );
                     }
                 }
-                if !tl_dn_done && down_fuse() && self.dev.supports_down_fuse() {
+                // ⚠️ `!bf16_truncate()`: the fused form sums the slots INSIDE one
+                // launch, so the reference's per-expert bf16 output
+                // (`Expert.forward` -> `w2`, bf16) is never materialised and the
+                // f32 sum rides on unrounded partials — one extra rounding per
+                // expert that the reference DOES apply (`y[idx] += expert(..)`,
+                // `model.py:894`, sums bf16 rows in an f32 accumulator). With the
+                // gate on the pair below runs, the `[topk][dim]` partials land in
+                // `ex_down_b` contiguously, and one flat `bf16_snap` puts every
+                // slot's row on the bf16 grid before the fixed-order sum — the
+                // reference's own order, slot by slot, in ascending index.
+                if !tl_dn_done && down_fuse() && !bf16_truncate() && self.dev.supports_down_fuse() {
                     self.dev.expert_down_reduce_fp4_batched(
                         self.s.ex_act_b.ptr as *const f32,
                         act_slot,
@@ -21343,6 +21530,16 @@ fn oracle_tap() -> bool {
                         w2s_stride,
                         ids,
                     )?;
+                    // D1 boundary — the routed experts' DOWN (`w2`) OUTPUT. The
+                    // reference's `Expert.forward` returns `self.w2(...)`, an
+                    // fp4 GEMM whose result is bf16 (`kernel.py:583`), and
+                    // `MoE.forward` adds that rounded `[dim]` row into its f32
+                    // accumulator (`y[idx] += expert(...)`, `model.py:894`). The
+                    // pair just wrote exactly those per-slot rows into `ex_down_b`
+                    // at `[slot][dim]`, contiguous, so ONE flat round trip puts
+                    // every slot on the bf16 grid before the sum below reads it.
+                    // OFF: not one instruction runs.
+                    self.bf16_snap(self.s.ex_down_b.ptr as *mut f32, topk * dim)?;
                     // Fixed-order sum, slot 0 first: the SAME order the sequential
                     // `o[row] += x` accumulation used (from the zeroed `o`), so the
                     // result is bit-identical (fp addition is not associative).
@@ -21407,12 +21604,28 @@ fn oracle_tap() -> bool {
                         slot as i32,
                         e4m3 as i32,
                     )?;
+                    // D1 boundaries (sequential arm) — the same two the batched
+                    // path snaps: the `w1`/`w3` GEMM outputs are bf16 in the
+                    // reference (`Linear` -> `fp4_gemm`, `kernel.py:583`) and so is
+                    // the `F.silu(gate) * up` activation fed to `w2`
+                    // (`model.py:841-849`). `ex_act` holds the raw [gate|up] pair
+                    // here (`2*inter_local` floats), then the swiglu writes the
+                    // first `inter_local`. Both round trips are flat and in bounds
+                    // (`ex_act` is `2*inter` wide).
+                    //
+                    // The per-expert DOWN output is NOT snapped on this arm: the
+                    // kernel accumulates straight into `s.o`, so there is no
+                    // per-slot [dim] row to round. That residual is documented in
+                    // the D1 report; this arm is the non-default one
+                    // (`DSV41_MOE_BATCH` defaults ON).
+                    self.bf16_snap(self.s.ex_act.ptr as *mut f32, 2 * inter_local)?;
                     self.dev.swiglu_limit(
                         self.s.ex_act.ptr as *mut f32,
                         1,
                         inter_local as i32,
                         cfg.swiglu_limit,
                     )?;
+                    self.bf16_snap(self.s.ex_act.ptr as *mut f32, inter_local)?;
                     self.dev.expert_down_fp4_indirect(
                         self.s.ex_act.ptr as *const f32,
                         self.s.o.ptr as *mut f32,
@@ -21501,11 +21714,35 @@ fn oracle_tap() -> bool {
                         )?;
                     }
                 }
+                // D1 boundary — the SHARED expert's `w1`/`w3` GEMM outputs. Same
+                // reference statement as the routed pair above
+                // (`Expert.forward`'s `gate = self.w1(x)`, `up = self.w3(x)`,
+                // `model.py:841-844`): both are bf16, and the clamps plus the silu
+                // below must see the rounded rows. `gemm_fp8_mx2` laid them out
+                // contiguously as [gate|up] (`sh_il` each), so one flat round trip
+                // over `2*sh_il` covers both. Stream: the mixed gate launch is a
+                // MAIN-stream writer (`dual` is forced off under MIX_GATE), while
+                // the shared half's own pair rides `sh_st` - so the snap follows
+                // whichever producer actually ran.
+                if sh_via_mixed {
+                    self.bf16_snap(self.s.ex_act.ptr as *mut f32, 2 * sh_il)?;
+                } else {
+                    self.bf16_snap_on(self.s.ex_act.ptr as *mut f32, 2 * sh_il, sh_st)?;
+                }
                 // A4: the swiglu epilogue emits the fp8 pair the w2 GEMV reads, so
                 // quant1(ex_act) disappears (40 launches/step). Only the SHARED
                 // expert's down needs it: the routed experts' down consumes
                 // ex_act_b as f32 directly (no quant to fold).
+                // ⚠️ `act_q` is DECLINED under `DSV41_BF16_TRUNCATE`: it emits the
+                // fp8 of its swiglu result in the SAME launch, so the bf16 boundary
+                // below (`F.silu(gate) * up` -> `.to(bf16)`, `model.py:847-849`)
+                // could not land between them and the w2 GEMV would read a
+                // quantisation of the unrounded row. With the gate on the plain
+                // `swiglu_limit_on` runs, `bf16_snap_on` rounds its output, and
+                // `quant1_on` then takes the fp8 of the ROUNDED activation — the
+                // reference's `silu*up -> bf16 -> act_quant` order.
                 let act_q = swiglu_q()
+                    && !bf16_truncate()
                     && self.dev.supports_swiglu_q()
                     && self.dev.swiglu_limit_q_on(
                         self.s.ex_act.ptr as *mut f32,
@@ -21524,6 +21761,12 @@ fn oracle_tap() -> bool {
                         cfg.swiglu_limit,
                         sh_st,
                     )?;
+                    // D1 boundary — the shared expert's ACTIVATION
+                    // (`F.silu(gate) * up`, bf16 in the reference before `w2`), on
+                    // the same side stream the swiglu just ran on. Placed ahead of
+                    // the `quant1` so the fp8 pair the w2 GEMV reads comes from the
+                    // rounded row.
+                    self.bf16_snap_on(self.s.ex_act.ptr as *mut f32, sh_il, sh_st)?;
                     self.quant1_on(self.s.ex_act.ptr as *const f32, sh_il as i32, sh_st)?;
                 }
                 // w2 is Cols-sharded: [dim, sh_il] locally, so the reduction is over
@@ -21542,7 +21785,16 @@ fn oracle_tap() -> bool {
                 // (the MoE accumulator AR#2 reduces), dropping the standalone
                 // ferrite_add launch (40/step). Association is unchanged --
                 // o + (acc + bias) either way -- so the result is bit-identical.
+                // ⚠️ `!bf16_truncate()`: the A5 epilogue adds the w2 result straight
+                // into `s.o` (the f32 MoE accumulator), so the reference's bf16
+                // rounding of the shared expert's output — `y += self.shared_experts(x)`
+                // adds an `Expert.forward` result, which is `w2`'s bf16 GEMM output
+                // (`model.py:897`) — would be skipped. The gate takes the plain GEMV
+                // into `ex_out`, `bf16_snap_on` rounds that `[dim]` row, and the
+                // existing `add_inplace` merges the ROUNDED row, exactly as the
+                // reference does.
                 let fused = !dual
+                    && !bf16_truncate()
                     && moe_epi_add()
                     && self.dev.supports_gemm_fp8_add()
                     && self.dev.gemm_fp8_mx_add(
@@ -21569,6 +21821,12 @@ fn oracle_tap() -> bool {
                         sh_il as i32,
                         sh_st,
                     )?;
+                    // D1 boundary — the shared expert's DOWN (`w2`) OUTPUT, the row
+                    // the merge below adds into the f32 accumulator. Same stream as
+                    // the GEMV that just wrote it (`sh_st` is stream 2 under
+                    // MOE_DUAL, the main stream otherwise); under MOE_DUAL the join
+                    // before the merge orders this against the add.
+                    self.bf16_snap_on(self.s.ex_out.ptr as *mut f32, dim, sh_st)?;
                     if !dual {
                         // ADD_EPI: defer the merge into the MoE all-reduce's
                         // store epilogue when the .so carries the biased entry

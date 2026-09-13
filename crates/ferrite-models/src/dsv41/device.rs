@@ -2336,6 +2336,23 @@ impl Device {
         Ok(true)
     }
 
+    /// [`Self::bf16_roundtrip`] on an explicit stream. `DSV41_BF16_TRUNCATE`'s
+    /// boundaries sit inside chains that ride the side streams (`dual_chain`
+    /// forks the kv norm+rope onto stream 2, `COMPRESS_SIDE` puts the
+    /// compressor's four launches on stream 3, `MOE_DUAL` puts the shared
+    /// expert's on stream 2), and a round trip issued on the MAIN stream while
+    /// its producer is still running on a side stream would race instead of
+    /// ordering. Same symbol, same kernel, same `Ok(false)`-when-stale
+    /// contract; only the stream moves.
+    pub fn bf16_roundtrip_on(&self, x: *mut f32, n: i64, s: CuStream) -> Result<bool> {
+        let Some(f) = self.kernels.bf16_roundtrip else {
+            return Ok(false);
+        };
+        let rc = unsafe { f(x, n, s) };
+        self.kerr(rc, "dsv41_bf16_roundtrip")?;
+        Ok(true)
+    }
+
     /// True when the runtime owns the SECOND side stream and its fork/join
     /// events. A cudart without the event primitives, or a failed stream create,
     /// reports false and the caller keeps the serial kv chain.
