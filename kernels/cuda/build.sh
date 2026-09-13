@@ -30,6 +30,29 @@ for f in "$DIR"/dsv41_kernels.cu "$DIR"/dsv41_experts_mxf4.cu "$DIR"/dsv41_visio
     [ -f "$f" ] && SRCS+=("$f")
 done
 
+# TILELANG (DSV41_GEMM_TILELANG, 2026-09-13): the FIRST TileLang-generated projection
+# kernel, forked from the tilelang-proj-proto prototype into the tree (route (a)
+# "source vendoring" of docs/agent/tilelang-integration-design.md §2).
+#
+# Layout: `tilelang_gen/wkv_shim.cu` is the ONLY TU taken from this subdir. The
+# frozen `wkv_*_tl.cu` dumps are #included by it (renamed — TileLang names every
+# kernel `main_kernel`, so two dumps in one link are a duplicate symbol) and are
+# deliberately NOT standalone SRCS. `tilelang_inc/` is the vendored header set
+# (tl_templates + the cutlass/cute transitive closure; see tilelang_gen/PROVENANCE.md).
+#
+# ⚠️ Same build-vs-runtime split as the other gated blocks here (mxf4 / e4m3 / PROJ-MMA):
+# the shim is COMPILED IN unconditionally so the symbol is always present in the .so;
+# the runtime gate `DSV41_GEMM_TILELANG` (default OFF, read once in chain_dev.rs) is
+# the only way in. A build that omitted the TU would make a `DSV41_GEMM_TILELANG=1`
+# A/B silently measure the OLD path (the project's #1 measurement-bias trap).
+# ⚠️ The frozen geometry (n=512/k=5120/bN=128/ks=8) is baked into the generated grid
+# and index arithmetic, so the C entry DECLINES (returns 2) every other shape and the
+# caller keeps its existing kernel. Extending to the second shape is per-shape: see
+# tilelang_gen/PROVENANCE.md §5.
+for f in "$DIR"/tilelang_gen/*_shim.cu; do
+    [ -f "$f" ] && SRCS+=("$f")
+done
+
 NVCC="${NVCC:-nvcc}"
 "$NVCC" --version >/dev/null 2>&1 || { echo "error: nvcc not found (CUDA toolkit required)"; exit 1; }
 
@@ -141,6 +164,7 @@ echo "$BUILD_ID" > "$(dirname "$0")/.build_id"
 "$NVCC" -O3 -shared -Xcompiler -fPIC $FAST_MATH_FLAG \
     -std=c++17 \
     -gencode "arch=compute_${ARCH},code=sm_${ARCH}" \
+    -I "$DIR/tilelang_inc" \
     -DFERRITE_KERNEL_BUILD_ID="\"${BUILD_ID}\"" \
     "${SKELETON_FLAGS[@]+"${SKELETON_FLAGS[@]}"}" \
     -o "$OUT" "${SRCS[@]}"

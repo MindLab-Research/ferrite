@@ -1557,6 +1557,35 @@ fn proj_mma_declined_note() {
     });
 }
 
+/// One-shot receipt for [`DevChain::gemm_tilelang_wkv`], same trap and same
+/// discipline as the notes above: `DSV41_GEMM_TILELANG=1` is armed but the
+/// generated kernel is NOT TAKABLE, so this run measures the OLD programs.
+///
+/// Two shapes of "inert" this line must NOT confuse:
+///   * a shape the C entry DECLINES is NORMAL and silent — phase 1 generated the
+///     wkv shape only, so the wq_a / wq_b / wo_b / indexer sites declining is the
+///     intended behaviour, not a phantom gate. It gets no line.
+///   * a `.so` that has no `dsv41_gemm_fp8_tilelang_wkv` symbol at all (the
+///     TILELANG TU absent from the build) is the real phantom: every arm silently
+///     runs the old path. THAT gets the line, once per process.
+///
+/// The ARMED side needs no line here: the shim prints its own
+/// `[proj-tilelang] ARMED wkv m=.. n=.. k=.. ks=.. -> grid=..` receipt on the
+/// first armed launch, and the generated kernel name is visible to nsys.
+fn proj_tilelang_skipped_note() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        eprintln!(
+            "[proj-tilelang] DSV41_GEMM_TILELANG=1 is ARMED but the loaded .so has NO \
+             `dsv41_gemm_fp8_tilelang_wkv` symbol: the projection sites keep their \
+             existing kernels, eager AND verify. Do NOT read this run as a TILELANG \
+             measurement (the arm is inert — the project's #1 measurement-bias trap). \
+             Rebuild with kernels/cuda/build.sh so kernels/cuda/tilelang_gen/wkv_shim.cu \
+             is linked in."
+        );
+    });
+}
+
 /// ENGRAM-GATHER-MROWS (`DSV41_ENGRAM_GATHER_MROWS=1`, DEFAULT OFF): the
 /// multi-row engram gather runs as ONE `dsv41_engram_gather_rows` launch for all
 /// `m` rows, instead of `m` one-row gathers (12 launches per verify block at
@@ -5401,6 +5430,31 @@ impl<'a> DevChain<'a> {
     /// fp8 dense linear for one row: `out[1, n_out] = a[1, k] @ w[n_out, k]^T`.
     fn lin(&self, a: *const f32, k: i32, w: &crate::dsv41::load::DevTensor, ws: &crate::dsv41::load::DevTensor, n_out: i32, out: *mut f32) -> Result<()> {
         self.quant1(a, k)?;
+        // TILELANG (DSV41_GEMM_TILELANG): the EAGER half of the double swap — see
+        // [`Self::gemm_tilelang_wkv`]. The generated shape is wkv's (n = hd = 512,
+        // k = dim = 5120); every other single-row projection declines here and keeps
+        // `gemm_fp8_mx_or_swap` below unchanged, so OFF (and the non-wkv shapes)
+        // are bit-for-bit today's path.
+        if Self::gemm_tilelang_wkv() {
+            if self.dev.supports_gemm_fp8_tilelang_wkv() {
+                if self.dev.gemm_fp8_tilelang_wkv(
+                    self.s.xq.as_u8(),
+                    self.s.xsc.as_f32(),
+                    w.as_u8(),
+                    ws.as_u8(),
+                    std::ptr::null(),
+                    out,
+                    1,
+                    n_out,
+                    k,
+                    n_out,
+                )? {
+                    return Ok(());
+                }
+            } else {
+                proj_tilelang_skipped_note();
+            }
+        }
         self.gemm_fp8_mx_or_swap(
             self.s.xq.as_u8(),
             self.s.xsc.as_f32(),
@@ -5556,6 +5610,32 @@ impl<'a> DevChain<'a> {
         k: i32,
         out_stride: i32,
     ) -> Result<bool> {
+        // ⓪ TILELANG (DSV41_GEMM_TILELANG): the double-swap arm, and the HIGHEST
+        // precedence — before PROJ_MMA (see [`Self::gemm_tilelang_wkv`] for why
+        // PROJ_MMA must not win under it: that would put verify on a third program).
+        // The generated shape (n=512, k=5120) is the wkv site; the wq_a / wq_b /
+        // wo_b sites DECLINE (silently, by design — only wkv was generated in phase 1).
+        // A missing SYMBOL is the inert case and gets its one-shot note.
+        if Self::gemm_tilelang_wkv() {
+            if self.dev.supports_gemm_fp8_tilelang_wkv() {
+                if self.dev.gemm_fp8_tilelang_wkv(
+                    self.s.xq_r.ptr as *const u8,
+                    self.s.xsc_r.ptr as *const f32,
+                    w,
+                    ws,
+                    std::ptr::null(),
+                    out,
+                    rows as i32,
+                    n,
+                    k,
+                    out_stride,
+                )? {
+                    return Ok(true);
+                }
+            } else {
+                proj_tilelang_skipped_note();
+            }
+        }
         // ① PROJ_MMA (numerics-changing): checked FIRST, and BEFORE the swapAB
         // refusal below. Switch order ① MMA > ② MPAR > ③ SIMT legacy; ②/③ both
         // live inside the C entry `dsv41_gemm_fp8_mrows`, so from here the choice
@@ -5781,6 +5861,43 @@ impl<'a> DevChain<'a> {
         *F.get_or_init(|| std::env::var("DSV41_PROJ_MMA").map(|v| v == "1").unwrap_or(false))
     }
 
+    /// **TILELANG (`DSV41_GEMM_TILELANG=1`, DEFAULT OFF)** — the fp8 projection
+    /// family on the TileLang-generated kernel (`dsv41_gemm_fp8_tilelang_wkv`,
+    /// the wkv shape of the mma-tile GEMM in `kernels/cuda/tilelang_gen/`).
+    ///
+    /// THE DEFINING PROPERTY IS THE DOUBLE SWAP. The generated program puts M
+    /// into the mma tile, so m=1 (eager) and m<=6 (verify) issue the same number
+    /// of mma instructions — but it is a DIFFERENT PROGRAM from both
+    /// `gemm_fp8_mx` and `gemm_fp8_mrows` (the k-block scale lands on the
+    /// 32-element sum, the tensor-core summation order is hardware-defined).
+    /// Program-consistent parity only holds WITHIN one program
+    /// (`row r of an M-row launch == row r of the M=1 launch of THIS program`),
+    /// so the arm is only coherent when eager AND verify both take it. Taking it
+    /// on the verify side alone is exactly the `DSV41_PROJ_MMA` death
+    /// (mean-k 2.240 -> 0.020, see docs/agent/proj-mma-verdict.md). This gate is
+    /// therefore DEFINED as the double swap: `proj_mrows` (verify) checks it
+    /// FIRST, and the eager side (`lin` / `lin2` / `layer()`) carries the same arm.
+    ///
+    /// PRECEDENCE: ① TILELANG > ② PROJ_MMA > ③ MPAR > ④ MTILE > ⑤ SIMT legacy.
+    /// ①② are MUTUALLY EXCLUSIVE — PROJ_MMA is the "one-side-only" shape this arm
+    /// exists to avoid, so letting it win under TILELANG would put verify back on a
+    /// third program. When both are armed, TILELANG wins and PROJ_MMA is inert for
+    /// the process (one-shot note in [`proj_tilelang_skipped_note`]).
+    ///
+    /// FIRST PHASE = ONE SHAPE: only wkv (n=512, k=5120) was generated. The C entry
+    /// DECLINES every other shape, so the wq_a / wq_b / wo_b / indexer sites keep
+    /// their existing kernels — this is the normal case, not an error. Strict
+    /// `== "1"`, the convention `DSV41_PROJ_MMA` / `DSV41_SWAPAB` use. Read ONCE and
+    /// cached (every projection of every verify layer inside graph capture).
+    fn gemm_tilelang_wkv() -> bool {
+        static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *F.get_or_init(|| {
+            std::env::var("DSV41_GEMM_TILELANG")
+                .map(|v| v == "1")
+                .unwrap_or(false)
+        })
+    }
+
     /// The plain M=1 fp8 GEMV with the swapAB dispatch in front of it: when the
     /// gate is on AND the loaded .so carries the kernel AND the shape can take it
     /// (n % 16 == 0, k % 32 == 0), the tensor-core form runs; otherwise the SIMT
@@ -5990,6 +6107,77 @@ impl<'a> DevChain<'a> {
             return Ok(false);
         }
         self.quant1(a, k)?;
+        // TILELANG (DSV41_GEMM_TILELANG): the EAGER half of the double swap, on the
+        // FUSED site. See [`Self::gemm_tilelang_wkv`] for the contract. This call
+        // shape is `(wq_a, wkv)` at the attention site, so family 2 is the one the
+        // generated shape matches; family 1 (wq_a) declines. When the generated
+        // program takes family 2 we run family 1 through `gemm_fp8_mx_or_swap` —
+        // the SAME program `lin` would run — so both outputs keep `lin2`'s
+        // "bit-identical to two `lin` calls" contract.
+        // ⚠️ The (wq_b, idx_wq_b) site declines BOTH families (neither is the
+        // generated shape), so it falls through to the fused launch verbatim —
+        // zero behaviour change there.
+        if Self::gemm_tilelang_wkv() {
+            if self.dev.supports_gemm_fp8_tilelang_wkv() {
+                let tl1 = self.dev.gemm_fp8_tilelang_wkv(
+                    self.s.xq.as_u8(),
+                    self.s.xsc.as_f32(),
+                    w1.as_u8(),
+                    ws1.as_u8(),
+                    std::ptr::null(),
+                    out1,
+                    1,
+                    n1,
+                    k,
+                    n1,
+                )?;
+                let tl2 = self.dev.gemm_fp8_tilelang_wkv(
+                    self.s.xq.as_u8(),
+                    self.s.xsc.as_f32(),
+                    w2.as_u8(),
+                    ws2.as_u8(),
+                    std::ptr::null(),
+                    out2,
+                    1,
+                    n2,
+                    k,
+                    n2,
+                )?;
+                if tl1 || tl2 {
+                    // The fused launch is NOT taken (it would run the OLD program for
+                    // the family the generated kernel just handled), so the other
+                    // family runs as its own single-row launch. Same program as
+                    // `lin`, same staged `s.xq`, so the outputs are unchanged.
+                    if !tl1 {
+                        self.gemm_fp8_mx_or_swap(
+                            self.s.xq.as_u8(),
+                            self.s.xsc.as_f32(),
+                            w1.as_u8(),
+                            ws1.as_u8(),
+                            std::ptr::null(),
+                            out1,
+                            n1,
+                            k,
+                        )?;
+                    }
+                    if !tl2 {
+                        self.gemm_fp8_mx_or_swap(
+                            self.s.xq.as_u8(),
+                            self.s.xsc.as_f32(),
+                            w2.as_u8(),
+                            ws2.as_u8(),
+                            std::ptr::null(),
+                            out2,
+                            n2,
+                            k,
+                        )?;
+                    }
+                    return Ok(true);
+                }
+            } else {
+                proj_tilelang_skipped_note();
+            }
+        }
         self.dev.gemm_fp8_mx2(
             self.s.xq.as_u8(),
             self.s.xsc.as_f32(),

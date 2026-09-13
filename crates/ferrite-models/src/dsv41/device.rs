@@ -697,6 +697,44 @@ struct Kernels {
             c_int, c_int, c_int, c_int, *mut f32, *mut c_uint, c_int, CuStream,
         ) -> c_int,
     >,
+    // TILELANG (`dsv41_gemm_fp8_tilelang_wkv`, from the generated TU
+    // `kernels/cuda/tilelang_gen/wkv_shim.cu`): the FIRST TileLang-generated
+    // projection kernel — the wkv shape (n=512, k=5120) of the fp8 projection GEMM,
+    // emitted by tilelang 0.1.14 and frozen into the tree (route (a) source
+    // vendoring; see docs/agent/tilelang-integration-design.md and
+    // tilelang_gen/PROVENANCE.md).
+    //
+    // WHY IT IS A PROGRAM SWAP AND NOT A KNOB, and why it is the ONLY projection
+    // arm that is safe to compare across m: the TileLang program puts M INTO the
+    // mma tile, so m=1 and m=6 issue the SAME number of mma instructions (the
+    // prototype measured M6/M1 = 1.00 on all four shapes, against the SIMT mrows
+    // family's 5.73/5.26/3.11/3.04x). It is NOT bit-identical to `gemm_fp8_mrows`
+    // (the k-block scale lands on the 32-element SUM, the tensor core's intra-block
+    // summation order is hardware-defined — §2 of tensorcore-proj-design.md proves
+    // SIMT parity unreachable). What it DOES guarantee per the same argument is
+    //     row r of an M-row launch == row r of the M=1 launch OF THIS PROGRAM
+    // ⇒ the arm must be taken on BOTH sides (eager and verify) or on neither:
+    // `DSV41_GEMM_TILELANG` is DEFINED as that double swap. Taking it on the verify
+    // side alone is exactly the `DSV41_PROJ_MMA` death (mean-k 2.240 -> 0.020),
+    // which is why `proj_mrows` checks this arm FIRST and the eager `lin` carries
+    // the same arm.
+    //
+    // FIRST PHASE = ONE SHAPE. The generated geometry (n/k/bN/ks) is baked into the
+    // grid and index arithmetic, so the C entry DECLINES (returns 2, never
+    // cudaErrorInvalidValue) for every other shape: `m` outside 1..=8, `n != 512`,
+    // `k != 5120`, `out_stride != n`, a non-null `bias` (the generated kernel has no
+    // bias path), a base that is not 16B-aligned, or an INIT failure (the [ks][16][n]
+    // partial scratch could not be allocated — e.g. the first call landed inside
+    // capture). A decline leaves the caller on its existing kernel.
+    // ABI: (a, a_scale, w, w_scale, bias, out, m, n, k, out_stride, s) — the SAME
+    // list as `gemm_fp8_mrows`, so a caller swaps the program without touching its
+    // activation staging.
+    gemm_fp8_tilelang_wkv: Option<
+        unsafe extern "C" fn(
+            *const u8, *const f32, *const u8, *const u8, *const f32, *mut f32,
+            c_int, c_int, c_int, c_int, CuStream,
+        ) -> c_int,
+    >,
     // K2, from dsv41_kernels.cu (`dsv41_gemm_fp8_mrows_rope_norm`): the verify's
     // q-chain tail folded into ONE launch — rmsnorm + fp8 quantisation + the
     // wq_b multi-row fp8 GEMV + RoPE, each segment reproduced from the kernel the
@@ -1793,6 +1831,7 @@ impl Device {
             wo_a_grouped_fp8: ko!(rt, "dsv41_wo_a_grouped_fp8"),
             gemm_fp8_mrows: ko!(rt, "dsv41_gemm_fp8_mrows"),
             gemm_fp8_mrows_mma: ko!(rt, "dsv41_gemm_fp8_mrows_mma"),
+            gemm_fp8_tilelang_wkv: ko!(rt, "dsv41_gemm_fp8_tilelang_wkv"),
             gemm_fp8_mrows_rope_norm: ko!(rt, "dsv41_gemm_fp8_mrows_rope_norm"),
             gemm_fp8_mrows2: ko!(rt, "dsv41_gemm_fp8_mrows2"),
             gemm_fp8_mrows_f32: ko!(rt, "dsv41_gemm_fp8_mrows_f32"),
@@ -5035,6 +5074,77 @@ impl Device {
     /// program they were verified against.
     pub fn supports_gemm_fp8_mrows_mma(&self) -> bool {
         self.kernels.gemm_fp8_mrows_mma.is_some()
+    }
+
+    /// TILELANG: the generated wkv-shape fp8 projection GEMM
+    /// (`dsv41_gemm_fp8_tilelang_wkv`, from `kernels/cuda/tilelang_gen/wkv_shim.cu`) —
+    /// the multi-row GEMM whose M rides inside the mma tile, so m=1 and m=6 cost the
+    /// same. See the `Kernels::gemm_fp8_tilelang_wkv` field for the mapping, the
+    /// (b′) program-consistent parity contract and the double-swap requirement.
+    ///
+    /// Deliberately the SAME argument list as `gemm_fp8_mrows`, so a caller swaps
+    /// the program without touching its activation staging: `a` [rows, k] fp8 e4m3,
+    /// `a_scale` [rows, k/32] f32, `out` f32 with row `r` at `+r*out_stride`.
+    ///
+    /// FIRST PHASE = THE wkv SHAPE ONLY (n=512, k=5120). The generated geometry is
+    /// baked into the grid/index arithmetic, so the C entry declines every other
+    /// shape; `Ok(false)` here therefore means exactly "this projection is not the
+    /// generated shape" for the wq_a / wq_b / wo_b sites, and "NOT performed" for
+    /// wkv. Either way the caller keeps its existing kernel.
+    ///
+    /// `Ok(false)` also covers a stale `.so` without the symbol (the TILELANG TU
+    /// absent from the build) and the C entry's declines (it returns 2, never
+    /// cudaErrorInvalidValue, so a decline can never read as a launch failure).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_fp8_tilelang_wkv(
+        &self,
+        a: *const u8,
+        a_scale: *const f32,
+        w: *const u8,
+        w_scale: *const u8,
+        bias: *const f32,
+        out: *mut f32,
+        rows: i32,
+        n: i32,
+        k: i32,
+        out_stride: i32,
+    ) -> Result<bool> {
+        let Some(f) = self.kernels.gemm_fp8_tilelang_wkv else {
+            return Ok(false);
+        };
+        if !(1..=8).contains(&rows) {
+            return Ok(false);
+        }
+        let rc = unsafe {
+            f(
+                a,
+                a_scale,
+                w,
+                w_scale,
+                bias,
+                out,
+                rows,
+                n,
+                k,
+                out_stride,
+                self.stream,
+            )
+        };
+        // 2 = the shim's "declined" (shape / bias / alignment / INIT failure), the
+        // caller falls back. Every other non-zero rc is a real cuda error.
+        if rc == 2 {
+            return Ok(false);
+        }
+        self.kerr(rc, "dsv41_gemm_fp8_tilelang_wkv")?;
+        Ok(true)
+    }
+
+    /// True when the loaded .so carries the TileLang wkv entry
+    /// (`dsv41_gemm_fp8_tilelang_wkv`, compiled in from `kernels/cuda/tilelang_gen/`
+    /// — see `kernels/cuda/build.sh`). A stale .so that predates the TU leaves the
+    /// projection sites on their existing kernels.
+    pub fn supports_gemm_fp8_tilelang_wkv(&self) -> bool {
+        self.kernels.gemm_fp8_tilelang_wkv.is_some()
     }
 
     /// K2: the verify's q-chain tail in ONE launch — rmsnorm(`qr_raw`) + its fp8
