@@ -6976,9 +6976,12 @@ extern "C" int dsv41_gemm_fp8_mrows(const uint8_t* a, const float* a_scale,
 // GEOMETRY. Deliberately the mtile arm's, resolved by the same helpers
 // (`dsv41_mrows_mtile_for` is NOT consulted here -- this entry IS the arm, so the
 // caller's gate is the only switch): `bn = g_mrows_mtile_bn`, `nw =
-// dsv41_mrows_mtile_warps_for(n, bn)`, `smem = nw*bn*k + 1 KB`. The weight slab
-// staging, the prologue order, the register tile and the write epilogue are the
-// `<M, 0>` program's, verbatim.
+// dsv41_mrows_mtile_warps_for(n, bn)`, `smem = nw*bn*k + nw*1 KB` (the e4m3 table
+// is PER WARP, and this arm stages NO activation: `AQ == 1`'s activation is f32
+// and quantised in-warp). The per-warp weight slab staging, the prologue order,
+// the register tile and the write epilogue are the `<M, 0>` program's, verbatim
+// (including the fix: the weight slab is warp-private, so no block barrier gates
+// it -- only the `<M, 0>` program's activation staging needs one).
 //
 // DECLINES (returns 2, never 1 -- the r42/r43 `cudaErrorInvalidValue` collision):
 // m outside 1..=8, n <= 0, `k % 32` (the quant's scale block IS 32, so a partial

@@ -152,6 +152,17 @@ const char* ferrite_kernel_build_id(void);
 unsigned ferrite_kernel_abi_version(void);
 }
 
+// The launchers return `int` (a cast cudaError_t), so they need their own check.
+#define CKI(x)                                                                       \
+    do {                                                                             \
+        int rc_ = (x);                                                               \
+        if (rc_ != 0) {                                                              \
+            fprintf(stderr, "launcher err @%d %s: %d (%s)\n", __LINE__, #x, rc_,     \
+                    cudaGetErrorString((cudaError_t)rc_));                           \
+            exit(1);                                                                 \
+        }                                                                            \
+    } while (0)
+
 #define CK(x)                                                                        \
     do {                                                                             \
         cudaError_t e_ = (x);                                                        \
@@ -280,15 +291,25 @@ int main(int argc, char** argv) {
                                                 BLOCK, w3s_base, BLOCK, d_ids, /*ilv=*/1,
                                                 /*act_e4m3=*/0, stream);
     };
+    // ARM 3 (candidate-1 probe): the rows==1 INDIRECT entry -> expert_gemv_fp4_kernel.
+    // `ilv=0` because that entry has no interleaved reader; the loader also refuses
+    // to interleave while DSV41_NO_GEMV_FP4 is set (load.rs::ilv_ok), so arm 3 must
+    // be run in a process where DSV41_NO_GEMV_FP4=1 is exported BEFORE load.
+    auto gateup_indirect = [&](int slot) {
+        return dsv41_expert_gate_up_fp4_indirect(d_a, d_asc, d_out_dense, /*rows=*/1, DIM, IL,
+                                                 LIMIT, w1_base, BLOCK, w1s_base, BLOCK, w3_base,
+                                                 BLOCK, w3s_base, BLOCK, d_ids, slot,
+                                                 /*act_e4m3=*/0, stream);
+    };
 
     auto run_point = [&](int rows) {
-        for (int i = 0; i < warm; i++) { set_ids(rows, i); CK(gateup(rows)); }
+        for (int i = 0; i < warm; i++) { set_ids(rows, i); CKI(gateup(rows)); }
         CK(cudaStreamSynchronize(stream));
         cudaEvent_t e0, e1;
         CK(cudaEventCreate(&e0));
         CK(cudaEventCreate(&e1));
         CK(cudaEventRecord(e0, stream));
-        for (int i = 0; i < iters; i++) { set_ids(rows, 1000 + i); CK(gateup(rows)); }
+        for (int i = 0; i < iters; i++) { set_ids(rows, 1000 + i); CKI(gateup(rows)); }
         CK(cudaEventRecord(e1, stream));
         CK(cudaEventSynchronize(e1));
         float ms = 0.f;
@@ -307,10 +328,10 @@ int main(int argc, char** argv) {
 
     // ---- profiler window (for `ncu --profile-from-start off`) ---------------
     auto profile_point = [&](int rows) {
-        for (int i = 0; i < 3; i++) { set_ids(rows, i); CK(gateup(rows)); }
+        for (int i = 0; i < 3; i++) { set_ids(rows, i); CKI(gateup(rows)); }
         CK(cudaStreamSynchronize(stream));
         CK(cudaProfilerStart());
-        for (int i = 0; i < 3; i++) { set_ids(rows, 100 + i); CK(gateup(rows)); }
+        for (int i = 0; i < 3; i++) { set_ids(rows, 100 + i); CKI(gateup(rows)); }
         CK(cudaStreamSynchronize(stream));
         CK(cudaProfilerStop());
     };
@@ -320,6 +341,32 @@ int main(int argc, char** argv) {
             run_point(rows);
     } else if (!strcmp(mode, "all")) {
         for (int rows = 1; rows <= MAX_ROWS; rows++) run_point(rows);
+    } else if (!strcmp(mode, "indirect")) {
+        // ARM 3: the rows==1 INDIRECT entry (expert_gemv_fp4_kernel). Run with
+        // DSV41_NO_GEMV_FP4 **unset** (the dispatch condition is
+        // `rows==1 && getenv("DSV41_NO_GEMV_FP4")==nullptr`) and with the pools it
+        // expects; profile it with `-k "regex:expert_gemv_fp4_kernel"`.
+        for (int i = 0; i < warm; i++) { set_ids(1, i); for (int s = 0; s < SLOTS; s++) CKI(gateup_indirect(s)); }
+        CK(cudaStreamSynchronize(stream));
+        cudaEvent_t e0, e1;
+        CK(cudaEventCreate(&e0));
+        CK(cudaEventCreate(&e1));
+        CK(cudaEventRecord(e0, stream));
+        for (int i = 0; i < iters; i++) {
+            set_ids(1, 1000 + i);
+            for (int s = 0; s < SLOTS; s++) CKI(gateup_indirect(s));
+        }
+        CK(cudaEventRecord(e1, stream));
+        CK(cudaEventSynchronize(e1));
+        float ms = 0.f;
+        CK(cudaEventElapsedTime(&ms, e0, e1));
+        const double us = ms * 1000.0 / iters;
+        // per (slot) call the entry streams one expert's [IL, DIM] fp4 pair
+        const double bytes = (double)SLOTS * IL * (double)(DIM / 2) * 2.0;
+        printf("   indirect(rows=1) %u slot-calls/call %8.2f us/call  %7.1f GB/s\n",
+               (unsigned)SLOTS, us, bytes / (us * 1e-6) / 1e9);
+        CK(cudaEventDestroy(e0));
+        CK(cudaEventDestroy(e1));
     } else {
         const int rows = atoi(mode);
         run_point(rows);
