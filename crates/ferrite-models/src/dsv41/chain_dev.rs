@@ -2979,6 +2979,13 @@ fn hc_tail_split() -> bool {
             self.moe(layer, ld)?;
         }
         let moe_hc_folded = self.moe_reduce(layer)?;
+        // op-level diagnostic: the MoE sublayer's output (kind 2), the same
+        // bisection contract as xn (0) and the attention o (1).
+        if let Some(xdp) = &xdump {
+            if layer == 0 {
+                self.gt_dump_vec(xdp, 2, self.s.o.ptr, dim)?;
+            }
+        }
         if phase_dbg() {
             eprintln!("[phs] L{layer} moe={:?}", _t_moeonly.elapsed());
         }

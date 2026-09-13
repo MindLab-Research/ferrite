@@ -214,6 +214,67 @@ __device__ __forceinline__ float glue_fast_round_scale(float amax, float max_inv
     return __int_as_float((e + 127) << 23);
 }
 
+// The e4m3 byte decoder and the bf16 boundary, ported from the HEAD-era parity
+// work: the window-KV quantization round trip needs the EXACT reference
+// semantics (kernel.py's act_quant, inplace=True arm):
+//   amax = max(amax, 1e-4); s = fast_round_scale(amax / 448);
+//   q = clamp(v/s, +-448); byte = e4m3(q); write = bf16(dequant(byte) * s)
+__device__ __forceinline__ float glue_e4m3_byte_to_f(uint8_t b) {
+    const uint32_t s = ((uint32_t)b & 0x80u) << 24;
+    const uint32_t e = ((uint32_t)b >> 3) & 0x0Fu;
+    const uint32_t m = (uint32_t)b & 0x07u;
+    if (e == 0u) {
+        const float v = (float)m * (1.0f / 512.0f);
+        return (b & 0x80u) ? -v : v;
+    }
+    return __uint_as_float(s | ((e + 120u) << 23) | (m << 20));
+}
+
+// The bf16 boundary of `x.to(dtype)`: RN narrowing then the exact widening back.
+__device__ __forceinline__ float glue_bf16_round(float v) {
+    return __bfloat162float(__float2bfloat16(v));
+}
+
+// The window-KV fp8 round trip, in place on one [cols] row in blocks of
+// `block` (= fp8_block_size = 32). The official `_window_kv` runs
+// `act_quant(kv, 32, ..., inplace=True)` on the POST-ROPE kv before it enters
+// the ring, so the cache holds bf16(dequant) — the ring must match that domain
+// exactly ("精度不能高也不能低"). One warp per scale block; all arithmetic
+// term-for-term the reference's (the amax tree order, the floor, the
+// power-of-two scale, the clamp, the e4m3 RN cast, the bf16 write-back).
+__global__ void win_kv_quant_rt_kernel(float* __restrict__ kv, int cols, int block) {
+    const int lane = (int)threadIdx.x;  // 0..31: the in-block element lane
+    const int b = (int)blockIdx.x;      // which scale block of the row
+    if (lane >= 32) return;             // defensive; the launcher uses 32
+    float* blk = kv + (size_t)b * (size_t)block;
+    // (1) the block amax -- `quant_kernel<0>`'s 32-lane shuffle tree
+    float a = 0.f;
+    for (int i = lane; i < block; i += 32) a = fmaxf(a, fabsf(blk[i]));
+    for (int off = 16; off > 0; off >>= 1) a = fmaxf(a, __shfl_xor_sync(0xFFFFFFFFu, a, off));
+    // (2) the reference's floor (`kernel.py:76`) then its power-of-two scale
+    const float amax = fmaxf(a, 1e-4f);
+    const float sc = fmaxf(glue_fast_round_scale(amax, 1.0f / 448.0f), 1e-30f);
+    const float inv = 1.f / sc;  // exact: sc is a power of two
+    // (3) clamp + cast -> the byte; (4) decode * scale -> the bf16 write-back
+    for (int i = lane; i < block; i += 32) {
+        const float v = blk[i];
+        const float q = fminf(fmaxf(v * inv, -448.0f), 448.0f);
+        const __nv_fp8_e4m3 f8 = __nv_fp8_e4m3(q);
+        const uint8_t code = *(const uint8_t*)&f8;
+        const float dq = glue_e4m3_byte_to_f(code) * sc;
+        // G3: the reference's inplace arm writes back in the INPUT dtype
+        // (bf16), so the ring stores bf16(dequant) — not f32.
+        blk[i] = glue_bf16_round(dq);
+    }
+}
+
+extern "C" int dsv41_win_kv_quant_rt(float* kv, int cols, int block, cudaStream_t s) {
+    if (cols <= 0 || block <= 0) return (int)cudaSuccess;
+    const int nblk = (cols + block - 1) / block;
+    win_kv_quant_rt_kernel<<<(unsigned)nblk, 32, 0, s>>>(kv, cols, block);
+    return (int)cudaGetLastError();
+}
+
 __global__ void swiglu_limit_q_kernel(float* __restrict__ gate_up, int rows, int inter,
                                       float limit, uint8_t* __restrict__ xq,
                                       float* __restrict__ xsc) {
