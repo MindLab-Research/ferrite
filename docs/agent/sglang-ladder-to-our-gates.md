@@ -72,3 +72,25 @@ A2 `WINDOW_KV_QUANT`(`:2320`)、A3 `COMPRESS_LATENT_QUANT`(`:1471`)、A4 `INDEXE
 
 **⇒ 因此优先级：大块头（MoE 换核：grouped tcgen05 e4m3 = 与官方 fp4_gemm 同格式）> 图化修停住 > 其余门。**
 
+## 📊 开关层已穷尽的实证清单（2026-09-13 19:12，全部实测）
+
+| 杠杆 | 实测 step | 备注 |
+|---|---|---|
+| 图开（`VERIFY_GRAPH=1 GRAPH_STEP=1`） | **51 ms** | 但**只 6 步就停** ✗ ⇒ 独立待修 |
+| **图关（与文档 32.5ms 同口径）** | **61.5 ms** | 43+ 步 ✓ |
+| `DRAFT_GRAPH=1` | 51.7 ms | **0 变化** ✗ |
+| `VERIFY_FORK=1`（图关） | **59.0 ms** | vs 61.5 ⇒ **+4%** ✓（博客的 +23% 是他们 plain 路） |
+| `GATEUP_FUSE=0` | 60 ms | **反向** ✗（只拆融合、未换来 MMA） |
+| `EXERT_TCGEN05_E4M3=1 EXERT_GROUPED=1` | 52 ms | **MMA 未上场** ✗ |
+| `MOE_TILELANG_BS=1` | — | **毁模型** ✗（1..100 全乱码） |
+| 文档基线 | 32.5 ms | — |
+
+**⇒ 结论：开关层找不到那 ~1.9×（更不要说 4.5×）** ✗。差距在**结构**：账本说 verify 37.3ms 里
+**MoE（routed 8.3 + shared 10.4）占一半** ✓ ⇒ **只能靠换核** ✓：
+1. **grouped tcgen05 e4m3**（与官方 fp4_gemm **同格式** ✓）—— 前置链已逐行读清
+   （`moe_route_grouped` 5 门 + `moe_experts_grouped_gate_up` 7 检 ✓；容量常量 `grp_n_experts=max(n_routed, dspark)=384`、
+   `grp_topk_max=6`、`m=6≤VERIFY_ROWS=6` **均通过** ✓ ⇒ **拦路点在"符号在但 kernel 未真跑"（门 #4/#5）** ✗）
+   ⇒ **待办：在 `dsv41_route_group` / `dsv41_route_gather_rows` 的返回值处加一次性出声**（门 #4/#5 的 `built`/`gathered` ✗）。
+2. **shared expert 单核**（照抄 SGLang PR 39296/39313 的 SF 布局 + "只乘一次"契约 ✓）。
+3. 图化**先修"6 步停住"**（不然图只能用在短段 ✓）。
+
