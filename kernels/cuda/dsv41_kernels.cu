@@ -1532,6 +1532,22 @@ static int dsv41_resolve_sparse_split_c() {
 }
 
 // grid (C, b*m, h): block (ck, row, hh) owns keys [topk*ck/C, topk*(ck+1)/C).
+// `kv_rows == nullptr` makes the helper return the plain ring address - the
+// pre-existing single-row / ATTN_MROWS behaviour, byte for byte.
+__device__ __forceinline__ float dsv41_kv_win_fetch(const float* __restrict__ ring,
+                                                    const float* __restrict__ kv_rows,
+                                                    int pos_base, int pos_r, int idx, int c,
+                                                    int window, int d) {
+    if (kv_rows != nullptr && idx >= 0 && idx < window) {
+        int dd = pos_r - idx;
+        dd %= window;
+        if (dd < 0) dd += window;
+        const int p = pos_r - dd;
+        if (p >= pos_base) return kv_rows[(size_t)(p - pos_base) * (size_t)d + (size_t)c];
+    }
+    return ring[(size_t)idx * (size_t)d + (size_t)c];
+}
+
 __global__ void sparse_attn_split_kernel(const float* __restrict__ q,
                                          const float* __restrict__ kv,
                                          const int32_t* __restrict__ idxs, int b, int m, int h,
@@ -2137,21 +2153,9 @@ __global__ void apply_rope_mrows_kernel(float* __restrict__ x, const float* __re
 // is bit-identical to `m` single-row calls AND needs no turnover precondition.
 //
 // `kv_rows == nullptr` makes the helper return the plain ring address - the
-// pre-existing single-row / ATTN_MROWS behaviour, byte for byte.
-__device__ __forceinline__ float dsv41_kv_win_fetch(const float* __restrict__ ring,
-                                                    const float* __restrict__ kv_rows,
-                                                    int pos_base, int pos_r, int idx, int c,
-                                                    int window, int d) {
-    if (kv_rows != nullptr && idx >= 0 && idx < window) {
-        int dd = pos_r - idx;
-        dd %= window;
-        if (dd < 0) dd += window;
-        const int p = pos_r - dd;
-        if (p >= pos_base) return kv_rows[(size_t)(p - pos_base) * (size_t)d + (size_t)c];
-    }
-    return ring[(size_t)idx * (size_t)d + (size_t)c];
-}
-
+// pre-existing single-row / ATTN_MROWS behaviour, byte for byte. The DEFINITION
+// lives above `sparse_attn_split_kernel`, since both ring readers need it.
+//
 // SPARSE-ATTN-ROPE-MROWS support #1: the block's window indices, ONE launch for
 // all m rows - `window_idxs_kernel`'s decode branch VERBATIM (same `oldest`,
 // same wrap, same `idx > start_pos -> -1`, same `start_pos == 0` case), with
@@ -6257,12 +6261,23 @@ static inline int dsv41_mrows_l2bcast_for(int m) {
 // fits the device ceiling.
 constexpr int kMrowsMtileBNMax = 4;   // register-tile N bound (acc[M][BN_MAX])
 constexpr int kMrowsMtileBM = 8;      // the M tile: >= VERIFY_ROWS = 6, power of two
-template <int M>
+// AQ selects the ACTIVATION OPERAND (the WO_PAIR-ROWS arm below). It is the ONLY
+// thing that distinguishes the two programs, and it is a compile-time selector so
+// the shipped AQ = 0 body compiles exactly as it did:
+//   0 = the fp8 activation `a`/`a_scale` -- the program this kernel has always
+//       been (and the one every existing call site instantiates);
+//   1 = the RAW f32 activation `a` (row pitch `a_stride` ELEMENTS) quantised ON
+//       THE FLY inside the warp, i.e. `quant_kernel<0>`'s byte for the (row q,
+//       k-block kb) 32-group -- the intermediate quant of the verify's
+//       `wo_a_grouped -> quant -> wo_b` chain folded into this kernel so the
+//       caller no longer launches it at all. `a_scale` is unused (null is fine)
+//       and `k` is the contraction (== the quantiser's per-row pitch).
+template <int M, int AQ = 0>
 __global__ void __launch_bounds__(256)
 gemm_fp8_mtile_kernel(const uint8_t* __restrict__ a, const float* __restrict__ a_scale,
                       const uint8_t* __restrict__ w, const uint8_t* __restrict__ w_scale,
                       const float* __restrict__ bias, float* __restrict__ out, int n, int k,
-                      int out_stride, int bn) {
+                      int out_stride, int bn, int a_stride) {
     constexpr int BM = kMrowsMtileBM;
     // The rows this specialisation actually folds. `RN = M` at every reachable
     // shape (the launcher caps m at 8 == BM), so BLOCK_M = 8 costs NOTHING: it is
@@ -6344,10 +6359,49 @@ gemm_fp8_mtile_kernel(const uint8_t* __restrict__ a, const float* __restrict__ a
             // free -- and because a LUT read is 1 instruction where the inline
             // decode is seven, which is the quantity this arm is buying.
             float av[RN];
-            #pragma unroll
-            for (int q = 0; q < RN; ++q)
-                av[q] = s_lut[__ldg(a + (size_t)q * (size_t)k + j)] *
-                        __ldg(a_scale + (size_t)q * (size_t)nb_k + kb);
+            if constexpr (AQ == 0) {
+                #pragma unroll
+                for (int q = 0; q < RN; ++q)
+                    av[q] = s_lut[__ldg(a + (size_t)q * (size_t)k + j)] *
+                            __ldg(a_scale + (size_t)q * (size_t)nb_k + kb);
+            } else {
+                // ---- WO_PAIR-ROWS (AQ == 1): the intermediate quant, in-warp ----
+                // Segment 2 of the verify's wo_a -> wo_b chain is a per-row
+                // `quant_kernel<0>` (block = 32, round_scale = 1) writing
+                // `a`/`a_scale`; the fp8 arm above then reads those bytes back.
+                // THIS warp's 32 lanes already hold exactly the 32 elements of row
+                // `q`'s k-block `[kb*32, kb*32+32)`, so the quantiser's own
+                // reduction tree runs HERE:
+                //   * amax: `fabsf(v)` then the `shfl_xor` 16/8/4/2/1 tree --
+                //     quant_kernel<0> starts from `fmaxf(0.f, |v|)` and runs the
+                //     SAME tree over the SAME 32 values (`|v|` is never negative,
+                //     so the seed is a no-op);
+                //   * scale: `fmaxf(fast_round_scale(amax, 1/448), 1e-30f)`, the
+                //     same device helper and the same `maxv`;
+                //   * byte: `__nv_fp8_e4m3(fminf(fmaxf(v * (1.0f/sc), -448), 448))`
+                //     -- the SAME `1.0f / sc` reciprocal multiply (not a division)
+                //     and the same clamp;
+                //   * operand: `s_lut[byte] * sc`, i.e. exactly the value the fp8
+                //     arm reads from the global `(a, a_scale)` pair the quantiser
+                //     would have written.
+                // Byte for byte, so the fold below is unchanged -- the fused arm's
+                // whole output is bit-identical to the three-launch chain it
+                // replaces (see the launcher header). The byte is deliberately NOT
+                // stored: nothing downstream of this launch reads `xq_r`/`xsc_r`
+                // (the caller's stale-reader note).
+                const float* __restrict__ af = reinterpret_cast<const float*>(a);
+                #pragma unroll
+                for (int q = 0; q < RN; ++q) {
+                    const float v = __ldg(af + (size_t)q * (size_t)a_stride + j);
+                    float am = fabsf(v);
+                    for (int off = 16; off > 0; off >>= 1)
+                        am = fmaxf(am, __shfl_xor_sync(0xFFFFFFFFu, am, off));
+                    const float sc = fmaxf(fast_round_scale(am, 1.0f / 448.0f), 1e-30f);
+                    const float qi = fminf(fmaxf(v * (1.0f / sc), -448.0f), 448.0f);
+                    const __nv_fp8_e4m3 f8 = __nv_fp8_e4m3(qi);
+                    av[q] = s_lut[*(const uint8_t*)&f8] * sc;
+                }
+            }
             #pragma unroll
             for (int nn = 0; nn < BN_MAX; ++nn) {
                 if (nn >= nvalid) break;
@@ -6578,14 +6632,14 @@ extern "C" int dsv41_gemm_fp8_mrows(const uint8_t* a, const float* a_scale,
             }
             const int blk_mt = nw * 32;
             switch (m) {
-                case 1: gemm_fp8_mtile_kernel<1><<<grid_mt, blk_mt, smem_mt, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, bn); break;
-                case 2: gemm_fp8_mtile_kernel<2><<<grid_mt, blk_mt, smem_mt, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, bn); break;
-                case 3: gemm_fp8_mtile_kernel<3><<<grid_mt, blk_mt, smem_mt, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, bn); break;
-                case 4: gemm_fp8_mtile_kernel<4><<<grid_mt, blk_mt, smem_mt, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, bn); break;
-                case 5: gemm_fp8_mtile_kernel<5><<<grid_mt, blk_mt, smem_mt, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, bn); break;
-                case 6: gemm_fp8_mtile_kernel<6><<<grid_mt, blk_mt, smem_mt, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, bn); break;
-                case 7: gemm_fp8_mtile_kernel<7><<<grid_mt, blk_mt, smem_mt, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, bn); break;
-                case 8: gemm_fp8_mtile_kernel<8><<<grid_mt, blk_mt, smem_mt, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, bn); break;
+                case 1: gemm_fp8_mtile_kernel<1><<<grid_mt, blk_mt, smem_mt, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, bn, k); break;
+                case 2: gemm_fp8_mtile_kernel<2><<<grid_mt, blk_mt, smem_mt, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, bn, k); break;
+                case 3: gemm_fp8_mtile_kernel<3><<<grid_mt, blk_mt, smem_mt, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, bn, k); break;
+                case 4: gemm_fp8_mtile_kernel<4><<<grid_mt, blk_mt, smem_mt, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, bn, k); break;
+                case 5: gemm_fp8_mtile_kernel<5><<<grid_mt, blk_mt, smem_mt, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, bn, k); break;
+                case 6: gemm_fp8_mtile_kernel<6><<<grid_mt, blk_mt, smem_mt, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, bn, k); break;
+                case 7: gemm_fp8_mtile_kernel<7><<<grid_mt, blk_mt, smem_mt, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, bn, k); break;
+                case 8: gemm_fp8_mtile_kernel<8><<<grid_mt, blk_mt, smem_mt, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, bn, k); break;
                 default: return 2;
             }
             return (int)cudaGetLastError();
@@ -6795,7 +6849,137 @@ extern "C" int dsv41_gemm_fp8_mrows(const uint8_t* a, const float* a_scale,
 }
 
 // ===========================================================================
-// COMPRESSOR-PROJ-MROWS (`dsv41_gemv_f32_mrows`): the compressor's kvp/scp
+// WO_PAIR-ROWS (`dsv41_gemm_fp8_mrows_q_f32`): the verify block's
+// `wo_a_grouped -> quant -> wo_b` chain as TWO launches, with the intermediate
+// quant folded into the SECOND one.
+// ===========================================================================
+// WHY. The m-row verify chain that this entry serves is
+//
+//     wo_a : wo_a_grouped_gemv_kernel<M>   [M, k] fp8 -> [M, olg] f32   (wo_r)  1 launch
+//     quant: m x quant_kernel<0>            wo_r -> xq_r/xsc_r fp8       m launches
+//     wo_b : gemm_fp8_mrows_kernel<M>      [M, ol_local] fp8 -> [M, dim] 1 launch
+//
+// The quant in the middle is a PER-ROW loop purely because its SOURCE row pitch
+// (`wo_r`'s `ol_total`) is not its column count (`ol_local`) -- the shape the
+// `quant_fp8` ABI cannot express (see `chain_dev.rs`'s ROW STRIDE FIX note). That
+// loop is `m` launches per layer for a transfer of `m * ol_local` bytes, and it is
+// the LAST unaligned pair on the verify's output projection.
+//
+// WHAT THIS ENTRY IS. The SAME `gemm_fp8_mtile_kernel<M, AQ>` program, at `AQ = 1`:
+// the mtile body (C1-C6 of its header) with the ACTIVATION OPERAND re-derived
+// in-warp instead of read from the quantiser's global output. The ABI is
+// `gemm_fp8_mrows_f32`'s -- the RAW f32 activation with an explicit `a_stride` --
+// because that is what removes the per-row loop: the pitch becomes a parameter
+// again.
+//
+// BIT-IDENTITY. Two independent halves, both argued at the point of code:
+//   * the quant (the `AQ == 1` av block) is `quant_kernel<0>`'s arithmetic term
+//     for term: the warp's 32 lanes are exactly one 32-element scale block, so
+//     the amax is the same `shfl_xor` tree over the same 32 values, `sc` is the
+//     same `fmaxf(fast_round_scale(amax, 1/448), 1e-30f)`, the byte is the same
+//     `__nv_fp8_e4m3(clamp(v * (1.0f/sc), +-448))` and the operand the same
+//     `s_lut[byte] * sc` the fp8 arm reads back from `(xq_r, xsc_r)`;
+//   * the fold is `gemm_fp8_mtile_kernel<M, 0>`, unchanged (`AQ` is a
+//     compile-time selector, so `<M, 0>` compiles the shipped body).
+// ⇒ `out` is BIT-IDENTICAL to the `wo_a_grouped + m x quant + proj_mrows(MTILE)`
+// chain it replaces. It is NOT the same claim as B6
+// (`dsv41_gemm_fp8_mrows_f32`), which skips the round trip entirely and so is
+// strictly MORE accurate rather than equal -- that arm's acceptance is the
+// `mean-k`/text red line, not a byte comparison. This one CAN be byte-compared.
+//
+// WHAT IT DOES NOT WRITE. Neither the fp8 nor its scales are materialised: the
+// byte is consumed in registers. That is safe exactly where the B6 arm is safe
+// (`chain_dev.rs`'s stale-reader check: within `attention_rows` the last reader
+// of `xq_r`/`xsc_r` is the quant this replaces, and the next reader
+// `indexer_front_rows` re-quantises first).
+//
+// GEOMETRY. Deliberately the mtile arm's, resolved by the same helpers
+// (`dsv41_mrows_mtile_for` is NOT consulted here -- this entry IS the arm, so the
+// caller's gate is the only switch): `bn = g_mrows_mtile_bn`, `nw =
+// dsv41_mrows_mtile_warps_for(n, bn)`, `smem = nw*bn*k + 1 KB`. The weight slab
+// staging, the prologue order, the register tile and the write epilogue are the
+// `<M, 0>` program's, verbatim.
+//
+// DECLINES (returns 2, never 1 -- the r42/r43 `cudaErrorInvalidValue` collision):
+// m outside 1..=8, n <= 0, `k % 32` (the quant's scale block IS 32, so a partial
+// block would quantise a shorter amax than `quant_kernel<0>` did), `out_stride <
+// n`, `a_stride < k` (the f32 row must hold the `k` columns this kernel reads),
+// a null pointer, `g_gemv_fp8_mode < 3`, `DSV41_NO_GEMV_FP8`, or an smem over the
+// device ceiling. Every one of them keeps the caller's three-launch chain.
+extern "C" int dsv41_gemm_fp8_mrows_q_f32(const float* a, int a_stride, const uint8_t* w,
+                                          const uint8_t* w_scale, const float* bias, float* out,
+                                          int m, int n, int k, int out_stride, cudaStream_t s) {
+    if (m <= 0 || m > 8) return 2;
+    if (n <= 0 || k <= 0 || (k & 31)) return 2;
+    if (a_stride < k) return 2;
+    if (out_stride < n) return 2;
+    if (a == nullptr || w == nullptr || w_scale == nullptr || out == nullptr) return 2;
+    if (g_gemv_fp8_mode < 3) return 2;
+    static const bool no_gemv = getenv("DSV41_NO_GEMV_FP8") != nullptr;
+    if (no_gemv) return 2;
+    const int bn = g_mrows_mtile_bn;
+    const int nw = dsv41_mrows_mtile_warps_for(n, bn);
+    const size_t smem = (size_t)nw * (size_t)bn * (size_t)k + (size_t)256 * sizeof(float);
+    const int smrows = nw * bn;
+    const dim3 grid((unsigned)((n + smrows - 1) / smrows));
+    if (smem > (size_t)dsv41_smem_ceiling(gemm_fp8_mtile_kernel<1, 1>)) {
+        static int reported_over = 0;
+        if (reported_over++ == 0)
+            fprintf(stderr,
+                    "[wo-pair-rows] DECLINED m=%d n=%d k=%d bn=%d nw=%d: smem=%zu > ceiling\n", m,
+                    n, k, bn, nw, smem);
+        return 2;
+    }
+    if (smem > 48 * 1024) {
+        // Same per-specialisation attribute discipline the mtile arm carries: the
+        // ceiling must be raised for EVERY M the verify can hand us or the launch
+        // dies with cudaErrorInvalidValue at the m actually used.
+        cudaError_t e = cudaSuccess;
+#define FERRITE_SET_WO_PAIR_ROWS_SMEM(k)                                               \
+    do {                                                                               \
+        cudaError_t r = cudaFuncSetAttribute(                                          \
+            gemm_fp8_mtile_kernel<k, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize,  \
+            dsv41_smem_ceiling(gemm_fp8_mtile_kernel<k, 1>));                          \
+        if (r != cudaSuccess && e == cudaSuccess) e = r;                               \
+    } while (0)
+        FERRITE_SET_WO_PAIR_ROWS_SMEM(1);
+        FERRITE_SET_WO_PAIR_ROWS_SMEM(2);
+        FERRITE_SET_WO_PAIR_ROWS_SMEM(3);
+        FERRITE_SET_WO_PAIR_ROWS_SMEM(4);
+        FERRITE_SET_WO_PAIR_ROWS_SMEM(5);
+        FERRITE_SET_WO_PAIR_ROWS_SMEM(6);
+        FERRITE_SET_WO_PAIR_ROWS_SMEM(7);
+        FERRITE_SET_WO_PAIR_ROWS_SMEM(8);
+#undef FERRITE_SET_WO_PAIR_ROWS_SMEM
+        if (e != cudaSuccess) { (void)cudaGetLastError(); return (int)e; }
+    }
+    // ACTIVITY RECEIPT (the `[mrows-mtile]` precedent): ONE line per process on the
+    // first armed launch, naming the geometry AND the fact that the intermediate
+    // quant was folded in (a caller must never have to guess whether it paid `m`
+    // quant launches or zero).
+    {
+        static int reported = 0;
+        if (reported++ == 0)
+            fprintf(stderr,
+                    "[wo-pair-rows] ARMED m=%d n=%d k=%d a_stride=%d bn=%d nw=%d -> block=%d "
+                    "warps, grid=%d, smem=%zu (intermediate quant FUSED: 0 quant launches)\n",
+                    m, n, k, a_stride, bn, nw, nw, (int)grid.x, smem);
+    }
+    const int blk = nw * 32;
+    switch (m) {
+        case 1: gemm_fp8_mtile_kernel<1, 1><<<grid, blk, smem, s>>>(reinterpret_cast<const uint8_t*>(a), nullptr, w, w_scale, bias, out, n, k, out_stride, bn, a_stride); break;
+        case 2: gemm_fp8_mtile_kernel<2, 1><<<grid, blk, smem, s>>>(reinterpret_cast<const uint8_t*>(a), nullptr, w, w_scale, bias, out, n, k, out_stride, bn, a_stride); break;
+        case 3: gemm_fp8_mtile_kernel<3, 1><<<grid, blk, smem, s>>>(reinterpret_cast<const uint8_t*>(a), nullptr, w, w_scale, bias, out, n, k, out_stride, bn, a_stride); break;
+        case 4: gemm_fp8_mtile_kernel<4, 1><<<grid, blk, smem, s>>>(reinterpret_cast<const uint8_t*>(a), nullptr, w, w_scale, bias, out, n, k, out_stride, bn, a_stride); break;
+        case 5: gemm_fp8_mtile_kernel<5, 1><<<grid, blk, smem, s>>>(reinterpret_cast<const uint8_t*>(a), nullptr, w, w_scale, bias, out, n, k, out_stride, bn, a_stride); break;
+        case 6: gemm_fp8_mtile_kernel<6, 1><<<grid, blk, smem, s>>>(reinterpret_cast<const uint8_t*>(a), nullptr, w, w_scale, bias, out, n, k, out_stride, bn, a_stride); break;
+        case 7: gemm_fp8_mtile_kernel<7, 1><<<grid, blk, smem, s>>>(reinterpret_cast<const uint8_t*>(a), nullptr, w, w_scale, bias, out, n, k, out_stride, bn, a_stride); break;
+        case 8: gemm_fp8_mtile_kernel<8, 1><<<grid, blk, smem, s>>>(reinterpret_cast<const uint8_t*>(a), nullptr, w, w_scale, bias, out, n, k, out_stride, bn, a_stride); break;
+        default: return 2;
+    }
+    return (int)cudaGetLastError();
+}
+
 // projections, m activation rows folded into ONE pass over the weight.
 // ===========================================================================
 // The verify block (`chain_dev.rs::compress_proj_rows`, :12357) issued
@@ -10790,7 +10974,7 @@ extern "C" int dsv41_sparse_attn_orope(
     return dsv41_sparse_attn_orope_impl(q, kv, sink, idxs, out, b, m, h, d, clen, window,
                                         index_topk, scale, cos, sin, base, rope_rd, half, mul, off,
                                         step, inverse, xq, xsc, clen_rows, idx_stride, row_step, 0,
-                                        s);
+                                        nullptr, s);
 }
 
 // W2-MROWS-TP (`DSV41_ATTN_MROWS` at `world > 1`): the fused o-rope / fp8 entry
@@ -10805,7 +10989,7 @@ extern "C" int dsv41_sparse_attn_orope_rp(
     return dsv41_sparse_attn_orope_impl(q, kv, sink, idxs, out, b, m, h, d, clen, window,
                                         index_topk, scale, cos, sin, base, rope_rd, half, mul, off,
                                         step, inverse, xq, xsc, clen_rows, idx_stride, row_step,
-                                        row_pitch, s);
+                                        row_pitch, nullptr, s);
 }
 
 // SPARSE-ATTN-ROPE-MROWS (`DSV41_VERIFY_OROPE_MROWS=1`, the verify block's ONE

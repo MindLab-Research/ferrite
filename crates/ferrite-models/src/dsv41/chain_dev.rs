@@ -2941,6 +2941,41 @@ fn attn_mrows_rope_norm() -> bool {
     })
 }
 
+/// LINROPE-MROWS (`DSV41_VERIFY_LINROPE_MROWS=1`, DEFAULT OFF — A/B first): the
+/// verify block's wq_b chain - `norm_rows(qr_r)` + `quant_rows(qr_r)` +
+/// `proj_mrows(wq_b)` + the q rope, FOUR launches (`chain_dev.rs`'s `attention_rows`
+/// mrows branch) - as ONE `dsv41_gemm_fp8_mrows_rope_norm` launch, i.e. the rows
+/// form of EAGER's `lin_rope_norm` (`dsv41_gemm_fp8_mx_rope_norm`, the m=1 GEMV
+/// family with the NORM_FUSE prologue).
+///
+/// It reuses the SAME kernel the draft's K2 arm uses (see [`attn_mrows_rope_norm`]):
+/// each of the four segments reproduces one of the four launches at its own
+/// blockDim (`dsv41_rmsnorm_rows_kernel` 1024, `quant_kernel<0>` block 32,
+/// `gemm_fp8_mrows_kernel<M>`'s ascending-`kb` chain, `apply_rope_mrows_kernel`),
+/// so the fusion is a segment fold over the SAME programs and not a program swap.
+/// The caller passes `qr_norm_out = null` (the kernel leaves `qr_r` RAW; the
+/// follow-up `norm_rows` materialises it for the indexer's q half, exactly as the
+/// unfused sequence did).
+///
+/// ⚠️ THE PARITY RECEIPT IS OUTSTANDING. `tests_dsv41_draft_parity.cu`'s l4/K2 arm
+/// is recorded as FAIL (`sglang-verify-model.md` §5: `6400/6400` elements of the
+/// `qr_norm` half differ), so "bit-identical" is NOT established for this kernel.
+/// The likely mechanism is the arm's own usage - it calls the entry with
+/// `qr_norm_out == qr_raw` while the kernel declares both `__restrict__`, i.e. a
+/// strict-aliasing UB that the SHIPPED caller avoids by passing `null` - but that
+/// is a hypothesis, not a receipt. This gate therefore stays OFF until the arm is
+/// re-run with `qr_norm_out = null` (the shipped shape) and reports OK.
+///
+/// Read ONCE and cached: the check runs 40x/step inside graph capture.
+fn verify_linrope_mrows() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("DSV41_VERIFY_LINROPE_MROWS")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
+}
+
 /// R2b (DSV41_INDEXER_QR_RAW, **default ON, only reachable under R2**): the
 /// indexer's q half consumes the RAW `qr_r` that R2's fused wq_b launch left
 /// behind, normalising it inside its own gemv prologue, instead of the copy R2
@@ -12145,7 +12180,9 @@ impl<'a> DevChain<'a> {
         // wq_b + rope — see [`attn_mrows_rope_norm`]). Unlike R2's fused launch
         // it WRITES THE NORMALISED ROWS BACK, so `qr_r` comes out normalised and
         // every later reader (the indexer's q half included) is untouched.
-        let k2_took = if attn_mrows_rope_norm() && mrows && self.dev.supports_gemm_fp8_mrows_rope_norm()
+        let k2_took = if (attn_mrows_rope_norm() || verify_linrope_mrows())
+            && mrows
+            && self.dev.supports_gemm_fp8_mrows_rope_norm()
         {
             self.mrows_rope_norm(
                 self.s.qr_r.ptr as *const f32,
@@ -12576,7 +12613,31 @@ impl<'a> DevChain<'a> {
         // launches are byte-for-byte the ones this path always ran; only the
         // deferred block-wide launch reads the new snapshot. `false` whenever the
         // block-wide launch is not taken, so the default path pays nothing.
-        let attn_own_snapshot = mrows_attn && is_comp_src && comp_proj && !mrows_compress;
+        // ---- OROPE-MROWS (`DSV41_VERIFY_OROPE_MROWS=1`, DEFAULT OFF) ----
+        // The verify block's sparse attention + inverse o-rope + fp8 emission as
+        // ONE m-row launch, valid in the STEADY STATE. See [`verify_orope_mrows`]
+        // for why this is NOT `ATTN_MROWS` (the appends are deferred instead of
+        // the reads being preconditioned) and [`Self::sparse_attn_orope_mrows`]
+        // for the substitution. Every precondition below mirrors a decline in the
+        // C entry, so a launch that this predicate accepts cannot come back
+        // `Ok(false)` - which matters because the per-row attention is SKIPPED on
+        // that promise.
+        //
+        // `owns_kv` and `!ring_owner_shared()` are both required: the deferral is
+        // only sound when the block's own append is the ONLY writer of this ring
+        // (a `CompressConsumer` layer reading an owner's ring after the owner's
+        // deferred append would see the block's future rows - the very hazard the
+        // per-row interleave exists to avoid).
+        let orope_mrows_ok = owns_kv
+            && vo
+            && m > 1
+            && verify_orope_mrows()
+            && !mrows_attn
+            && !ring_owner_shared()
+            && sparse_orope_env_ok()
+            && self.dev.supports_sparse_attn_orope_mrows();
+        let attn_own_snapshot =
+            (mrows_attn || orope_mrows_ok) && is_comp_src && comp_proj && !mrows_compress;
         // Row `r`'s bound for that launch. `mrows_own_owner` (this layer's or its
         // owner's hoisted compressor) and `attn_own_snapshot` (this layer's
         // per-row compressor, which just took its own copy above) both hand the
@@ -12620,6 +12681,7 @@ impl<'a> DevChain<'a> {
         // byte for byte.
         let rw_mrows = owns_kv
             && m > 1
+            && !orope_mrows_ok
             && ring_win_mrows()
             && (pos_base as i64) + (m as i64) - 1 < win as i64
             && self.dev.ring_win_fuse_mrows(
@@ -12632,6 +12694,23 @@ impl<'a> DevChain<'a> {
                 self.s.idxs_r.ptr as *mut i32,
                 ist as i32,
             )?;
+        // OROPE-MROWS: the block's window indices, ONE launch for all m rows -
+        // `window_idxs_mrows` reproduces `window_idxs_kernel`'s decode branch row
+        // for row with `pos_rows[r]` (row r writes `idxs_r + r*ist`), so hoisting
+        // them out of the interleave changes no byte: the indices depend only on
+        // that row's own position and the fixed ring geometry, never on anything
+        // an append writes. The per-row `ring_win_fuse` / `ring_append` /
+        // `window_idxs` calls below are skipped on this arm, and the appends move
+        // to AFTER the fused attention.
+        if orope_mrows_ok {
+            self.dev.window_idxs_mrows(
+                self.s.idxs_r.ptr as *mut i32,
+                self.s.pos_rows.ptr as *const std::os::raw::c_int,
+                win as i32,
+                m as i32,
+                ist as i32,
+            )?;
+        }
         for r in 0..m {
             // ---- 1) ring append + THIS row's causal window ----
             // (audit defect #2: the window half.) `window_idxs(r)` must run after
@@ -12658,7 +12737,7 @@ impl<'a> DevChain<'a> {
             // RING-WIN-MROWS: when the hoisted block launch above took, every row's
             // append AND window indices are already written - skipping this whole
             // block is what turns 6 (or 12) ring+window launches into 1.
-            if owns_kv && !rw_mrows {
+            if owns_kv && !rw_mrows && !orope_mrows_ok {
                 let rw_fused = verify_ring_win_fuse()
                     && self.dev.ring_win_fuse(
                         ring_ptr as *mut f32,
@@ -12792,7 +12871,7 @@ impl<'a> DevChain<'a> {
             // launch reads `attn_clen` (the device snapshot, or the owner's live
             // counter) instead of a host array, so all that is left here is the
             // per-row launch it replaces.
-            if !mrows_attn {
+            if !mrows_attn && !orope_mrows_ok {
                 //
                 // P1v (DSV41_VERIFY_OROPE): the EAGER path runs the FUSED launch
                 // (`sparse_attn_orope`: the inverse o-rope and the fp8 emission of the
@@ -12949,6 +13028,79 @@ impl<'a> DevChain<'a> {
                 // No row was found; the block's answer is uniform.
                 for slot in orope_rows[..m].iter_mut() {
                     *slot = oroped;
+                }
+            }
+        }
+
+        // ---- OROPE-MROWS: the block's ONE fused sparse-attention launch ----
+        // `kv_rows = s.kv_r` is the block's OWN `[m, hd]` KV and the appends are
+        // still DEFERRED (they run immediately below, AFTER this launch). That
+        // pair - deferred append + the position-resolved `kv_rows` substitution -
+        // is what makes the batch equal `m` single-row calls WITHOUT the
+        // `pos_base + m - 1 < win` regime restriction `ATTN_MROWS` carries, so
+        // this arm is the one that is correct in the steady state. See
+        // [`Self::sparse_attn_orope_mrows`] and `dsv41_kv_win_fetch`.
+        if orope_mrows_ok {
+            let oroped = self.dev.sparse_attn_orope_mrows(
+                self.s.q_r.ptr as *const f32,
+                ring_ptr as *const f32,
+                self.s.kv_r.ptr as *const f32,
+                ld.attn_sink.as_ref().unwrap().as_f32(),
+                self.s.idxs_r.ptr as *const i32,
+                self.s.o_r.ptr as *mut f32,
+                1,
+                m as i32,
+                nlh as i32,
+                hd as i32,
+                clen_owner,
+                win as i32,
+                cfg.index_topk as i32,
+                scale,
+                self.cos.as_f32(),
+                self.sin.as_f32(),
+                pos_ctr,
+                rd as i32,
+                half,
+                1,
+                0,
+                0,
+                true,
+                self.s.xq_r.ptr as *mut u8,
+                self.s.xsc_r.ptr as *mut f32,
+                attn_clen,
+                ist as i32,
+                // `row_step = 1`: `tt = pos_ctr + mm`, the per-row call's
+                // `off = r` - and the SAME value the kernel's substitution uses
+                // for row `mm`'s position (`dsv41_kv_win_fetch`).
+                1,
+                attn_row_pitch,
+            )?;
+            if !oroped {
+                // Unreachable by construction: `orope_mrows_ok` mirrors every
+                // decline the C entry has (see the gate above). Fail loudly rather
+                // than emit the block's attention output from stale `o_r`.
+                return Err(FerriteError::InvalidArg(
+                    "DSV41_VERIFY_OROPE_MROWS: dsv41_sparse_attn_orope_mrows declined a \
+                     shape/environment the host gate accepted; the per-row attention was \
+                     already skipped by that gate, so there is no sound fallback"
+                        .to_string(),
+                ));
+            }
+            self.dev.ring_append_mrows(
+                ring_ptr as *mut f32,
+                self.s.kv_r.ptr as *const f32,
+                self.s.pos_rows.ptr as *const std::os::raw::c_int,
+                win as i32,
+                hd as i32,
+                m as i32,
+            )?;
+            if vo {
+                // Every row of the block took the fused launch (a decline is a
+                // property of the call SHAPE and the env, not of a row), so the
+                // per-row o-rope below is skipped for the whole block and the
+                // o-quant is the fused kernel's emission.
+                for slot in orope_rows[..m].iter_mut() {
+                    *slot = true;
                 }
             }
         }
