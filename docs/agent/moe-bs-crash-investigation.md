@@ -1243,3 +1243,25 @@ E3 = 候选 D（SWIZZLE_64B）。本轮同时应首次拿到 **`[NC]` 数值**�
 
 **下一步（已交 subagent）**：拿官方 oracle 做**同输入逐元素对拍**，把差异按行/列/K-block 打成分布，
 直接指向上面 1–3 中的哪一个。
+
+## §45 排除：SF 的行对应与角色（两种朝向都正确）
+
+`moe_bs_handwritten.cu:362-376, 402-403` 实测：
+```c
+// 激活 SF（128 行 = 128 个 token 行）
+(g_swapab ? SFB_sh : SFA_sh)[i] = SFA[k*(HW_SEGCAP*HW_BM) + seg*HW_BM + i];
+// 权重 SF：W1 -> B 行 [0,64)，W3 -> B 行 [64,128)（与权重行 m = HW_NH + row 对齐 ✓）
+(g_swapab ? SFA_sh : SFB_sh)[i]          = SFW1[e*(40*HW_NP) + k*HW_NP + n_tile*HW_NH + i];
+(g_swapab ? SFA_sh : SFB_sh)[HW_NH + i]  = SFW3[e*(40*HW_NP) + k*HW_NP + n_tile*HW_NH + i];
+...
+hw_sf_transpose(SFA_sh); hw_sf_transpose(SFB_sh);
+hw_tc_cp(hw_make_sf_desc(SFA_sh), SF_tmem + 0);   // A 操作数的 SF
+hw_tc_cp(hw_make_sf_desc(SFB_sh), SF_tmem + 4);   // B 操作数的 SF
+```
+**结论**：
+1. **W3 的 SF 确实落在 B 行 64..127** ✓（不是误写在 `[i]`）——§44 里点名的这个候选**排除**；
+2. **SF 的角色切换正确**：swapAB 下权重 SF 走 SFA（A 操作数 = 权重 ✓）、激活 SF 走 SFB（B 操作数 = 激活 ✓）；
+3. 激活 SF 的 gather 布局 `[k][seg][row]`（步长 `SEGCAP*BM = 4608` 词）与 kernel 的读法**一致** ✓。
+
+⇒ §44 的候选 ② 里"W3 行错位"这一支也被排除，剩余集中在
+①A/B tile 的**内容装配**（激活行 / W 行距 / `w_stride` 的实际取值）与 ③朝向/M-N 角色（U 回合在测）。
