@@ -107,6 +107,12 @@ warp w  → (m_block = 0, n_block = w)     // BM=8 覆盖全部 M ⇒ m 轴恰�
 
 ### 2.3 smem 预算
 
+> ⚠️ **本节的「激活不进 smem」论证已被 bn=1 对照实验证伪（2026-09-13），修复见
+> `mrows-mtile-fix.md`。** 现状（修复版）：激活**照 legacy stage 进 `s_a`/`s_as`** 并读 LDS；
+> 权重 slab 改 **per-warp 发布**；e4m3 表改 **每 warp 一份**。下面的原始预算表与论证保留为
+> g2 的设计记录（**不要照它实现**）；修复后的预算表见 fix 文档 §4。为什么错：复用不是决定读法的量，
+> **延迟**才是；且 legacy **每个 block 也 stage 激活**（`M*k`），那不是 M-tile 新引入的 prologue。
+
 ```
 s_w   : nw * bn * k     字节   权重 tile，cp.async16 一次 stage，warp 间 + M 行间共享
 s_lut : 256 * 4 = 1 KB         e4m3 解码表

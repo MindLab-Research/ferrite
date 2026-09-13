@@ -6211,21 +6211,46 @@ static inline int dsv41_mrows_l2bcast_for(int m) {
 // WHY THE WEIGHT IS STILL STAGED (the 5a lesson used correctly). 5a removed the
 // private smem slab and read the weight straight from L1/L2 -- measured negative,
 // because at rpb = 1 the grid is n (=3200-3840) blocks of duplicated L1/L2
-// requests (audit §10.9). Here the block's weight tile is `nw*bn` rows staged
-// ONCE by cp.async16 and read from low-latency smem, so the weight's DRAM traffic
-// is n*k per launch (1x) and its request count is 1x. The ACTIVATION is what is
-// NOT staged: its per-warp read is M bytes (6), not n, and each byte already
-// serves `bn` rows inside the warp, so a block-wide activation slab would only
-// re-introduce a per-block prologue -- the fold_r / MPAR lesion ("the repeated
-// quantity is the PROLOGUE, not the bytes").
+// requests (audit §10.9). Here each warp stages its OWN `bn` weight rows by
+// cp.async16 and reads them back from low-latency smem, so the weight's DRAM
+// traffic is n*k per launch (1x) and its request count is 1x.
+//
+// FIX (2026-09-13, docs/agent/mrows-mtile-fix.md). The first cut of this kernel
+// staged the WHOLE `nw*bn`-row tile block-wide (one cp.async group, one
+// `cp_wait_all`, one `__syncthreads` for the slab) and read the ACTIVATION
+// straight from L1 with `__ldg`. The bn = 1 control arm -- whose instruction
+// count, warp count and smem all EQUAL the legacy kernel's -- still ran +2.54 ms
+// SLOWER, and that control is what isolated the two lesions:
+//   (a) the activation `__ldg` direct read. It is now staged into `s_a`/`s_as`
+//       by the LEGACY kernel's own copy rule and consumed through LDS, which is
+//       the short-dependency-chain form the legacy arm has;
+//   (c) the weight slab's CROSS-WARP publication. It is now staged per warp into
+//       the warp's own `bn` rows (`i = lane; i += 32` instead of `blockDim.x`)
+//       and retired by a warp-local wait, so a block's weight round trip is no
+//       longer a block-sized hard serialisation point. The e4m3 table follows the
+//       same rule (each warp builds all 256 entries of its OWN copy and publishes
+//       them to its own lanes with `__syncwarp`), which is what lets the weight
+//       publication drop the block barrier entirely. The ONE remaining barrier is
+//       the activation's -- i.e. exactly the legacy program's own barrier -- so at
+//       bn = 1 this kernel is now STRUCTURALLY the legacy program.
+// The design's §2.3 argument ("the activation does not enter smem ... its reuse is
+// the warp-local bn axis, so a block-wide copy would only re-introduce a per-block
+// prologue") is disproven by that control: the quantity that decides the read form
+// is LATENCY, not reuse -- the activation is staged by every block in the legacy
+// program too, and staging it costs nothing the legacy arm did not already pay.
 //
 // GEOMETRY. BLOCK_M = 8 (>= VERIFY_ROWS = 6, a power of two, and the m <= 8
 // dispatch ceiling). A warp is identified by (m_block, n_block); with BLOCK_M = 8
 // covering every production M there is exactly ONE m_block, so the coordinate
-// that varies is n_block = warp. The PROLOGUE ORDER is MPAR's reworked one verbatim
-// (issue the slab -> build the table as its cover -> wait -> barrier): the first
-// MPAR cut built the table first and left each block's DRAM round trip fully
-// exposed, which was one of its two measured death terms.
+// that varies is n_block = warp. The PROLOGUE ORDER keeps MPAR's reworked shape
+// (issue -> build the table as the cover -> wait -> barrier): the first MPAR cut
+// built the table first and left each block's DRAM round trip fully exposed,
+// which was one of its two measured death terms. Spelled out for this kernel it
+// is ISSUE THE ACTIVATION ROWS (block-wide) -> BUILD THE TABLE (the cover) ->
+// RETIRE THE ACTIVATION -> ISSUE THIS WARP'S OWN WEIGHT ROWS -> BARRIER (the
+// activation's, the legacy one) -> RETIRE THE WEIGHT WITHIN THE WARP. The weight
+// transfer is deliberately left IN FLIGHT ACROSS the barrier, exactly as the
+// legacy prologue leaves its own row's transfer.
 //
 // NUMERICS -- BIT-IDENTICAL to `gemm_fp8_mrows_kernel<M>` and therefore to the
 // m = 1 launch of the same row (the legacy kernel's C1-C6):
@@ -6233,10 +6258,11 @@ static inline int dsv41_mrows_l2bcast_for(int m) {
 //   * C2 same operands, same bytes: the weight byte is the staged slab byte at
 //     the 1:1 flat index (`(n_block*bn + nn)*k + j` == `w[row*k + j]`, because the
 //     slab is the contiguous global range `w[row0*k .. (row0+nrows)*k)`); the
-//     activation byte is `a[q*k + j]` -- the very byte the legacy kernel copies
-//     into `s_a[q*k + j]`, and a copy's width is not observable (C2's own
-//     argument), so reading the source is the same byte; `s_lut[b] ==
-//     e4m3_to_f(b)` BY CONSTRUCTION (the table is built from it), `w_scale` /
+//     activation byte is `s_a[q*k + j]` -- the SAME slot, filled by the SAME
+//     pure-copy rule, that the legacy kernel reads (nothing is re-associated, so
+//     the staged byte is the global byte); `s_lut[b] ==
+//     e4m3_to_f(b)` BY CONSTRUCTION (the table is built from it, one identical
+//     copy per warp), `w_scale` /
 //     `a_scale` are the same words, and `j>>5 == kb`;
 //   * C3 same reduction tree: `shfl_xor` off = 16,8,4,2,1 emitted verbatim, run
 //     ONCE per (warp, activation row, output row) -- each element is still
@@ -6296,44 +6322,98 @@ gemm_fp8_mtile_kernel(const uint8_t* __restrict__ a, const float* __restrict__ a
     const int n_block = warp;
     const int row0 = blockIdx.x * nw * bn;          // the block's first output row
     const int row_base = row0 + n_block * bn;       // this warp's first output row
-    // smem: the block's weight tile (`nw*bn` rows of `k` bytes) | the 256-entry
-    // e4m3 table. NO activation slab (see the header): the activation's reuse is
-    // the warp-local `bn` axis, and a block-wide copy would only re-introduce a
-    // per-block prologue.
+    // smem: the block's weight tile (`nw*bn` rows of `k` bytes) | the e4m3 table
+    // (ONE COPY PER WARP, `nw*256` entries) | the M staged activation scale rows
+    // (f32) | the M staged activation rows (fp8 bytes). The last two are
+    // block-wide and exist only for the fp8 arm (`AQ == 0`): the f32 arm's
+    // activation is quantised in-warp and a staged f32 tile would be `m*k*4`
+    // bytes. Layout/order is the LEGACY kernel's (`s_w | s_lut | s_as | s_a`).
     extern __shared__ uint8_t smem[];
     uint8_t* s_w = smem;
     float* s_lut = reinterpret_cast<float*>(s_w + (size_t)nw * (size_t)bn * (size_t)k);
-    // PROLOGUE ORDER (MPAR's reworked order, verbatim): ISSUE -> COMMIT ->
-    // BUILD THE TABLE (the only producer-independent cover) -> WAIT -> BARRIER.
-    // The slab is the contiguous global range `w[row0*k .. (row0+nrows)*k)`, so a
-    // flat 16B-unit index maps onto it 1:1; one unit per THREAD (not per warp --
-    // MPAR's first cut issued the same 16B copy from all 32 lanes, i.e. a 32x
-    // redundant request per unit).
-    const int nrows = min(nw * bn, n - row0);       // >= 1: the grid is ceil(n/(nw*bn))
-    const uint8_t* __restrict__ wsrc = w + (size_t)row0 * (size_t)k;
-    const bool w16 = dsv41_f4_ok(wsrc) && dsv41_f4_ok(s_w);   // block-uniform
-    if (w16) {
-        const int nflat = nrows * n16;
-        for (int i = threadIdx.x; i < nflat; i += blockDim.x)
-            dsv41_cp_async16(s_w + ((size_t)i << 4), wsrc + ((size_t)i << 4));
-        dsv41_cp_commit();
+    // THIS WARP'S OWN table: warp `w` owns `s_lut + w*256`, is the only writer of
+    // it and the only reader, so `__syncwarp` (not a block barrier) publishes it.
+    float* s_lutw = s_lut + (size_t)warp * 256;
+    float* s_as = nullptr;
+    uint8_t* s_a = nullptr;
+    if constexpr (AQ == 0) {
+        s_as = s_lut + (size_t)nw * 256;
+        s_a = reinterpret_cast<uint8_t*>(s_as + (size_t)RN * (size_t)nb_k);
     }
-    // The e4m3 decode table, built UNDER the slab transfer (the order note above).
-    for (int i = threadIdx.x; i < 256; i += blockDim.x) s_lut[i] = e4m3_to_f((uint8_t)i);
-    if (w16) {
-        // Retire the slab here: the reader of `s_w[...]` may be a DIFFERENT warp
-        // than the writer, so the transfer must complete before the barrier
-        // publishes it (the legacy prologue could leave it in flight because each
-        // warp staged its OWN row).
-        dsv41_cp_wait_all();
-    } else {
-        // k % 16 tail / unaligned arm: unreachable for every launcher (they all
-        // reject `k & 31`, which makes `row0*k` and the slab 16B multiples).
-        for (int i = threadIdx.x; i < nrows * k; i += blockDim.x) s_w[i] = wsrc[i];
+    // PROLOGUE ORDER -- see the kernel header. The activation rows are staged
+    // BLOCK-WIDE (the legacy kernel's own rule: 16 B per thread per issue,
+    // `wait_all` before the barrier, `__syncthreads` to publish), the e4m3 table
+    // is built as the transfer's cover, and the weight is staged PER WARP
+    // afterwards so its transfer stays IN FLIGHT ACROSS the activation's barrier
+    // and is retired by a warp-local wait.
+    //
+    // FIX 1 -- the activation is the LEGACY staging verbatim (same slot, same
+    // source bytes, a pure copy; nothing is re-associated). `AQ == 1` stages no
+    // activation: its activation is f32 and quantised in-warp, and a staged f32
+    // tile would be `m*k*4` bytes.
+    bool a16 = false;
+    if constexpr (AQ == 0) {
+        a16 = dsv41_f4_ok(a) && dsv41_f4_ok(s_a);
+        #pragma unroll
+        for (int q = 0; q < RN; ++q) {
+            const uint8_t* __restrict__ ar = a + (size_t)q * (size_t)k;
+            const float* __restrict__ asr = a_scale + (size_t)q * (size_t)nb_k;
+            for (int i = threadIdx.x; i < nb_k; i += blockDim.x)
+                s_as[(size_t)q * nb_k + i] = asr[i];
+            if (a16) {
+                uint8_t* __restrict__ sar = s_a + (size_t)q * (size_t)k;
+                const int n16a = k >> 4;
+                for (int i = threadIdx.x; i < n16a; i += blockDim.x)
+                    dsv41_cp_async16(sar + (i << 4), ar + (i << 4));
+                // k % 16 tail: unreachable for every launcher (all reject `k & 31`),
+                // kept so the row is staged by exactly the rule the weight row uses.
+                for (int i = (n16a << 4) + threadIdx.x; i < k; i += blockDim.x) sar[i] = ar[i];
+            } else {
+                for (int i = threadIdx.x; i < k; i += blockDim.x)
+                    s_a[(size_t)q * (size_t)k + i] = ar[i];
+            }
+        }
     }
-    // Cross-warp publication (the order note above).
-    __syncthreads();
-    if (row_base < n) {
+    // The e4m3 decode table -- built UNDER the activation transfer (the cover).
+    // FIX 2: each warp builds ALL 256 entries of its OWN copy (`i = lane`, stride
+    // 32) and publishes them to its own lanes with `__syncwarp`, so the table
+    // needs no block barrier. The values are `e4m3_to_f`'s and each warp holds the
+    // complete table, so every decode below is the legacy decode.
+    for (int i = lane; i < 256; i += 32) s_lutw[i] = e4m3_to_f((uint8_t)i);
+    __syncwarp();
+    if (a16) dsv41_cp_wait_all();
+    // FIX 2 -- the weight rows: THIS WARP'S OWN `bn` rows only (`i = lane`, stride
+    // 32, instead of the previous block-wide flat `i += blockDim.x`). A warp's
+    // slab slots are private to it, so publication is a warp-local `wait_all` +
+    // `__syncwarp` after the barrier -- there is no cross-warp read of `s_w` left,
+    // which is what removes the block-sized DRAM/L2 round trip the bn = 1 control
+    // isolated. Slot addresses, bytes and the 1:1 flat index are unchanged, so the
+    // decode is bit-identical.
+    const uint8_t* __restrict__ wsrc = w + (size_t)row_base * (size_t)k;
+    uint8_t* __restrict__ s_ww = s_w + (size_t)n_block * (size_t)bn * (size_t)k;
+    const bool w16 = dsv41_f4_ok(wsrc) && dsv41_f4_ok(s_ww);   // warp-uniform
+    const int wrows = min(bn, n - row_base);   // rows this warp owns; <= 0 => inactive
+    if (wrows > 0) {
+        if (w16) {
+            const int nflat = wrows * n16;
+            for (int i = lane; i < nflat; i += 32)
+                dsv41_cp_async16(s_ww + ((size_t)i << 4), wsrc + ((size_t)i << 4));
+            dsv41_cp_commit();
+        } else {
+            // k % 16 tail / unaligned arm: unreachable for every launcher (they all
+            // reject `k & 31`, which makes `row_base*k` and the slab 16B multiples).
+            for (int i = lane; i < wrows * k; i += 32) s_ww[i] = wsrc[i];
+        }
+    }
+    // The ACTIVATION's barrier -- the legacy program's own, and now the ONLY block
+    // barrier here. The weight transfer is deliberately left in flight ACROSS it
+    // (retired per warp below), exactly as the legacy prologue leaves its own row.
+    if constexpr (AQ == 0) __syncthreads();
+    if (wrows > 0) {
+        if (w16) dsv41_cp_wait_all();
+        __syncwarp();
+    }
+    if (wrows > 0) {
         // THE REGISTER TILE: RN activation rows x bn output rows. `acc[q][nn]` is
         // the element `out[q][row_base + nn]`, and its chain is the legacy chain.
         float acc[RN][BN_MAX];
@@ -6341,29 +6421,28 @@ gemm_fp8_mtile_kernel(const uint8_t* __restrict__ a, const float* __restrict__ a
         for (int q = 0; q < RN; ++q)
             #pragma unroll
             for (int nn = 0; nn < BN_MAX; ++nn) acc[q][nn] = 0.f;
-        // Rows this warp actually writes (bn capped by the n tail). Warp-uniform,
-        // so the early returns / breaks below are warp-uniform branches and the
-        // `shfl_xor` full mask stays valid.
-        const int nvalid = min(bn, n - row_base);
+        // Rows this warp actually writes == the rows it staged (`wrows`, computed in
+        // the prologue). Warp-uniform, so the early returns / breaks below are
+        // warp-uniform branches and the `shfl_xor` full mask stays valid.
+        const int nvalid = wrows;
         #pragma unroll 32
         for (int kb = 0; kb < nb_k; ++kb) {
             const int j = kb * 32 + lane;
             // ONE activation decode per (q, kb), shared by the warp's whole N tile.
-            // The byte comes from L1 (`__ldg`), and it is decoded through the SAME
-            // `s_lut` the legacy kernel reads: the legacy `s_a[q*k+j]` is a PURE COPY
-            // of this address (a copy's width is not observable), so
-            // `s_lut[__ldg(a + q*k + j)]` IS the legacy `s_lut[s_a[q*k+j]]` -- the
-            // identical expression. The LUT (1 LDS) is used rather than an inline
-            // `e4m3_to_f` (the 5a family's form, ~7 ALU ops) precisely because this
-            // kernel HAS a smem block for the weight slab, so the 1 KB table is
+            // FIX 1: the byte comes from the STAGED slab (`s_a`), i.e. the legacy
+            // kernel's own `s_lut[s_a[q*k+j]] * s_as[q*nb_k + (j>>5)]` expression --
+            // an LDS pair with the short dependency chain the L1 `__ldg` form this
+            // kernel first shipped did not have. The LUT (1 LDS) is used rather than
+            // an inline `e4m3_to_f` (the 5a family's form, ~7 ALU ops) precisely
+            // because this kernel HAS a smem block for the slab, so the table is
             // free -- and because a LUT read is 1 instruction where the inline
             // decode is seven, which is the quantity this arm is buying.
             float av[RN];
             if constexpr (AQ == 0) {
                 #pragma unroll
                 for (int q = 0; q < RN; ++q)
-                    av[q] = s_lut[__ldg(a + (size_t)q * (size_t)k + j)] *
-                            __ldg(a_scale + (size_t)q * (size_t)nb_k + kb);
+                    av[q] = s_lutw[s_a[(size_t)q * (size_t)k + j]] *
+                            s_as[(size_t)q * (size_t)nb_k + (j >> 5)];
             } else {
                 // ---- WO_PAIR-ROWS (AQ == 1): the intermediate quant, in-warp ----
                 // Segment 2 of the verify's wo_a -> wo_b chain is a per-row
@@ -6399,7 +6478,7 @@ gemm_fp8_mtile_kernel(const uint8_t* __restrict__ a, const float* __restrict__ a
                     const float sc = fmaxf(fast_round_scale(am, 1.0f / 448.0f), 1e-30f);
                     const float qi = fminf(fmaxf(v * (1.0f / sc), -448.0f), 448.0f);
                     const __nv_fp8_e4m3 f8 = __nv_fp8_e4m3(qi);
-                    av[q] = s_lut[*(const uint8_t*)&f8] * sc;
+                    av[q] = s_lutw[*(const uint8_t*)&f8] * sc;
                 }
             }
             #pragma unroll
@@ -6411,7 +6490,7 @@ gemm_fp8_mtile_kernel(const uint8_t* __restrict__ a, const float* __restrict__ a
                 // the legacy `wv` hoist (C4).
                 const float sb = ue8m0_to_f(__ldg(w_scale + (size_t)(row >> 5) * (size_t)nb_k + kb));
                 const float wv =
-                    s_lut[s_w[(size_t)(n_block * bn + nn) * (size_t)k + j]] * sb;
+                    s_lutw[s_w[(size_t)(n_block * bn + nn) * (size_t)k + j]] * sb;
                 #pragma unroll
                 for (int q = 0; q < RN; ++q) acc[q][nn] += av[q] * wv;
             }
@@ -6579,13 +6658,14 @@ extern "C" int dsv41_gemm_fp8_mrows(const uint8_t* a, const float* a_scale,
         const int bn = g_mrows_mtile_bn;
         // "The widest block that still covers the SMs" -- see the helper's header.
         const int nw = dsv41_mrows_mtile_warps_for(n, bn);
-        // weight tile (nw*bn rows of k bytes) + the 256-entry e4m3 table. NO
-        // activation slab: the activation's reuse is the warp-local bn axis, and a
-        // block-wide copy would only re-introduce a per-block prologue (the
-        // fold_r / MPAR lesion). Strictly smaller than the legacy program's smem
-        // at wq_a/wkv, within a KB of it at wq_b/wo_b.
-        const size_t smem_mt =
-            (size_t)nw * (size_t)bn * (size_t)k + (size_t)256 * sizeof(float);
+        // weight tile (nw*bn rows of k bytes) + the e4m3 table (ONE COPY PER WARP
+        // -- that is what let the block-wide publication barrier go) + the m staged
+        // activation scale rows + the m staged activation rows (the FIX's staging).
+        // `m` is exact: the kernel's RN is min(m, kMrowsMtileBM) and this launcher
+        // already rejects m > 8 == kMrowsMtileBM.
+        const size_t smem_mt = (size_t)nw * (size_t)bn * (size_t)k +
+                               (size_t)nw * 256 * sizeof(float) +
+                               (size_t)m * (size_t)nb_k * sizeof(float) + (size_t)m * (size_t)k;
         const int smrows = nw * bn;
         const dim3 grid_mt((unsigned)((n + smrows - 1) / smrows));
         if (smem_mt <= (size_t)dsv41_smem_ceiling(gemm_fp8_mtile_kernel<1>)) {
@@ -6919,7 +6999,11 @@ extern "C" int dsv41_gemm_fp8_mrows_q_f32(const float* a, int a_stride, const ui
     if (no_gemv) return 2;
     const int bn = g_mrows_mtile_bn;
     const int nw = dsv41_mrows_mtile_warps_for(n, bn);
-    const size_t smem = (size_t)nw * (size_t)bn * (size_t)k + (size_t)256 * sizeof(float);
+    // Weight tile + the e4m3 table (one copy per warp). NO activation slab on THIS
+    // entry: `AQ == 1`'s activation is f32 and quantised in-warp, so the kernel
+    // stages nothing for it (a staged f32 tile would be `m*k*4` bytes).
+    const size_t smem =
+        (size_t)nw * (size_t)bn * (size_t)k + (size_t)nw * 256 * sizeof(float);
     const int smrows = nw * bn;
     const dim3 grid((unsigned)((n + smrows - 1) / smrows));
     if (smem > (size_t)dsv41_smem_ceiling(gemm_fp8_mtile_kernel<1, 1>)) {
