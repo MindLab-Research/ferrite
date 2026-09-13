@@ -2163,3 +2163,24 @@ dsv41_glue.cu(3281): error: function "<unnamed>::glue_e2m1_encode" has already b
 `arm_run.sh`（5 图门全关 + OUT/ERR/STEP 回写日志）、`arm_run_fast.sh`（图 ON，唯一可作性能 p50）、
 `wq_check.py`、`bs_vs_old.sh`、`decisive2.sh`、`endgame.sh`、`promote_all.sh`、`promote_precision.sh`、`packed_matrix.sh`。
 **编译检查**：必须在**仓库目录**编 shim（kernel 被 shim `#include`）；`.cu` 变则**双产物背靠背重编**。
+
+## §86 工具与验证方案补充（cp.async 门 + 合并验收脚本）
+
+### (a) `cp.async` 双缓冲门的**验证方案**（`DSV41_MOE_BS_CPASYNC`，等实现交付后执行）
+它属于**性能门**，与精度门不同，判据必须**两条都过**：
+1. **数值逐字节一致**：同一次会话内 `DSV41_MOE_BS_CPASYNC=0` 与 `=1` 两臂跑同一 prompt，
+   用 `~/wq_check.py --log A --eager-file <B 的 OUT>` 判"同现"（等价 ⇒ SAME）；
+   **更硬的判据**：`DSV41_MOE_BS_NUMCHECK=1` 的 `[NC]` 数值在两臂应**完全一致**（延迟探针在重放期命中）。
+2. **性能**：两臂背靠背（同会话、同构建）取 `~/arm_run_fast.sh` 的 `[dsv41] step pos=` **p50**（图 ON ✓），
+   预期 verify 34.5ms → ~22ms（交接文档的量化目标）；**禁止用图关掉的诊断臂数字**（§42）。
+3. smem 预算**已核算**（§85/§84 附）：单 stage 装载 33792 B、双缓冲 67584 B ≪ `kSmem=166912` ✓
+   —— 但 **C staging 的别名区间**必须在实现里重新确认（epilogue 之前不得再读 A/B）。
+
+### (b) `~/merge_worktree.sh`（新工具：把"合并纪律"自动化）
+```bash
+bash ~/merge_worktree.sh <worktree-dir> <新符号> [必须仍存在的符号...]
+```
+它按 AGENTS.md 的合并纪律逐步执行：导出未提交 diff（排除 docs）→ 预检 → `git apply`（冲突则 `patch -p1 -F3`）
+→ **三项确认**（新符号计数 / `diff --stat` / 传入的"必须仍存在"符号）→ 残留检查（`.rej/.orig`）
+→ **重复定义普查**（§83 的教训，只扫被改动的 `.cu`）→ 提示用 **build.sh 真实标志**编译。
+**不自动提交**（先看输出）。三次合并（cheap-align / cpasync / cgrade）都用它。
