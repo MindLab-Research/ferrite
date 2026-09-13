@@ -651,6 +651,16 @@ bool tl_bs_init() {
         (void)cudaGetLastError();
         fprintf(stderr, "[moe-bs] canon layout = %d\n", canon);
     }
+    // g_packed: stage the fp4 operand PACKED (two K elements per byte, the way the
+    // hardware reads it) instead of unpacked
+    if (ok) {
+        int pk = 0;
+        const char* e = getenv("DSV41_MOE_BS_PACKED");
+        if (e != nullptr && e[0] == '1') pk = 1;
+        (void)cudaMemcpyToSymbol(g_packed, &pk, sizeof(int));
+        (void)cudaGetLastError();
+        fprintf(stderr, "[moe-bs] packed fp4 staging = %d\n", pk);
+    }
     // g_sfrev: SF word byte order (0 = LSB-first, 1 = MSB-first -> sf_id = 3-ki)
     if (ok) {
         int sr = 0;

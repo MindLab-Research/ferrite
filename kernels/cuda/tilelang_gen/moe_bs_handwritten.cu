@@ -49,6 +49,27 @@ __device__ int g_swapab = 0;
 // A one-line test of the only hypothesis that explains a systematic error shared by
 // every layout / orientation / SF-delivery combination: the sf_id byte order.
 __device__ int g_sfrev = 0;
+// g_packed: stage the fp4 (E2M1) operand the way the HARDWARE reads it — PACKED, two K
+// elements per byte (low nibble = even k). Measured, not assumed: with every B byte set
+// to 0x22 (both nibbles = 1.0) a dense parity matches the gold standard EXACTLY
+// (relerr = 0), while 0x02 (high nibble 0) yields exactly half of it and only the even
+// k indices respond to an impulse. One scale_vec::1X K-block (32 elements) is therefore
+// 16 smem bytes; the descriptor that the vendor's own W operand uses is
+// lbo=1 (16 B) / sbo=64 (1024 B) / layout_type=2 (SWIZZLE_128B). See
+// docs/agent/moe-bs-crash-investigation.md §29-§31.
+__device__ int g_packed = 0;
+
+// Address inside the PACKED fp4 operand tile (K packed into K/2 bytes = 64 B per row at
+// K=128). PREDICTION (§30): the 128-byte swizzle span holds two 64-byte rows, so the row's
+// four 16-byte chunks are XOR-permuted by the row index. The empirical calibration
+// (subagent bs-packed-geometry, judged by relerr==0 on a dense parity) is authoritative —
+// if its formula differs, replace THIS FUNCTION only.
+__device__ __forceinline__ int hw_pack_idx(int row, int col /* p acked byte index, 0..63 */) {
+    const int chunk = col >> 4;          // 16-byte chunk inside the row (0..3)
+    const int within = col & 15;         // byte inside the chunk
+    return (row >> 3) * 512 + (row & 7) * 64 +
+           ((((chunk) ^ (row & 3))) << 4) + within;
+}
 
 // smem index for a (row, kk) element of a 128-row x 128-K(tiles) operand tile.
 __device__ __forceinline__ int hw_smem_idx(int row, int kk, int canon) {
@@ -281,11 +302,16 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
             //   gp0 = fmaf(sa[0], gt0.x, gp0)  // sa[0] (even K) × LOW nibble
             //   gp1 = fmaf(sa[1], gt0.y, gp1)  // sa[1] (odd K) × HIGH nibble
             // And fp4_pack_kernel: packed = (lo & 0xF) | (hi << 4), lo = element 2i
-            const int k0 = col * 2;      // first element K index
-            const int k1 = col * 2 + 1;  // second element K index
-            // SW128 swizzled write (same layout as TileLang's TMA)
-            (g_swapab ? A_sh : B_sh)[hw_smem_idx(row, k0, g_canon)] = packed & 0xF;
-            (g_swapab ? A_sh : B_sh)[hw_smem_idx(row, k1, g_canon)] = packed >> 4;
+            if (g_packed) {
+                // the hardware reads two K elements per byte -> stage the byte as-is
+                (g_swapab ? A_sh : B_sh)[hw_pack_idx(row, col)] = packed;
+            } else {
+                const int k0 = col * 2;      // first element K index
+                const int k1 = col * 2 + 1;  // second element K index
+                // SW128 swizzled write (same layout as TileLang's TMA)
+                (g_swapab ? A_sh : B_sh)[hw_smem_idx(row, k0, g_canon)] = packed & 0xF;
+                (g_swapab ? A_sh : B_sh)[hw_smem_idx(row, k1, g_canon)] = packed >> 4;
+            }
         }
         for (int i = tid; i < HW_NH * 64; i += 128) {
             const int row = i >> 6;
@@ -293,10 +319,14 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
             const uint8_t packed =
                 W3[(int64_t)e * w_stride + (int64_t)(n_tile * HW_NH + row) * 2560 + k * 64 + col];
             const int m = HW_NH + row;  // W3 rows are after W1
-            const int k0 = col * 2;
-            const int k1 = col * 2 + 1;
-            (g_swapab ? A_sh : B_sh)[hw_smem_idx(m, k0, g_canon)] = packed & 0xF;
-            (g_swapab ? A_sh : B_sh)[hw_smem_idx(m, k1, g_canon)] = packed >> 4;
+            if (g_packed) {
+                (g_swapab ? A_sh : B_sh)[hw_pack_idx(m, col)] = packed;
+            } else {
+                const int k0 = col * 2;
+                const int k1 = col * 2 + 1;
+                (g_swapab ? A_sh : B_sh)[hw_smem_idx(m, k0, g_canon)] = packed & 0xF;
+                (g_swapab ? A_sh : B_sh)[hw_smem_idx(m, k1, g_canon)] = packed >> 4;
+            }
         }
 
         // (3) 加载 SF
@@ -353,10 +383,17 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
             //                 writes use unit16(r,kb)=(r%8)+8*kb+16*(r/8), atom = 4096 B
             // The two parameter sets are NOT interchangeable — each must pair with its own
             // write formula (hw_smem_idx) and its own K-block advance (see below).
-            const uint64_t a_desc_base = g_canon ? hw_make_desc(A_sh, 8, 16, 0)    // canonical SWIZZLE_NONE
-                                     : hw_make_desc(A_sh, 1, 64, 2);   // TileLang SW128
-            const uint64_t b_desc_base = g_canon ? hw_make_desc(B_sh, 8, 16, 0)
-                                     : hw_make_desc(B_sh, 1, 64, 2);
+            // The fp4 operand (A under swapAB, else B) needs the PACKED descriptor when
+            // g_packed: one scale_vec::1X K-block is 16 smem bytes there, so the vendor's
+            // own W descriptor numbers apply — lbo=1 (16 B), sbo=64 (1024 B), layout=2.
+            const bool a_packed = g_packed && g_swapab;
+            const bool b_packed = g_packed && !g_swapab;
+            const uint64_t a_desc_base = a_packed ? hw_make_desc(A_sh, 1, 64, 2)
+                                     : (g_canon ? hw_make_desc(A_sh, 8, 16, 0)    // canonical SWIZZLE_NONE
+                                                : hw_make_desc(A_sh, 1, 64, 2));  // TileLang SW128
+            const uint64_t b_desc_base = b_packed ? hw_make_desc(B_sh, 1, 64, 2)
+                                     : (g_canon ? hw_make_desc(B_sh, 8, 16, 0)
+                                                : hw_make_desc(B_sh, 1, 64, 2));
 
             for (int ki = 0; ki < 4; ++ki) {
                 // idesc: M=128, N=128, a_fmt=0 (E4M3), b_fmt=5 (E2M1), sf_id=ki
@@ -373,8 +410,9 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
                 // K-block descriptor advance: TileLang's `desc_a + (ki*32)` where
                 // Tcgen05SMemDescriptor::operator+ does `reg32_[0] += offset >> 4`
                 // (offset in BYTES). So the advance is ki*32 bytes = ki*2 units.
-                const uint64_t a_desc = a_desc_base + (uint64_t)(ki * (g_canon ? 256 : 2));
-                const uint64_t b_desc = b_desc_base + (uint64_t)(ki * (g_canon ? 256 : 2));
+                // packed fp4: a K-block is 16 B = 1 unit, so the advance is ki*1
+                const uint64_t a_desc = a_desc_base + (uint64_t)(ki * (a_packed ? 1 : (g_canon ? 256 : 2)));
+                const uint64_t b_desc = b_desc_base + (uint64_t)(ki * (b_packed ? 1 : (g_canon ? 256 : 2)));
                 // enable_d: 0 for first MMA (clear accumulator), 1 for rest
                 const uint32_t enable_d = (k == 0 && ki == 0) ? 0 : 1;
 
