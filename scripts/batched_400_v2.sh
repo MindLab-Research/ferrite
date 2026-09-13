@@ -85,6 +85,9 @@
 #                                                    # ARM block below)
 #   B400_B6=1 bash scripts/batched_400_v2.sh         # B6 arm: the verify wo_b as ONE
 #                                                    # m-rows f32 launch (see below)
+#   B400_1B=1 bash scripts/batched_400_v2.sh         # 1b arm: the mrows ACTIVATION
+#                                                    # staging -> cp.async16 (16x
+#                                                    # instruction asymmetry; bit-exact)
 #
 # OUTPUT: $LOGDIR/<tag>.{log,dspark,metrics,txt,env,resp.json,build_*.log}
 #   Exit: 0 = usable AND both red lines hold; 1 = a red line broke (拉丁 / 双字 /
@@ -392,6 +395,41 @@ fi
 B4_ARM="${B400_B4:-0}"
 if [ "$B4_ARM" = 1 ]; then
     GATES_ONELINE="$GATES_ONELINE DSV41_RMSNORM_ROPE_MROWS=1"
+fi
+
+# ---------------------------------------------------------------------------
+# 1b (L4/L5 W-N1 N1-1; docs/agent/l4l5-next-batch-implementation-plan.md §2 W-N1
+# + docs/agent/l4-mgrid-first-step-design.md §4). Opt-in arm, DEFAULT unset
+# => `$GATES_ONELINE` is byte-identical to the shipped configuration.
+#
+#   B400_1B=1  -> DSV41_MROWS_ACT_CPASYNC=1
+#     `gemm_fp8_mrows_kernel` stages its activation ROWS with `dsv41_cp_async16`
+#     (16 B per lane per issue) instead of the scalar byte loop (1 B per lane per
+#     issue) — the rule the WEIGHT row in that SAME kernel has used all along, i.e.
+#     the 16x instruction asymmetry inside one kernel. `DSV41_GEMV_ACT_CPASYNC`
+#     (P4) had wired the m=1 GEMV only; this arm is the multi-row half. Production
+#     account at wkv (128 threads, k = 5120, m = 6): 480 exposed warp-instructions
+#     -> 15.
+#     ⚠️ ACTIVITY: no symbol of its own AND no grid change, so kernel name, launch
+#        count and GridX distribution are identical on both arms. The two pieces of
+#        evidence are (a) the launcher's own
+#        `[mrows-act-cp16] ARMED m=.. n=.. k=.. => activation staging = ...` line
+#        (one per process, first armed launch; if it is absent the arm never
+#        reached the branch — and the line prints the DECLINE case too), and
+#        (b) the in-tree bit-parity suite (kernels/cuda/tests_dsv41_gemm_mrows.cu,
+#        `mr_case_cp16_axis`, sweeps both arms in one process against the same
+#        m=1 references).
+#     NUMERICS: staging is a pure copy — same bytes into the same slot, with the
+#        scalar loop kept as the fallback for a shape that fails the runtime 16B
+#        guard. This arm is therefore BIT-EXACT by construction and is judged as a
+#        bit-exact arm (token-for-token), NOT as a red-line arm.
+#     The kernel is live on this path: `proj_mrows` (the verify's wq_a/wkv/wq_b at
+#     `m <= VERIFY_ROWS = 6`) and the shared expert's w1/w3/w2 all call it.
+#
+# USAGE:  B400_1B=1 bash scripts/batched_400_v2.sh
+B1B_ARM="${B400_1B:-0}"
+if [ "$B1B_ARM" = 1 ]; then
+    GATES_ONELINE="$GATES_ONELINE DSV41_MROWS_ACT_CPASYNC=1"
 fi
 
 echo "== BATCHED-400 v2 (rebuilt) comprehensive run =="

@@ -5646,6 +5646,43 @@ extern "C" int dsv41_gemm_fp8_mrows(const uint8_t* a, const float* a_scale,
 #undef FERRITE_SET_MROWS_SMEM
         if (e != cudaSuccess) { (void)cudaGetLastError(); return (int)e; }
     }
+    // 1b ACTIVITY RECEIPT (DSV41_MROWS_ACT_CPASYNC). The arm has NO symbol of its
+    // own and, unlike `fold_r`, it does not move the grid either: kernel name,
+    // launch count and GridX distribution are IDENTICAL with the gate on and off.
+    // `/proc/<pid>/environ` therefore proves the variable REACHED the process but
+    // never that the branch was taken -- the one hole in the plan's ① activity leg
+    // (docs/agent/l4l5-next-batch-implementation-plan.md §5.2; lazy_l45_ab.sh's
+    // header says the same). This line closes it: ONE line per process, on the
+    // first ARMED launch, naming the branch that launch actually resolves to. The
+    // alignment decline is printed too, because "armed but inert" is exactly the
+    // phantom-gate shape this tree has been bitten by.
+    //
+    // HOST code in the launcher: it cannot touch a value, and with the gate unset
+    // (the shipped default) nothing is printed at all. A run whose log carries NO
+    // receipt while its `.env` shows the gate armed means the mrows launcher never
+    // got this far -- declined earlier (mode < 3, NO_GEMV_FP8, shape rejection) or
+    // never called on that path. That is information, not a bug.
+    if (act_cp16 != 0) {
+        static int reported = 0;
+        if (reported++ == 0) {
+            // The device's own guard is `(act_cp16 != 0) && dsv41_f4_ok(a) &&
+            // dsv41_f4_ok(s_a)`. The host cannot take the address of the dynamic
+            // smem block, so the smem side is reported from the very arithmetic
+            // that places `s_a` below (the dynamic-smem base is 16B-aligned, which
+            // is what the device-side `dsv41_f4_ok(s_a)` re-checks anyway).
+            const size_t s_a_off = (size_t)nwarps * (size_t)k +
+                                   (size_t)256 * sizeof(float) +
+                                   (size_t)fold_r * (size_t)nb_k * sizeof(float);
+            const bool aligned = (((uintptr_t)a & 0xF) == 0) && ((s_a_off & 0xF) == 0);
+            fprintf(stderr,
+                    "[mrows-act-cp16] ARMED m=%d n=%d k=%d fold_r=%d nwarps=%d smem=%zu "
+                    "-> activation staging = %s\n",
+                    m, n, k, fold_r, nwarps, smem,
+                    aligned ? "cp.async16 (16B per lane per issue)"
+                            : "scalar loop (the 16B guard DECLINED this shape: the arm is "
+                              "INERT here -- l4-mgrid-first-step-design.md §4.2)");
+        }
+    }
     const dim3 grid(nt * ng);
     switch (m) {
         case 1: gemm_fp8_mrows_kernel<1><<<grid, nwarps * 32, smem, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, (int)g_gemv_a32, fold_r, act_cp16); break;
