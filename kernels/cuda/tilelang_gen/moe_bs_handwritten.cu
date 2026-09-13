@@ -342,9 +342,13 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
             }
 
             // MMA: 4 sub-MMAs (ki=0-3, each covers 32 K elements)
-            // smem descriptors for A and B tiles
-            // layout=0 (no swizzle), LBO=1 (16B = core matrix row stride), SBO=64 (1024B = 8-row atom stride)
-            // (数据已按 core matrix 布局写入，无需 swizzle)
+            // smem descriptors for A and B tiles — the layout family is a RUNTIME choice:
+            //   g_canon=0 -> TileLang SW128  : lbo=1, sbo=64, layout_type=2 (SWIZZLE_128B),
+            //                 writes use addr(r,c)=(r/8)*1024+(r%8)*128+(((c/16)^(r%8))*16)+(c%16)
+            //   g_canon=1 -> repo canonical  : lbo=8, sbo=16, layout_type=0 (SWIZZLE_NONE),
+            //                 writes use unit16(r,kb)=(r%8)+8*kb+16*(r/8), atom = 4096 B
+            // The two parameter sets are NOT interchangeable — each must pair with its own
+            // write formula (hw_smem_idx) and its own K-block advance (see below).
             const uint64_t a_desc_base = g_canon ? hw_make_desc(A_sh, 8, 16, 0)    // canonical SWIZZLE_NONE
                                      : hw_make_desc(A_sh, 1, 64, 2);   // TileLang SW128
             const uint64_t b_desc_base = g_canon ? hw_make_desc(B_sh, 8, 16, 0)
