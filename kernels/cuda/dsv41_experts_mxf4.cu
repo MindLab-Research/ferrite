@@ -5942,6 +5942,49 @@ extern "C" int dsv41_expert_tcgen05_gate_up_e4m3(
         return (e != nullptr && e[0] == '1') ? 1 : 0;
     }();
     if (!enabled) return 0;
+    // ---- SECOND gate, dedicated to THIS symbol, default OFF --------------------
+    // WHY (2026-09-13): `DSV41_EXPERT_TCGEN05_E4M3` is ONE name shared by THREE
+    // consumers -- this single-row swapAB arm, the grouped masked arm
+    // (`dsv41_expert_gemm_e4m3_grouped`, the one the `DSV41_EXPERT_GROUPED` A/B
+    // ticket actually measures) and the Rust mirror
+    // `chain_dev.rs::expert_tcgen05_e4m3()`. THIS arm is dispatched from the
+    // SINGLE-ROW backbone path (`moe()` -> `layer()` -> `step_body()`), which is
+    // exactly the path PREFILL walks (`serve.rs::prefill_chain`: one `step` per
+    // prompt token), so arming the shared name armed THIS (never-GPU-verified)
+    // kernel in front of every grouped launch: prefill died with err 716 before
+    // `moe_rows` -- the only place the grouped arm runs -- was ever reached. The
+    // grouped ticket could therefore not be measured at all.
+    // See docs/agent/tcgen05-716-e4m3-confound-verdict.md.
+    //
+    // The split confines the fault to THIS symbol and changes nothing about the
+    // grouped arm: the shared name still arms `dsv41_expert_gemm_e4m3_grouped`
+    // (its own `enabled` lambda ANDs the same variable with DSV41_EXPERT_GROUPED),
+    // and the Rust mirror is deliberately left alone so the grouped consumer's
+    // gate stays byte-for-byte equivalent.
+    //
+    // Returning 0 here is the DOCUMENTED fallback contract of this entry point
+    // ("Returns 0 (and does nothing) while disabled, so the caller can call it
+    // unconditionally and keep the proven GEMV path as the fallback") -- the
+    // single-row path lands on the proven SIMT GEMV, bit-for-bit the pre-tcgen05
+    // behaviour. The note below keeps the decline LOUD (an armed gate must never
+    // silently measure the old path).
+    static const int swapab_enabled = [] {
+        const char* e = getenv("DSV41_EXPERT_TCGEN05_E4M3_SWAPAB");
+        return (e != nullptr && e[0] == '1') ? 1 : 0;
+    }();
+    if (!swapab_enabled) {
+        static bool said = false;
+        if (!said) {
+            said = true;
+            fprintf(stderr,
+                    "dsv41: dsv41_expert_tcgen05_gate_up_e4m3 (swapAB e4m3, single-row) is OPT-IN "
+                    "and OFF -- DSV41_EXPERT_TCGEN05_E4M3 now arms the GROUPED e4m3 arm only, and "
+                    "the proven SIMT GEMV answers the single-row path. It faults with err 716 at "
+                    "the first prefill (see docs/agent/tcgen05-716-e4m3-confound-verdict.md); set "
+                    "DSV41_EXPERT_TCGEN05_E4M3_SWAPAB=1 to run it anyway\n");
+        }
+        return 0;
+    }
     if (inter <= 0 || dim <= 0 || slots <= 0) return (int)cudaErrorInvalidValue;
     const cudaError_t e = e4_launch_gateup(act, act_scale, out, out_slot_stride, 2 * inter, dim,
                                            slots, limit, /*epi_mode=*/1, /*split=*/inter, w1_base,
