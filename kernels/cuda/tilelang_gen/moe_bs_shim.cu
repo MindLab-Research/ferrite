@@ -998,7 +998,8 @@ extern "C" int dsv41_moe_tilelang_gate_up_bs_dev(
                             "sequential execution, no TMA pipeline\n");
         }
         moe_bs_handwritten_kernel<<<dim3((unsigned)kGridX, (unsigned)kSegCap), 128, 65536, s>>>(
-            g_a, w1, w3, g_sfa, sfw1, sfw3, eid_dev, g_c, w_stride);
+            g_a, (const uint8_t*)w1, (const uint8_t*)w3, g_sfa,
+            (const uint32_t*)sfw1, (const uint32_t*)sfw3, eid_dev, g_c, w_stride);
         cudaError_t ehw = cudaGetLastError();
         if (ehw != cudaSuccess) return (int)ehw;
         if (g_sync_diag) {
