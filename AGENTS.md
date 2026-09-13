@@ -97,7 +97,10 @@ LD_LIBRARY_PATH=$HOME/ferrite/kernels/cuda ./target/release/ferrite-serve --back
    本次 `glue_e2m1_encode` 重复定义让**完整构建失败**，而单文件检查报 RC=0（标志/上下文不同）。
 2. **看到 `build failed`，那一轮的任何 e2e 结果都不能用**（二进制陈旧 ⇒ 跑的不是你以为的代码，
    与"测量偏置陷阱"同类）。
-3. **多 subagent 汇入同一大文件时，新增辅助函数必须带唯一前缀**（如 `a2_`/`a3_`/`i3_`），
+3. **构建命令必须传播真实退出码**：`bash build.sh 103a | tail -1 && …` 的退出码是 `tail` 的 **0**
+   ⇒ 构建失败也会"看起来成功"（本次 T3 回合就是这么跑了一轮**陈旧二进制**）。
+   正确写法：`set -o pipefail`（或 `; echo BUILD_RC=${PIPESTATUS[0]}`），并**显式检查**后再跑臂。
+4. **多 subagent 汇入同一大文件时，新增辅助函数必须带唯一前缀**（如 `a2_`/`a3_`/`i3_`），
    否则极易同名重复定义——给 subagent 的 brief 里要写明这一条。
 4. 合并 subagent 的 worktree 改动：**导出未提交 diff**（排除 docs）再 `git apply`；
    冲突时用 `patch -p1 -F3`；并**三项确认**（新符号计数 / `diff --stat` 与报告一致 / 我此前的修复仍在），
