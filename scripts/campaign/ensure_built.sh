@@ -46,9 +46,16 @@ else
   echo "=== kernel sources unchanged ($NEW): skipping build.sh ==="
 fi
 source "$HOME/.cargo/env"
+# `.build_id` is an INPUT to the Rust build: build.rs reads exactly that file and bakes it into the
+# binary as FERRITE_BUILD_ID (crates/ferrite-kernel/build.rs:215), and the engine compares the .so's
+# exported id against it at startup. So a kernel rebuild (which rewrites .build_id) MUST also re-run
+# cargo — skipping it leaves a binary carrying the OLD id, which the three-source gate correctly
+# rejects (measured: scoreboard aborted with exit 1 and never started the serve, because this branch
+# said "Rust sources unchanged" while .build_id was newer than the binary).
 if [ ! -f target/release/ferrite-serve ] ||
+   [ kernels/cuda/.build_id -nt target/release/ferrite-serve ] ||
    [ -n "$(find crates -name '*.rs' -newer target/release/ferrite-serve -print -quit 2>/dev/null)" ]; then
-  echo "=== Rust sources changed: cargo build --release ==="
+  echo "=== rebuilding binary (Rust sources and/or .build_id newer than it) ==="
   set -o pipefail
   cargo build --release 2>&1 | tail -2
   rc=$?
