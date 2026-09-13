@@ -883,6 +883,17 @@ pub struct DevChain<'a> {
     /// would let one layer's capture clobber another's under a per-layer MoE
     /// graph (`DSV41_GRAPH_MOE`).
     moe_add_in: Vec<Option<*const f32>>,
+    // ---- DSpark ground-truth spec step (port plan S3a) ----
+    /// Flat snapshot buffers for the golden spec path, layout
+    /// `[pre_a|pre_b|pre_c|clen|state_kv(l0)|state_score(l0)|...]`.
+    /// Slot 0 = pre-draft; slots 1..=6 = taken before each verify row.
+    /// Allocated lazily on first use (always OUTSIDE any graph capture).
+    gt_snaps: Vec<DevBuf>,
+    /// Host mirror of `layers[*].compress_len` per snapshot slot (the device
+    /// halves are in `gt_snaps`; this counter only lives on the host).
+    gt_host: Vec<Vec<usize>>,
+    /// Spec step counter; drives the "cycle" draft mode's k_acc pattern.
+    gt_step_idx: u64,
 }
 
 fn fb(n: usize) -> usize {
@@ -1124,6 +1135,9 @@ impl<'a> DevChain<'a> {
             eng_layout,
             eng_map,
             moe_add_in: vec![None; cfg.n_layers],
+            gt_snaps: Vec::new(),
+            gt_host: Vec::new(),
+            gt_step_idx: 0,
         })
     }
 
@@ -1833,6 +1847,180 @@ impl<'a> DevChain<'a> {
         self.step_impl(token, pos)
     }
 
+    // ==================== DSpark ground-truth spec step (port plan S3a) ====================
+    //
+    // The GOLDEN REFERENCE for the ported spec decode: verify runs as M
+    // sequential single-row `step`s (the rows literally ARE eager steps),
+    // bracketed by per-row snapshots of every cross-token piece of state.
+    // Committing rows 0..k restores snapshot k+2 — the state after exactly the
+    // committed prefix — so the next block continues as the eager stream would.
+    // Contract: docs/agent/dsv41-sglang-port-plan.md §1 (I1..I13).
+    //
+    // Draft modes (DSV41_SPEC_GT_DRAFT): "noise" (k_acc=0, bonus-only commit),
+    // "self" (drafts = the eager stream, k_acc=5), "cycle" (default: k_acc
+    // cycles 0..5 so every partial-commit path is exercised). The golden
+    // property — the committed stream equals the eager stream token-for-token
+    // — must hold in ALL modes; the mode only changes the accept length.
+
+    /// DSV41_SPEC_GT=1 arms the ground-truth spec path (driver-side check).
+    pub fn spec_gt(&self) -> bool {
+        std::env::var("DSV41_SPEC_GT").map(|v| v != "0").unwrap_or(false)
+    }
+
+    fn gt_draft_mode(&self) -> usize {
+        match std::env::var("DSV41_SPEC_GT_DRAFT").as_deref() {
+            Ok("noise") => 0,
+            Ok("self") => 1,
+            _ => 2, // cycle
+        }
+    }
+
+    fn gt_snap_bytes(&self) -> usize {
+        let mut b = self.s.pre_a.bytes + self.s.pre_b.bytes + self.s.pre_c.bytes;
+        b += self.cfg.n_layers * 4; // clen
+        for c in self.layers.iter() {
+            b += c.state_kv.bytes + c.state_score.bytes;
+        }
+        b
+    }
+
+    /// Save the cross-token state into `slot` (premix trio, device clen, every
+    /// compressor layer's state_kv/state_score, host compress_len mirror).
+    fn gt_save(&mut self, slot: usize) -> Result<()> {
+        while self.gt_snaps.len() <= slot {
+            self.gt_snaps.push(self.dev.alloc(self.gt_snap_bytes())?);
+            self.gt_host.push(Vec::new());
+        }
+        let dev = self.dev;
+        let dst = self.gt_snaps[slot].ptr as usize;
+        let mut off = 0usize;
+        for src in [&self.s.pre_a, &self.s.pre_b, &self.s.pre_c] {
+            dev.memcpy_d2d((dst + off) as *mut std::ffi::c_void, src.ptr, src.bytes)?;
+            off += src.bytes;
+        }
+        dev.memcpy_d2d(
+            (dst + off) as *mut std::ffi::c_void,
+            self.s.clen.ptr,
+            self.cfg.n_layers * 4,
+        )?;
+        off += self.cfg.n_layers * 4;
+        for c in self.layers.iter() {
+            dev.memcpy_d2d((dst + off) as *mut std::ffi::c_void, c.state_kv.ptr, c.state_kv.bytes)?;
+            off += c.state_kv.bytes;
+            dev.memcpy_d2d(
+                (dst + off) as *mut std::ffi::c_void,
+                c.state_score.ptr,
+                c.state_score.bytes,
+            )?;
+            off += c.state_score.bytes;
+        }
+        self.gt_host[slot] = self.layers.iter().map(|c| c.compress_len).collect();
+        Ok(())
+    }
+
+    /// The mirror of [`Self::gt_save`].
+    fn gt_restore(&mut self, slot: usize) -> Result<()> {
+        let dev = self.dev;
+        let src = self.gt_snaps[slot].ptr as usize;
+        let mut off = 0usize;
+        for dst in [&self.s.pre_a, &self.s.pre_b, &self.s.pre_c] {
+            dev.memcpy_d2d(dst.ptr, (src + off) as *const std::ffi::c_void, dst.bytes)?;
+            off += dst.bytes;
+        }
+        dev.memcpy_d2d(
+            self.s.clen.ptr,
+            (src + off) as *const std::ffi::c_void,
+            self.cfg.n_layers * 4,
+        )?;
+        off += self.cfg.n_layers * 4;
+        for c in self.layers.iter_mut() {
+            dev.memcpy_d2d(c.state_kv.ptr, (src + off) as *const std::ffi::c_void, c.state_kv.bytes)?;
+            off += c.state_kv.bytes;
+            dev.memcpy_d2d(
+                c.state_score.ptr,
+                (src + off) as *const std::ffi::c_void,
+                c.state_score.bytes,
+            )?;
+            off += c.state_score.bytes;
+        }
+        let host = self.gt_host[slot].clone();
+        for (c, &v) in self.layers.iter_mut().zip(host.iter()) {
+            c.compress_len = v;
+        }
+        Ok(())
+    }
+
+    /// Force the device position counter (host-side 4-byte upload, legal only
+    /// OUTSIDE a graph capture — exactly where the spec commit runs).
+    fn gt_set_pos(&mut self, p: usize) -> Result<()> {
+        let v = [p as i32];
+        self.dev.upload_f32_at(
+            self.s.pos_ctr.ptr,
+            0,
+            unsafe { std::slice::from_raw_parts(v.as_ptr() as *const f32, 1) },
+        )
+    }
+
+    /// One ground-truth DSpark spec step at block base `pos` with anchor
+    /// `token`. Returns the committed tokens (1..=6 of them), which are exactly
+    /// the tokens the eager stream would emit at positions pos+1..=pos+k+1.
+    pub fn spec_step_gt(&mut self, token: u32, pos: usize) -> Result<Vec<u32>> {
+        let bs = self.cfg.dspark_block_size.max(1); // 5 drafts
+        let m = bs + 1; // 6 rows: [anchor, d1..d5]
+        let noise = self.cfg.dspark_noise_token_id;
+        let kk = match self.gt_draft_mode() {
+            0 => 0,
+            1 => bs,
+            _ => (self.gt_step_idx % (m as u64)) as usize, // cycle 0..=5
+        };
+        // ---- draft ----
+        let mut drafts = vec![noise; bs];
+        if kk > 0 {
+            // The drafts are the eager stream itself: kk extra forwards, then a
+            // full restore (the ring and the engram cache are position-keyed and
+            // self-heal under the causal mask; everything else is snapshotted).
+            self.gt_save(0)?;
+            let mut t = token;
+            for i in 0..kk {
+                let x = self.step(t, pos + i)?;
+                drafts[i] = x;
+                t = x;
+            }
+            self.gt_restore(0)?;
+            self.gt_set_pos(pos)?;
+        }
+        // ---- verify: m sequential golden rows ----
+        let mut am: Vec<u32> = Vec::with_capacity(m);
+        let mut t = token;
+        for r in 0..m {
+            self.gt_save(1 + r)?; // state BEFORE row r == after rows 0..r-1
+            let a = self.step(t, pos + r)?;
+            am.push(a);
+            if r + 1 < m {
+                t = drafts[r];
+            }
+        }
+        // ---- accept: longest prefix (I2: draft j is judged by row j-1's argmax) ----
+        let mut k = 0usize;
+        while k < bs && drafts[k] == am[k] {
+            k += 1;
+        }
+        // ---- commit rows 0..k (I3: bonus = am[k]; I4: pointer += k+1; I7: ids = am[k]) ----
+        if k < bs {
+            self.gt_restore(k + 2)?; // snap before row k+1 == after rows 0..k
+            self.gt_set_pos(pos + k + 1)?;
+        }
+        let last = am[k];
+        let v = [last as i32];
+        self.dev.upload_f32_at(
+            self.s.ids.ptr,
+            0,
+            unsafe { std::slice::from_raw_parts(v.as_ptr() as *const f32, 1) },
+        )?;
+        self.gt_step_idx += 1;
+        Ok(am[..=k].to_vec())
+    }
+
     /// The whole decode step as ONE CUDA graph (DSV41_GRAPH_STEP=1, the default):
     /// every per-step value now lives on the DEVICE - the position counter, the
     /// per-layer latent counters, the all-reduce epoch - so no launch argument
@@ -1933,6 +2121,23 @@ impl<'a> DevChain<'a> {
             let mut top: Vec<(usize, f32)> = lg.iter().copied().enumerate().collect();
             top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
             eprintln!("[top5] n={} top={:?}", lg.len(), &top[..5.min(top.len())]);
+        }
+        if let Ok(path) = std::env::var("DSV41_GT_LOGITS_DUMP") {
+            // Diagnostic ONLY — the per-step full-logits dump for the official
+            // PyTorch diff harness. This is a D2H in the decode path, so it must
+            // NEVER be enabled in a perf arm (multi-rank lockstep poison).
+            let rank0 = self.comm.as_ref().map(|c| c.rank).unwrap_or(0) == 0;
+            if rank0 {
+                let mut lg = vec![0f32; cfg.vocab_size];
+                let b = Device::view(self.s.logits.ptr, cfg.vocab_size * 4);
+                self.dev.download_f32(&b, &mut lg)?;
+                use std::io::Write as _;
+                let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
+                f.write_all(&(self.step_count as u64).to_le_bytes())?;
+                for v in &lg {
+                    f.write_all(&v.to_le_bytes())?;
+                }
+            }
         }
         Ok(tok)
     }

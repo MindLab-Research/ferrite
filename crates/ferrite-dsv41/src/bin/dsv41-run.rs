@@ -858,20 +858,55 @@ fn pool_rank_body(
                 let mut out: Vec<u32> = Vec::with_capacity(n);
                 let mut t = token;
                 let mut r = Ok(());
-                for i in 0..n {
-                    let st = std::time::Instant::now();
-                    match chain.step_dev(t, pos + i) {
-                        Ok(next) => {
-                            step_time(pos + i, st.elapsed());
-                            out.push(next);
-                            t = next;
-                            if stop_set.contains(&next) {
+                if chain.spec_gt() {
+                    // DSpark ground-truth spec steps (port plan S3a): each call
+                    // commits 1..=6 tokens that MUST equal the eager stream.
+                    let mut p = pos;
+                    let mut stop = false;
+                    while out.len() < n && !stop {
+                        let st = std::time::Instant::now();
+                        match chain.spec_step_gt(t, p) {
+                            Ok(toks) => {
+                                step_time(p, st.elapsed());
+                                if rank == 0 {
+                                    eprintln!(
+                                        "[spec-gt] pos={} committed={}",
+                                        p,
+                                        toks.len()
+                                    );
+                                }
+                                p += toks.len();
+                                t = *toks.last().unwrap();
+                                for &x in toks.iter() {
+                                    out.push(x);
+                                    if stop_set.contains(&x) {
+                                        stop = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                r = Err(e);
                                 break;
                             }
                         }
-                        Err(e) => {
-                            r = Err(e);
-                            break;
+                    }
+                } else {
+                    for i in 0..n {
+                        let st = std::time::Instant::now();
+                        match chain.step_dev(t, pos + i) {
+                            Ok(next) => {
+                                step_time(pos + i, st.elapsed());
+                                out.push(next);
+                                t = next;
+                                if stop_set.contains(&next) {
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                r = Err(e);
+                                break;
+                            }
                         }
                     }
                 }
