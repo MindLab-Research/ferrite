@@ -107,20 +107,27 @@ LD_LIBRARY_PATH=$HOME/ferrite/kernels/cuda ./target/release/ferrite-serve --back
 - serve 卡住/日志 mtime 停滞 = 挂了（查 `stat -c %y` + pgrep，别等）。
 - 加载错防线（三道 runtime + 三道编译期 + git hooks）见 `docs/agent/` 的加载防线文档。
 
-## 当前状态与下一步（2026-09-14——手写 fp4 MoE BS 臂：🎯 根因已定谳 = fp4 操作数必须按 PACKED staging）
+## 当前状态与下一步（2026-09-14——手写 fp4 MoE BS 臂：参数面已全部证明与官方 PASS 参考一致，缺陷在别处）
 
 **详细记录一律在 `docs/agent/moe-bs-crash-investigation.md`（§10–§22），本节只放结论与指针。**
 
 - **手写 kernel 的 6 个真 bug 已修**：idesc `b_sf_id` 漏 `<<4`、smem 布局与 descriptor 的 swizzle 声明不匹配、
   K-block 递进单位误判 8×、缺 `fence.proxy.async`、缺 `tcgen05.fence::before/after_thread_sync`（3 处）。
-- **🎯 根因（§29，实证非推导）**：**硬件把 fp4(E2M1) 操作数按 PACKED（2 元素/字节，低 nibble=偶 k）读，
-  而我们按 unpacked（1 元素/字节）写** ⇒ 所有奇数 K 元素恒为 0、K 覆盖腰斩。铁证：B 字节全 `0x22`（两 nibble 都=1.0）
-  时稠密 parity **relerr=0 精确 PASS**；全 `0x02` 时 D 恰好是金标准的 **1/2**。官方 W 子 tile 8192 B
-  = 128 行 × 64 B 亦独立佐证 packed。**其它全部已验证正确**（36/36 冲激命中、A 侧字节级一致、descriptor lbo/sbo/K 递进、
-  idesc、M/N 方向、TMEM 读回、MMA 确实发射——含 TMEM 毒化自证）。
-  ⇒ 修法 = 把 fp4 操作数按 packed staging（64 B/行 for K=128）+ 相应改 descriptor/K-block 递进。
-- **⚠️ 因此之前一切基于"全错文本"的结论都是在 B 打包错的条件下得到的**：朝向（SWAPAB）与 SF 字节序（SFREV）
-  都必须**修好打包后用受控实验重新判定**（§27 给出了 `~/orient_controlled.sh`，且必须以 `[NC]` 数值为主判据）。
+- **⚠️ 旧结论已作废**：曾判定"硬件把 fp4 按 PACKED 读"（旧 §29）——**这是错的**，见 §43。
+  我那个冲激探针的"0x02 只剩一半"极可能是**探针自己只写了 64 B/行**造成的假象。
+- **🎯 现在的权威事实（§43）**：另一个 subagent 用官方入口 `T.tcgen05_gemm_blockscaled()` 在本机跑出了
+  **通过 float64 金标准**的最小参考（**两种朝向都 PASS**，`rel≈1.3e-07`）。其生成码给出的权威约定是
+  **unpacked fp4 smem（1 值/字节，TMA 把全局 packed 展开）+ SW128 + descriptor (lbo=1,sbo=64,layout=2) +
+  K 递进 `ki*32` + idesc `144708608|(ki<<29)|(ki<<4)`** —— **与我们现有 SW128 路径逐项一致**。
+  生成码并**明确警告**"packed `float4_e2m1fn` 能编译能跑但静默错值" ⇒ `DSV41_MOE_BS_PACKED` **保持 OFF**。
+- **🎯 §44 逐项核对结论**：布局公式 / descriptor / idesc / K 递进 / `enable_d` 时机（只在最首个子 MMA 清零）/
+  SF 投递与转置顺序 / **SF 字节序（LSB = 组内最低 K-block）** / SF 词组 group-major / 粒度 32 —— **全部与官方 PASS 参考一致**。
+  ⇒ **参数面已排除**，缺陷在**我们自己的实现细节**里；且官方 a8b4/a4b8 **两朝向都 PASS** ⇒ 我们的朝向依赖
+  必然来自**我们自己**的 swapAB 实现（两朝向都错 ⇒ 先在**共用部分**找）。
+- **在途线索**：subagent `bs-packed-geometry` 已改派为"拿官方 PASS 参考当 oracle，同输入逐元素对拍"，
+  重点查：①A/B tile 的内容装配（激活行/ W 行距 2560 / `w_stride`）②**SF 内容与行的对应**
+  （尤其 **W3 的 SF 是否落在 B 行 64..127 上**，以及 K 组 `k` 与逐迭代重写 tile 是否同步）③朝向/M-N 角色。
+- **⚠️ `DSV41_MOE_BS_SCALEVEC1X` 也须保持 OFF**（官方生成码**没有** `.scale_vec::1X` 后缀）。
 - **头号假设 = SF 字节序**（硬件可能 MSB-first：byte j 携带 K-block `3-j`；我们两侧都按 LSB-first 打包）。
   门控 `DSV41_MOE_BS_SFREV=1` 用一行 idesc 改动（`sf_id = 3-ki`）同时修正权重侧与激活侧。
 - **门控一览**（全默认 OFF）：`DSV41_MOE_BS_{HANDWRITTEN,CANON,SCALEVEC1X,SWAPAB,SFREV,NUMCHECK}`。
