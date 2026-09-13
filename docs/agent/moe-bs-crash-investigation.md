@@ -1750,3 +1750,29 @@ A 行距 = `dim`（e4m3 1 B/value）、W 行距 = `K/2 = 2560`（§59 已验）�
 2. **跨语言不对称契约**：shim **不检查** `topk*rows ≤ SEG_CAP`（只在 Rust 侧
    `chain_dev.rs:16732` 的 `n_assign > TILELANG_SEG_CAP → Ok(false)` 把关）⇒ 建议 shim 加一条断言
    （当前生产形状 (6,6)=36 恰取等，不触发）。
+
+## §66 两项精度语义的**主 agent 交叉确证**（发给 subagent 的 brief 已核实）
+
+为避免 subagent 误读最难的那两处，主 agent 亲自读了官方原文：
+
+### A2（窗口 KV，fp8 就地往返）—— `ref_inference/kernel.py:70-92`
+```python
+amax_local[i] = T.max(amax_local[i], 1e-4)                     # 下限 1e-4
+if round_scale:  s_local[i] = fast_round_scale(amax_local[i], fp8_max_inv)   # 幂次
+else:            s_local[i] = amax_local[i] * fp8_max_inv                    # 非幂次（本处不用）
+if inplace:      y = Cast(out_dtype, Cast(compute_dtype,
+                     Cast(FP8, clamp(x/s, fp8_min, fp8_max))) * s)           # ← 写回**反量化值**
+```
+⇒ 与 §61/发给 A2 的 brief **逐项一致** ✓（block=32、clamp ±448、下限 1e-4、round_scale=True、写回反量化值）。
+
+### A3（压缩 KV latent，fp4 + **e4m3 标度**）—— `ref_inference/kernel.py:152-166`
+```python
+if scale_dtype == FP8:      # "Training's compressed KV: keep even an all-zero group's scale nonzero."
+    amax_local[i] = T.max(amax_local[i], 6 * (2**-9))
+    s_local[i] = T.Cast(compute_dtype, T.Cast(FP8, amax_local[i] / fp4_max))   # ← **非幂次**（e4m3 舍入）
+else:
+    amax_local[i] = T.max(amax_local[i], 6 * (2**-126))
+    s_local[i] = fast_round_scale(amax_local[i], fp4_max_inv)                   # 幂次（A4 用这条）
+```
+⇒ 与 §61/发给 A3 的 brief **逐项一致** ✓；且**注释原文直接点名是 "compressed KV"**，
+独立印证 A3 的目标就是压缩 latent（block=16，`model.py:760`）✓；A4（indexer）走 `else` 的**幂次**分支 ✓。
