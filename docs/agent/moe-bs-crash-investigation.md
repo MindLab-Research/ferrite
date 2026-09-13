@@ -736,3 +736,23 @@ for k in T.Pipelined(K_iters, num_stages=2):          # block_K = 32
 （每 K-block 一次普通 MMA + f32 累加器里显式乘标度）。代价是每 K-block 需要独立累加（160 个 block），
 要么用多个 TMEM 累加器 + epilogue 里做 rank-1 缩放（4 个累加器/128 列可行，但跨 40 个 k-iteration
 的标度不同 ⇒ 需要每轮 TMEM 读回缩放 ⇒ 昂贵），要么接受更大开销。**优先把硬件路径搞对**。
+
+## §24 决策树（两条独立探针的结论 → 立即动作）
+
+### 探针 A：`bs-impulse-probe`（冲激响应 + SF 字节扫描 + MMA 存活自证）
+| 结论 | 立即动作 |
+|---|---|
+| **MMA 根本没发射**（TMEM 预毒化后 D 不变） | 探针自身无效 ⇒ 改用 in-situ `[NC]` 路线（§16，`DSR41_GRAPH_STEP=0`）；我们的 kernel 的 MMA **确实在跑**（证据：e2e 输出随朝向/数据改变）⇒ 只修探针 |
+| **A 侧 byte j ↔ K-block (3-j)** | **SF 字节序反了** ⇒ 直接用已落地的 `DSV41_MOE_BS_SFREV=1`（§19，一行 idesc 改动）跑 `~/sfrev_round.sh` |
+| **byte j ↔ K-block j**（与我们假设一致） | SF 字节序无罪 ⇒ 转向 descriptor/取数约定：比探针给出的 (m0,k0)→(m,n) 表与 canonical 公式的预期，改 `hw_smem_idx` 或 descriptor 的 lbo/sbo/layout |
+| **(m0,k0)→(m,n) 完全符合我们的公式** | 我们 kernel 的取数**没错** ⇒ 残余误差在别处（SF 之外的路径：TMEM D 的列顺序、epilogue 转置、或权重池寻址）⇒ 用 in-situ `[NC]` 与"官方 oracle"逐元素比 |
+
+### 探针 B：`tl-blockscale-anchor`（TileLang 最小硬件 block-scale 参考）
+| 结论 | 立即动作 |
+|---|---|
+| **跑通**（本机第一个可用参考） | 拿它 dump 的生成 CUDA 提取**权威约定**（smem 写公式 / descriptor lbo,sbo,layout / idesc 全字段 / SF 投递方式与 TMEM 列偏移 / K-block 递进量）⇒ 逐项改我们的 kernel（这是最省时的路径） |
+| **跑不通**（与 PH0/moe_bs_up_tl 一样失败） | 硬件 block_scale 在本机/本驱动**不可用** ⇒ 执行 §23 的退路：按官方方式（普通 FP8 MMA + f32 累加器显式乘标度）重做 gate/up，性能代价需重新评估（但正确性优先） |
+
+### 共同前提
+- 任何 in-situ 结论都必须带 **`DSV41_GRAPH_STEP=0`**（否则 shim 在捕获期 decline，BS 臂只在非捕获调用里跑）。
+- 我们的 kernel 的 MMA **确实在发射**（e2e 输出随朝向/数据变化）；因此"探针里 MMA 不发射"是**探针侧**问题，不推翻 e2e 结论。
