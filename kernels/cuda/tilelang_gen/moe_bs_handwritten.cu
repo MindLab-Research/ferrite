@@ -70,6 +70,22 @@ __device__ int g_packed = 0;
 // The empirical calibration (relerr==0 on a dense parity) is authoritative.
 __device__ int g_packgeom = 0;
 
+// AUTHORITATIVE fp4 smem layout, measured to EXACT parity (relerr = 0) on B300/sm_103a:
+// the hardware consumes two packed 4-bit elements per byte, but each byte pair lives in a
+// 16-BYTE container of which ONLY THE FIRST 8 BYTES ARE READ (TMA dtype 16U4_ALIGN16B =
+// 16 four-bit elements = 8 B of data in a 16 B container). So a 64-byte packed row (K=128)
+// occupies 8 containers = 128 B of smem, and 128 rows = 16384 B — which is exactly why the
+// vendor's per-stage fp4 smem is 16384 B with the SAME SW128 descriptor and the SAME ki*32
+// advance as the e4m3 operand. Sweeping raw smem offsets showed both descriptor families
+// read only bytes 0..7 of every 16-byte slot.
+//   p = packed byte index inside the row, 0..63; c = 16-byte container index, 0..7
+//   verified: const/random/sfprobe/impulse all PASS exactly; unpacked staging and every
+//   dense-row variant FAIL (relerr 1.49 / 1.03 / 0.457).
+__device__ __forceinline__ int hw_pack_sw128(int row, int p) {
+    const int c = (p >> 3) & 7;
+    return (row >> 3) * 1024 + (row & 7) * 128 + (((c ^ (row & 7)) & 7) << 4) + (p & 7);
+}
+
 __device__ __forceinline__ int hw_pack_idx(int row, int col /* packed byte index, 0..63 */) {
     if (g_packgeom == 3) {
         // candidate E (most likely): PLAIN row-major, no swizzle at all. Derived from the
@@ -331,8 +347,10 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
             //   gp1 = fmaf(sa[1], gt0.y, gp1)  // sa[1] (odd K) × HIGH nibble
             // And fp4_pack_kernel: packed = (lo & 0xF) | (hi << 4), lo = element 2i
             if (g_packed) {
-                // the hardware reads two K elements per byte -> stage the byte as-is
-                (g_swapab ? A_sh : B_sh)[hw_pack_idx(row, col)] = packed;
+                // the hardware reads two elements per byte, in 16 B containers of which
+                // only the first 8 B are read -> write the source packed byte as-is at the
+                // authoritative offset (MEASURED exact-parity layout, see hw_pack_sw128)
+                (g_swapab ? A_sh : B_sh)[hw_pack_sw128(row, col)] = packed;
             } else {
                 const int k0 = col * 2;      // first element K index
                 const int k1 = col * 2 + 1;  // second element K index
@@ -348,7 +366,7 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
                 W3[(int64_t)e * w_stride + (int64_t)(n_tile * HW_NH + row) * 2560 + k * 64 + col];
             const int m = HW_NH + row;  // W3 rows are after W1
             if (g_packed) {
-                (g_swapab ? A_sh : B_sh)[hw_pack_idx(m, col)] = packed;
+                (g_swapab ? A_sh : B_sh)[hw_pack_sw128(m, col)] = packed;
             } else {
                 const int k0 = col * 2;
                 const int k1 = col * 2 + 1;
@@ -423,14 +441,11 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
             // candidate D -> lbo=1/sbo=32/layout=4 (SWIZZLE_64B — the documented match for a
             //                64-byte inner box; see common.h:751-757)
             // geom 3 (candidate E) -> lbo=1 / sbo=32 / layout=0 (plain rows, SWIZZLE_NONE)
-            const uint64_t a_pk = (g_packgeom == 3) ? hw_make_desc(A_sh, 1, 32, 0)
-                                 : ((g_packgeom == 1) ? hw_make_desc(A_sh, 8, 32, 0)
-                                 : ((g_packgeom == 2) ? hw_make_desc(A_sh, 1, 32, 4)
-                                                      : hw_make_desc(A_sh, 1, 64, 2)));
-            const uint64_t b_pk = (g_packgeom == 3) ? hw_make_desc(B_sh, 1, 32, 0)
-                                 : ((g_packgeom == 1) ? hw_make_desc(B_sh, 8, 32, 0)
-                                 : ((g_packgeom == 2) ? hw_make_desc(B_sh, 1, 32, 4)
-                                                      : hw_make_desc(B_sh, 1, 64, 2)));
+            // The packed layout pairs with the VENDOR's unchanged descriptor (1,64,2) and
+            // the standard ki*32 B advance — measured exact PARITY with relerr = 0 when
+            // combined with hw_pack_sw128, and FAILING for every other combination.
+            const uint64_t a_pk = hw_make_desc(A_sh, 1, 64, 2);
+            const uint64_t b_pk = hw_make_desc(B_sh, 1, 64, 2);
             const uint64_t a_desc_base = a_packed ? a_pk
                                      : (g_canon ? hw_make_desc(A_sh, 8, 16, 0)    // canonical SWIZZLE_NONE
                                                 : hw_make_desc(A_sh, 1, 64, 2));  // TileLang SW128
@@ -455,8 +470,8 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
                 // (offset in BYTES). So the advance is ki*32 bytes = ki*2 units.
                 // packed fp4: a K-block is 16 B = 1 unit, so the advance is ki*1
                 // packed K-block advance: geometry 0 -> 16 B = 1 unit; candidate B -> 128 B = 8
-                const uint64_t a_pkadv = (g_packgeom == 1) ? 8 : 1;
-                const uint64_t b_pkadv = (g_packgeom == 1) ? 8 : 1;
+                const uint64_t a_pkadv = 2;   // ki*32 B: one MMA = two 16 B containers
+                const uint64_t b_pkadv = 2;
                 const uint64_t a_desc = a_desc_base + (uint64_t)(ki * (a_packed ? a_pkadv : (g_canon ? 256 : 2)));
                 const uint64_t b_desc = b_desc_base + (uint64_t)(ki * (b_packed ? b_pkadv : (g_canon ? 256 : 2)));
                 // enable_d: 0 for first MMA (clear accumulator), 1 for rest
