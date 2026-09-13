@@ -347,6 +347,19 @@ struct Kernels {
     quant_fp4: unsafe extern "C" fn(
         *const f32, *mut u8, *mut f32, c_int, c_int, c_int, c_int, CuStream,
     ) -> c_int,
+    // A2 (`DSV41_WINDOW_KV_QUANT`): the sliding-window KV's IN-PLACE fp8 e4m3
+    // round trip -- the reference's `act_quant(..., inplace=True)` on the
+    // post-RoPE row (`ref_inference/model.py:705`). Quantise the row in blocks
+    // of `block` and write the DEQUANTISED value back, so the ring stores the
+    // f32 number the official stores. The element type does not change.
+    //
+    // Return codes: 0 = ran; 1 = the SHAPE was refused (the row is untouched);
+    // 2 = no round trip applies. Optional: a stale `.so` without the symbol
+    // keeps the row unquantised, announced by a one-shot notice -- an A/B arm of
+    // "WINDOW_KV_QUANT" under that state would measure the OLD path.
+    win_kv_quant_rt: Option<
+        unsafe extern "C" fn(*mut f32, c_int, c_int, *mut f32, CuStream) -> c_int,
+    >,
     expert_gate_up_fp4: unsafe extern "C" fn(
         *const u8, *const f32, *const u8, *const u8, *const u8, *const u8, *mut f32,
         c_int, c_int, c_int, f32, CuStream,
@@ -1677,6 +1690,24 @@ struct Kernels {
         unsafe extern "C" fn(*mut f32, *const f32, c_int, c_int, c_int, c_int, *mut f32, CuStream)
             -> c_int,
     >,
+    /// A4 (`DSV41_INDEXER_FP4_RT`, default OFF): the indexer's q/k **fp4 round
+    /// trip**, in place — the reference's `fp4_act_quant(x, 32, True)` with the
+    /// default e8m0 power-of-two scale (`ref_inference/model.py:546` for k,
+    /// `:552` for q; `kernel.py:126-183`). Block-32 amax -> `2^ceil(log2(amax/6))`
+    /// -> e2m1 code -> the DEQUANTISED value written back. Optional: an older
+    /// `.so` without the symbol leaves the gate inert (with a one-shot notice).
+    /// ABI: (x, rows, cols, io, tag, dbg, stream).
+    indexer_fp4_rt: Option<
+        unsafe extern "C" fn(
+            *mut f32,
+            c_int,
+            c_int,
+            c_int,
+            *const std::os::raw::c_char,
+            *mut f32,
+            CuStream,
+        ) -> c_int,
+    >,
     ar_reduce: Option<
         unsafe extern "C" fn(*mut f32, *const f32, i64, i64, c_int, *const c_uint, c_uint, CuStream) -> c_int,
     >,
@@ -2224,6 +2255,7 @@ impl Device {
             quant_fp8: km!(rt, "dsv41_quant_fp8"),
             quant_fp8_stride: ko!(rt, "dsv41_quant_fp8_stride"),
             quant_fp4: km!(rt, "dsv41_quant_fp4"),
+            win_kv_quant_rt: ko!(rt, "dsv41_win_kv_quant_rt"),
             expert_gate_up_fp4: km!(rt, "dsv41_expert_gate_up_fp4"),
             expert_down_fp4: km!(rt, "dsv41_expert_down_fp4"),
             engram_hash: km!(rt, "dsv41_engram_hash"),
@@ -2330,6 +2362,7 @@ impl Device {
             w2_l2_prewarm: ko!(rt, "dsv41_w2_l2_prewarm"),
             swiglu_limit_batched: ko!(rt, "dsv41_swiglu_limit_batched"),
             routed_down_prep: ko!(rt, "dsv41_routed_down_prep"),
+            indexer_fp4_rt: ko!(rt, "dsv41_indexer_fp4_rt"),
             ar_reduce: ko!(rt, "dsv41_ar_reduce"),
             route_topk: ko!(rt, "dsv41_route_topk"),
             route_group: ko!(rt, "dsv41_route_group"),
@@ -3855,6 +3888,60 @@ impl Device {
             )
         };
         self.kerr(rc, "dsv41_quant_fp4")
+    }
+
+    /// Is the A2 round trip in this `.so`? (See [`Self::win_kv_quant_rt_on`].)
+    pub fn supports_win_kv_quant_rt(&self) -> bool {
+        self.kernels.win_kv_quant_rt.is_some()
+    }
+
+    /// A2 (`DSV41_WINDOW_KV_QUANT`): the sliding-window KV's IN-PLACE fp8 e4m3
+    /// round trip on `kv[0, cols)`, issued on `s`.
+    ///
+    /// This is the reference's `act_quant(kv, 32, "ue8m0", e8m0fnu, True)`
+    /// (`ref_inference/model.py:705`) on the post-RoPE row, whose `inplace=True`
+    /// arm (`kernel.py:83-88`) stores the DEQUANTISED value: the row becomes
+    /// `e4m3_decode(e4m3_encode(clamp(v / s, ±448))) * s` with
+    /// `s = 2^ceil(log2(max(amax, 1e-4) / 448))`. The buffer keeps its f32
+    /// element type -- only the VALUE moves onto the official grid.
+    ///
+    /// Returns `Ok(true)` when the round trip ran. `Ok(false)` means the arm
+    /// declined and **the row is untouched**: either the loaded `.so` has no
+    /// symbol (a one-shot notice says so -- otherwise an A/B arm would silently
+    /// measure the OLD path) or the launcher refused the shape (`cols % block`,
+    /// or a block the launch geometry cannot express). Never a partial snap.
+    pub fn win_kv_quant_rt_on(
+        &self,
+        kv: *mut f32,
+        cols: i32,
+        block: i32,
+        dbg: Option<*mut f32>,
+        s: CuStream,
+    ) -> Result<bool> {
+        let Some(f) = self.kernels.win_kv_quant_rt else {
+            return Ok(false);
+        };
+        if kv.is_null() || cols <= 0 || block <= 0 {
+            return Ok(false);
+        }
+        let dbg = dbg.unwrap_or(std::ptr::null_mut());
+        let rc = unsafe { f(kv, cols, block, dbg, s) };
+        if rc == 1 || rc == 2 {
+            return Ok(false);
+        }
+        self.kerr(rc, "dsv41_win_kv_quant_rt")?;
+        Ok(true)
+    }
+
+    /// [`Self::win_kv_quant_rt_on`] on the main stream.
+    pub fn win_kv_quant_rt(
+        &self,
+        kv: *mut f32,
+        cols: i32,
+        block: i32,
+        dbg: Option<*mut f32>,
+    ) -> Result<bool> {
+        self.win_kv_quant_rt_on(kv, cols, block, dbg, self.stream)
     }
 
     /// Native fp4 experts (tcgen05 MXFP4): gate and up in one pass.
@@ -8810,6 +8897,42 @@ impl Device {
     /// inert — with a one-shot notice from the chain, never silently.
     pub fn supports_routed_down_prep(&self) -> bool {
         self.kernels.routed_down_prep.is_some()
+    }
+
+    /// A4: the indexer's in-place fp4 round trip for ONE row-block of `rows` rows
+    /// (`rows` == 1 on the k path, `index_n_heads` on the q path) — the
+    /// reference's `fp4_act_quant(x, 32, True)` with the default e8m0 scale
+    /// (`model.py:546`/`:552`, `kernel.py:126-183`). `cols` (`index_head_dim`)
+    /// must be a multiple of 32.
+    ///
+    /// `io` == 1 is the faithful arm (the reference reads and writes BF16:
+    /// `in_dtype` default `kernel.py:128`, `out_dtype = in_dtype` `:136`);
+    /// `io` == 0 skips both bf16 boundaries and is strictly more precise, so it
+    /// is an A/B arm only.
+    ///
+    /// `dbg` is None in production. Some(ptr) enables the 224-float probe dump
+    /// (DSV41_INDEXER_FP4_RT_DBG) — the round trip is identical either way. The
+    /// probe does a D2H readback, so it MUST NOT be armed inside a capture.
+    pub fn indexer_fp4_rt(
+        &self,
+        x: *mut f32,
+        rows: i32,
+        cols: i32,
+        io: i32,
+        tag: *const std::os::raw::c_char,
+        dbg: Option<*mut f32>,
+    ) -> Result<()> {
+        let f = self.need(self.kernels.indexer_fp4_rt, "dsv41_indexer_fp4_rt")?;
+        let d = dbg.unwrap_or(std::ptr::null_mut());
+        let rc = unsafe { f(x, rows, cols, io, tag, d, self.stream) };
+        self.kerr(rc, "dsv41_indexer_fp4_rt")
+    }
+
+    /// True when the loaded .so carries the indexer fp4 round-trip entry point
+    /// (`dsv41_indexer_fp4_rt`). A stale .so leaves DSV41_INDEXER_FP4_RT inert —
+    /// with a one-shot notice from the chain, never silently.
+    pub fn supports_indexer_fp4_rt(&self) -> bool {
+        self.kernels.indexer_fp4_rt.is_some()
     }
     /// Publish `src` into every rank's staging slot for this rank, from the device.
     pub fn ar_store(

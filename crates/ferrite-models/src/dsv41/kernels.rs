@@ -107,6 +107,30 @@ extern "C" {
         stream: CuStream,
     ) -> i32;
 
+    /// A2 (`DSV41_WINDOW_KV_QUANT`): the sliding-window KV's IN-PLACE fp8 e4m3
+    /// round trip (`ref_inference/model.py:705` `act_quant(..., True)`).
+    ///
+    /// Quantise `kv[0, cols)` in blocks of `block` with the reference's
+    /// power-of-two scale (`amax = max(amax, 1e-4)`, `s = 2^ceil(log2(amax/448))`,
+    /// clamp ±448, e4m3) and write the DEQUANTISED value back into `kv` -- so the
+    /// row the ring stores is the f32 number the official's inplace arm stores.
+    /// The buffer keeps its f32 element type; only the VALUE moves onto the grid.
+    ///
+    /// `dbg` (optional, nullptr in production) receives `GLUE_KVQ_DBG_FLOATS`
+    /// floats for block 0: ① the pre-round-trip value, ② amax (after the floor),
+    /// ②b amax before the floor, ③ the scale, ③b its e8m0 exponent byte, ④ the
+    /// e4m3 code byte, ⑤ the value written back.
+    ///
+    /// Returns 0 when the round trip ran, 1 when the shape was refused (untouched
+    /// row), 2 when no round trip applies.
+    pub fn dsv41_win_kv_quant_rt(
+        kv: *mut f32,
+        cols: i32,
+        block: i32,
+        dbg: *mut f32,
+        stream: CuStream,
+    ) -> i32;
+
     /// Activation quantisation, fp4 e2m1 (I8-packed output, 2 per byte).
     pub fn dsv41_quant_fp4(
         x: *const f32,

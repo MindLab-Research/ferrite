@@ -25,6 +25,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cmath>
+#include <cstring>
 
 namespace {
 
@@ -2789,6 +2791,115 @@ __global__ void routed_down_prep_kernel(float* __restrict__ act, const float* __
     }
 }
 
+// ===========================================================================
+// A2: THE SLIDING-WINDOW KV'S IN-PLACE FP8 ROUND TRIP (DSV41_WINDOW_KV_QUANT)
+// ===========================================================================
+// WHY. The official window KV keeps its K on an fp8 e4m3 round trip
+// (`ref_inference/model.py:700-707`, `Attention._window_kv`):
+//
+//     kv = self.kv_norm(self.wkv(x))                              # :703
+//     apply_rotary_emb(kv[..., -self.rope_head_dim:], freqs_cis)   # :704
+//     act_quant(kv, fp8_block_size, scale_fmt, scale_dtype, True)  # :705
+//
+// `fp8_block_size = 32` (:27), `scale_fmt = "ue8m0"`, `scale_dtype =
+// torch.float8_e8m0fnu` (:29-30, which is what makes `round_scale` true --
+// `kernel.py:117`), and `inplace=True`: the inplace arm (`kernel.py:83-88`)
+// writes the DEQUANTISED value back to `x`, i.e. the K the ring stores is
+//
+//     bf16(e4m3_decode(e4m3_encode(clamp(v / s, -448, 448))) * s)
+//
+// with `amax = max(amax, 1e-4)` (`kernel.py:76`) and
+// `s = 2^ceil(log2(amax / 448))` (`fast_round_scale`, `kernel.py:33-34`).
+// The docstring is explicit that the span is the WHOLE post-RoPE vector, RoPE
+// tail included -- so the K in the ring, and every K a query attends to, lives
+// on that e4m3 grid. ferrite's ring is f32 and stored the RAW post-RoPE row:
+// too precise against the reference by exactly this snap.
+//
+// WHAT THIS IS NOT. It is not a storage change. The ring keeps its f32 element
+// type (the file header's "ring is f32 in this increment" stays true); only the
+// VALUE moves onto the official grid -- `e4m3_decode(byte) * s` is itself an
+// ordinary f32 number. Minimal intrusion: one in-place launch on the row the
+// ring append reads, before the append.
+//
+// NUMERIC CONTRACT. The amax striding, the shuffle tree, the 1e-4 floor, the
+// power-of-two scale and the clamp+cast are `quant_kernel<0>`'s
+// (dsv41_kernels.cu:136-181) term for term -- the same quantiser
+// `dsv41_quant_fp8` runs on the SAME row -- plus its decode partner
+// `e4m3_to_f` (:52-62, which this TU carries as `glue_e4m3_byte_to_f`). The
+// launch is one 32-lane warp per scale block with threadIdx.x == the in-block
+// element index, i.e. the (x=lane, y=0) thread of this kernel is the
+// (x=0, y=lane) thread of `quant_kernel`; both read the same element and run
+// the same `fmaxf(..., __shfl_xor_sync(0xFFFFFFFF, ..., off))` sequence over
+// lanes 0..31, and `fmaxf` is exact and associative, so for block == 32 the
+// byte formed here is the byte `dsv41_quant_fp8` forms on that row -- no second
+// rounding, no re-derived scale.
+//
+// `dbg` is OPTIONAL (nullptr in production; the stores touch no input or output
+// element, so the launch is bit-identical either way). It carries the
+// DSV41_WINDOW_KV_QUANT_DBG probe's one-shot (row 0, block 0) readback: the five
+// value groups the ticket asks for (pre-rope-output, amax, the e8m0 scale, the
+// e4m3 code byte, the dequantised value) PLUS the pre-floor amax and the scale's
+// exponent byte, which are what make "the 1e-4 floor was active" and "the scale
+// is a power of two" visible rather than arguable.
+#define GLUE_KVQ_DBG_BLOCK 32
+#define GLUE_KVQ_DBG_GROUPS 7
+#define GLUE_KVQ_DBG_FLOATS (GLUE_KVQ_DBG_GROUPS * GLUE_KVQ_DBG_BLOCK)
+#define GLUE_KVQ_DBG_PRE 0        // ① the rope OUTPUT, before the round trip
+#define GLUE_KVQ_DBG_AMAX 32      // ② amax after the floor
+#define GLUE_KVQ_DBG_AMAX_RAW 64  // ②b amax BEFORE the floor (floor_active iff < 1e-4)
+#define GLUE_KVQ_DBG_SCALE 96     // ③ the scale s, as f32
+#define GLUE_KVQ_DBG_SCALE_EXP 128  // ③b s's e8m0 exponent byte
+#define GLUE_KVQ_DBG_CODE 160     // ④ the e4m3 code byte
+#define GLUE_KVQ_DBG_DEQUANT 192  // ⑤ the value written back: decode(④) * s
+
+__global__ void win_kv_quant_rt_kernel(float* __restrict__ kv, int cols, int block,
+                                       float* __restrict__ dbg) {
+    const int lane = (int)threadIdx.x;  // 0..31: the in-block element lane
+    const int b = (int)blockIdx.x;      // which scale block of the row
+    const int npw = block >> 5;         // warps per block (1 when block == 32)
+    if (lane >= 32 || (int)threadIdx.y >= npw) return;  // defensive; the launcher never does this
+    float* blk = kv + (size_t)b * (size_t)block;
+    const int i0 = (int)threadIdx.y * 32 + lane;  // == lane when npw == 1
+    const int stride = 32 * npw;                  // == 32 when npw == 1
+    // (1) the block amax -- `quant_kernel<0>`'s strided per-thread loop, then its
+    // 32-lane shuffle tree (off = 16, 8, 4, 2, 1; same order, exact max).
+    float a = 0.f;
+    for (int i = i0; i < block; i += stride) a = fmaxf(a, fabsf(blk[i]));
+    for (int off = 16; off > 0; off >>= 1) a = fmaxf(a, __shfl_xor_sync(0xFFFFFFFFu, a, off));
+    __shared__ float samax[8];  // npw <= 8: the launcher caps block at 256
+    if (lane == 0) samax[threadIdx.y] = a;
+    __syncthreads();
+    a = 0.f;
+    for (int w = 0; w < npw; w++) a = fmaxf(a, samax[w]);
+    // (2) the reference's floor (`kernel.py:76`) then its power-of-two scale
+    // (`fast_round_scale(amax, fp8_max_inv)` == `fast_pow2(fast_log2_ceil(amax *
+    // (1/448)))`). NOTE the MULTIPLY by the reciprocal, not a divide: that is the
+    // reference's own spelling, and `fast_log2_ceil`'s `man != 0` term makes the
+    // two differ only when `amax/448` is EXACTLY a power of two.
+    const float amax_raw = a;
+    const float amax = fmaxf(amax_raw, 1e-4f);
+    const float sc = fmaxf(glue_fast_round_scale(amax, 1.0f / 448.0f), 1e-30f);
+    const float inv = 1.0f / sc;  // exact: sc is a power of two
+    // (3) clamp + cast -> the byte; (4) decode * scale -> the value written back.
+    for (int i = i0; i < block; i += stride) {
+        const float v = blk[i];
+        const float q = fminf(fmaxf(v * inv, -448.0f), 448.0f);
+        const __nv_fp8_e4m3 f8 = __nv_fp8_e4m3(q);
+        const uint8_t code = *(const uint8_t*)&f8;
+        const float dq = glue_e4m3_byte_to_f(code) * sc;
+        blk[i] = dq;
+        if (dbg != nullptr && b == 0 && i < GLUE_KVQ_DBG_BLOCK) {
+            dbg[GLUE_KVQ_DBG_PRE + i] = v;
+            dbg[GLUE_KVQ_DBG_AMAX + i] = amax;
+            dbg[GLUE_KVQ_DBG_AMAX_RAW + i] = amax_raw;
+            dbg[GLUE_KVQ_DBG_SCALE + i] = sc;
+            dbg[GLUE_KVQ_DBG_SCALE_EXP + i] = (float)((__float_as_uint(sc) >> 23) & 0xFFu);
+            dbg[GLUE_KVQ_DBG_CODE + i] = (float)code;
+            dbg[GLUE_KVQ_DBG_DEQUANT + i] = dq;
+        }
+    }
+}
+
 }  // namespace
 
 // `dbg` is OPTIONAL: pass nullptr in production (the probe is a default-OFF
@@ -2803,4 +2914,308 @@ extern "C" int dsv41_routed_down_prep(float* act, const float* route_w, int rows
     const dim3 grid((unsigned)nb, (unsigned)slots, (unsigned)rows);
     routed_down_prep_kernel<<<grid, 32, 0, s>>>(act, route_w, slots, pitch, inter, dbg);
     return (int)cudaGetLastError();
+}
+
+// A2's entry. `dbg` is OPTIONAL (nullptr in production).
+// Return codes: 0 = the round trip ran; 1 = the shape was REFUSED (cols not a
+// multiple of `block`, or a block the launch geometry cannot express) and the
+// row is untouched; 2 = no round trip applies (block <= 0). The caller's gate
+// treats 1/2 as "declined" and keeps its existing row, with a one-shot notice,
+// so a mis-shaped call can never silently half-quantise a ring.
+//
+// Deliberately NOT folded into `dsv41_quant_fp8`: that entry writes an fp8
+// BYTE array (a different destination type), and the whole point here is the
+// in-place DEQUANTISED f32 write-back the reference's `inplace=True` arm does.
+// The arithmetic is nevertheless that kernel's, term for term (see the comment
+// on `win_kv_quant_rt_kernel`).
+extern "C" __attribute__((visibility("default"))) int dsv41_win_kv_quant_rt(
+    float* kv, int cols, int block, float* dbg, cudaStream_t s) {
+    if (kv == nullptr || cols <= 0) return (int)cudaErrorInvalidValue;
+    if (block <= 0) return 2;
+    if (block % 32 != 0 || block > 256) return 1;  // the launcher's geometry
+    if (cols % block != 0) return 1;
+    const int nb = cols / block;
+    const dim3 blk(32, (unsigned)(block >> 5));
+    win_kv_quant_rt_kernel<<<(unsigned)nb, blk, 0, s>>>(kv, cols, block, dbg);
+    return (int)cudaGetLastError();
+}
+
+// ===========================================================================
+// A4: INDEXER q/k FP4 ROUND TRIP  (DSV41_INDEXER_FP4_RT, default OFF)
+// ===========================================================================
+// WHY. The reference quantises the indexer's KEY and its QUERY in place, once
+// each, at the END of their rope (ref_inference/model.py:544-552):
+//
+//     k = self.k_norm(self.wk(latent))
+//     apply_rotary_emb(k[..., -rd:], freqs)
+//     fp4_act_quant(k, fp4_block_size, True)      # :546   (k)
+//     self.k_cache[...] = k                       # :547   <- published AFTER
+//     q = self.wq_b(qr).unflatten(-1, (n_local_heads, index_head_dim))
+//     apply_rotary_emb(q[..., -rd:], self.freqs_cis[start_pos:end_pos])
+//     fp4_act_quant(q, fp4_block_size, True)      # :552   (q)
+//     index_score = torch.einsum("bshd,btd->bsht", q, index_k)   # :556 <- AFTER
+//
+// `fp4_block_size = 32` (model.py:28) and the call sites pass NO `scale_dtype`,
+// so it stays at its default `torch.float8_e8m0fnu` (kernel.py:188) and the
+// FE8M0 (power-of-two scale) branch of `fp4_quant_kernel` runs
+// (kernel.py:164-172). Term for term:
+//
+//   amax = T.reduce_absmax over the 32-element block      # kernel.py:158
+//   amax = T.max(amax, 6 * 2**-126)                       # kernel.py:165
+//   s    = fast_pow2(fast_log2_ceil(amax * (1/6)))        # kernel.py:166 -> :36-37
+//   y    = Cast(out_dtype, Cast(f32, Cast(FP4,
+//              T.clamp(x / s, -6, 6))) * s)               # kernel.py:169-172
+//   x.copy_(y)                                            # kernel.py:201-203
+//
+// `fp4_max = 6.0` (kernel.py:131), `inplace=True` => `out_dtype = in_dtype`
+// (kernel.py:136) and `in_dtype = BF16` (kernel.py:128). Both call sites pass
+// bf16 tensors, so the reference reads bf16, quantises, and writes the
+// DEQUANTISED value back as bf16. Three details that are easy to get wrong and
+// are reproduced here on purpose:
+//   * the scale is a POWER OF TWO, `2^ceil(log2(amax / 6))`, NOT `amax / 6`;
+//   * the clamp is +-6 (the e2m1 top), not the e4m3 +-448 of `dsv41_quant_fp8`;
+//   * the `6 * 2^-126` floor keeps an all-zero block's scale NONZERO, so an
+//     empty block dequantises to 0 rather than to NaN.
+// This is NOT `dsv41_quant_fp8` with another clamp: that one is e4m3, has its
+// own `1e-4`/`fmaxf(...,1e-30)` floor and packs bytes; here the result stays f32
+// in place (the reference's `x` is the tensor, not a packed buffer).
+//
+// INSERTION POINT (official order). The k round trip must sit AFTER
+// `apply_rope` and BEFORE `index_k_publish` (:546 vs :547) and the q round trip
+// AFTER its rope and BEFORE the score (:552 vs :556) - quantising before the
+// rope would round a different operand, publishing first would leave the
+// already-quantised values unscored.
+//
+// `io`:
+//   1 (faithful, the default the chain arms) - reads bf16(x) and writes bf16(.)
+//     back, which is exactly `in_dtype = BF16` + `out_dtype = in_dtype`
+//     (kernel.py:128/:136). Our `s.idx_k`/`s.idx_q` are f32 scratch, so this
+//     single bf16 widening/narrowing pair is the one difference between "a
+//     bf16 tensor" and "an f32 tensor holding bf16 values";
+//   0 - pure fp4 round trip on the f32 values, NO bf16 boundary. Kept because
+//     it isolates the fp4 half from the bf16 half in an A/B; it is strictly
+//     MORE precise than the reference and must not be the shipping arm.
+//
+// ABI: (x, rows, cols, io, tag, dbg, s). `rows` is 1 on the k path (one roped
+// key per committed group) and `index_n_heads` on the q path; `cols` is
+// `index_head_dim` and must be a multiple of 32 (the scale group).
+// `dbg == nullptr` in production; a non-null pointer enables the one-shot
+// readback probe (DSV41_INDEXER_FP4_RT_DBG), which performs a D2H copy and is
+// therefore illegal inside a capture - the caller owns that guard.
+
+namespace {
+
+// The e2m1 code table. Byte-for-byte the values of `dsv41_kernels.cu:104`
+// (`kFp4Table`), `dsv41_experts_mxf4.cu`'s decode and `quant.rs:22`
+// (`FP4_TABLE`) - all four are `convert.py`'s FP4_TABLE = the 8 magnitudes
+// {0, .5, 1, 1.5, 2, 3, 4, 6} with the sign in bit 3. Re-declared here because
+// dsv41_glue.cu is a separate translation unit (build.sh compiles each .cu on
+// its own), so the `__constant__` table in dsv41_kernels.cu is not visible.
+__device__ __constant__ float glue_kFp4Table[16] = {
+    0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f,
+    0.f, -0.5f, -1.f, -1.5f, -2.f, -3.f, -4.f, -6.f};
+
+__device__ __forceinline__ float glue_e2m1_to_f(uint8_t code) {
+    return glue_kFp4Table[code & 0x0Fu];
+}
+
+// Nearest e2m1 code == the loop `quant_kernel<1>` / `quant_fp4_fused_kernel`
+// run (dsv41_kernels.cu:168-174 and :251-257) and `quant.rs:40-55`
+// `e2m1_encode`: first minimum-distance slot wins, i.e. a tie goes to the
+// SMALLER magnitude. The caller has already clamped to +-6.
+__device__ __forceinline__ uint8_t glue_e2m1_encode(float v) {
+    const float a = fabsf(v);
+    const float mags[8] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
+    uint8_t best = 0;
+    float bd = 1e30f;
+    #pragma unroll
+    for (int c = 0; c < 8; c++) {
+        const float d = fabsf(a - mags[c]);
+        if (d < bd) {
+            bd = d;
+            best = (uint8_t)c;
+        }
+    }
+    return (uint8_t)(best | (v < 0.f ? 8u : 0u));
+}
+
+// The probe's seven 32-wide groups, written by the ONE warp that owns
+// (row 0, block 0). `dbg` is nullptr in production and the kernel is
+// bit-identical either way (the stores touch no input or output element).
+#define GLUE_RT_DBG_BLOCK 32
+#define GLUE_RT_DBG_RAW 0    // (a) the raw f32 scratch value (io == 1 only differs here)
+#define GLUE_RT_DBG_PRE 32   // (1) what the reference kernel READS: bf16(raw) when io == 1
+#define GLUE_RT_DBG_AMAX 64  // (2) block amax, AFTER the `6 * 2**-126` floor (kernel.py:165)
+#define GLUE_RT_DBG_SCALE 96 // (3) s = 2^ceil(log2(amax / 6)) as f32        (kernel.py:166)
+#define GLUE_RT_DBG_SEXP 128 // (3b) s's biased exponent byte (what an e8m0 byte would hold)
+#define GLUE_RT_DBG_CODE 160 // (4) the 4-bit e2m1 code, widened to f32 (0 .. 15)
+#define GLUE_RT_DBG_DEQ 192  // (5) the value written back: bf16(decode(code) * s)
+#define GLUE_RT_DBG_FLOATS 224  // 7 x 32
+
+// ONE WARP per (row, 32-element scale block): lane i owns element i of the
+// block, so the amax is a warp shuffle tree and every element is written by
+// exactly one lane (bitwise stable run to run, no cross-block reduction).
+__global__ void indexer_fp4_rt_kernel(float* __restrict__ x, int nblk, int nb, int cols, int io,
+                                      float* __restrict__ dbg) {
+    const int gw = (int)((blockIdx.x * blockDim.x + threadIdx.x) >> 5);
+    if (gw >= nblk) return;
+    const int lane = (int)(threadIdx.x & 31u);
+    const int r = gw / nb, b = gw % nb;
+    float* blk = x + (size_t)r * (size_t)cols + (size_t)b * 32u;
+    const float raw = blk[lane];
+    // (0) `in_dtype = BF16` (kernel.py:128/:140): the reference kernel READS x
+    // as bf16, so the value it quantises is bf16(x), not our raw f32.
+    const float v0 = (io != 0) ? glue_bf16_round(raw) : raw;
+    // (1) amax over the 32-element block, then the reference's floor.
+    float a = fabsf(v0);
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) a = fmaxf(a, __shfl_xor_sync(0xFFFFFFFFu, a, off));
+    const float amax = fmaxf(a, 6.0f * 1.17549435e-38f);  // 6 * 2^-126 (kernel.py:165)
+    // (2) s = 2^ceil(log2(amax / 6)) (kernel.py:166 -> fast_round_scale :36-37).
+    // Same shape as the sibling quantisers (`maxv` + `1.0f / maxv`): under
+    // --use_fast_math a folded literal and a folded variable could round the
+    // reciprocal differently, and 1 ULP there can flip the exponent.
+    const float maxv = 6.0f;
+    const float sc = fmaxf(glue_fast_round_scale(amax, 1.0f / maxv), 1e-30f);
+    // (3) code = fp4(clamp(v / s, -6, 6)) (kernel.py:169).
+    const float qv = fminf(fmaxf(v0 * (1.0f / sc), -6.0f), 6.0f);
+    const uint8_t code = glue_e2m1_encode(qv);
+    // (4) write back the DEQUANTISED value, `Cast(f32, Cast(fp4, .)) * s`, then
+    // `Cast(out_dtype, .)` with out_dtype == in_dtype == BF16 (kernel.py:136,
+    // :169-172, :201-203). The bf16 cast is the LAST step, exactly as written.
+    float dq = glue_e2m1_to_f(code) * sc;
+    if (io != 0) dq = glue_bf16_round(dq);
+    blk[lane] = dq;
+    if (dbg != nullptr && r == 0 && b == 0) {
+        dbg[GLUE_RT_DBG_RAW + lane] = raw;
+        dbg[GLUE_RT_DBG_PRE + lane] = v0;
+        dbg[GLUE_RT_DBG_AMAX + lane] = amax;  // warp-uniform; the host reads lane 0
+        dbg[GLUE_RT_DBG_SCALE + lane] = sc;
+        dbg[GLUE_RT_DBG_SEXP + lane] = (float)((__float_as_uint(sc) >> 23) & 0xFFu);
+        dbg[GLUE_RT_DBG_CODE + lane] = (float)code;
+        dbg[GLUE_RT_DBG_DEQ + lane] = dq;
+    }
+}
+
+// ---------------------------------------------------- the probe's host half
+// A genuinely INDEPENDENT implementation of the same spec: the device side uses
+// bit tricks (`fast_round_scale`) and `__float2bfloat16`, the host side uses
+// `log2f`/`ceilf`/`exp2f` and an explicit round-to-nearest-even, so a mismatch
+// between them is a real disagreement about the formula (or one of the three
+// boundary cases) rather than one implementation compared with itself.
+
+static inline float glue_rt_host_bf16_rn(float v) {
+    uint32_t b;
+    std::memcpy(&b, &v, 4);
+    if ((b & 0x7F800000u) == 0x7F800000u) return v;  // inf / NaN pass through
+    const uint32_t lsb = (b >> 16) & 1u;
+    b = (b + 0x7FFFu + lsb) & 0xFFFF0000u;
+    float out;
+    std::memcpy(&out, &b, 4);
+    return out;
+}
+
+static inline uint8_t glue_rt_host_e2m1_encode(float v) {
+    const float a = fabsf(v);
+    const float mags[8] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
+    uint8_t best = 0;
+    float bd = 1e30f;
+    for (int c = 0; c < 8; c++) {
+        const float d = fabsf(a - mags[c]);
+        if (d < bd) {
+            bd = d;
+            best = (uint8_t)c;
+        }
+    }
+    return (uint8_t)(best | (v < 0.f ? 8u : 0u));
+}
+
+static inline float glue_rt_host_e2m1_to_f(uint8_t code) {
+    static const float t[16] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f,
+                                0.f, -0.5f, -1.f, -1.5f, -2.f, -3.f, -4.f, -6.f};
+    return t[code & 0x0Fu];
+}
+
+// `d` is the 224-float readback. Prints the five groups side by side
+// (kernel | host | difference) plus the raw-vs-pre shift the bf16 boundary makes.
+static void glue_idx_rt_report(const float* d, const char* tag) {
+    float pre[GLUE_RT_DBG_BLOCK], amax_h, sc_h, deq_h[GLUE_RT_DBG_BLOCK];
+    float code_h[GLUE_RT_DBG_BLOCK], amax_d, sc_d;
+    int sexp_h;
+    const int io = (d[GLUE_RT_DBG_RAW] != d[GLUE_RT_DBG_PRE]) ? 1 : 0;
+    for (int i = 0; i < GLUE_RT_DBG_BLOCK; i++) {
+        const float raw = d[GLUE_RT_DBG_RAW + i];
+        pre[i] = io ? glue_rt_host_bf16_rn(raw) : raw;
+    }
+    amax_h = 0.f;
+    for (int i = 0; i < GLUE_RT_DBG_BLOCK; i++) amax_h = fmaxf(amax_h, fabsf(pre[i]));
+    amax_h = fmaxf(amax_h, 6.0f * 1.17549435e-38f);  // 6 * 2^-126 (kernel.py:165)
+    sc_h = exp2f(ceilf(log2f(amax_h * (1.0f / 6.0f))));  // 2^ceil(log2(amax/6))
+    for (int i = 0; i < GLUE_RT_DBG_BLOCK; i++) {
+        const float qv = fminf(fmaxf(pre[i] * (1.0f / sc_h), -6.0f), 6.0f);
+        code_h[i] = (float)glue_rt_host_e2m1_encode(qv);
+        deq_h[i] = glue_rt_host_e2m1_to_f((uint8_t)code_h[i]) * sc_h;
+        if (io) deq_h[i] = glue_rt_host_bf16_rn(deq_h[i]);
+    }
+    amax_d = d[GLUE_RT_DBG_AMAX];
+    sc_d = d[GLUE_RT_DBG_SCALE];
+    sexp_h = (int)((*(const uint32_t*)&sc_h >> 23) & 0xFFu);
+    std::printf(
+        "[indexer-fp4-rt] probe tag=%s io=%d block=(row 0, elements 0..31) — KERNEL vs HOST, five "
+        "groups: (1) pre-quant, (2) amax, (3) s (+its biased exponent), (4) fp4 code, (5) dequant\n",
+        tag, io);
+    std::printf("[indexer-fp4-rt]   (2) amax   KERNEL %.9e  HOST %.9e  D %+.3e\n", amax_d, amax_h,
+                amax_d - amax_h);
+    std::printf("[indexer-fp4-rt]   (3) s      KERNEL %.9e  HOST %.9e  D %+.3e  | exp KERNEL %d HOST "
+                "%d\n",
+                sc_d, sc_h, sc_d - sc_h, (int)d[GLUE_RT_DBG_SEXP], sexp_h);
+    for (int i = 0; i < GLUE_RT_DBG_BLOCK; i++) {
+        std::printf(
+            "[indexer-fp4-rt]  i=%02d  K %15.9e %5.0f %15.9e | H %15.9e %5.0f %15.9e | D %+.2e "
+            "%+.0f %+.2e\n",
+            i, d[GLUE_RT_DBG_PRE + i], d[GLUE_RT_DBG_CODE + i], d[GLUE_RT_DBG_DEQ + i], pre[i],
+            code_h[i], deq_h[i], d[GLUE_RT_DBG_PRE + i] - pre[i],
+            d[GLUE_RT_DBG_CODE + i] - code_h[i], d[GLUE_RT_DBG_DEQ + i] - deq_h[i]);
+    }
+    float wpre = 0.f, wcode = 0.f, wdeq = 0.f, wraw = 0.f;
+    for (int i = 0; i < GLUE_RT_DBG_BLOCK; i++) {
+        wpre = fmaxf(wpre, fabsf(d[GLUE_RT_DBG_PRE + i] - pre[i]));
+        wcode = fmaxf(wcode, fabsf(d[GLUE_RT_DBG_CODE + i] - code_h[i]));
+        wdeq = fmaxf(wdeq, fabsf(d[GLUE_RT_DBG_DEQ + i] - deq_h[i]));
+        wraw = fmaxf(wraw, fabsf(d[GLUE_RT_DBG_RAW + i] - pre[i]));
+    }
+    std::printf(
+        "[indexer-fp4-rt] max|kernel-host|: (1) pre %.3e  (4) code %.0f  (5) dequant %.3e  |  "
+        "max|raw - pre| (the bf16 boundary) %.3e\n",
+        wpre, wcode, wdeq, wraw);
+    std::fflush(stdout);
+}
+
+}  // namespace
+
+extern "C" int dsv41_indexer_fp4_rt(float* x, int rows, int cols, int io, const char* tag,
+                                    float* dbg, cudaStream_t s) {
+    if (x == nullptr) return (int)cudaErrorInvalidValue;
+    if (rows <= 0 || cols <= 0) return (int)cudaSuccess;
+    if ((cols & 31) != 0) return (int)cudaErrorInvalidValue;  // one scale per 32 elements
+    const int nb = cols >> 5;
+    const int nblk = rows * nb;
+    const int wpb = 8;  // warps per block
+    const unsigned blocks = (unsigned)((nblk + wpb - 1) / wpb);
+    indexer_fp4_rt_kernel<<<blocks, (unsigned)(wpb * 32), 0, s>>>(x, nblk, nb, cols, io, dbg);
+    const int rc = (int)cudaGetLastError();
+    if (rc != 0) return rc;
+    if (dbg == nullptr) return 0;
+    // One-shot diagnostic: the D2H readback + the host reference + the print.
+    // Illegal inside a capture, so the caller must not arm the probe there; the
+    // extra guard keeps a mistake from turning into a stream error.
+    cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(s, &cs) == cudaSuccess && cs != cudaStreamCaptureStatusNone)
+        return 0;
+    float host[GLUE_RT_DBG_FLOATS];
+    if (cudaMemcpyAsync(host, dbg, sizeof(host), cudaMemcpyDeviceToHost, s) != cudaSuccess)
+        return (int)cudaGetLastError();
+    if (cudaStreamSynchronize(s) != cudaSuccess) return (int)cudaGetLastError();
+    glue_idx_rt_report(host, (tag != nullptr) ? tag : "?");
+    return 0;
 }

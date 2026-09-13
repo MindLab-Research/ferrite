@@ -1282,6 +1282,94 @@ pub(crate) const ROUTED_DOWN_NO_SYMBOL: &str = "the loaded .so has no \
     `dsv41_routed_down_prep` entry point (rebuild kernels/cuda: bash build.sh 103a)";
 
 // ===========================================================================
+// DSV41_INDEXER_FP4_RT: the indexer q/k fp4 round trip (A4)
+// ===========================================================================
+// The reference quantises the indexer's key AND query in place, once each, at
+// the END of their rope: `fp4_act_quant(k, 32, True)` at `ref_inference/model.py:546`
+// and `fp4_act_quant(q, 32, True)` at `:552` (`fp4_block_size = 32` at `:28`,
+// `scale_dtype` left at its `torch.float8_e8m0fnu` default at `kernel.py:188`).
+// One block-32 round trip: `amax` -> `max(amax, 6*2^-126)` -> `s = 2^ceil(log2(amax/6))`
+// -> `code = e2m1(clamp(x/s, +-6))` -> the DEQUANTISED value written back
+// (`kernel.py:158-172`, `:201-203`), in bf16 (`in_dtype` `:128`, `out_dtype =
+// in_dtype` `:136`). Ferrite ran the whole indexer in f32, i.e. MORE precise than
+// the reference — the §61 audit's defect A4.
+//
+// `DSV41_INDEXER_FP4_RT=1` arms the round trip at both call sites of
+// `fn indexer` (chain_dev.rs): after the k rope and BEFORE `index_k_publish`
+// (`:546` vs `:547`), and after the q rope and BEFORE the score (`:552` vs `:556`).
+//
+// DEFAULT OFF, read ONCE and cached like every other gate here (a per-call
+// getenv is a CUDA-graph capture hazard and a hot-path slip), and only "1" turns
+// it ON.
+pub(crate) fn indexer_fp4_rt() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("DSV41_INDEXER_FP4_RT")
+            .map(|v| v.starts_with('1'))
+            .unwrap_or(false)
+    })
+}
+
+/// `DSV41_INDEXER_FP4_RT_IO=0` selects the pure-fp4 arm of the new kernel (no
+/// bf16 boundary on either side). DEFAULT is the FAITHFUL one (`io = 1`):
+/// the reference's kernel reads and writes BF16 (`kernel.py:128/:136`), and our
+/// `s.idx_k`/`s.idx_q` scratch is f32, so skipping the pair would leave us MORE
+/// precise than the reference — exactly the defect this gate exists to remove.
+/// Kept as a knob because it isolates the fp4 half from the bf16 half in an A/B.
+pub(crate) fn indexer_fp4_rt_io() -> i32 {
+    static F: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("DSV41_INDEXER_FP4_RT_IO")
+            .map(|v| v.parse::<i32>().unwrap_or(1))
+            .unwrap_or(1)
+    })
+}
+
+/// `DSV41_INDEXER_FP4_RT_DBG=1` (default OFF, only meaningful with the gate
+/// above) turns on the ONE-SHOT probe: the kernel additionally writes the
+/// (row 0, elements 0..32) block's seven 32-wide groups (the raw f32, the value
+/// the reference kernel actually reads, `amax`, `s`, `s`'s biased exponent, the
+/// e2m1 code, the dequantised value) into a 224-float device buffer, and the
+/// host side of the entry recomputes the same five groups INDEPENDENTLY
+/// (`log2f`/`ceilf`/`exp2f` + an explicit round-to-nearest-even, against the
+/// device's bit-trick `fast_round_scale` + `cvt.rn.bf16.f32`) and prints both
+/// plus the per-element difference. The point is to prove on real data that the
+/// operand the indexer scores with is the operand the reference scores with.
+pub(crate) fn indexer_fp4_rt_dbg() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("DSV41_INDEXER_FP4_RT_DBG")
+            .map(|v| v.starts_with('1'))
+            .unwrap_or(false)
+    })
+}
+
+/// One-shot notice for an armed-but-inert indexer fp4 gate — the #1 measurement
+/// trap in this project is "a gate was exported and the OLD path answered the
+/// step", so every state in which the arm cannot do what its name says announces
+/// itself exactly once.
+pub(crate) fn indexer_fp4_rt_skipped_note(reason: &str) {
+    static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    ONCE.get_or_init(|| {
+        eprintln!(
+            "warning: DSV41_INDEXER_FP4_RT is set, but the indexer q/k were NOT aligned with the \
+             reference: {reason}. The step still computes correct values — it just runs the OLD \
+             f32 path (an A/B arm of \"INDEXER_FP4_RT\" under this state is measuring the OLD \
+             path)."
+        );
+    });
+}
+
+/// The `.so`-missing reason string, shared by the two indexer call sites so the
+/// notice text cannot drift between them.
+pub(crate) const INDEXER_RT_NO_SYMBOL: &str = "the loaded .so has no \
+    `dsv41_indexer_fp4_rt` entry point (rebuild kernels/cuda: bash build.sh 103a)";
+
+/// The probe buffer's float count, mirroring `GLUE_RT_DBG_FLOATS`
+/// (kernels/cuda/dsv41_glue.cu): seven 32-wide groups.
+const INDEXER_RT_DBG_FLOATS: usize = 224;
+
+// ===========================================================================
 // DSV41_ROUTED_DOWN_QUANT_DBG: the one-shot operand probe
 // ===========================================================================
 // The prep kernel writes these five groups for its (row 0, slot 0, block 0)
@@ -1449,6 +1537,224 @@ pub(crate) fn expert_fp4_mode() -> i32 {
 fn nr_fuse() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *F.get_or_init(|| std::env::var("DSV41_NR_FUSE").map(|v| v != "0").unwrap_or(true))
+}
+
+/// A2 (`DSV41_WINDOW_KV_QUANT`, default **OFF**): the sliding-window KV's
+/// in-place fp8 e4m3 round trip — the ONE item that moves the whole window KV's
+/// numerical domain onto the official's.
+///
+/// WHY IT EXISTS. The official `Attention._window_kv` (`ref_inference/model.py:700-707`)
+/// runs, after the norm and the in-place rope,
+///
+/// ```text
+/// act_quant(kv, fp8_block_size, scale_fmt, scale_dtype, True)   # model.py:705
+/// ```
+///
+/// with `fp8_block_size = 32` (:27), `scale_fmt = "ue8m0"` and
+/// `scale_dtype = torch.float8_e8m0fnu` (:29-30, which is what makes
+/// `round_scale` true — `kernel.py:117`), and `inplace=True`: the inplace arm
+/// (`kernel.py:83-88`) stores the DEQUANTISED value back, i.e.
+/// `bf16(e4m3_decode(e4m3_encode(clamp(v / s, ±448))) * s)` with
+/// `amax = max(amax, 1e-4)` (:76) and `s = 2^ceil(log2(amax / 448))`
+/// (`fast_round_scale`, :33-34). Its docstring is explicit that the span is the
+/// WHOLE post-RoPE vector, **RoPE tail included** — so the K the ring holds, and
+/// every K a query attends to, lives on that e4m3 grid.
+///
+/// ferrite's ring is f32 and stored the RAW post-RoPE row, i.e. the runtime was
+/// **too precise** against the reference by exactly this snap. A2 closes it.
+///
+/// ⚠️ WHAT IT IS **NOT**. It is not a storage-format change: the ring keeps its
+/// f32 element type (the file header's "ring is f32 in this increment" stays
+/// true). Only the VALUE moves onto the grid — `e4m3_decode(byte) * s` is an
+/// ordinary f32 number. Minimal intrusion: one in-place launch on the row the
+/// ring append reads, issued before the append.
+///
+/// ⚠️ OFF (the default) issues NO launch at all and is byte-for-byte the
+/// pre-A2 step — see the insertion site's comment for the two ring paths (fused
+/// and unfused) and why one site covers both.
+fn window_kv_quant() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("DSV41_WINDOW_KV_QUANT")
+            .map(|v| v.starts_with('1'))
+            .unwrap_or(false)
+    })
+}
+
+/// DSV41_WINDOW_KV_QUANT_DBG=1 (default OFF, only meaningful with the gate
+/// above) turns on the ONE-SHOT block-0 probe: the fused round-trip kernel
+/// additionally records the ① pre-round-trip (post-rope) value, ② amax (after
+/// the 1e-4 floor), ②b the raw amax, ③ the scale, ③b its e8m0 exponent byte,
+/// ④ the e4m3 code byte and ⑤ the value written back into a 224-float device
+/// buffer; the host downloads it, recomputes all of them on the CPU from the
+/// OFFICIAL semantics (`kernel.py:41-95`, `act_quant(block=32, "ue8m0", inplace=True)`)
+/// and prints both plus their difference. The point is to prove, on real data,
+/// that the row the ring stores is the row the official's inplace arm stores —
+/// the check "looks right, numbers wrong" cannot survive.
+pub(crate) fn window_kv_quant_dbg() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("DSV41_WINDOW_KV_QUANT_DBG")
+            .map(|v| v.starts_with('1'))
+            .unwrap_or(false)
+    })
+}
+
+/// The `GLUE_KVQ_DBG_*` layout of `win_kv_quant_rt_kernel` in
+/// `kernels/cuda/dsv41_glue.cu` (7 groups of 32 floats).
+const WIN_KVQ_DBG_BLOCK: usize = 32;
+const WIN_KVQ_DBG_FLOATS: usize = 7 * WIN_KVQ_DBG_BLOCK;
+
+/// The A2 probe's seven 32-float groups, as either side computes them.
+struct WinKvDbg {
+    pre: Vec<f32>,
+    amax_used: Vec<f32>,
+    amax_raw: Vec<f32>,
+    scale: Vec<f32>,
+    scale_exp: Vec<f32>,
+    code: Vec<f32>,
+    dequant: Vec<f32>,
+}
+
+impl WinKvDbg {
+    /// The groups as the KERNEL wrote them (a flat 224-float buffer).
+    fn from_device(vals: &[f32]) -> Self {
+        let g = |k: usize| vals[k * 32..(k + 1) * 32].to_vec();
+        Self {
+            pre: g(0),
+            amax_used: g(1),
+            amax_raw: g(2),
+            scale: g(3),
+            scale_exp: g(4),
+            code: g(5),
+            dequant: g(6),
+        }
+    }
+
+    /// The same groups on the CPU, written from the REFERENCE
+    /// (`ref_inference/kernel.py:41-95`, the `inplace=True` arm at :83-88) rather
+    /// than from the CUDA kernel — the probe must compare two implementations,
+    /// not one implementation with itself.
+    ///
+    /// Two details are copied from the reference ON PURPOSE, because getting
+    /// either wrong is a silent 1-ulp divergence:
+    ///   * `fast_round_scale` computes `fast_log2_ceil(amax * fp8_max_inv)` — it
+    ///     MULTIPLIES by `1/448` (kernel.py:34), it does not divide. With
+    ///     `fast_log2_ceil`'s `man != 0` term the two spellings differ only when
+    ///     `amax/448` is EXACTLY a power of two, which is why this is spelled out
+    ///     here instead of reusing `quant::fast_round_scale` (that one divides).
+    ///   * the clamp is `±448`, the e4m3 domain, and the cast is e4m3
+    ///     (`quant::e4m3_encode`, the crate's golden), NOT fp4's ±6.
+    fn cpu_reference(pre: &[f32]) -> Self {
+        use crate::dsv41::quant::{e4m3_decode, e4m3_encode};
+        let fast_log2_ceil = |x: f32| -> i32 {
+            let bits = x.to_bits();
+            let exp = ((bits >> 23) & 0xFF) as i32;
+            let man = bits & ((1 << 23) - 1);
+            exp - 127 + if man != 0 { 1 } else { 0 }
+        };
+        let fast_pow2 = |e: i32| f32::from_bits(((e + 127) << 23) as u32);
+        let raw = pre.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+        let amax = raw.max(1e-4);
+        let sc = fast_pow2(fast_log2_ceil(amax * (1.0 / 448.0)));
+        let exp_byte = ((sc.to_bits() >> 23) & 0xFF) as f32;
+        let code: Vec<f32> = pre
+            .iter()
+            .map(|&v| e4m3_encode((v / sc).clamp(-448.0, 448.0)) as f32)
+            .collect();
+        let dequant: Vec<f32> = code
+            .iter()
+            .map(|&c| e4m3_decode(c as u8) * sc)
+            .collect();
+        let fill = |v: f32| vec![v; WIN_KVQ_DBG_BLOCK];
+        Self {
+            pre: pre.to_vec(),
+            amax_used: fill(amax),
+            amax_raw: fill(raw),
+            scale: fill(sc),
+            scale_exp: fill(exp_byte),
+            code,
+            dequant,
+        }
+    }
+
+    fn show(label: &str, a: &[f32], b: &[f32]) {
+        let mut worst = 0.0f32;
+        let mut all_zero = true;
+        for i in 0..WIN_KVQ_DBG_BLOCK {
+            let d = (a[i] - b[i]).abs();
+            worst = worst.max(d);
+            if d != 0.0 {
+                all_zero = false;
+            }
+        }
+        eprintln!(
+            "[window-kv-quant] {label}: kernel-vs-cpu max|diff| = {worst:e}{}",
+            if all_zero { " (bit-identical)" } else { "" }
+        );
+    }
+
+    /// Kernel vs CPU, group by group, element by element (the column dump is
+    /// what makes a mismatch diagnosable rather than merely visible).
+    fn report(&self, cpu: &Self) {
+        eprintln!(
+            "[window-kv-quant] DSV41_WINDOW_KV_QUANT_DBG probe (ONE-SHOT) — block (row 0, block 0, \
+             elements 0..{WIN_KVQ_DBG_BLOCK}); columns: ① pre-quant (post-rope) ② amax(after floor) \
+             ③ scale s ④ e4m3 byte ⑤ dequant (written back)"
+        );
+        eprintln!(
+            "[window-kv-quant] context: raw amax = {:e}, floor(1e-4) active = {}, s = {:e} (e8m0 \
+             exponent byte = {})",
+            self.amax_raw[0],
+            self.amax_raw[0] < 1e-4,
+            self.scale[0],
+            self.scale_exp[0] as u32,
+        );
+        for i in 0..WIN_KVQ_DBG_BLOCK {
+            eprintln!(
+                "[window-kv-quant]  i={i:02}  KERNEL {:>15.9e} {:>15.9e} {:>15.9e} {:>5.0} \
+                 {:>15.9e}  |  CPU {:>15.9e} {:>15.9e} {:>15.9e} {:>5.0} {:>15.9e}  |  D {:+.2e} \
+                 {:+.2e} {:+.2e} {:+.0e} {:+.2e}",
+                self.pre[i],
+                self.amax_used[i],
+                self.scale[i],
+                self.code[i],
+                self.dequant[i],
+                cpu.pre[i],
+                cpu.amax_used[i],
+                cpu.scale[i],
+                cpu.code[i],
+                cpu.dequant[i],
+                self.pre[i] - cpu.pre[i],
+                self.amax_used[i] - cpu.amax_used[i],
+                self.scale[i] - cpu.scale[i],
+                self.code[i] - cpu.code[i],
+                self.dequant[i] - cpu.dequant[i],
+            );
+        }
+        Self::show("① pre-quant ", &self.pre, &cpu.pre);
+        Self::show("② amax      ", &self.amax_used, &cpu.amax_used);
+        Self::show("②b amax raw ", &self.amax_raw, &cpu.amax_raw);
+        Self::show("③ scale     ", &self.scale, &cpu.scale);
+        Self::show("③b s exp    ", &self.scale_exp, &cpu.scale_exp);
+        Self::show("④ e4m3 byte ", &self.code, &cpu.code);
+        Self::show("⑤ dequant   ", &self.dequant, &cpu.dequant);
+    }
+}
+
+/// One-shot notice for a state in which the A2 arm cannot do what its name says
+/// — the #1 measurement trap in this project is "a gate was exported and the OLD
+/// path answered the step", so every such state announces itself exactly once.
+pub(crate) fn window_kv_quant_skipped_note(reason: &str) {
+    static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    ONCE.get_or_init(|| {
+        eprintln!(
+            "warning: DSV41_WINDOW_KV_QUANT is set, but the window KV row was NOT snapped onto the \
+             official e4m3 grid: {reason}. The step still computes correct values — it just runs \
+             the OLD (too-precise) path (an A/B arm of \"WINDOW_KV_QUANT\" under this state is \
+             measuring the OLD path)."
+        );
+    });
 }
 
 /// DUAL_CHAIN (DSV41_DUAL_CHAIN, default ON): the kv half of `attention()` (kv
@@ -19807,6 +20113,106 @@ fn oracle_tap() -> bool {
         Ok(())
     }
 
+    /// A2 (`DSV41_WINDOW_KV_QUANT`, default OFF): snap the window KV row onto the
+    /// official's e4m3 grid, IN PLACE, on `s` — the reference's
+    /// `act_quant(..., inplace=True)` (`ref_inference/model.py:705`).
+    ///
+    /// `n` is the row length (`head_dim`), `block` is
+    /// [`crate::dsv41::ops::kv_quant_block()`] — the official
+    /// `fp8_block_size = 32` (`model.py:27`) unless `DSV41_KV_BLOCK` deliberately
+    /// widens it. The row keeps its f32 element type; only the VALUE moves.
+    ///
+    /// Three states can make the arm inert, and each announces itself ONCE via
+    /// [`window_kv_quant_skipped_note`] (the project's #1 measurement trap is a
+    /// gate whose name the OLD path answers):
+    ///   * the loaded `.so` has no `dsv41_win_kv_quant_rt` symbol;
+    ///   * `n % block != 0` (the row cannot be covered by whole blocks);
+    ///   * the launcher refused the shape.
+    /// In every one of them the row is left UNTOUCHED — never a partial snap.
+    ///
+    /// With `DSV41_WINDOW_KV_QUANT_DBG=1` the first UNCAPPED call additionally
+    /// records the block-0 five-value groups in the kernel, downloads them and
+    /// prints them beside an independent CPU computation of the same groups from
+    /// the official semantics (see [`WinKvDbg`]). The probe needs a D2H readback,
+    /// which is an illegal capture op, so inside a capture it defers (with a
+    /// one-shot note) to the first uncaptured step — the gate itself is untouched.
+    /// The round trip is IDEMPOTENT (a value already on the grid re-encodes to the
+    /// same code and the same scale), so the deferred probe's extra launch cannot
+    /// perturb the values it exists to observe.
+    fn window_kv_quant_on(
+        &self,
+        ptr: *mut f32,
+        n: usize,
+        layer: usize,
+        s: CuStream,
+    ) -> Result<()> {
+        if !window_kv_quant() {
+            return Ok(());
+        }
+        let block = crate::dsv41::ops::kv_quant_block();
+        if n == 0 {
+            return Ok(());
+        }
+        if n % block != 0 {
+            window_kv_quant_skipped_note(&format!(
+                "the KV row length {n} is not a multiple of the official block {block} \
+                 (ref_inference/model.py:27 fp8_block_size)"
+            ));
+            return Ok(());
+        }
+        if !self.dev.supports_win_kv_quant_rt() {
+            window_kv_quant_skipped_note(
+                "the loaded kernel .so has no `dsv41_win_kv_quant_rt` symbol \
+                 (rebuild the kernels to run the arm)",
+            );
+            return Ok(());
+        }
+        if !window_kv_quant_dbg() {
+            if !self.dev.win_kv_quant_rt_on(ptr, n as i32, block as i32, None, s)? {
+                window_kv_quant_skipped_note("the launcher refused the shape");
+            }
+            return Ok(());
+        }
+        // ---- the one-shot block-0 probe ----
+        static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        static NOTE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        if ONCE.get().is_some() {
+            self.dev
+                .win_kv_quant_rt_on(ptr, n as i32, block as i32, None, s)?;
+            return Ok(());
+        }
+        if self.dev.capturing() {
+            if NOTE.set(()).is_ok() {
+                eprintln!(
+                    "[window-kv-quant] DSV41_WINDOW_KV_QUANT_DBG is set but a capture is in flight \
+                     — the one-shot probe needs a D2H readback (illegal inside a capture) and will \
+                     run on the first UNCAPPED step instead"
+                );
+            }
+            self.dev
+                .win_kv_quant_rt_on(ptr, n as i32, block as i32, None, s)?;
+            return Ok(());
+        }
+        ONCE.set(()).ok();
+        let dbg = self.dev.alloc(WIN_KVQ_DBG_FLOATS * 4)?;
+        if !self
+            .dev
+            .win_kv_quant_rt_on(ptr, n as i32, block as i32, Some(dbg.ptr as *mut f32), s)?
+        {
+            window_kv_quant_skipped_note("the launcher refused the shape");
+            return Ok(());
+        }
+        let vals = self.dl(dbg.ptr as *const f32, WIN_KVQ_DBG_FLOATS)?;
+        eprintln!(
+            "[window-kv-quant] probe context: layer={layer}, row length n={n}, block={block} \
+             (ops::kv_quant_block()), e4m3 domain ±448, scale = 2^ceil(log2(amax/448))"
+        );
+        let kern = WinKvDbg::from_device(&vals);
+        let cpu = WinKvDbg::cpu_reference(&kern.pre);
+        kern.report(&cpu);
+        Ok(())
+    }
+
     fn bf16_snap(&self, ptr: *mut f32, n: usize) -> Result<()> {
         if !bf16_truncate() || n == 0 {
             return Ok(());
@@ -20251,7 +20657,33 @@ fn oracle_tap() -> bool {
         // IN PLACE, so the rotated value is bf16 as well: whatever `sparse_attn`
         // (and the ring append below) reads is a rounded row. Same stream as the
         // rotation, for the same ordering reason.
-        self.bf16_snap_on(self.s.kv.ptr as *mut f32, hd, kv_stream)?;
+        // A2 (`DSV41_WINDOW_KV_QUANT`, default OFF): the official KEEPS ITS WINDOW K
+        // ON AN FP8 ROUND TRIP — `act_quant(kv, 32, "ue8m0", e8m0fnu, True)` over
+        // the WHOLE post-RoPE vector, RoPE tail included (`ref_inference/model.py:705`;
+        // its `inplace=True` arm, `kernel.py:83-88`, stores the DEQUANTISED value).
+        // ferrite stored the RAW post-rope row, i.e. it was too precise by exactly
+        // this snap.
+        //
+        // ⚠️ ONE SITE COVERS BOTH RING PATHS. `s.kv` is the only source the ring
+        // ever reads — `ring_win_fuse` / `ring_win_fuse_ph` on the fused arm and
+        // `ring_append` on the unfused one, both below — so snapping the ROW here
+        // makes BOTH store the snapped value with no edit inside either ring
+        // kernel, and `sparse_attn` (the only other reader, via the ring) then
+        // attends the values the reference attends. `ring_win_fuse()` /
+        // `DSV41_RING_WIN_FUSE=0` therefore change nothing about the arm.
+        //
+        // STREAM/ORDER: issued on `kv_stream`, right after the rope — the row's
+        // LAST producer on both the fused (`rmsnorm_rope_on`) and the unfused
+        // (rmsnorm → bf16_snap → rope → bf16_snap) arm — i.e. INSIDE the DUAL_CHAIN
+        // kv half and before the join below. A main-stream launch here would race
+        // the side-stream rope and snap the PREVIOUS step's bytes, which is exactly
+        // the class of bug `bf16_snap_on` documents. The join is what makes the two
+        // ring launches see the snapped row.
+        //
+        // GATE OFF = byte-for-byte the pre-A2 step: `window_kv_quant_on` returns
+        // before issuing anything, `s.kv` keeps the raw post-rope row, and both ring
+        // paths copy it verbatim exactly as they did before this line existed.
+        self.window_kv_quant_on(self.s.kv.ptr as *mut f32, hd, layer, kv_stream)?;
         }
         // DUAL_CHAIN join: the kv half is fully issued (nothing below writes
         // `s.kv` until the ring append, which is its first consumer). Join the
@@ -20863,6 +21295,57 @@ fn oracle_tap() -> bool {
         Ok(hc_folded)
     }
 
+    /// A4: the indexer's fp4 round trip for ONE row-block, if armed AND the .so
+    /// carries the entry point. `tag` labels the DBG probe line (`b"k\0"` /
+    /// `b"q\0"`); the C entry prints, so the two sites never race on the format.
+    ///
+    /// The probe needs a D2H readback, which is an illegal capture op — the same
+    /// guard `routed_down_prep_launch` uses. The GATE is untouched: only the
+    /// probe is deferred to the first UNCAPPED round trip, and the `OnceLock` is
+    /// set only when the probe actually runs, so a captured first step loses
+    /// nothing.
+    fn indexer_fp4_rt_launch(
+        &self,
+        x: *mut f32,
+        rows: i32,
+        cols: i32,
+        tag: &'static [u8],
+    ) -> Result<()> {
+        let io = indexer_fp4_rt_io();
+        let null = std::ptr::null();
+        if !indexer_fp4_rt_dbg() {
+            return self.dev.indexer_fp4_rt(x, rows, cols, io, null, None);
+        }
+        static ONCE_K: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        static ONCE_Q: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        // `tag` is `b"k\0"` or `b"q\0"`: the first byte selects the one-shot slot.
+        let once: &std::sync::OnceLock<()> = if tag[0] == b'k' { &ONCE_K } else { &ONCE_Q };
+        if once.get().is_some() {
+            return self.dev.indexer_fp4_rt(x, rows, cols, io, null, None);
+        }
+        if self.dev.capturing() {
+            static NOTE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            if NOTE.set(()).is_ok() {
+                eprintln!(
+                    "[indexer-fp4-rt] DSV41_INDEXER_FP4_RT_DBG is set but a capture is in flight — \
+                     the one-shot operand probe needs a D2H readback (illegal inside a capture) and \
+                     will run on the first UNCAPPED indexer step instead"
+                );
+            }
+            return self.dev.indexer_fp4_rt(x, rows, cols, io, null, None);
+        }
+        once.set(()).ok();
+        let dbg = self.dev.alloc(INDEXER_RT_DBG_FLOATS * 4)?;
+        self.dev.indexer_fp4_rt(
+            x,
+            rows,
+            cols,
+            io,
+            tag.as_ptr() as *const std::os::raw::c_char,
+            Some(dbg.ptr as *mut f32),
+        )
+    }
+
     /// Indexer for one decode step: publish this layer's index key for the
     /// latent the compressor just produced, then score the published keys and
     /// let the kernel write the top-k straight into the selection buffer at
@@ -20886,6 +21369,12 @@ fn oracle_tap() -> bool {
         ) else {
             return Ok(false);
         };
+        // A4: armed but inert (a stale .so) must announce itself exactly once —
+        // the chain's other gates follow the same rule.
+        let idx_fp4_rt = indexer_fp4_rt();
+        if idx_fp4_rt && !self.dev.supports_indexer_fp4_rt() {
+            indexer_fp4_rt_skipped_note(INDEXER_RT_NO_SYMBOL);
+        }
         // Only kv-source layers publish index keys (they own the compressor's
         // latent). Non-source index layers compute their own queries and
         // selection from the keys their source already published.
@@ -20925,6 +21414,15 @@ fn oracle_tap() -> bool {
             1,
             false,
         )?;
+        // A4: the reference quantises the KEY right here — after its rope
+        // (`model.py:545`) and BEFORE it is published into the cache (`:546` vs
+        // `:547`) — so the value that lands in `index_k`, and is later scored by
+        // `einsum("bshd,btd->bsht", q, index_k)` (`:556`), is the fp4 round
+        // trip's output. Quantising before the rope would round the wrong
+        // operand; publishing first would store unquantised keys.
+        if idx_fp4_rt {
+            self.indexer_fp4_rt_launch(self.s.idx_k.ptr as *mut f32, 1, idx_hd as i32, b"k\0")?;
+        }
         // DEVICE-derived destination: a host-computed group slot here is exactly
         // the frozen-address bug that made the window ring go stale under the
         // graph (the index key would land in the same group every replay).
@@ -21018,6 +21516,19 @@ fn oracle_tap() -> bool {
                 self.s.pos_ctr.ptr as *const std::os::raw::c_int, 1, 0,
                 0,
                 false,
+            )?;
+        }
+        // A4: the reference quantises the QUERY right here — after its rope
+        // (`model.py:551`) and BEFORE the score (`:552` vs `:556`) — so the
+        // operand `indexer_topk` scores with is the fp4 round trip's output.
+        // Both q shapes are a multiple of 32 wide (`index_head_dim`), and the
+        // rows are `index_n_heads` (one roped query head per row).
+        if idx_fp4_rt {
+            self.indexer_fp4_rt_launch(
+                self.s.idx_q.ptr as *mut f32,
+                idx_nh as i32,
+                idx_hd as i32,
+                b"q\0",
             )?;
         }
         // per-head weights; the reference folds softmax_scale * n_heads^-0.5 into
@@ -22639,6 +23150,123 @@ mod moe_tilelang_tests {
         // One segment wider than the MMA M-tile.
         let wide = vec![7i32; TILELANG_BM + 1];
         assert!(moe_align_host(&wide, 1).is_none());
+    }
+}
+
+// The CPU yardstick the DSV41_WINDOW_KV_QUANT_DBG probe prints next to the
+// kernel's own numbers must be right ON ITS OWN TERMS first — otherwise the
+// probe could "pass" with two implementations agreeing on the wrong grid.
+// Every case below is hand-computed AND independently reproduced by
+// `kernels/cuda/win_kv_quant_ref.py` (pure-stdlib float32 implementation of
+// `ref_inference/kernel.py:41-95`'s `inplace=True` arm), which is the second
+// implementation the ticket's CPU算例 asks for. The values are the python's.
+#[cfg(test)]
+mod win_kv_quant_tests {
+    use super::WinKvDbg;
+
+    fn unit_at(v: f32) -> Vec<f32> {
+        let mut b = vec![v; 32];
+        b[0] = v;
+        b
+    }
+
+    /// `all-ones`: amax = 1, `s = 2^ceil(log2(1/448)) = 2^-8`, `1 / s = 256` is
+    /// exactly representable, so the block round-trips EXACTLY (byte 0x78 = 256)
+    /// and the snap is a no-op. The identity case: A2 must not move a value that
+    /// already sits on the grid.
+    #[test]
+    fn cpu_reference_matches_the_python_reference_all_ones() {
+        let r = WinKvDbg::cpu_reference(&unit_at(1.0));
+        assert_eq!(r.amax_raw[0], 1.0);
+        assert_eq!(r.scale[0], 2f32.powi(-8));
+        assert_eq!(r.scale_exp[0], 119.0); // e8m0 / f32 exponent byte of 2^-8
+        assert_eq!(r.code[0], 0x78u8 as f32); // 256 = 2^8
+        assert_eq!(r.dequant[0], 1.0);
+    }
+
+    /// The reference's 1e-4 FLOOR (`kernel.py:76`): a block of 1e-6 gets
+    /// `amax = 1e-4`, i.e. `s = 2^ceil(log2(1e-4 / 448)) = 2^-22` — the same
+    /// hand-computed answer the routed-down probe's own floor test pins. Without
+    /// the floor the scale would be 2^-29 and the value would land far finer.
+    #[test]
+    fn cpu_reference_matches_the_python_reference_floor() {
+        let r = WinKvDbg::cpu_reference(&unit_at(1e-6));
+        assert!(r.amax_raw[0] < 1e-4, "the floor must be the active branch");
+        assert_eq!(r.amax_used[0], 1e-4f32);
+        assert_eq!(r.scale[0], 2f32.powi(-22));
+        assert_eq!(r.scale_exp[0], 105.0);
+        // 1e-6 / 2^-22 = 4.1943 -> nearest e4m3 code is 4.0 (0x48)
+        assert_eq!(r.code[0], 0x48u8 as f32);
+        assert_eq!(r.dequant[0], 4.0 * 2f32.powi(-22));
+        assert_ne!(r.scale[0], 2f32.powi(-29));
+    }
+
+    /// Saturation is e4m3's ±448, NOT fp4's ±6: a 1000 spike keeps
+    /// `s = 2^ceil(log2(1000/448)) = 4` and `1000/4 = 250` rounds UP to the
+    /// 0x78 code (256), i.e. a dequantised 1024 — the reference's own behaviour
+    /// (the clamp is on `v/s`, and 250 < 448 never clamps).
+    #[test]
+    fn cpu_reference_matches_the_python_reference_large_spike() {
+        let r = WinKvDbg::cpu_reference(&unit_at(1000.0));
+        assert_eq!(r.scale[0], 4.0);
+        assert_eq!(r.scale_exp[0], 129.0);
+        assert_eq!(r.code[0], 0x78u8 as f32);
+        assert_eq!(r.dequant[0], 1024.0);
+    }
+
+    /// A 3.7 spike with 1e-5 tails: `s = 2^-6`, the spike lands on 3.75 (0x77),
+    /// and the tails — 1e-5 / 2^-6 = 6.4e-4, below e4m3's first-subnormal half
+    /// step (2^-10 = 9.77e-4) — FLUSH TO ZERO. That is the official grid doing
+    /// real damage, and it is exactly what "too precise" means here: the raw f32
+    /// ring kept 1e-5 where the reference keeps 0.
+    #[test]
+    fn cpu_reference_matches_the_python_reference_spike_and_tails() {
+        let mut xs = vec![1e-5f32; 32];
+        xs[0] = 3.7;
+        let r = WinKvDbg::cpu_reference(&xs);
+        assert_eq!(r.amax_used[0], 3.7f32);
+        assert_eq!(r.scale[0], 2f32.powi(-6));
+        assert_eq!(r.code[0], 0x77u8 as f32);
+        assert_eq!(r.dequant[0], 3.75);
+        assert_eq!(r.code[1], 0.0, "the tail must flush to the zero code");
+        assert_eq!(r.dequant[1], 0.0);
+    }
+
+    /// The map is IDEMPOTENT: a snapped block re-encodes to the same bytes and
+    /// the same scale (the scale is a function of the amax, which the snap does
+    /// not move; each value is already a grid point). This is what makes the
+    /// deferred one-shot probe harmless, and it is the property a wrong
+    /// (non-power-of-two, non-official) scale would break.
+    #[test]
+    fn cpu_reference_is_idempotent() {
+        for xs in [
+            (0..32).map(|i| 0.1f32 * (i as f32 % 7.0 - 3.0)).collect::<Vec<f32>>(),
+            {
+                let mut v = vec![1e-3f32; 32];
+                v[7] = 112.0;
+                v
+            },
+            unit_at(1e-6),
+        ] {
+            let a = WinKvDbg::cpu_reference(&xs);
+            let b = WinKvDbg::cpu_reference(&a.dequant);
+            assert_eq!(b.scale[0], a.scale[0], "the scale must survive a second pass");
+            assert_eq!(b.code, a.code, "every byte must survive a second pass");
+            assert_eq!(b.dequant, a.dequant, "every value must survive a second pass");
+        }
+    }
+
+    /// The scale is always a power of two on the e8m0 grid, and the byte the
+    /// probe prints is that scale's exponent — the two must agree, or the
+    /// printout is describing a different number than the kernel used.
+    #[test]
+    fn cpu_reference_scale_is_a_power_of_two() {
+        for v in [1e-6f32, 1e-3, 0.3, 1.0, 3.7, 112.0, 448.0, 1000.0] {
+            let r = WinKvDbg::cpu_reference(&unit_at(v));
+            let s = r.scale[0];
+            assert!(s > 0.0 && s.log2().fract() == 0.0, "s = {s:e} is not a power of two");
+            assert_eq!(r.scale_exp[0], ((s.to_bits() >> 23) & 0xFF) as f32);
+        }
     }
 }
 
