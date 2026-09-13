@@ -2020,3 +2020,24 @@ let dbg = if dbg_arm && compress_latent_quant_dbg() && !self.dev.capturing() {
 `[NC]` 已按此模式改为延迟执行（§73/§78）。
 ⇒ **推广窗口（`~/promote_all.sh`）可直接跑**：DBG 会在首次非捕获的合格调用上输出；
 若某个门在整轮都没打印，应按 §58/§73 的顺序排查（先确认 `dbg_arm` 条件是否成立，再确认是否全程被捕获）。
+
+## §80 本轮两项"数值件"的主 agent 亲自核验（不依赖 subagent 报告）
+
+### (a) 激活 SF 的幂次→ue8m0 转换：正确 ✓
+`moe_bs_shim.cu:489-495`：
+```c
+__device__ __forceinline__ uint8_t tl_bs_f_pow2_to_ue8m0(float s) {
+    if (!(s > 0.f)) return 0;                                  // 非正 → 0 字节（"无标度"）
+    int e = (int)((__float_as_uint(s) >> 23) & 0xFFu) - 127;    // f32 指数域
+    if (e < -127) e = -127;
+    if (e > 127)  e = 127;                                     // 钳到 e8m0 值域
+    return (uint8_t)(e + 127);                                 // 加偏置
+}
+```
+与 e8m0 定义 `2^(b-127)` **一致**：`e=0 → byte 127 → 1.0` ✓、`e=-127 → byte 0 → 2^-127` ✓、
+`e=127 → byte 254` ✓。且与 `dsv41_experts_mxf4.cu:287` 的既有实现**逐字同源**（注释自述）✓。
+
+### (b) 权重 SF 的平面尺寸：三方一致 ✓（详见 §59）
+Rust 断言（字节）= 官方 TMA `gstride[1]` = kernel 的词步长 × 4 ✓。
+
+⇒ 这两项都是"不经 subagent、主 agent 自己读出来的"结论，与 §44–§46/§59 同属"参数面已排除"的证据链。
