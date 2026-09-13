@@ -1036,3 +1036,25 @@ DSV41_GRAPH_STEP=0
 ```
 （已写进 `~/packed_matrix.sh` 的 `COMMON`。另：`arm_run.sh` 已加"失败时打印决定性日志行"，
 下次若有 build-id/decline 一类问题会直接看到。）
+
+## §36 运维坑：`git apply --3way` 在 linked worktree 场景"报告成功却没落地"
+
+**现象**：在隔离 worktree `/tmp/prec-align` 里 `git diff HEAD -- crates kernels > /tmp/prec_code.patch`，
+回到主工作树执行 `git apply --3way /tmp/prec_code.patch`，它逐文件打印
+`Applied patch to 'crates/.../chain_dev.rs' cleanly.` ⇒ 看起来成功；
+但 `git diff --stat` 为空、`git diff --cached --stat` 为空、工作树里 `grep` 不到新符号
+（`routed_down_prep` / `DSV41_ROUTED_DOWN_QUANT` 全 0）⇒ **实际什么都没改**。
+（`--3way` 隐含 `--index`，在 linked worktree 上的行为与预期不符；不再深究。）
+
+**确定性替代（本次采用，已验证）**：直接把 worktree 里**已打好补丁的文件内容**拷回主工作树——
+```bash
+cd /home/smith/src/ferrite
+for f in crates/ferrite-models/src/dsv41/chain_dev.rs \
+         crates/ferrite-models/src/dsv41/device.rs \
+         crates/ferrite-models/src/dsv41/kernels.rs \
+         kernels/cuda/dsv41_glue.cu; do cp /tmp/prec-align/$f $f; done
+grep -c routed_down_prep kernels/cuda/dsv41_glue.cu crates/ferrite-models/src/dsv41/device.rs   # 3 / 8 ✓
+git diff --stat | tail -6    # 4 files changed, 797 insertions(+), 8 deletions(-) ✓
+```
+**纪律**：跨 worktree 搬代码时，**必须**用 `grep -c <新符号>` + `git diff --stat` **双向确认落地**，
+不要相信 apply 的"cleanly"字样。
