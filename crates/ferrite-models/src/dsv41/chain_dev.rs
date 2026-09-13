@@ -1382,6 +1382,19 @@ pub(crate) fn routed_down_quant() -> bool {
     })
 }
 
+/// `DSV41_GATEUP_DUMP=<path>` (default unset) dumps the routed gate/up arm's RAW output
+/// (`[topk][act_slot]` f32, little-endian) once, at the first `moe()` call of the eager
+/// path — the A/B numeric comparator for the block-scaled arm (see the dump site).
+pub(crate) fn gateup_dump_path() -> Option<String> {
+    static P: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    P.get_or_init(|| {
+        std::env::var("DSV41_GATEUP_DUMP")
+            .ok()
+            .filter(|v| !v.is_empty() && v != "0")
+    })
+    .clone()
+}
+
 /// DSV41_ROUTED_DOWN_QUANT_DBG=1 (default OFF, only meaningful with the gate
 /// above) turns on the ONE-SHOT operand probe: the prep kernel additionally
 /// writes the five per-element values of its (row 0, slot 0, block 0) block into
@@ -23791,6 +23804,49 @@ fn oracle_tap() -> bool {
                 // [topk][act_slot] raw layout, and `act_slot` is the slot pitch.
                 // OFF: not one instruction runs. Only reached with the gate on,
                 // where the fused arm was declined and `ex_act_b` holds raw gate|up.
+                //
+                // ---- OPT-IN ONE-SHOT gate|up DUMP (`DSV41_GATEUP_DUMP=<path>`) ------
+                // The A/B numeric comparator for the routed gate/up step, placed BEFORE
+                // the bf16 boundary and the in-place swiglu so the dumped array is the
+                // RAW arm output: `[topk][act_slot]` f32, little-endian, no header.
+                //
+                // Why this is the decisive harness for the block-scaled arm: on the same
+                // prompt the FIRST `moe()` call of a run sees byte-identical inputs in
+                // every arm (it is layer 0's attention output), so dumping here for the
+                // proven per-slot path and for the experimental arm yields two arrays
+                // that are directly comparable element by element — the difference
+                // pattern then says WHICH part is wrong (one column half only => the
+                // B-side row mapping; a uniform ratio => a scale; a permutation => a
+                // layout; all zeros => staging) instead of "the text is garbage".
+                //
+                // Diagnostic only: a blocking D2H on the decode path, same hazard class
+                // as `DSV41_MOE_BS_TABLE_DUMP`, so never set it in a performance arm.
+                {
+                    static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                    if ONCE.set(()).is_ok() {
+                        if let Some(path) = gateup_dump_path() {
+                            let n = topk * act_slot as usize;
+                            let mut v = vec![0f32; n];
+                            let view = Device::view(self.s.ex_act_b.ptr, n * 4);
+                            match self.dev.download_f32(&view, &mut v) {
+                                Ok(()) => {
+                                    let bytes: Vec<u8> =
+                                        v.iter().flat_map(|x| x.to_le_bytes()).collect();
+                                    match std::fs::write(&path, &bytes) {
+                                        Ok(()) => eprintln!(
+                                            "[gateup-dump] wrote {n} f32 (topk={topk} \
+                                             act_slot={act_slot}) to {path}"
+                                        ),
+                                        Err(e) => {
+                                            eprintln!("[gateup-dump] write {path} failed: {e}")
+                                        }
+                                    }
+                                }
+                                Err(e) => eprintln!("[gateup-dump] download failed: {e}"),
+                            }
+                        }
+                    }
+                }
                 self.bf16_snap(
                     self.s.ex_act_b.ptr as *mut f32,
                     topk * act_slot as usize,
