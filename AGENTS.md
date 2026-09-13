@@ -75,6 +75,14 @@ LD_LIBRARY_PATH=$HOME/ferrite/kernels/cuda ./target/release/ferrite-serve --back
 | `DSV41_VERIFY_GRAPH=1` | verify 的 CUDA 图化 | OFF |
 | `DSV41_TIMING=1` | `[dspark] steps=` 计时行 | OFF |
 
+## 测量与工具纪律（用户裁决 2026-09-13，防遗忘）
+
+1. **step time 必须真实测量**：`[dspark] steps=` 的 draft/verify/commit 分解或 nsys per-kernel；**禁止吞吐反推**（受 prefill/accept 污染）。
+2. **NCU 只跑特定 kernel 的 micro bench**（tests_*.cu 二进制），**不能 e2e**。
+3. **nsys 多跑**（per-kernel 时间唯一来源），**死锁规避必带**：`DSV41_AR_V5=0 DSV41_GRAPH_STEP=0` + `env -u FERRITE_P2P` + `NCCL_NVLS_ENABLE=0` + 5 分钟 SIGINT 硬帽；nsys 轮只看 kernel 相对倍数（AR 形态已变），吞吐数字必须来自非 nsys 轮。
+4. **所有 e2e 必须 background 模式**（serve 启动的 ssh 会挂住前台）。
+5. **MTP 性能模型（用户裁决，勿再犯）**：单并发 decode 是 memory-bound ⇒ **verify(m 行) ≈ eager(1 行)+ε**；**400 = step ~8ms + acc length 2-3**。任何"verify 4-5× eager 是结构性代价"的理论都是错的（详见 `docs/agent/mtp-verify-amortization-model.md` + `verify-amortization-lesion-audit.md`）。
+
 ## 诊断模式（下次直接用）
 
 - **数字任务数数**（"请从 1 数到 100，每个数字单独一行"）——**对重复/错位最灵敏的探针**（EAGER 对照完美 1..100）。
