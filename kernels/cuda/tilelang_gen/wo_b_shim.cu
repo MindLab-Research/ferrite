@@ -51,12 +51,13 @@ constexpr int kTLRedThreads = 256;  // reduce block
 constexpr int kTLMPad = 16;         // mma m16 的 M（激活的 pad 目标）
 constexpr int kTLMRows = 8;         // 本阶段接受的 m 上界
 
-// 常驻 scratch：P[KS][MPAD][N] f32。INIT 期分配，进程生命周期内复用。
-float* g_part = nullptr;
+// 常驻 scratch：P[KS][MPAD][N] f32。**per-thread（per-rank）** 惰性分配（理由见 wkv_shim.cu）。
+thread_local float* g_part = nullptr;
 
 // INIT：只做一次。返回 false ⇒ 本 shim 永不发射。
 bool tl_wo_b_init() {
-    static int state = 0;
+    // thread_local：每个 rank 线程各自 SetAttribute + cudaMalloc 一次（理由见 wkv_shim.cu）。
+    static thread_local int state = 0;
     if (state != 0) return state > 0;
     (void)cudaFuncSetAttribute(wo_b_tl_partial_kernel,
                                cudaFuncAttributeMaxDynamicSharedMemorySize, kTLSmem);
@@ -97,12 +98,14 @@ extern "C" int dsv41_gemm_fp8_tilelang_wo_b(const uint8_t* a, const float* a_sca
         (((uintptr_t)out & 0x1F) != 0))
         return 2;
 
-    // P0-2 (graph-capture audit): NEVER run cudaMalloc inside a capture — it
-    // invalidates the caller's capture BEFORE we could decline. Decline here.
+    // P0-2 (graph-capture audit, v2 state-gated): only decline when INIT hasn't
+    // completed (g_part == nullptr) — once scratch is allocated, launches are
+    // capture-safe and SHOULD enter the verify graph (the head_bf16 pattern).
     cudaStreamCaptureStatus cap_st = cudaStreamCaptureStatusNone;
     if (s && cudaStreamIsCapturing(s, &cap_st) == cudaSuccess
-        && cap_st != cudaStreamCaptureStatusNone) {
-        return 2;  // decline without touching capture
+        && cap_st != cudaStreamCaptureStatusNone
+        && g_part == nullptr) {
+        return 2;  // INIT hasn't run yet — decline without touching capture
     }
 
     if (!tl_wo_b_init()) {
@@ -123,6 +126,21 @@ extern "C" int dsv41_gemm_fp8_tilelang_wo_b(const uint8_t* a, const float* a_sca
                     "smem=%d + reduce grid=%d x %d\n",
                     m, n, k, kTLKS, kTLOS, kTLN / kTLBN, kTLKS, kTLThreads, kTLSmem,
                     kTLN / kTLRedBN, kTLRedThreads);
+    }
+
+    // 一次性回执（tl-parity-vs-old #4：out_stride 的 row-0 免疫陷阱）。行 stride 只在
+    // m > 1 参与地址计算（第 0 行恒在 offset 0）⇒ 调用侧把 out_stride 传成一个「错的但
+    // 非零」的值时，m == 1 的逐位测试永远看不见（row 0 正确、row >= 1 整行错位）——
+    // 只有多行 kernel 才暴露。本 shim 的形状门只在 m > 1 时强制 out_stride == OS
+    // （内核烘死的行 stride），所以这里把**实际收到的** out_stride 与**烘死的** OS 各打
+    // 一次；**out 缓冲的真实行距 shim 看不到，调用方必须自行核对它 == baked_os**。
+    {
+        static int reported = 0;
+        if (reported++ == 0)
+            fprintf(stderr,
+                    "[proj-tilelang:wo_b] FIRST CALL out_stride=%d n=%d m=%d baked_os=%d — "
+                    "caller MUST verify the out buffer's real row pitch == baked_os\n",
+                    (int)out_stride, (int)n, (int)m, kTLOS);
     }
 
     wo_b_tl_partial_kernel<<<dim3((unsigned)(kTLN / kTLBN), (unsigned)kTLKS), kTLThreads,

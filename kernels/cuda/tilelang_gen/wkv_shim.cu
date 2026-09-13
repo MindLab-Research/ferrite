@@ -91,12 +91,17 @@ constexpr int kTLRedThreads = 256;  // reduce block
 constexpr int kTLMPad = 16;         // mma m16 的 M（激活的 pad 目标，生成物内部使用）
 constexpr int kTLMRows = 8;         // 本阶段接受的 m 上界（与 mrows 族一致）
 
-// 常驻 scratch：P[KS][MPAD][N] f32。INIT 期分配，进程生命周期内复用。
-float* g_part = nullptr;
+// 常驻 scratch：P[KS][MPAD][N] f32。**per-thread（per-rank）** 惰性分配。
+// TP8 的 ranks-are-threads 模型下，同一 .so 的多个 rank 线程会并发调用本 shim；进程级单例
+// 会让他们互相竞写 P（静默数值损坏 = T 臂乱码根因 #4）。thread_local 把 scratch 绑到执行
+// 线程：并发调用必在不同线程 ⇒ 必用不同缓冲区 ⇒ 竞写窗口消除（单线程进程行为不变）。
+thread_local float* g_part = nullptr;
 
 // INIT：只做一次。返回 false ⇒ 本 shim 永不发射（调用方保持老路径）。
 bool tl_wkv_init() {
-    static int state = 0;  // 0 = 未初始化, 1 = 已就绪, -1 = 初始化失败
+    // thread_local：每个 rank 线程各自 SetAttribute + cudaMalloc 一次。state 也线程本地 ⇒
+    // 下方的永久闩锁（-1）变成「本线程」的失败记忆，其它线程仍可正常初始化。
+    static thread_local int state = 0;  // 0 = 未初始化, 1 = 已就绪, -1 = 初始化失败
     if (state != 0) return state > 0;
     // INIT-TIME ONLY（见文件头约束 1）。smem 只有 13.8 KiB（< 48 KiB 默认上限），
     // 这里的 SetAttribute 是契约对齐（多形状/大 smem 时才是必要条件），失败不致命。
@@ -145,12 +150,20 @@ extern "C" int dsv41_gemm_fp8_tilelang_wkv(const uint8_t* a, const float* a_scal
         (((uintptr_t)out & 0x1F) != 0))
         return 2;
 
-    // P0-2 (graph-capture audit): NEVER run cudaMalloc inside a capture — it
-    // invalidates the caller's capture BEFORE we could decline. Decline here.
+    // P0-2 (graph-capture audit, v2 state-gated): the ORIGINAL unconditional
+    // decline was a DESIGN FLAW — it blocked ALL TileLang launches from ever
+    // entering the verify graph (VERIFY_GRAPH=1 is the production config),
+    // making the entire TileLang effort pointless (zero speedup on verify).
+    // The correct semantics (matching head_bf16_shim's audited pattern):
+    //   - capturing AND INIT not done (g_part == nullptr) → decline (can't
+    //     cudaMalloc inside capture)
+    //   - capturing AND INIT done (g_part != nullptr) → ALLOW the launch into
+    //     the graph (launches are capture-safe once scratch is allocated)
     cudaStreamCaptureStatus cap_st = cudaStreamCaptureStatusNone;
     if (s && cudaStreamIsCapturing(s, &cap_st) == cudaSuccess
-        && cap_st != cudaStreamCaptureStatusNone) {
-        return 2;  // decline without touching capture
+        && cap_st != cudaStreamCaptureStatusNone
+        && g_part == nullptr) {
+        return 2;  // INIT hasn't run yet — decline without touching capture
     }
 
     if (!tl_wkv_init()) {
@@ -175,6 +188,21 @@ extern "C" int dsv41_gemm_fp8_tilelang_wkv(const uint8_t* a, const float* a_scal
                     "smem=%d + reduce grid=%d x %d\n",
                     m, n, k, kTLKS, kTLN / kTLBN, kTLKS, kTLThreads, kTLSmem,
                     kTLN / kTLRedBN, kTLRedThreads);
+    }
+
+    // 一次性回执（tl-parity-vs-old #4：out_stride 的 row-0 免疫陷阱）。行 stride 只在
+    // m > 1 参与地址计算（第 0 行恒在 offset 0）⇒ 调用侧把 out_stride 传成一个「错的但
+    // 非零」的值时，m == 1 的逐位测试永远看不见（row 0 正确、row >= 1 整行错位）——
+    // 只有多行 kernel 才暴露。本 shim 的形状门只在 m > 1 时强制 out_stride == OS
+    // （内核烘死的行 stride），所以这里把**实际收到的** out_stride 与**烘死的** OS 各打
+    // 一次；**out 缓冲的真实行距 shim 看不到，调用方必须自行核对它 == baked_os**。
+    {
+        static int reported = 0;
+        if (reported++ == 0)
+            fprintf(stderr,
+                    "[proj-tilelang:wkv] FIRST CALL out_stride=%d n=%d m=%d baked_os=%d — "
+                    "caller MUST verify the out buffer's real row pitch == baked_os\n",
+                    (int)out_stride, (int)n, (int)m, kTLN);
     }
 
     // (1) K-split 分片：grid (N/BN, KS)，每块算一段 K 的 partial 写 P[kp]。

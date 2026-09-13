@@ -74,11 +74,13 @@ constexpr int kTLG8 = 8;
 constexpr int kTLAstride8 = 32768;  // nlg=8（TP1）：跨组行距
 
 // 常驻 scratch：P[KS][G][MPAD][N] f32。G=8 是上界，两个变体复用同一块。
-float* g_part = nullptr;
+// **per-thread（per-rank）** 惰性分配（理由见 wkv_shim.cu）：并发 rank 线程各持一块。
+thread_local float* g_part = nullptr;
 
 // INIT：只做一次。返回 false ⇒ 本 shim 永不发射（调用方保持老路径）。
 bool tl_wo_a_init() {
-    static int state = 0;
+    // thread_local：每个 rank 线程各自 SetAttribute + cudaMalloc 一次（理由见 wkv_shim.cu）。
+    static thread_local int state = 0;
     if (state != 0) return state > 0;
     (void)cudaFuncSetAttribute(wo_a_g1_tl_partial_kernel,
                                cudaFuncAttributeMaxDynamicSharedMemorySize, kTLSmem);
@@ -129,12 +131,14 @@ extern "C" int dsv41_gemm_fp8_tilelang_wo_a(const uint8_t* a, const float* a_sca
         (((uintptr_t)out & 0x1F) != 0))
         return 2;
 
-    // P0-2 (graph-capture audit): NEVER run cudaMalloc inside a capture — it
-    // invalidates the caller's capture BEFORE we could decline. Decline here.
+    // P0-2 (graph-capture audit, v2 state-gated): only decline when INIT hasn't
+    // completed (g_part == nullptr) — once scratch is allocated, launches are
+    // capture-safe and SHOULD enter the verify graph (the head_bf16 pattern).
     cudaStreamCaptureStatus cap_st = cudaStreamCaptureStatusNone;
     if (s && cudaStreamIsCapturing(s, &cap_st) == cudaSuccess
-        && cap_st != cudaStreamCaptureStatusNone) {
-        return 2;  // decline without touching capture
+        && cap_st != cudaStreamCaptureStatusNone
+        && g_part == nullptr) {
+        return 2;  // INIT hasn't run yet — decline without touching capture
     }
 
     if (!tl_wo_a_init()) {
@@ -157,6 +161,23 @@ extern "C" int dsv41_gemm_fp8_tilelang_wo_a(const uint8_t* a, const float* a_sca
                     "-> grid=(%d,%d,%d)x%d + reduce grid=(%d,%d)x%d\n",
                     groups, rows, n, k, a_stride, kTLOS, kTLKS, kTLN / kTLBN, groups, kTLKS,
                     kTLThreads, kTLN / kTLRedBN, groups, kTLRedThreads);
+    }
+
+    // 一次性回执（tl-parity-vs-old #4：out_stride 的 row-0 免疫陷阱）。本形状的 OS =
+    // groups*o_lora_rank = 8192 ≠ groups*n（ColumnParallel：本 rank 的每组写进全局宽行的
+    // +g*n 列，行距是整行）。行 stride 只在 rows > 1 参与地址计算（第 0 行恒在 offset 0）
+    // ⇒ 调用侧把 out_stride 传成一个「错的但非零」的值时，rows == 1 的逐位测试永远看不见
+    // （row 0 正确、row >= 1 整行错位）—— 只有多行 kernel 才暴露。形状门只在 rows > 1 时
+    // 强制 out_stride == OS，所以这里把**实际收到的** out_stride 与**烘死的** OS 各打一次；
+    // **out 缓冲的真实行距 shim 看不到，调用方必须自行核对它 == baked_os（verify 的 wo_r
+    // 行距就是 ol_total）**。
+    {
+        static int reported = 0;
+        if (reported++ == 0)
+            fprintf(stderr,
+                    "[proj-tilelang:wo_a] FIRST CALL out_stride=%d n=%d rows=%d G=%d a_stride=%d "
+                    "baked_os=%d — caller MUST verify the out buffer's real row pitch == baked_os\n",
+                    (int)out_stride, (int)n, (int)rows, (int)groups, (int)a_stride, kTLOS);
     }
 
     cudaError_t e;

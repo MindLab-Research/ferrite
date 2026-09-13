@@ -123,17 +123,23 @@ constexpr int kMovThreads = 256;
 // ---- 常驻 scratch（INIT 期分配一次，进程生命周期内复用）--------------------
 // A: [SEG_CAP*BM, K] bf16（up 的 K=dim，dn 的 K=inter）
 // C: [SEG_CAP*BM, N] f32（up 的 N=2*inter，dn 的 N=dim）
-__nv_bfloat16* g_a_up = nullptr;  // 36*16*5120 bf16 = 5.90 MiB
-__nv_bfloat16* g_a_dn = nullptr;  // 36*16*320  bf16 = 0.35 MiB
-float* g_c_up = nullptr;          // 36*16*640  f32  = 1.47 MiB
-float* g_c_dn = nullptr;          // 36*16*5120 f32  = 11.80 MiB
+// **全部 per-thread（per-rank）**：TP8 的 ranks-are-threads 模型下，同一 .so 的多个 rank
+// 线程会并发调用本 shim；进程级单例 scratch 会让他们互相竞写（gather/GEMM/scatter 全链
+// 静默数值损坏 = T 臂乱码根因 #4）。thread_local 把每个缓冲区绑到执行线程：并发调用必在
+// 不同线程 ⇒ 必用不同缓冲区 ⇒ 竞写窗口消除（单线程进程行为不变）。
+thread_local __nv_bfloat16* g_a_up = nullptr;  // 36*16*5120 bf16 = 5.90 MiB
+thread_local __nv_bfloat16* g_a_dn = nullptr;  // 36*16*320  bf16 = 0.35 MiB
+thread_local float* g_c_up = nullptr;          // 36*16*640  f32  = 1.47 MiB
+thread_local float* g_c_dn = nullptr;          // 36*16*5120 f32  = 11.80 MiB
 // 元数据（每调用上行一次；见「EAGER 臂」）
-int* g_eid = nullptr;             // [SEG_CAP]
-int* g_order = nullptr;           // [SEG_CAP*BM]
-int* g_counts = nullptr;          // [SEG_CAP]
+thread_local int* g_eid = nullptr;             // [SEG_CAP]
+thread_local int* g_order = nullptr;           // [SEG_CAP*BM]
+thread_local int* g_counts = nullptr;          // [SEG_CAP]
 
 bool tl_moe_init() {
-    static int state = 0;  // 0 = 未初始化, 1 = 已就绪, -1 = 初始化失败
+    // thread_local：每个 rank 线程各自 SetAttribute + 7 次 cudaMalloc 一次。state 线程本地 ⇒
+    // 下方两处永久闩锁（-1）都变成「本线程」的失败记忆，其它 rank 线程仍可正常初始化。
+    static thread_local int state = 0;  // 0 = 未初始化, 1 = 已就绪, -1 = 初始化失败
     if (state != 0) return state > 0;
     // INIT-TIME ONLY（见文件头约束 1）。两个生成物的动态 smem 都 > 48 KiB 默认上限，
     // 这里**必须**成功，否则 launch 直接 err 1。
@@ -297,15 +303,14 @@ extern "C" int dsv41_moe_tilelang_gate_up_bf16(
         (((uintptr_t)out & 0x1F) != 0))
         return 2;
 
-    // P0-2 (graph-capture audit): NEVER run cudaMalloc inside a capture — it
-    // invalidates the caller's capture BEFORE we could decline. Decline here.
-    // (This is the DEFENSIVE shim-side decline the file header at :72 promises:
-    // the caller (chain_dev.rs) also declines this EAGER arm while capturing, but
-    // the shim must not rely on that — the guard makes the header true.)
+    // P0-2 (graph-capture audit, v2 state-gated): only decline when INIT hasn't
+    // completed — once scratch is allocated, launches are capture-safe and SHOULD
+    // enter the verify graph (the head_bf16 pattern).
     cudaStreamCaptureStatus cap_st = cudaStreamCaptureStatusNone;
     if (s && cudaStreamIsCapturing(s, &cap_st) == cudaSuccess
-        && cap_st != cudaStreamCaptureStatusNone) {
-        return 2;  // decline without touching capture
+        && cap_st != cudaStreamCaptureStatusNone
+        && g_a_up == nullptr) {
+        return 2;  // INIT hasn't run yet — decline without touching capture
     }
 
     if (!tl_moe_init()) {
@@ -320,6 +325,21 @@ extern "C" int dsv41_moe_tilelang_gate_up_bf16(
                     "[moe-tilelang] ARMED gate_up rows=%d dim=%d inter=%d topk=%d nseg=%d -> "
                     "grid=(%d,%d)x%d smem=%zu + gather/scatter\n",
                     rows, dim, inter, topk, nseg, kUpGridX, kTLSegCap, kUpThreads, kUpSmem);
+    }
+
+    // 一次性回执（tl-parity-vs-old #4：out_stride 的 row-0 免疫陷阱的 MoE 形态）。
+    // 本入口没有 `out_stride` 参数 —— scatter 的行距是**烘死的**：assignment
+    // idx = row*topk + slot 落在 out + idx*2*inter，token 行距 = topk*2*inter。调用方把
+    // out 缓冲的行距/槽距摆错时，只有 rows > 1（或多 topk 槽）才暴露。这里把烘死的行距
+    // 打一次；**out 缓冲的真实行距 shim 看不到，调用方必须自行核对**。
+    {
+        static int reported = 0;
+        if (reported++ == 0)
+            fprintf(stderr,
+                    "[proj-tilelang:moe_up] FIRST CALL rows=%d topk=%d n=%d inter=%d — caller "
+                    "MUST verify out token pitch == topk*2*inter=%d and slot pitch == 2*inter=%d\n",
+                    (int)rows, (int)topk, (int)kTLUpN, (int)inter, (int)(topk * kTLUpN),
+                    (int)kTLUpN);
     }
 
     // (0) 元数据上行（小数组；见文件头「EAGER 臂」）。
@@ -374,15 +394,14 @@ extern "C" int dsv41_moe_tilelang_down_bf16(
         (((uintptr_t)out & 0x1F) != 0))
         return 2;
 
-    // P0-2 (graph-capture audit): NEVER run cudaMalloc inside a capture — it
-    // invalidates the caller's capture BEFORE we could decline. Decline here.
-    // (This is the DEFENSIVE shim-side decline the file header at :72 promises:
-    // the caller (chain_dev.rs) also declines this EAGER arm while capturing, but
-    // the shim must not rely on that — the guard makes the header true.)
+    // P0-2 (graph-capture audit, v2 state-gated): only decline when INIT hasn't
+    // completed — once scratch is allocated, launches are capture-safe and SHOULD
+    // enter the verify graph (the head_bf16 pattern).
     cudaStreamCaptureStatus cap_st = cudaStreamCaptureStatusNone;
     if (s && cudaStreamIsCapturing(s, &cap_st) == cudaSuccess
-        && cap_st != cudaStreamCaptureStatusNone) {
-        return 2;  // decline without touching capture
+        && cap_st != cudaStreamCaptureStatusNone
+        && g_a_up == nullptr) {
+        return 2;  // INIT hasn't run yet — decline without touching capture
     }
 
     if (!tl_moe_init()) {
@@ -397,6 +416,20 @@ extern "C" int dsv41_moe_tilelang_down_bf16(
                     "[moe-tilelang] ARMED down rows=%d dim=%d inter=%d topk=%d nseg=%d -> "
                     "grid=(%d,%d)x%d smem=%zu + gather/scatter\n",
                     rows, dim, inter, topk, nseg, kDnGridX, kTLSegCap, kDnThreads, kDnSmem);
+    }
+
+    // 一次性回执（tl-parity-vs-old #4：out_stride 的 row-0 免疫陷阱的 MoE 形态）。
+    // 本入口的 scatter 走 split == 0（dst = idx*dim，idx = row*topk + slot）：assignment
+    // 行距 = dim。调用方把 out（`ex_down_r` 的 per-slot partial）的行距摆错时，只有
+    // rows > 1 才暴露。这里把烘死的行距打一次；**out 缓冲的真实行距 shim 看不到，调用方
+    // 必须自行核对它 == dim**。
+    {
+        static int reported = 0;
+        if (reported++ == 0)
+            fprintf(stderr,
+                    "[proj-tilelang:moe_dn] FIRST CALL rows=%d topk=%d n=%d — caller MUST "
+                    "verify out per-slot pitch == dim=%d\n",
+                    (int)rows, (int)topk, (int)dim, (int)kTLDim);
     }
 
     cudaError_t e = cudaMemcpyAsync(g_eid, eid, (size_t)nseg * sizeof(int), cudaMemcpyHostToDevice, s);
