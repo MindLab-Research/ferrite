@@ -206,3 +206,29 @@ W = **原生 fp4 nibble + ue8m0 标度面**（与官方 `fp4_gemm` 完全同格�
 - `DSV41_DIFF_EAGER=1`：逐轮重放并报**第一个 mismatch 的 index 与绝对位置**（AGENTS 原文称"定位利器"）✓
 - `DSV41_TOKTRACE=1`：非 spec 路径每步打 `[toktr] ds= pos= tok=`（**直接看 argmax 写下的 id**，零改动）✓
 - 二者已封装进 `scripts/campaign/verify_value_probe.sh`（带 `DSV41_SPEC=1`）✓
+
+## 11. 🎯 两个决定"一切数字"的武装门（2026-09-14 深夜四）
+
+**实测证据**：生产式配置（BS 臂 OFF + `DSV41_SPEC=1` + 两图 ON + `AR_V5=0`，但**没**带 `DSV41_DSPARK`）
+跑出 `step pos=22: 50.55ms (19.8 tok/s)` ⇒ **换算 = 1.0 token/步** ✗ ⇒ 即 **draft/verify 未真正武装**，
+每步仍付 verify 的代价却只吐 1 个 token —— 这是**最坏形态** ✗。
+
+**代码依据**（`config.rs:464-472`）：
+```rust
+pub fn dspark_armed(&self) -> bool {
+    if !self.dspark_enabled() { return false; }
+    *ARMED.get_or_init(|| std::env::var("DSV41_DSPARK").map(|v| v != "0").unwrap_or(false))
+}
+```
+⇒ **真正的 spec 武装 = `DSV41_SPEC=1` **+** `DSV41_DSPARK=1`** ✓（AGENTS 的表里两者并列 ✓）。
+`serve.rs:473` 那句 `[dspark] shadow mode armed … all effects rolled back` 是**过时措辞** ✗
+（它只在 `dspark_armed()` 为真时打印 ⇒ 它是**武装成功**的标志，不是"回滚"✗）。
+
+⇒ **所以任何用于 MTP/tok-s 判定的臂，环境必须是**：
+```bash
+DSV41_SPEC=1 DSV41_DSPARK=1 \
+DSV41_VERIFY_GRAPH=1 DSV41_GRAPH_STEP=1 DSV41_AR_V5=0 \
+DSV41_MOE_TILELANG_BS=0 DSV41_MOE_BS_HANDWRITTEN=0
+```
+（前两者决定 spec 是否真跑；后三者决定图与 AR 形态；最后两者是那条"永远对"的正确路径。）
+**判定口径**：`tok/步 = 打印的 tok/s × step_ms / 1000` 必须 ≈ `mean-k + 1`（≈3.2）；若 ≈1.0 ⇒ **没武装** ✗。
