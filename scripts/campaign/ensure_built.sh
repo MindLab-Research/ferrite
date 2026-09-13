@@ -17,8 +17,21 @@ cd "$HOME/ferrite"
 STAMP="$HOME/.ferrite_cu_stamp"
 NEW=$(cat kernels/cuda/*.cu kernels/cuda/tilelang_gen/*.cu kernels/cuda/tilelang_inc/tl_templates/cuda/*.h 2>/dev/null | md5sum | cut -d' ' -f1)
 OLD=$(cat "$STAMP" 2>/dev/null || echo none)
-if [ "$NEW" != "$OLD" ] || [ ! -f kernels/cuda/libferrite_kernels.so ]; then
-  echo "=== kernel sources changed ($OLD -> $NEW): rebuilding .so (full build.sh) ==="
+
+# ⚠️ The stamp only proves the SOURCES did not change. It says NOTHING about whether the .so was built
+# FROM those sources: a partial `git checkout <rev> -- kernels crates` (what the bisect scripts do)
+# leaves the sources at one commit and the .so at another. Measured consequence: this script printed
+# "unchanged, skipping", and build.rs then refused the pair with
+#   error: failed to run custom build command for ferrite-kernel   (CARGO_RC=101)
+# i.e. the gate was right and this decision was wrong. So verify the three build-id sources
+# (.so / binary / kernels/cuda/.build_id) BEFORE trusting the stamp, and force the rebuild when they
+# disagree — that is the only way "stale pair" cannot be silently measured.
+ART_OK=1
+bash "$HOME/check_artifacts.sh" >/dev/null 2>&1 || ART_OK=0
+if [ "$NEW" != "$OLD" ] || [ ! -f kernels/cuda/libferrite_kernels.so ] || [ "$ART_OK" = 0 ]; then
+  echo "=== rebuilding .so (full build.sh) — reason: $( \
+        [ "$NEW" != "$OLD" ] && echo 'kernel sources changed' || \
+        { [ "$ART_OK" = 0 ] && echo 'artefacts are NOT same-source (check_artifacts says stale)' || echo 'no .so yet'; } ) ==="
   set -o pipefail
   (cd kernels/cuda && bash build.sh 103a) 2>&1 | tail -2
   rc=$?
