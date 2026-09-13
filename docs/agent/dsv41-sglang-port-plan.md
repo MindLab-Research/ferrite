@@ -21,6 +21,14 @@
 5. **ref 工具链的 encode bug 已修**：transformers 5.17 的 `encode(text, False)` 第二位置参是 `text_pair` 而非 `add_special_tokens` → 改关键字传参。hunt.sh 步骤 1/1b 因旧码崩（模型加载后崩于 encode），需在队列后重跑；步骤 3+ 用修好的 ref_diff.py。
 6. **parity 内核源码已提取备好**（HEAD 的 `win_kv_quant_rt_kernel`（含 G3 bf16 写回修）与 `glue_latent_fp4_block16`（e4m3 标度 + e2m1 码 + bf16 写回））——NO-FP4 判别一旦证实量化域假设即开干移植。
 
+## ⚠️ 战况修订三（2026-09-14 凌晨，op 级下钻定谳）
+
+1. **h-dump 步号差一的重大修正**：我们的 `(s,L)` 记录=位置 s（step_count 在 step_body 内未自增），ref 侧=位置 s-1 ⇒ 此前所有"逐层发散"在比不同位置。正确对齐后：embeddings 完全一致 ✓。
+2. **op 级三路对拍（layer 0，位置 20/50/100）**：xn（前端 collapse 输出）rmsdiff **0.18%**（corr 0.999998，RMSNorm 输出 rms 恒定）——**前端混合完全正确**；attn_o rmsdiff **3.85-4.51%**；moe_o rmsdiff **5.38-10.84%**。两个子层都是域级中度发散，叠加 80 次/步 → logits ~2-5% → marginal 处翻 argmax（117）。
+3. **NO-FP8KV 判别**：官方去掉窗口 KV fp8 量化仍干净数到 99 ⇒ fp8-KV 域差非腐蚀驱动（官方对此域鲁棒），但 attn_o 的 ~4% 正是该域差 —— **win_kv_quant_rt 已移植+接线（默认 ON）**，A/B 待 routehunt 验证坍缩。
+4. **路由嫌疑**：`dsv41_route.cu` 文件头自曝"生产形状 384/6 下 12/12 assignments 与 CPU 参考不同（非近 tie 伪影）"——但该 STATUS 段可能早于 -INF 消费标记修复，真伪待 kinds 3/4（专家集+权重）对拍。官方 Gate 在 **f32** 算分数（x.float()@weight.float()/gate_temp），我们走 bf16 gate GEMM——精度域差可能翻转近 tie 的专家选择。
+5. **官方 MoE 语义已读全**：scores+bias 选专家、原始 scores 取权重、/(sum+1e-20) 归一、×route_scale、权重作参数传 Expert（乘在 w2 **之前**）、shared 在 AR 后加、输出转 bf16。score_func=sqrtsoftplus（两边一致）。
+
 ## 0. 基座决策（已定）
 
 - **基座 = tag `dsv41-6.15ms-162toks`（8a5a952，09-12 02:16）**：纯 eager 基座，chain_dev.rs 仅 4668 行，无任何 dspark/mrows 机器；eager 正确（用户锚点）、step 6.15ms。
