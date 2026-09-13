@@ -110,6 +110,22 @@ __device__ __forceinline__ float e2m1_to_f(uint8_t code) {
 }
 
 // The reference's power-of-two scale: 2^ceil(log2(amax / maxv)).
+// `DSV41_ACTQ_FLOOR=1` (default OFF) puts the floor where the official puts it: on amax
+// (`max(amax, 1e-4)`, kernel.py:76) rather than on the scale (`fmaxf(s, 1e-30)` here, which can also
+// produce a non-power-of-two scale). The two are equivalent for amax >= 1e-4, so this is inert for
+// routed activations and only matters for near-empty blocks at the other reuse sites.
+__device__ int g_actq_floor = 0;
+__device__ __forceinline__ float actq_scale(float amax, float maxv, bool round_scale) {
+    if (g_actq_floor) {
+        const float a = fmaxf(amax, 1e-4f);
+        return round_scale ? fast_round_scale(a, 1.0f / maxv) : (a / maxv);
+    }
+    return round_scale ? fmaxf(fast_round_scale(amax, 1.0f / maxv), 1e-30f)
+                       : fmaxf(amax / maxv, 1e-30f);
+}
+extern "C" int dsv41_quant_set_actq_floor(int v) {
+    return (int)cudaMemcpyToSymbol(g_actq_floor, &v, sizeof(int));
+}
 __device__ __forceinline__ float fast_round_scale(float amax, float max_inv) {
     const uint32_t bits = __float_as_uint(amax * max_inv);
     const int exp = (int)((bits >> 23) & 0xFFu);
@@ -153,8 +169,7 @@ __global__ void quant_kernel(const float* __restrict__ x, uint8_t* __restrict__ 
     __syncthreads();
     amax = samax;
     const float maxv = FP4 ? 6.0f : 448.0f;
-    const float sc = round_scale ? fmaxf(fast_round_scale(amax, 1.0f / maxv), 1e-30f)
-                                 : fmaxf(amax / maxv, 1e-30f);
+    const float sc = actq_scale(amax, maxv, round_scale);
     if (threadIdx.x == 0 && threadIdx.y == 0) scale[idx] = sc;
     const float inv = 1.0f / sc;
     for (int i = threadIdx.y; i < block; i += blockDim.y) {
