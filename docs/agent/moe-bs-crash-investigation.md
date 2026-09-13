@@ -3482,3 +3482,26 @@ CUDA_VISIBLE_DEVICES=<gpu> BSPACK=4 BSLAYOUT=1 BSB=0x22 /tmp/bsimp sweep   # 冲
 ```
 ⇒ 若这两条 **PASS** ⇒ **kernel 内部无罪** ⇒ 缺陷在**接线/取数**（gather / SF 表 / eid / order / pitch）✗；
 若 **FAIL** ⇒ kernel 自身在此构建下退化 ⇒ 回 kernel 层 ✓。（一次 1–2 分钟 ✓，比静态推断省时 ✓。）
+
+## §139 下一臂队列（GPU，各 1–2 分钟；按 §124 的纪律用**单臂诊断**形式）
+
+缺陷已锁定在 BS 臂（§135 ✓），容器布局/映射/SF 配对/descriptor/ABI 均已排除（§44/§125/§134 ✓）
+⇒ 剩下必须由**仪器**回答：**"喂进去的数据"对不对**，还是 **kernel 自身退化**。两条互补的 1–2 分钟臂：
+
+### 臂 ①（首选）：`DSV41_MOE_BS_NUMCHECK=1` 的**单臂诊断**
+```bash
+bash ~/arm_run.sh NC1 DSV41_MOE_BS_NUMCHECK=1 DSV41_MOE_BS_SWAPAB=1
+grep -E "\[NC\]" ~/armrun_NC1.log | head -12
+```
+- 它把**e2e 真实数据**（gather 出的激活 / W 表 / SF 表）与**主机侧独立参考**逐元素对拍 ⇒
+  `[NC] WORST rel=` 直接给出**量级** ✓；
+- **按 §124 明确前置**：这是**唯一的**带 `_DBG`/`NUMCHECK` 回读的臂 ⇒ 若它卡住（`0 step + ar5-hang` 刷屏），
+  **先判为回读探针的死锁** ✗（§119 机制），**不要**去查模型/kernel ✓；看门狗会在 ~2 分钟内收掉它 ✓。
+**判读**：rel 小（≤1e-2）⇒ 数据无罪 ⇒ 缺陷在 kernel 内部 ✓；rel 大 ⇒ 数据/接线错 ✓（再按 §138 的仪器细分）。
+
+### 臂 ②（互补）：kernel 级隔离（§138 已给确切 env）
+```bash
+CUDA_VISIBLE_DEVICES=<空闲卡> BSPACK=4 BSLAYOUT=1 /tmp/bsimp const
+```
+**判读**：`[PASS]`（relerr≈0）⇒ kernel 内部无罪 ✓；`[FAIL]` ⇒ kernel 在此构建下退化 ✓。
+⇒ 两臂合起来即可把缺陷**二分成"数据"或"kernel"**，再用 §28 的指纹表定位具体环节 ✓。
