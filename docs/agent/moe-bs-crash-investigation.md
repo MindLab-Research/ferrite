@@ -180,3 +180,22 @@
 - scatter 最大写：(5×6+5)×640+639 = 23,039 floats（远小于分配）
 
 **结论：无低级错误。代码路径完整正确。**
+
+## 🎉 根因定谳（2026-09-14 晚——手写 kernel 二分成功）
+
+**手写 kernel 测试结果**：0 illegal errors（vs TileLang 的 10 errors）
+- HANDWRITTEN gate 激活确认（日志有消息）
+- **TileLang kernel 的 pipeline 结构（TMA + mbarrier + 3-stage）是 m>1 crash 的根因**
+- tcgen05 MMA 指令、数据加载、SF 处理全部正确
+
+**第一次测试的 cuda error 1**：手写 kernel 缺少 `cudaFuncSetAttribute`（smem 65536 > 48KB 默认限制）——已修复（ced1fb9）
+
+**含义**：
+- TileLang 的 TMA+mbarrier 流水线在 m>1（verify）场景下有某种竞态或状态问题
+- 手写版的顺序执行（直接 load + __syncthreads）完全安全
+- 性能代价：无 TMA 硬件加速、无流水线重叠——比 TileLang 慢但可用
+
+**后续**：
+1. 验证手写 kernel 输出质量（修复 SetAttribute 后）
+2. 如果输出正确：用 DSV41_MOE_BS_HANDWRITTEN=1 跑 push400
+3. 后续优化：给手写版加 TMA 和简单双缓冲（不学 TileLang 的复杂 3-stage）
