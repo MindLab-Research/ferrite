@@ -522,7 +522,7 @@ __global__ void tl_moe_bs_gather_kernel(const uint8_t* __restrict__ xq4,
     const int live = counts[seg] < kBm ? counts[seg] : kBm;
     const int idx = (r < live) ? order[seg * kBm + r] : -1;
     // ⚠️ order stores the FLAT assignment index (row*topk + slot); activations
-    //    are quantized PER ROW (xq4 is [rows][dim], NOT [rows*topk][dim]).
+    //    are quantized PER ROW (xq4 is [rows][dim] /* activations are quantised PER ROW (not per assignment) */).
     //    Source row = idx / row_div (= topk). The bf16 twin (moe_bf16_shim.cu:225)
     //    and the grouped gather (dsv41_route.cu:341) both do this division —
     //    the BS gather was the only one missing it.
@@ -743,7 +743,7 @@ void bs_init_failed_note(int rows, int dim, int inter) {
 // 本臂不接受 `DSV41_EXPERT_ILV`（交错布局把 w1/w3 混在一个区域里，w1 指针不再是一个
 // 干净的 [NP, K/2] 面）—— 交错时由调用方 decline（见 wiring §5，与 bf16 臂同一条互斥）。
 extern "C" int dsv41_moe_tilelang_gate_up_bs(
-    const uint8_t* xq4,      // [rows*topk][dim] u8 —— routed 的 **e4m3** 激活（行距 dim）
+    const uint8_t* xq4,      // [rows][dim] /* activations are quantised PER ROW (not per assignment) */ u8 —— routed 的 **e4m3** 激活（行距 dim）
     const float* xsc4,       // [rows*topk][dim/32] f32 —— routed 的 per-(row,32) 标度
     float* out,              // [rows][topk][2*inter] f32（RAW gate‖up；swiglu 仍走既有 pass）
     const void* w1,          // u8 [E, NP, K/2]（expert 0 的面；expert e 在 base + e*w_stride）
@@ -759,6 +759,11 @@ extern "C" int dsv41_moe_tilelang_gate_up_bs(
         counts == nullptr)
         return 2;
     if (dim != kDim || inter != kNp) return 2;
+    // Cross-language contract, made explicit here: a call needs topk*rows activation rows,
+    // i.e. that many assignment slots, and the tables are sized SEG_CAP (36). The Rust side
+    // already refuses to arm when n_assign > TILELANG_SEG_CAP (chain_dev.rs:16732), but that
+    // asymmetry was implicit -- the shipping shape (rows=6, topk=6) sits exactly at the limit.
+    if ((int64_t)topk * (int64_t)rows > (int64_t)kSegCap) return 2;
     if (topk < 1 || topk > kTopkMax) return 2;
     if (rows < 1 || rows > kRowsMax) return 2;
     if (nseg < 1 || nseg > kSegCap) return 2;
@@ -882,7 +887,7 @@ static void tl_bs_numcheck(const uint8_t* xq4, const float* xsc4, const uint8_t*
                            const float* g_c, cudaStream_t s);
 
 extern "C" int dsv41_moe_tilelang_gate_up_bs_dev(
-    const uint8_t* xq4,      // [rows*topk][dim] u8 —— routed 的 **e4m3** 激活（行距 dim）
+    const uint8_t* xq4,      // [rows][dim] /* activations are quantised PER ROW (not per assignment) */ u8 —— routed 的 **e4m3** 激活（行距 dim）
     const float* xsc4,       // [rows*topk][dim/32] f32 —— routed 的 per-(row,32) 标度
     float* out,              // [rows][topk][2*inter] f32（RAW gate‖up；swiglu 仍走既有 pass）
     const void* w1,          // u8 [E, NP, K/2]（expert 0 的面；expert e 在 base + e*w_stride）

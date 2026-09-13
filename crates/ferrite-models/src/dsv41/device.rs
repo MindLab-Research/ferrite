@@ -1555,7 +1555,7 @@ struct Kernels {
     /// `+105 GiB/rank` bf16 mirror. Args:
     /// `(xq4, xsc4, out, w1, w3, sfw1, sfw3, eid, order, counts, nseg, w_stride,
     ///   rows, dim, inter, topk, stream)` — ⚠️ `xq4` is the **e4m3** activation
-    /// (`[rows*topk][dim]`, ONE byte per value — the official DeepSeek-V4.1
+    /// (`[rows][dim] /* NOT [rows*topk]: activations are quantised per row */`, ONE byte per value — the official DeepSeek-V4.1
     /// `act_quant(fp8_block_size=32)` form the D2 fix adopted; it was packed e2m1
     /// `[dim/2]` before 2026-09-13) and `xsc4` its `[rows*topk][dim/32]` f32
     /// scales. `w1`/`w3` the expert pool's gate/up planes (still packed fp4),
@@ -7895,7 +7895,7 @@ impl Device {
     ///
     /// `act` is the swiglu'd `[rows*topk][inter]` activation (the existing
     /// `dsv41_swiglu_limit_batched` output), `w_dn` the bf16 copy
-    /// `[E, dim, inter]`, and `out` the per-slot partials `[rows*topk][dim]` — the
+    /// `[E, dim, inter]`, and `out` the per-slot partials `[rows][dim] /* NOT [rows*topk]: activations are quantised per row */` — the
     /// same buffer `dsv41_expert_down_fp4_batched` writes, so the existing
     /// fixed-order `moe_down_reduce` sum is unchanged. `act_pitch` is the SOURCE
     /// slot stride in floats: the swiglu pass writes in place, so with the unfused
@@ -8124,7 +8124,7 @@ impl Device {
     /// INIT not done); `Err` on any other rc.
     ///
     /// The operand contract is identical, including the activation format
-    /// (`xq4` = `[rows*topk][dim]` u8 **e4m3**, one byte per value) — see
+    /// (`xq4` = `[rows][dim] /* NOT [rows*topk]: activations are quantised per row */` u8 **e4m3**, one byte per value) — see
     /// [`Self::moe_tilelang_gate_up_bs`].
     ///
     /// `w_stride` is the measured per-expert **block stride** in bytes — the
