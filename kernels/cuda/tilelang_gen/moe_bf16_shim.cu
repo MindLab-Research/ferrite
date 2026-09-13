@@ -69,7 +69,9 @@
 // 写出），所以这个臂**天然需要一个 D2H 回读 + 三个小 H2D 上行**，在 CUDA-graph
 // capture 内非法。原型 §8-3 已把「把 nseg 摊到 GPU 侧」列为后续项；在那之前：
 //   * 调用方（chain_dev.rs）在 `dev.capturing()` 时**不派遣**本臂（decline 回老路径）；
-//   * shim 自身也在 capture 内 decline（防御性，见下）。
+//   * shim 自身也在 capture 内 decline（防御性——入口处的 P0-2 capture guard 在
+//     tl_moe_init() 之前用 cudaStreamIsCapturing 拒绝，绝不把 cudaMalloc 带进 capture；
+//     见两个入口 `dsv41_moe_tilelang_{gate_up,down}_bf16`）。
 //
 // =============================================================================
 // 形状域（冻结）
@@ -144,6 +146,12 @@ bool tl_moe_init() {
          ok;
     (void)cudaGetLastError();  // 吞掉 SetAttribute 的潜在错误，别污染后面的 launch 检查
     if (!ok) {
+        // P1 (no-latch-death): -1 is a PERMANENT latch, kept deliberately. Every
+        // failure reachable here is deterministic (cudaFuncSetAttribute rejection is
+        // repeatable), and the transient "called inside a capture" case is
+        // intercepted by the P0-2 guard at the entry point — INIT is never entered
+        // while capturing. A retry could not rescue a latched failure, so
+        // re-attempting each call would only re-pay a guaranteed-to-fail init.
         state = -1;
         return false;
     }
@@ -160,6 +168,9 @@ bool tl_moe_init() {
                     cudaMalloc(&g_counts, kTLSegCap * sizeof(int)) == cudaSuccess;
     if (!alloc_ok) {
         (void)cudaGetLastError();
+        // P1 (no-latch-death): same permanent-latch rationale as the SetAttribute
+        // branch above — cudaMalloc OOM is deterministic, and capture-time entry is
+        // blocked by the P0-2 guard, so there is no transient case to retry.
         state = -1;
         return false;
     }
@@ -286,6 +297,17 @@ extern "C" int dsv41_moe_tilelang_gate_up_bf16(
         (((uintptr_t)out & 0x1F) != 0))
         return 2;
 
+    // P0-2 (graph-capture audit): NEVER run cudaMalloc inside a capture — it
+    // invalidates the caller's capture BEFORE we could decline. Decline here.
+    // (This is the DEFENSIVE shim-side decline the file header at :72 promises:
+    // the caller (chain_dev.rs) also declines this EAGER arm while capturing, but
+    // the shim must not rely on that — the guard makes the header true.)
+    cudaStreamCaptureStatus cap_st = cudaStreamCaptureStatusNone;
+    if (s && cudaStreamIsCapturing(s, &cap_st) == cudaSuccess
+        && cap_st != cudaStreamCaptureStatusNone) {
+        return 2;  // decline without touching capture
+    }
+
     if (!tl_moe_init()) {
         init_failed_note(rows, dim, inter);
         return 2;
@@ -351,6 +373,17 @@ extern "C" int dsv41_moe_tilelang_down_bf16(
     if ((((uintptr_t)act & 0xF) != 0) || (((uintptr_t)w_dn & 0xF) != 0) ||
         (((uintptr_t)out & 0x1F) != 0))
         return 2;
+
+    // P0-2 (graph-capture audit): NEVER run cudaMalloc inside a capture — it
+    // invalidates the caller's capture BEFORE we could decline. Decline here.
+    // (This is the DEFENSIVE shim-side decline the file header at :72 promises:
+    // the caller (chain_dev.rs) also declines this EAGER arm while capturing, but
+    // the shim must not rely on that — the guard makes the header true.)
+    cudaStreamCaptureStatus cap_st = cudaStreamCaptureStatusNone;
+    if (s && cudaStreamIsCapturing(s, &cap_st) == cudaSuccess
+        && cap_st != cudaStreamCaptureStatusNone) {
+        return 2;  // decline without touching capture
+    }
 
     if (!tl_moe_init()) {
         init_failed_note(rows, dim, inter);

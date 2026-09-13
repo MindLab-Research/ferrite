@@ -283,6 +283,14 @@ pub struct DevExpert {
     /// The bf16 copy of w2 (`[dim, inter_local]`), same pool, for
     /// `dsv41_moe_tilelang_down_bf16`.
     pub dn_bf16: Option<DevTensor>,
+    /// `DSV41_MOE_TILELANG_BS=1` only: the **group-major packed** ue8m0 words of
+    /// this expert's gate plane (`w1.scale`), `[sf_words * inter_local]` u32, the
+    /// layout `T.tcgen05_gemm_blockscaled`'s SF operand wants. The fp4 `w1` plane
+    /// above is untouched and is fed to the arm **as-is** (zero dequant, zero copy
+    /// of the weight itself); only the scale bytes are permuted, once, at load.
+    pub wsf1: Option<DevTensor>,
+    /// Same for the up plane (`w3.scale`).
+    pub wsf3: Option<DevTensor>,
 }
 
 /// A big device allocation that experts are carved out of. Dropped when the
@@ -337,6 +345,10 @@ pub struct LayerDev {
     /// (`DSV41_MOE_BF16_DEQUANT` only; `None` otherwise — no allocation, no
     /// behaviour change).
     pub expert_bf16_pool: Option<DevBuf>,
+    /// owns the memory the experts' `wsf1`/`wsf3` packed-SF views point into
+    /// (`DSV41_MOE_TILELANG_BS` only; `None` otherwise — no allocation, no
+    /// behaviour change). Same pattern as [`Self::expert_bf16_pool`].
+    pub expert_bs_pool: Option<DevBuf>,
     /// The routed experts' w1/w3 are stored INTERLEAVED in one region
     /// (DSV41_EXPERT_ILV). The consumer MUST pass `ilv = 1` to the batched
     /// gate/up launcher; the sequential (unfused) fallback cannot read this
@@ -785,7 +797,7 @@ impl<'a> Loader<'a> {
         world: usize,
         rank: usize,
         ilv: bool,
-    ) -> Result<(Vec<DevExpert>, DevBuf, bool, Option<DevBuf>)> {
+    ) -> Result<(Vec<DevExpert>, DevBuf, bool, Option<DevBuf>, Option<DevBuf>)> {
         const NAMES: [&str; 6] = [
             "w1.weight", "w1.scale", "w3.weight", "w3.scale", "w2.weight", "w2.scale",
         ];
@@ -795,6 +807,12 @@ impl<'a> Loader<'a> {
         // rather than reading bytes that are not there.
         let want_bf16 = crate::dsv41::chain_dev::moe_bf16_dequant()
             && self.dev.supports_moe_bf16_dequant();
+        // DSV41_MOE_TILELANG_BS: the block-scaled (native fp4) MoE arm needs no
+        // bf16 copy at all — it streams the fp4 planes above AND their ue8m0 planes.
+        // What it DOES need is the e8m0 words in `T.tcgen05_gemm_blockscaled`'s
+        // group-major packing, which is a one-time byte permutation done below.
+        let want_bs =
+            crate::dsv41::weights::moe_tilelang_bs() && self.dev.supports_moe_tilelang_bs();
         // pass 1: plan every slice (no allocation)
         let mut plans: Vec<TensorPlan> = Vec::with_capacity(n_routed * 6);
         for e in 0..n_routed {
@@ -1044,6 +1062,98 @@ impl<'a> Loader<'a> {
                  (DSV41_EXPERT_ILV) -> no bf16 copy; the TileLang MoE arm will decline"
             );
         }
+
+        // ---- DSV41_MOE_TILELANG_BS: the LOAD-TIME group-major ue8m0 pack --------
+        // The block-scaled arm feeds `T.tcgen05_gemm_blockscaled` the e8m0 bytes in
+        // **group-major packed uint32** form (`word[g*rows + row]` = 4 consecutive
+        // ue8m0 bytes covering 128 K), while the pool stores them row-major
+        // (`[rows, k/32]` u8). This is the ONE place that repack happens, ONCE per
+        // expert per layer: it is a pure byte permutation of already-e8m0 data, so
+        // it is bit-exact and lossless (nothing is decoded or re-rounded), and it
+        // takes the hot path to zero extra launches.
+        //
+        // Cost: 2 planes x sf_words(40) x inter_local(320) x 4 B = 51200 B/expert,
+        // i.e. ~1.54 GiB/rank at the production shape (40 layers x 384 experts) —
+        // 1.5% of what the bf16 arm's mirror costs (`DSV41_MOE_BF16_DEQUANT`,
+        // +105 GiB/rank) and 4% of the fp4 pool it lives next to.
+        // ⚠️ Requires the PLAIN gate/up planes (same reason as the bf16 copy above:
+        // under DSV41_EXPERT_ILV the w1 view aliases the doubled region and the w1
+        // plane is not a clean `[inter_local, k/2]` face).
+        let mut bs_pool: Option<DevBuf> = None;
+        let mut wsf1_views: Vec<Option<DevTensor>> = vec![None; n_routed];
+        let mut wsf3_views: Vec<Option<DevTensor>> = vec![None; n_routed];
+        if want_bs && !ilv && !plans.is_empty() {
+            let il = plans[0].local[0]; // inter_local (padded)
+            let k = plans[0].local[1] * 2; // fp4 packs 2 values/byte
+            let words = crate::dsv41::weights::moe_bs_sf_words(k);
+            if words == 0 {
+                eprintln!(
+                    "[load] DSV41_MOE_TILELANG_BS armed but k={k} is not a multiple of 128 (the \
+                     packed e8m0 word) -> no SF pool; the block-scaled arm will decline"
+                );
+            } else {
+                let plane = words * il * 4; // u32 words x rows
+                let pool_bs = self.dev.alloc(plane * 2 * n_routed)?;
+                let base_bs = pool_bs.ptr as *mut u8;
+                let mut ok = true;
+                for e in 0..n_routed {
+                    let eb = base_bs.wrapping_add(e * (plane * 2));
+                    let i = e * 6;
+                    for (sk, dst, tag) in [
+                        (i + 1, eb, "w1.scale"),
+                        (i + 3, eb.wrapping_add(plane), "w3.scale"),
+                    ] {
+                        // The routed gate/up scale planes are `Shard::ExpertRows`, which
+                        // the SF-pitch fix does NOT re-pitch (only `w2.scale` is), so the
+                        // source row stride is the logical `k/32`. `moe_bs_sf_src_pitch`
+                        // keeps this from drifting from `sf_pitch_plane`.
+                        let pitch = crate::dsv41::weights::moe_bs_sf_src_pitch(
+                            tag,
+                            Shard::ExpertRows,
+                            k,
+                        );
+                        debug_assert_eq!(pitch, k / 32);
+                        let _ = pitch; // the kernel derives nsc from k; kept for the assert
+                        let ok_one = self.dev.moe_bs_pack_wsf(
+                            views[sk].ptr() as *const std::ffi::c_void,
+                            dst as *mut std::ffi::c_void,
+                            il as i32,
+                            k as i32,
+                        )?;
+                        ok &= ok_one;
+                    }
+                    wsf1_views[e] = Some(DevTensor {
+                        buf: Device::view(eb as *mut std::ffi::c_void, plane),
+                        shape: vec![words * il],
+                        dtype: "U32".into(),
+                    });
+                    wsf3_views[e] = Some(DevTensor {
+                        buf: Device::view(eb.wrapping_add(plane) as *mut std::ffi::c_void, plane),
+                        shape: vec![words * il],
+                        dtype: "U32".into(),
+                    });
+                }
+                if ok {
+                    bs_pool = Some(pool_bs);
+                } else {
+                    // Declined (missing symbol / shape outside the contract): drop the
+                    // pool and leave the experts without packed SF — the arm then
+                    // declines loudly instead of reading garbage.
+                    self.dev.free(&pool_bs);
+                    wsf1_views = vec![None; n_routed];
+                    wsf3_views = vec![None; n_routed];
+                    eprintln!(
+                        "[load] DSV41_MOE_TILELANG_BS armed but `dsv41_moe_bs_pack_wsf` declined \
+                         (missing symbol, or k % 128 != 0) -> the block-scaled MoE arm will decline"
+                    );
+                }
+            }
+        } else if want_bs && ilv {
+            eprintln!(
+                "[load] DSV41_MOE_TILELANG_BS is armed but the gate/up planes are INTERLEAVED \
+                 (DSV41_EXPERT_ILV) -> no packed SF pool; the block-scaled MoE arm will decline"
+            );
+        }
         let mut experts = Vec::with_capacity(n_routed);
         for e in 0..n_routed {
             let i = e * 6;
@@ -1056,9 +1166,11 @@ impl<'a> Loader<'a> {
                 w2_scale: views[i + 5].clone(),
                 up_bf16: up_views[e].clone(),
                 dn_bf16: dn_views[e].clone(),
+                wsf1: wsf1_views[e].clone(),
+                wsf3: wsf3_views[e].clone(),
             });
         }
-        Ok((experts, pool, ilv, bf16_pool))
+        Ok((experts, pool, ilv, bf16_pool, bs_pool))
     }
 
     /// Whether the routed experts' w1/w3 can be stored INTERLEAVED
@@ -1201,12 +1313,13 @@ impl<'a> Loader<'a> {
             // pooled allocation — 6 cudaMallocs per expert (92k over the model)
             // exhausted the 4 GB host's driver bookkeeping.
             let (n_routed, _) = cfg.moe_config(l);
-            let (experts, pool, experts_ilv, bf16_pool) =
+            let (experts, pool, experts_ilv, bf16_pool, bs_pool) =
                 self.load_expert_pool(&p, n_routed, l, world, rank, ilv_ok)?;
             ld.experts = experts;
             ld.expert_pool = Some(pool);
             ld.experts_ilv = experts_ilv;
             ld.expert_bf16_pool = bf16_pool;
+            ld.expert_bs_pool = bs_pool;
             w.layers[l] = ld;
         }
 
@@ -1246,12 +1359,13 @@ impl<'a> Loader<'a> {
             take!(p, ld, "ffn.shared_experts.w2.weight", shared_w2);
             take!(p, ld, "ffn.shared_experts.w2.scale", shared_w2_scale);
             let (n_routed, _) = cfg.moe_config(cfg.n_layers + s);
-            let (experts, pool, experts_ilv, bf16_pool) =
+            let (experts, pool, experts_ilv, bf16_pool, bs_pool) =
                 self.load_expert_pool(&p, n_routed, cfg.n_layers + s, world, rank, ilv_ok)?;
             ld.experts = experts;
             ld.expert_pool = Some(pool);
             ld.experts_ilv = experts_ilv;
             ld.expert_bf16_pool = bf16_pool;
+            ld.expert_bs_pool = bs_pool;
             if s == 0 {
                 // THE ROOT CAUSE of the 100% q divergence (unit-diff verdict):
                 // this block once "parked" main_proj's spec in the attn_norm

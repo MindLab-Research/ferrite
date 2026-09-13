@@ -2302,6 +2302,73 @@ fn verify_head_mrows() -> bool {
     })
 }
 
+/// `DSV41_HEAD_TILELANG=1` (DEFAULT OFF) dispatches the DSpark verify's SLICED
+/// head to the TileLang bf16 K-split + M-pad-16 mma program
+/// (`dsv41_head_bf16_tilelang`, `kernels/cuda/tilelang_gen/head_bf16_shim.cu`;
+/// prototype: docs/agent/tilelang-attn-head.md).
+///
+/// **What it is.** The head is the verify block's single largest weight, and the
+/// prototype proved the M-in-tile program flattens the M scaling the SIMT fold
+/// pays: M6/M1 = **1.00** against `gemv_bf16_v1_mrows`'s **3.23–3.81**, and
+/// **2.93×** on the m=6 absolute (slice 125.2 → 42.2µs).
+///
+/// ⚠️ **A/B ARM, NOT A PRODUCTION REPLACEMENT — and it OWES A NUMERIC DEBT.**
+/// The head's real program is "bf16 weight × f32 activation" (f32 FMA), and a
+/// tensor-core bf16 mma has no bf16 × f32 form, so the shim CASTS the activation
+/// to bf16 in its host-side staging kernel. The head output feeds an argmax, and
+/// the prototype measured that cast's **max_rel ≈ 2.3e-2** — far above the
+/// `~1e-3` near-tie flip threshold of `draft-head-fold-v2-argmax-verdict.md`
+/// (33% echo). So this arm is coherent only as a "measure the M-in-tile win"
+/// experiment; the debt must be repaid on the verify's acc gate (mean-k / Z_)
+/// before it could ever be a production path. See prototype §4/§6.3.
+///
+/// It is the drop-in of [`verify_head_mrows`]'s call site (identical ABI, and
+/// the arm reaches `dev.head_bf16_tilelang` with the same `(w, x, out, m, n, k)`),
+/// but on a DIFFERENT program and with the additional shape/capture declines the
+/// shim documents (n != 16160, k != 5120, m outside 1..=8, an INIT failure, or a
+/// capture whose INIT has not completed). Strict `== "1"`, the convention
+/// `DSV41_VERIFY_HEAD_MROWS` / `DSV41_PROJ_MMA` / `DSV41_SWAPAB` use — an
+/// opt-in A/B arm, so an exported-but-empty or mistyped value must not arm it.
+/// Read once and cached (this branch runs at the verify's head, inside the
+/// graph capture).
+fn head_tilelang() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("DSV41_HEAD_TILELANG")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
+}
+
+/// One-shot note when [`head_tilelang`] is ARMED but the shim declined — the
+/// project's #1 measurement-bias trap ("the gate is ON and the OLD path ran,
+/// with nothing said"). The decline arms, all of them `Ok(false)`:
+///
+/// * `n != 16160` (`seg` = vocab / world at the production geometry) — the
+///   frozen shape the generated kernel was dumped for. This is also the arm an
+///   UNSLICED head call lands on, so an armed gate there says so instead of
+///   silently measuring the per-row loop;
+/// * `k != 5120`, or `m` outside `1..=8`;
+/// * the shim's one-time INIT (the AOT dump upload) failed, or a CUDA capture
+///   was recorded before it completed — the arm is only legal on the direct/DRY
+///   path until INIT has landed;
+/// * a stale `.so` with no `dsv41_head_bf16_tilelang` symbol.
+///
+/// `OnceLock`, so it costs the head branch one predictable read.
+fn head_tilelang_note(m: usize, seg: usize) {
+    static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    ONCE.get_or_init(|| {
+        eprintln!(
+            "warning: DSV41_HEAD_TILELANG=1 but the TileLang head did NOT run (m={m}, \
+             n={seg}): the generated kernel is frozen to the production slice shape \
+             (n=16160, k=5120, m<=8, INIT complete, no capture before INIT) and the loaded \
+             .so must carry `dsv41_head_bf16_tilelang` (rebuild kernels/cuda: bash build.sh \
+             103a). The per-row / v1-mrows head answers instead, so an A/B run with this gate \
+             ON measures the OLD path."
+        );
+    });
+}
+
 /// The verify head's SLICE conditions, evaluated by `DevChain::verify_head_geom`
 /// and carried as ONE value so the DECISION and its one-shot decline report
 /// cannot drift: a second copy of the condition list is exactly how the report
@@ -8652,8 +8719,29 @@ impl<'a> DevChain<'a> {
             // is a traffic + launch change and not a numerical one. Default OFF:
             // a stale .so (no symbol) or `m > 8` makes the method return
             // `Ok(false)` and the per-row loop below still runs.
+            // TILELANG head arm (`DSV41_HEAD_TILELANG`, default OFF — see
+            // [`head_tilelang`]): the bf16 K-split + M-pad-16 mma program
+            // (`dsv41_head_bf16_tilelang`, kernels/cuda/tilelang_gen/
+            // head_bf16_shim.cu), i.e. the M-in-tile win the prototype measured
+            // (M6/M1 = 1.00 against this fold's 3.23-3.81; m=6 absolute 2.93x).
+            // HIGHEST precedence when armed. ⚠️ It CASTS the f32 activation to
+            // bf16, so it is an A/B arm that OWES the verify's acc gate.
+            // The shim DECLINES every other shape/state (n != 16160, k != 5120,
+            // m outside 1..=8, INIT failure, or a capture whose INIT has not
+            // completed) and `Ok(false)` falls straight through, so OFF and
+            // ON-but-declined both land on the sequence below.
+            let tl_ok = head_tilelang()
+                && self.dev.head_bf16_tilelang(
+                    head_ptr as *const c_void,
+                    self.s.xn_r.ptr as *const f32,
+                    self.s.logits_r.ptr as *mut f32,
+                    m as i32,
+                    seg as i32,
+                    dim as i32,
+                )?;
             let armed = verify_head_mrows();
-            let mrows = armed
+            let mrows = !tl_ok
+                && armed
                 && self.dev.head_gemv_bf16_v1_mrows(
                     head_ptr as *const c_void,
                     self.s.xn_r.ptr as *const f32,
@@ -8662,7 +8750,13 @@ impl<'a> DevChain<'a> {
                     seg as i32,
                     dim as i32,
                 )?;
-            if !mrows {
+            // An armed TileLang gate that did NOT run must say so once (the
+            // project's #1 measurement-bias trap: an armed arm may never silently
+            // measure the OLD path — see [`head_tilelang_note`]).
+            if head_tilelang() && !tl_ok {
+                head_tilelang_note(m, seg);
+            }
+            if !tl_ok && !mrows {
                 // Armed-but-declined is this gate's OTHER silent no-op (a stale
                 // .so without the symbol, or `m > 8`): the per-row loop below
                 // answers, so an A/B with the gate ON would otherwise measure the
@@ -8701,8 +8795,27 @@ impl<'a> DevChain<'a> {
             // (`head_gemv_bf16_mrows`) and is a numerical change, which is why it
             // is gated separately and tested first (`folded` above). A non-BF16
             // head has no v1 kernel to fold, so the `lin_f32` loop keeps it.
+            // TILELANG head arm (see the SLICED branch above for the full note):
+            // tried here too, so an armed `DSV41_HEAD_TILELANG` is never a
+            // STRUCTURAL no-op on the unsliced geometry — the mistake
+            // `verify_head_mrows` itself was fixed for. It DECLINES by
+            // construction here: the generated kernel is frozen to the per-rank
+            // vocabulary slice (`n = 16160`), while this arm's `n` is the full
+            // `cfg.vocab_size` = 129280. [`head_tilelang_note`] says so once, so
+            // the A/B cannot mistake this for a live arm.
+            let tl_ok = head_tilelang()
+                && head.dtype == "BF16"
+                && self.dev.head_bf16_tilelang(
+                    head.ptr(),
+                    self.s.xn_r.ptr as *const f32,
+                    self.s.logits_r.ptr as *mut f32,
+                    m as i32,
+                    cfg.vocab_size as i32,
+                    dim as i32,
+                )?;
             let armed = verify_head_mrows();
-            let mrows = armed
+            let mrows = !tl_ok
+                && armed
                 && head.dtype == "BF16"
                 && self.dev.head_gemv_bf16_v1_mrows(
                     head.ptr(),
@@ -8712,12 +8825,15 @@ impl<'a> DevChain<'a> {
                     cfg.vocab_size as i32,
                     dim as i32,
                 )?;
+            if head_tilelang() && !tl_ok {
+                head_tilelang_note(m, cfg.vocab_size);
+            }
             // Say which arm ran (or why none did) once — the whole point of the
             // fix: an armed gate must never be a silent no-op.
             if armed {
                 verify_head_mrows_note(false, head.dtype == "BF16", mrows, cfg.vocab_size, m);
             }
-            if !mrows {
+            if !tl_ok && !mrows {
                 for r in 0..m {
                     let xnr = (self.s.xn_r.ptr as *const f32).wrapping_add(r * dim);
                     let lg = (self.s.logits_r.ptr as *mut f32).wrapping_add(r * lg_stride);

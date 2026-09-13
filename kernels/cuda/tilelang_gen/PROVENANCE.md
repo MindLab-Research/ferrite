@@ -371,4 +371,72 @@ nvcc -arch=sm_103a -O3 -std=c++17 -I kernels/cuda -I kernels/cuda/tilelang_inc \
 
 接线侧的活性证据：`[proj-tilelang] ARMED {wq_a,wq_b,wo_b,wo_a} ...` 一次性回执（stderr）。
 
+---
+
+## 9. 第五阶段：tcgen05 block-scaled 原生 fp4 MoE-up（`DSV41_MOE_TILELANG_BS`）
+
+> 原型与全部 GPU 结论：`docs/agent/tcgen05-blockscaled-proto.md`。
+> 接线设计 + 验证手册：`docs/agent/tilelang-moe-bs-wiring.md`（**改这个臂之前先读它**）。
+
+| 文件 | 性质 | 说明 |
+|---|---|---|
+| `moe_bs_up_tl.cu` | **生成物（禁止手改）** | up（gate‖up）block-scaled grouped GEMM |
+| `moe_bs_up_tl_host.cu` | **生成物** | TileLang 自己的 host launcher = **CUtensorMap 的权威配方**（§9.3） |
+| `moe_bs_tl_config.txt` | 生成物 | 冻结几何 + grid/block/smem + 参数签名 + tensormap 表 |
+| `moe_bs_shim.cu` | **手写** | launcher shim（`dsv41_moe_tilelang_gate_up_bs` + `dsv41_moe_bs_pack_wsf`） |
+
+### 9.1 与 bf16 臂（§7）的三点不同
+
+1. **没有 bf16 镜像**。本臂直接吃 fp4 池 + 它自己的 ue8m0 面（零 dequant、零副本），
+   所以**不需要** `DSV41_MOE_BF16_DEQUANT`，也不花 §7.5 那笔 `+105~113 GiB/rank`。
+   代价是**装载期 pack 出 group-major 的 SF 池**：`+1.54 GiB/rank`（§8 的 1.5%）。
+2. **权重按 expert 直取**（`W1/W3: [E, NP, K]`，`e = Eid[by]`），不是原型那套
+   `[NSEG, N, K]` 的 per-segment 副本。
+3. **ABI 是 TMA 描述符**（默认 lowering），不是 §7 的裸指针：
+   blockscaled 的 A/B smem 必须是 `float4_e2m1_unpacked`，而 packed-global →
+   unpacked-smem 只有 TMA 的 tensor 形式能做（`copy_analysis.cc:539`）。
+   shim 因此用 `dlopen("libcuda.so.1")` + `dlsym("cuTensorMapEncodeTiled")`
+   —— **`build.sh` 一行不改**（不引入 `-lcuda`，`BUILD_ID` 的 flag 集不动）。
+
+### 9.2 重生成（唯一合法路径）
+
+```bash
+scp kernels/tilelang/gen_moe_bs_aot.py ubuntu@43.202.208.136:~/tl_bs/
+ssh ubuntu@43.202.208.136 \
+  'cd ~/tl_bs && mkdir -p aot_gen && /opt/dlami/nvme/dsv41_venv/bin/python \
+   gen_moe_bs_aot.py aot_gen'
+scp ubuntu@43.202.208.136:'~/tl_bs/aot_gen/*' kernels/cuda/tilelang_gen/
+# 再给 moe_bs_up_tl.cu 加 banner（内容在 aot_gen/moe_bs_up_tl.banner）
+```
+
+| 项 | 值 |
+|---|---|
+| 形状 | up `n=640 (gate‖up), k=5120`；`E=384`、`NP=320`、`SEG_CAP=36` |
+| 几何 | `BM=64`（目标；`--bm 128` 是原型认证回退）、`BN=128`、`BK=128`、`nh=64`、`grid=(5,36)`、`threads=128`、`stages=6`、`gran=32` |
+| 数值路线 | **原生 mxfp4**：e2m1 数据 + ue8m0 标度直进 tensor core（`kind::mxf8f6f4.block_scale`） |
+| ABI | **TMA 描述符**（默认 lowering；见 §9.1-3） |
+| 0.1.14 补丁 | `gen_moe_bs_aot.py::install_blockscaled_fix()`（缺 `ann["is_tcgen05"]`，上游 v0.1.14 与 main 都缺） |
+
+### 9.3 描述符配方（**不许猜**）
+
+`moe_bs_up_tl_host.cu` 是 TileLang 为同一 kernel 生成的 host launcher，里面有它对每个
+张量调 `cuTensorMapEncodeTiled` 的完整实参。`moe_bs_shim.cu` 的 5 个 `spec_*` 就是那份
+配方的转写；**唯一允许需要人工比对的是 box 首维（字节 vs 元素）与 swizzle 枚举**。
+转写流程与自检见 `docs/agent/tilelang-moe-bs-wiring.md` §4.3 / §6.2–6.3。
+
+⚠️ `moe_bs_shim.cu` 顶部的 `static_assert` 是**第一道闸**：若 dump 不是描述符形态
+（例如有人加了 `TL_DISABLE_TMA_LOWER`），它会在编译期直接失败并指向 §4.3 ——
+**不要绕过它**（绕过 = 一个「能编译但走错路」的 shim）。
+
+### 9.4 验收证据
+
+| 检查 | 结果 |
+|---|---|
+| `cargo check -p ferrite-models` / `cargo check --workspace` | **EXIT=0**（device.rs + weights.rs + load.rs） |
+| `nvcc … -cubin`（`moe_bs_up_tl.cu`）/ `-shared -fPIC`（`moe_bs_shim.cu`） | ⏳ 需先跑 §9.2 生成（主 agent，见 wiring §6.2） |
+| `nm -D` 两个 T 符号 | ⏳ 同上 |
+| GPU e2e + parity + bench | ⏳ 见 wiring §6.5/§6.6（主 agent 职责；**空卡**才用绝对 µs） |
+| raw sha256（`moe_bs_up_tl.cu`，banner 之前） | ⏳ 生成后回填（照 §7.2 的格式） |
+
+
 

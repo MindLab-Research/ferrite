@@ -89,6 +89,12 @@ bool tl_wo_a_init() {
     if (cudaMalloc(&g_part, bytes) != cudaSuccess) {
         g_part = nullptr;
         (void)cudaGetLastError();
+        // P1 (no-latch-death): -1 is a PERMANENT latch, kept deliberately. Every
+        // failure reachable here is deterministic (cudaMalloc OOM / SetAttribute
+        // rejection are repeatable), and the transient "called inside a capture"
+        // case is intercepted by the P0-2 guard at the entry point — INIT is never
+        // entered while capturing. A retry could not rescue a latched failure, so
+        // re-attempting each call would only re-pay a guaranteed-to-fail init.
         state = -1;
         return false;
     }
@@ -122,6 +128,14 @@ extern "C" int dsv41_gemm_fp8_tilelang_wo_a(const uint8_t* a, const float* a_sca
         (((uintptr_t)w & 0xF) != 0) || (((uintptr_t)w_scale & 0xF) != 0) ||
         (((uintptr_t)out & 0x1F) != 0))
         return 2;
+
+    // P0-2 (graph-capture audit): NEVER run cudaMalloc inside a capture — it
+    // invalidates the caller's capture BEFORE we could decline. Decline here.
+    cudaStreamCaptureStatus cap_st = cudaStreamCaptureStatusNone;
+    if (s && cudaStreamIsCapturing(s, &cap_st) == cudaSuccess
+        && cap_st != cudaStreamCaptureStatusNone) {
+        return 2;  // decline without touching capture
+    }
 
     if (!tl_wo_a_init()) {
         // 初始化失败（分配不到 scratch / 恰好发生在 capture 内）：decline，不发射。

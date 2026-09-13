@@ -604,6 +604,34 @@ struct Kernels {
     gemv_bf16_v1_mrows: Option<
         unsafe extern "C" fn(*const c_void, *const f32, *mut f32, c_int, c_int, c_int, CuStream) -> c_int,
     >,
+    // TILELANG head bf16 GEMM, from `kernels/cuda/tilelang_gen/head_bf16_shim.cu`
+    // (`dsv41_head_bf16_tilelang`; prototype: docs/agent/tilelang-attn-head.md).
+    // The K-split + M-pad-16 mma program of the head: M rides INSIDE the mma
+    // tile, so m=1 and m=6 issue the same number of mma instructions — the
+    // prototype measured M6/M1 = 1.00 against `gemv_bf16_v1_mrows`'s 3.23-3.81,
+    // and 2.93x on the m=6 absolute (slice 125.2 -> 42.2us).
+    //
+    // ⚠️ A/B ARM, NOT A PRODUCTION REPLACEMENT (default OFF): the head's real
+    // program is "bf16 weight x f32 activation" (f32 FMA), and tensor-core bf16
+    // mma has no bf16 x f32 form, so the shim CASTS the activation to bf16 on
+    // its host side. The head feeds an argmax, and that cast's ~2.3e-2 max_rel
+    // (prototype §4) is far above the ~1e-3 near-tie flip threshold
+    // (`draft-head-fold-v2-argmax-verdict.md`, 33% echo), so this arm OWES a
+    // numeric debt that only the verify's acc gate (mean-k / Z_) can repay. It
+    // exists to measure the M-in-tile win, not to be switched on in production.
+    //
+    // ABI is `dsv41_gemv_bf16_v1_mrows`'s verbatim — (w, x, out, m=rows, n, k, s)
+    // — so the Rust arm is that entry's drop-in: `w` is the [n, k] bf16 head
+    // weight (or its slice), `x` the [m, k] f32 activation, `out` the [m, n] f32
+    // logits (its row stride MUST be n). SHAPE-SPECIFIC: the frozen geometry
+    // (n=16160=kTLN, k=5120) is baked into the generated grid, so the C entry
+    // DECLINES (returns 2, never cudaErrorInvalidValue) for every other shape
+    // (n != 16160 / k != 5120 / m outside 1..=8 / a base that is not 16B-aligned
+    // / an INIT failure / a call inside a capture before INIT has completed).
+    // Optional: a stale .so without the symbol keeps the per-row loop.
+    head_bf16_tilelang: Option<
+        unsafe extern "C" fn(*const c_void, *const f32, *mut f32, c_int, c_int, c_int, CuStream) -> c_int,
+    >,
     /// Tap bf16 round-trip (DSV41_TAP_BF16): in-place elementwise
     /// `x[i] = bf16_to_f32(f32_to_bf16(x[i]))` for the dspark draft's main_h
     /// buffer, aligning the MTP head's input with the official model's bf16
@@ -1349,6 +1377,45 @@ struct Kernels {
         unsafe extern "C" fn(*const c_void, *const c_void, *mut c_void, c_int, c_int, c_int, c_int, CuStream)
             -> c_int,
     >,
+    /// TILELANG MoE block-scaled arm — the **native fp4** up (gate‖up) grouped GEMM
+    /// (`DSV41_MOE_TILELANG_BS`, default OFF; mutually exclusive with
+    /// `DSV41_MOE_TILELANG`). Unlike the bf16 arm this one reads the loader's fp4
+    /// pool and its e8m0 scales **as-is** (zero dequant, zero bf16 copy), which is
+    /// the whole point: it does not need `DSV41_MOE_BF16_DEQUANT` and its
+    /// `+105 GiB/rank` bf16 mirror. Args:
+    /// `(xq4, xsc4, out, w1, w3, sfw1, sfw3, eid, order, counts, nseg, rows, dim,
+    ///   inter, topk, stream)` — `xq4`/`xsc4` are the routed fp4 activations
+    /// (`[rows*topk][dim/2]` packed e2m1 and `[rows*topk][dim/32]` f32 scales),
+    /// `w1`/`w3` the expert pool's gate/up planes, `sfw1`/`sfw3` the LOAD-TIME
+    /// group-major packed scale words (see [`Self::moe_bs_pack_wsf`]).
+    moe_tilelang_gate_up_bs: Option<
+        unsafe extern "C" fn(
+            *const u8,
+            *const f32,
+            *mut f32,
+            *const c_void,
+            *const c_void,
+            *const c_void,
+            *const c_void,
+            *const c_int,
+            *const c_int,
+            *const c_int,
+            c_int,
+            c_int,
+            c_int,
+            c_int,
+            c_int,
+            CuStream,
+        ) -> c_int,
+    >,
+    /// Load-time repack for the block-scaled arm: one expert's e8m0 plane,
+    /// row-major `[rows, k/32]` u8 → **group-major packed** `[words*rows]` u32
+    /// (`word[g*rows + row] = u32(src[row*(k/32) + g*4 .. +4])`), which is the
+    /// layout `T.tcgen05_gemm_blockscaled`'s SF operand wants. A pure byte
+    /// permutation of already-ue8m0 data ⇒ bit-exact and lossless. Called
+    /// `2 * n_routed` times per layer at load (see `load.rs`).
+    moe_bs_pack_wsf:
+        Option<unsafe extern "C" fn(*const c_void, *mut c_void, c_int, c_int, CuStream) -> c_int>,
     moe_down_reduce: Option<unsafe extern "C" fn(*const f32, *mut f32, c_int, c_int, CuStream) -> c_int>,
     /// `dsv41_moe_down_reduce_st` (A1a): the same fixed-order sum, whose epilogue
     /// also copies `out` into every peer's staging slot (carries the following
@@ -1945,6 +2012,7 @@ impl Device {
             gemv_f32_mrows: ko!(rt, "dsv41_gemv_f32_mrows"),
             head_gemv_bf16_mrows: ko!(rt, "dsv41_head_gemv_bf16_mrows"),
             gemv_bf16_v1_mrows: ko!(rt, "dsv41_gemv_bf16_v1_mrows"),
+            head_bf16_tilelang: ko!(rt, "dsv41_head_bf16_tilelang"),
             bf16_roundtrip: ko!(rt, "dsv41_bf16_roundtrip"),
             wo_a_grouped_fp8: ko!(rt, "dsv41_wo_a_grouped_fp8"),
             gemm_fp8_mrows: ko!(rt, "dsv41_gemm_fp8_mrows"),
@@ -1993,6 +2061,8 @@ impl Device {
             moe_tilelang_gate_up_bf16: ko!(rt, "dsv41_moe_tilelang_gate_up_bf16"),
             moe_tilelang_down_bf16: ko!(rt, "dsv41_moe_tilelang_down_bf16"),
             moe_fp4_to_bf16: ko!(rt, "dsv41_moe_fp4_to_bf16"),
+            moe_tilelang_gate_up_bs: ko!(rt, "dsv41_moe_tilelang_gate_up_bs"),
+            moe_bs_pack_wsf: ko!(rt, "dsv41_moe_bs_pack_wsf"),
             w2_l2_prewarm: ko!(rt, "dsv41_w2_l2_prewarm"),
             swiglu_limit_batched: ko!(rt, "dsv41_swiglu_limit_batched"),
             ar_reduce: ko!(rt, "dsv41_ar_reduce"),
@@ -5008,6 +5078,71 @@ impl Device {
         Ok(true)
     }
 
+    /// TILELANG head bf16 GEMM (`DSV41_HEAD_TILELANG`, default OFF; see
+    /// `head_tilelang()` in chain_dev.rs) — the K-split + M-pad-16 mma program
+    /// from `kernels/cuda/tilelang_gen/head_bf16_shim.cu`, prototype in
+    /// docs/agent/tilelang-attn-head.md.
+    ///
+    /// Deliberately the SAME argument list as [`Self::head_gemv_bf16_v1_mrows`] —
+    /// `(w, x, out, m=rows, n, k)` — so the arm is that entry's drop-in: `w` is
+    /// the `[n, k]` bf16 head weight (or its per-rank slice), `x` the `[m, k]`
+    /// f32 activation (`xn_r`), `out` the `[m, n]` f32 logits (`logits_r`, whose
+    /// row stride MUST be `n`).
+    ///
+    /// ⚠️ A/B ARM (NOT a production replacement). The head's real program is
+    /// "bf16 weight x f32 activation" (f32 FMA); tensor-core bf16 mma has no
+    /// such form, so the shim CASTS the activation to bf16 — a ~2.3e-2 max_rel
+    /// change that is far above the argmax near-tie flip threshold (see the
+    /// `Kernels::head_bf16_tilelang` field). Its purpose is to MEASURE the
+    /// M-in-tile win (prototype: M6/M1 = 1.00 vs the v1 fold's 3.23-3.81, and
+    /// 2.93x at m=6), not to be switched on in production.
+    ///
+    /// `Ok(false)` means NOT performed — keep the per-row / v1-fold path: either
+    /// the loaded `.so` has no `dsv41_head_bf16_tilelang` (a stale build, or the
+    /// frozen dumps were not AOT-generated yet — see
+    /// `kernels/tilelang/gen_head_aot.py`), or the C entry DECLINED (it returns
+    /// 2, never cudaErrorInvalidValue, so a decline can never read as a launch
+    /// failure). The C decline set is: `n != 16160` / `k != 5120` / `rows`
+    /// outside 1..=8 / a base that is not 16B-aligned / an INIT failure (the
+    /// resident scratch could not be allocated) / a call inside a CUDA-graph
+    /// capture BEFORE the one-time INIT has completed (the shim's capture guard,
+    /// the verify-graph-tl-audit P0-2 red line). Every other non-zero rc is a
+    /// real cuda error.
+    pub fn head_bf16_tilelang(
+        &self,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        rows: i32,
+        n: i32,
+        k: i32,
+    ) -> Result<bool> {
+        let Some(f) = self.kernels.head_bf16_tilelang else {
+            return Ok(false);
+        };
+        if !(1..=8).contains(&rows) {
+            return Ok(false);
+        }
+        let rc = unsafe { f(w, x, out, rows, n, k, self.stream) };
+        // 2 = the shim's "declined" (shape / alignment / INIT / capture), the
+        // caller falls back. Every other non-zero rc is a real cuda error.
+        if rc == 2 {
+            return Ok(false);
+        }
+        self.kerr(rc, "dsv41_head_bf16_tilelang")?;
+        Ok(true)
+    }
+
+    /// True when the loaded `.so` carries the TileLang head entry
+    /// (`dsv41_head_bf16_tilelang`). A `.so` built before the AOT dumps existed
+    /// (or on which `gen_head_aot.py` has not been run — the shim's
+    /// `__has_include` guard then compiles an empty TU) has no such symbol, so
+    /// `DSV41_HEAD_TILELANG` must stay OFF and be reported instead of silently
+    /// measuring the OLD path (the project's #1 measurement-bias trap).
+    pub fn supports_head_tilelang(&self) -> bool {
+        self.kernels.head_bf16_tilelang.is_some()
+    }
+
     /// The draft's block-diagonal `wo_a` as ONE weight-stationary launch.
     ///
     /// `a` is the quantised attention output `[rows][a_stride/4 f32]` (fp8 bytes,
@@ -7174,6 +7309,79 @@ impl Device {
         Ok(true)
     }
 
+    /// TILELANG MoE block-scaled arm — up (gate‖up), the **native fp4** path
+    /// (`DSV41_MOE_TILELANG_BS`; mutually exclusive with `DSV41_MOE_TILELANG`).
+    ///
+    /// Fires the shim's three-launch sequence (gather fp4 + pack the activation SF →
+    /// block-scaled grouped MMA → scatter) and writes the **RAW gate‖up**
+    /// `[rows][topk][2*inter]` layout into `out`, exactly the layout
+    /// `dsv41_expert_gate_up_fp4_batched` writes when swiglu is NOT fused, so the
+    /// existing separate swiglu pass still applies.
+    ///
+    /// `xq4`/`xsc4` are the **already-quantised** routed activations (`[rows*topk]`
+    /// slots of `dim/2` packed e2m1 bytes and `dim/32` f32 scales — the same buffers
+    /// the proven batched launch reads), `w1`/`w3` are the expert pool's gate/up
+    /// planes and `sfw1`/`sfw3` the load-time packed group-major scale words. No
+    /// bf16 copy is involved, so `DSV41_MOE_BF16_DEQUANT` is NOT a precondition.
+    ///
+    /// Returns `Ok(false)` on `rc == 2` (DECLINED) so the caller keeps the proven
+    /// SIMT launch, and an `Err` on any other non-zero rc.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_tilelang_gate_up_bs(
+        &self,
+        xq4: *const u8,
+        xsc4: *const f32,
+        out: *mut f32,
+        w1: *const c_void,
+        w3: *const c_void,
+        sfw1: *const c_void,
+        sfw3: *const c_void,
+        eid: *const c_int,
+        order: *const c_int,
+        counts: *const c_int,
+        nseg: i32,
+        rows: i32,
+        dim: i32,
+        inter: i32,
+        topk: i32,
+    ) -> Result<bool> {
+        let f = self.need(
+            self.kernels.moe_tilelang_gate_up_bs,
+            "dsv41_moe_tilelang_gate_up_bs",
+        )?;
+        let rc = unsafe {
+            f(
+                xq4, xsc4, out, w1, w3, sfw1, sfw3, eid, order, counts, nseg, rows, dim, inter, topk,
+                self.stream,
+            )
+        };
+        if rc == 2 {
+            return Ok(false);
+        }
+        self.kerr(rc, "dsv41_moe_tilelang_gate_up_bs")?;
+        Ok(true)
+    }
+
+    /// Load-time ue8m0 repack for the block-scaled arm (one expert's plane per call).
+    /// `src` is `[rows, k/32]` row-major u8, `dst` the `[words*rows]` u32 group-major
+    /// pool. A byte permutation of already-e8m0 data ⇒ bit-exact; `k % 128 == 0` and
+    /// 16-byte-aligned bases are required (rc 2 otherwise).
+    pub fn moe_bs_pack_wsf(
+        &self,
+        src: *const c_void,
+        dst: *mut c_void,
+        rows: i32,
+        k: i32,
+    ) -> Result<bool> {
+        let f = self.need(self.kernels.moe_bs_pack_wsf, "dsv41_moe_bs_pack_wsf")?;
+        let rc = unsafe { f(src, dst, rows, k, self.stream) };
+        if rc == 2 {
+            return Ok(false);
+        }
+        self.kerr(rc, "dsv41_moe_bs_pack_wsf")?;
+        Ok(true)
+    }
+
     /// True when the `.so` carries BOTH TileLang MoE grouped-GEMM arms. A stock
     /// `.so` (or a stale one from before the tilelang_gen MoE shim) has neither, so
     /// `DSV41_MOE_TILELANG` must stay OFF and be reported — otherwise an armed gate
@@ -7181,6 +7389,13 @@ impl Device {
     pub fn supports_moe_tilelang(&self) -> bool {
         self.kernels.moe_tilelang_gate_up_bf16.is_some()
             && self.kernels.moe_tilelang_down_bf16.is_some()
+    }
+
+    /// True when the `.so` carries the block-scaled (native fp4) MoE arm AND its
+    /// load-time SF repack. `DSV41_MOE_TILELANG_BS` must stay OFF (and be reported)
+    /// without both — the same build-vs-runtime split as every other arm here.
+    pub fn supports_moe_tilelang_bs(&self) -> bool {
+        self.kernels.moe_tilelang_gate_up_bs.is_some() && self.kernels.moe_bs_pack_wsf.is_some()
     }
 
     /// True when the `.so` carries the load-time fp4→bf16 dequant

@@ -490,6 +490,60 @@ pub fn sf_stride_pad() -> bool {
     *F.get_or_init(|| std::env::var("DSV41_SF_STRIDE_PAD").map(|v| v != "0").unwrap_or(true))
 }
 
+/// `DSV41_MOE_TILELANG_BS` — the **tcgen05 block-scaled (native fp4) MoE arm**,
+/// DEFAULT **OFF**, and **mutually exclusive** with `DSV41_MOE_TILELANG` (the bf16
+/// arm). Read once per process, like every other arm gate here.
+///
+/// Why it lives in `weights.rs` and not next to `moe_tilelang()` in
+/// `chain_dev.rs`: the LOADER needs the answer (`load.rs` decides whether to build
+/// the packed-SF pool, exactly as it does for `DSV41_MOE_BF16_DEQUANT`), and a
+/// load-time decision read from the runtime dispatch site is the shape that
+/// drifts. The dispatch site calls `weights::moe_tilelang_bs()` — one definition,
+/// both users.
+///
+/// Semantics of the pair (see docs/agent/tilelang-moe-bs-wiring.md §5.1):
+///   * BS off            -> unchanged (bf16 arm follows its own gate).
+///   * BS on, bf16 arm off -> the block-scaled arm serves the routed gate/up.
+///   * BTTH on            -> the block-scaled arm WINS and the bf16 arm is reported
+///                          as shadowed (one shot). They read different weight
+///                          pools with different lifetimes, so running both in one
+///                          process would double the expert memory for no gain.
+pub fn moe_tilelang_bs() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_MOE_TILELANG_BS").map(|v| v != "0").unwrap_or(false))
+}
+
+/// Bytes of the LOAD-TIME packed e8m0 pool for one expert's ONE weight plane
+/// (`k` = that plane's reduction size). `words = k / 128` because one uint32 holds
+/// four `gran=32` ue8m0 bytes (the MXFP4 word), and the pool is group-major:
+/// `word[g * rows + row]`.
+///
+/// `k % 128 != 0` returns 0 — the caller must then NOT arm the arm (a partial word
+/// would silently mis-index every following group). At the production up shape
+/// `k = dim = 5120` and `rows = padded_inter(inter/world) = 320` ⇒ 51200 B/plane,
+/// 2 planes × 384 experts × L layers.
+pub fn moe_bs_sf_words(k: usize) -> usize {
+    if k % 128 != 0 {
+        return 0;
+    }
+    k / 128
+}
+
+/// The ue8m0 byte->byte distance inside one row of an expert scale plane: logical
+/// `k/32`, PHYSICAL [`sf_plane_pitch`] when the SF-pitch fix applies to that plane.
+/// The routed gate/up planes (`w1.scale`/`w3.scale`, `Shard::ExpertRows`) are NOT
+/// re-pitched (their `dim/32 = 160` is already a 16 B multiple), so for the
+/// block-scaled arm's repack this is simply `k/32` — kept as a function so the one
+/// caller cannot drift from [`sf_pitch_plane`].
+pub fn moe_bs_sf_src_pitch(name: &str, shard: Shard, k: usize) -> usize {
+    let logical = k / 32;
+    if sf_pitch_plane(name, shard) {
+        sf_plane_pitch(logical)
+    } else {
+        logical
+    }
+}
+
 /// The PHYSICAL row stride, in bytes, of an expert e8m0 scale plane whose
 /// LOGICAL row is `logical_pitch` bytes wide (one byte per `k/32` scale column,
 /// so bytes == scale columns here).
