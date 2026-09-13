@@ -1093,15 +1093,24 @@ impl<'a> Loader<'a> {
                 );
             } else {
                 let plane = words * il * 4; // u32 words x rows
+                // FIX(pool-geometry): allocate as TWO CONTIGUOUS segments — all wsf1
+                // first, then all wsf3 — so that consecutive experts' wsf1 (and wsf3)
+                // are exactly `plane` bytes apart. The previous interleaved layout
+                // ([wsf1[e], wsf3[e], wsf1[e+1], ...]) put them 2*plane apart, which
+                // fails moe_bs_weights()'s contiguous-pool validation and the shim's
+                // `sfw1 + e*sf_words*NP` indexing contract.
                 let pool_bs = self.dev.alloc(plane * 2 * n_routed)?;
                 let base_bs = pool_bs.ptr as *mut u8;
+                let wsf1_seg = base_bs;
+                let wsf3_seg = base_bs.wrapping_add(n_routed * plane);
                 let mut ok = true;
                 for e in 0..n_routed {
-                    let eb = base_bs.wrapping_add(e * (plane * 2));
+                    let wsf1_dst = wsf1_seg.wrapping_add(e * plane);
+                    let wsf3_dst = wsf3_seg.wrapping_add(e * plane);
                     let i = e * 6;
                     for (sk, dst, tag) in [
-                        (i + 1, eb, "w1.scale"),
-                        (i + 3, eb.wrapping_add(plane), "w3.scale"),
+                        (i + 1, wsf1_dst, "w1.scale"),
+                        (i + 3, wsf3_dst, "w3.scale"),
                     ] {
                         // The routed gate/up scale planes are `Shard::ExpertRows`, which
                         // the SF-pitch fix does NOT re-pitch (only `w2.scale` is), so the
@@ -1123,12 +1132,12 @@ impl<'a> Loader<'a> {
                         ok &= ok_one;
                     }
                     wsf1_views[e] = Some(DevTensor {
-                        buf: Device::view(eb as *mut std::ffi::c_void, plane),
+                        buf: Device::view(wsf1_dst as *mut std::ffi::c_void, plane),
                         shape: vec![words * il],
                         dtype: "U32".into(),
                     });
                     wsf3_views[e] = Some(DevTensor {
-                        buf: Device::view(eb.wrapping_add(plane) as *mut std::ffi::c_void, plane),
+                        buf: Device::view(wsf3_dst as *mut std::ffi::c_void, plane),
                         shape: vec![words * il],
                         dtype: "U32".into(),
                     });
