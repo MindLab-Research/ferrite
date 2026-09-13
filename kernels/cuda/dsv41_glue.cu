@@ -1169,32 +1169,54 @@ extern "C" int dsv41_comp_placeholder(int32_t* idxs, const int* clen, int window
 // destination, so no cross-thread ordering is needed at all.
 // The rope math mirrors apply_rope_kernel exactly: the rotated region starts at
 // hd - rope_dim, pairs (2i, 2i+1), the tables indexed as cos[t*half + i].
+//
+// `clen_row_out` (F10, optional, trailing): the row's COUNTER SNAPSHOT slot. The
+// verify's multi-row arms need, per row, "the counter as it stood after THIS
+// row's commit" — the live `*clen` only ever holds the last row's value, so the
+// caller used to `memcpy_d2d` it into `clen_rows_r[owner][r]` once per row (6
+// D2D launches per layer, one graph node each). Writing it HERE costs nothing: the
+// store is on the same thread that bumps `*clen`, so it is ordered behind the
+// commit, and it is read back from the same location the caller's D2D read — the
+// values are IDENTICAL row for row, including on a row that completes no group
+// (then the counter is unchanged and the snapshot is that unchanged value, which
+// is why the early return below is an `if` now instead of a `return`).
+// `nullptr` = the kernel this has always been, bit for bit, and the entry it is
+// reached through is unchanged (`dsv41_compress_commit` never passes it).
 __global__ void compress_commit_kernel(const float* __restrict__ latent,
                                        const float* __restrict__ cos_t,
                                        const float* __restrict__ sin_t, float* __restrict__ ring,
                                        const int* __restrict__ out_rows, int* __restrict__ clen,
-                                       int hd, int rope_dim, int half, int window, int ratio) {
-    if (*out_rows <= 0) return;  // the device-side branch that replaces the download
-    const int len = *clen;
-    const int group_first = len * ratio;
-    const int i0 = hd - rope_dim;
-    const float* cs_row = cos_t + (size_t)group_first * half;
-    const float* sn_row = sin_t + (size_t)group_first * half;
-    float* dst = ring + (size_t)(window + len) * hd;
-    for (int c = threadIdx.x; c < hd; c += blockDim.x) {
-        float v = latent[c];
-        if (c >= i0) {
-            const int j = (c - i0) >> 1;
-            const int base = i0 + (j << 1);
-            const float x0 = latent[base];
-            const float x1 = latent[base + 1];
-            const float cv = cs_row[j];
-            const float sv = sn_row[j];
-            v = (c == base) ? (x0 * cv - x1 * sv) : (x0 * sv + x1 * cv);
+                                       int hd, int rope_dim, int half, int window, int ratio,
+                                       int* clen_row_out = nullptr) {
+    // The device-side branch that replaces the download. It no longer RETURNS:
+    // the snapshot store below must run on every row. Nothing about the commit
+    // moves — the same threads take the same branch, the loop body is verbatim,
+    // and there is no barrier in this kernel for the skipped threads to miss.
+    if (*out_rows > 0) {
+        const int len = *clen;
+        const int group_first = len * ratio;
+        const int i0 = hd - rope_dim;
+        const float* cs_row = cos_t + (size_t)group_first * half;
+        const float* sn_row = sin_t + (size_t)group_first * half;
+        float* dst = ring + (size_t)(window + len) * hd;
+        for (int c = threadIdx.x; c < hd; c += blockDim.x) {
+            float v = latent[c];
+            if (c >= i0) {
+                const int j = (c - i0) >> 1;
+                const int base = i0 + (j << 1);
+                const float x0 = latent[base];
+                const float x1 = latent[base + 1];
+                const float cv = cs_row[j];
+                const float sv = sn_row[j];
+                v = (c == base) ? (x0 * cv - x1 * sv) : (x0 * sv + x1 * cv);
+            }
+            dst[c] = v;
         }
-        dst[c] = v;
+        if (threadIdx.x == 0) *clen = len + 1;
     }
-    if (threadIdx.x == 0) *clen = len + 1;
+    // The row's snapshot, read back AFTER the (possible) bump by the thread that
+    // wrote it: `len + 1` on a committing row, the untouched counter otherwise.
+    if (clen_row_out != nullptr && threadIdx.x == 0) *clen_row_out = *clen;
 }
 
 extern "C" int dsv41_compress_commit(const float* latent, const float* cos_t, const float* sin_t,
@@ -1203,6 +1225,26 @@ extern "C" int dsv41_compress_commit(const float* latent, const float* cos_t, co
                                      cudaStream_t s) {
     compress_commit_kernel<<<1, 128, 0, s>>>(latent, cos_t, sin_t, ring, out_rows, clen, hd,
                                              rope_dim, half, window, ratio);
+    return (int)cudaGetLastError();
+}
+
+// F10's capability twin (`DSV41_F10_CLEN_BLOCK`): the SAME commit launch with the
+// per-row counter snapshot written in-kernel — see `compress_commit_kernel`'s
+// `clen_row_out`. It exists as its own symbol (rather than a trailing default on
+// the entry above) precisely so a stale `.so` is DETECTABLE: the ABI would accept
+// an extra argument and silently ignore it, leaving `clen_rows_r` holding the
+// previous step's counters, which the block-wide attention launch reads as this
+// step's bounds. Absent symbol ⇒ the caller keeps its per-row `memcpy_d2d` loop,
+// which is the bit-exact reference. `clen_row_out` may be null, and is then the
+// entry above, launch for launch.
+// ABI: (latent, cos, sin, ring, out_rows, clen, clen_row_out, hd, rope_dim, half,
+//       window, ratio, s).
+extern "C" __attribute__((visibility("default"))) int dsv41_compress_commit_rows(
+    const float* latent, const float* cos_t, const float* sin_t, float* ring,
+    const int* out_rows, int* clen, int* clen_row_out, int hd, int rope_dim, int half, int window,
+    int ratio, cudaStream_t s) {
+    compress_commit_kernel<<<1, 128, 0, s>>>(latent, cos_t, sin_t, ring, out_rows, clen, hd,
+                                             rope_dim, half, window, ratio, clen_row_out);
     return (int)cudaGetLastError();
 }
 

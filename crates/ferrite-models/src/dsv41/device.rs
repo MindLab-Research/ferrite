@@ -272,6 +272,30 @@ struct Kernels {
     quant_fp8: unsafe extern "C" fn(
         *const f32, *mut u8, *mut f32, c_int, c_int, c_int, c_int, CuStream,
     ) -> c_int,
+    // F7 (`dsv41_quant_fp8_stride`, from dsv41_kernels.cu): the STRIDED spelling of
+    // the quantiser above — the same `quant_kernel<0>`, with the SOURCE row pitch
+    // passed in instead of being derived from `cols`.
+    //
+    // WHY IT EXISTS. Every multi-row call site in the verify feeds a source whose
+    // rows are NOT `cols` apart (`o_r` is `nh*hd` per row while the rank's slice is
+    // `nlh*hd`; `wo_r` is `ol_total` while the contraction is `ol_local`), so the
+    // block call had to be spelled as a per-row LOOP of `m` single-row launches —
+    // the "verify-value-hunt" row-stride fix, which is correct but costs `m`
+    // launches per site per layer. With the pitch explicit, each loop collapses to
+    // ONE launch while every row keeps the bytes its own `rows = 1` launch wrote
+    // (`r` only picks base pointers; the row's block amax is its own reduction).
+    //
+    // `src_stride == 0` is the legacy "== cols" spelling, and the C entry rejects
+    // `0 < src_stride < cols` (overlapping rows) instead of reading row 0's tail.
+    //
+    // Optional: a stale .so without the symbol keeps the per-row loop verbatim,
+    // which is the bit-exact reference the fold is judged against.
+    // ABI: (x, y, scale, rows, cols, block, round_scale, src_stride, s).
+    quant_fp8_stride: Option<
+        unsafe extern "C" fn(
+            *const f32, *mut u8, *mut f32, c_int, c_int, c_int, c_int, c_int, CuStream,
+        ) -> c_int,
+    >,
     quant_fp4: unsafe extern "C" fn(
         *const f32, *mut u8, *mut f32, c_int, c_int, c_int, c_int, CuStream,
     ) -> c_int,
@@ -359,6 +383,37 @@ struct Kernels {
         *const f32, *const f32, *const f32, *const u8, *const i32, *mut i32,
         c_int, c_int, c_int, c_int, c_int, c_int, c_int, f32, f32, c_int, CuStream,
     ) -> c_int,
+    // F8 (`dsv41_indexer_topk_rows`, from dsv41_kernels.cu): the indexer SELECTION
+    // for a whole block in ONE launch — `b = 1, m = rows`, a PER-ROW `compress_lens`
+    // array and an explicit output row pitch.
+    //
+    // WHY IT EXISTS. The grid has always been `dim3(m, b)` and each row of it is an
+    // independent selection, so `m` per-row calls carry no information an `m`-row
+    // call lacks — but the old entry could not EXPRESS two things a `b*m > 1` call
+    // needs (and `chain_dev.rs`'s `indexer_rows_m` header spells out the same three
+    // blockers): the launch ceiling had to be the MAXIMUM of the per-row counts
+    // (the kernels took `*lens`, i.e. row 0's, and the verify's counts ascend with
+    // `r`, so rows 1..m-1 lost their newest groups), and the output row pitch had to
+    // be the caller's (`idxs_r`: `offset + index_topk`) rather than the kernel's
+    // `cols = min(topk, cl)`, a RUNTIME value. Both are now explicit and both are
+    // no-ops at `b*m == 1`, which is why `dsv41_indexer_topk` is untouched.
+    //
+    // The folded call site (`indexer_rows_one` at `m > 1`, hoisted to
+    // `indexer_select_rows`) is valid only where the per-row attention is NOT taken
+    // (nothing reads `idxs_r` inside the block loop) and every row's bound is a
+    // device snapshot (`clen_rows_r`) — see the Rust-side gate.
+    //
+    // Optional: a stale .so without the symbol keeps the per-row `b = m = 1` call,
+    // which is the bit-exact reference (each row's launch already carried its own
+    // `*lens`).
+    // ABI: (q, index_k, weights, candidates, compress_lens, out, b, m, nh, hd, n_pos,
+    //       topk, offset, out_stride, softmax_scale, head_scale, uses_candidates, s).
+    indexer_topk_rows: Option<
+        unsafe extern "C" fn(
+            *const f32, *const f32, *const f32, *const u8, *const i32, *mut i32,
+            c_int, c_int, c_int, c_int, c_int, c_int, c_int, c_int, f32, f32, c_int, CuStream,
+        ) -> c_int,
+    >,
     candidate_blocks: unsafe extern "C" fn(
         *const f32, *const i32, *mut u8, c_int, c_int, c_int, c_int, CuStream,
     ) -> c_int,
@@ -1165,6 +1220,45 @@ struct Kernels {
             CuStream,
         ) -> c_int,
     >,
+    // F10 (`dsv41_compress_commit_rows`, from dsv41_glue.cu): the commit launch
+    // with the row's COUNTER SNAPSHOT written in-kernel.
+    //
+    // WHY IT EXISTS. The verify's block-wide attention arms hand the m-row launch a
+    // per-row bound (`clen_rows_r[owner][r]` = the counter after row r's own
+    // commit) while the compressor ran PER ROW, so row r's copy has to be taken
+    // between the two. Reading the live counter is the only device-side source, and
+    // it is a SCALAR that advances: one `memcpy_d2d` per row (6 launches + 6 graph
+    // nodes per layer) is the minimum a caller-side copy can do, because a single
+    // D2D of `m * 4` bytes cannot carry `m` DISTINCT values. Taking the snapshot
+    // inside the commit instead costs nothing — it is one store on the thread that
+    // already bumped the counter — and the values are the same row for row,
+    // including rows that complete no group (the counter is simply unchanged).
+    //
+    // Optional: a stale .so without the symbol keeps the per-row `memcpy_d2d` loop,
+    // which is the bit-exact reference. The entry is a separate symbol (rather than a
+    // trailing default parameter on `dsv41_compress_commit`) precisely because a
+    // stale symbol would accept an extra argument, ignore it, and leave
+    // `clen_rows_r` holding the PREVIOUS step's counters — silently wrong bounds for
+    // a whole block.
+    // ABI: (latent, cos, sin, ring, out_rows, clen, clen_row_out, hd, rope_dim,
+    //       half, window, ratio, s).
+    compress_commit_rows: Option<
+        unsafe extern "C" fn(
+            *const f32,
+            *const f32,
+            *const f32,
+            *mut f32,
+            *const c_int,
+            *mut c_int,
+            *mut c_int,
+            c_int,
+            c_int,
+            c_int,
+            c_int,
+            c_int,
+            CuStream,
+        ) -> c_int,
+    >,
     engram_hash_step: Option<
         unsafe extern "C" fn(
             *const i64,
@@ -1429,6 +1523,36 @@ struct Kernels {
             *const c_int,
             *const c_int,
             c_int,
+            c_int,
+            c_int,
+            c_int,
+            c_int,
+            CuStream,
+        ) -> c_int,
+    >,
+    /// The block-scaled arm's DEVICE-TABLE twin
+    /// (`dsv41_moe_tilelang_gate_up_bs_dev`, `tilelang_gen/moe_bs_shim.cu`).
+    /// Same three launches (gather → block-scaled grouped MMA → scatter) and the
+    /// same TMA-descriptor construction as [`Self::moe_tilelang_gate_up_bs`], but
+    /// `eid`/`order`/`counts` are the DEVICE segment tables (`tl_eid`/`tl_order`/
+    /// `tl_counts` filled by [`Self::moe_align_from_group`]) and `nseg` is a
+    /// DEVICE **pointer** (`tl_nseg`, not a value). No H2D upload and no D2H read
+    /// ⇒ the whole sequence is legal inside a CUDA-graph capture, which is what
+    /// lets the native-fp4 arm enter the verify graph. The host-table entry is
+    /// kept as the A/B baseline. Same `rc` contract (2 = DECLINED).
+    moe_tilelang_gate_up_bs_dev: Option<
+        unsafe extern "C" fn(
+            *const u8,
+            *const f32,
+            *mut f32,
+            *const c_void,
+            *const c_void,
+            *const c_void,
+            *const c_void,
+            *const c_int,
+            *const c_int,
+            *const c_int,
+            *const c_int,
             c_int,
             c_int,
             c_int,
@@ -1994,6 +2118,7 @@ impl Device {
             gemm_fp8_sh_pair: ko!(rt, "dsv41_gemm_fp8_sh_pair"),
             gemm_fp8_sh_exp_fused: ko!(rt, "dsv41_gemm_fp8_sh_exp_fused"),
             quant_fp8: km!(rt, "dsv41_quant_fp8"),
+            quant_fp8_stride: ko!(rt, "dsv41_quant_fp8_stride"),
             quant_fp4: km!(rt, "dsv41_quant_fp4"),
             expert_gate_up_fp4: km!(rt, "dsv41_expert_gate_up_fp4"),
             expert_down_fp4: km!(rt, "dsv41_expert_down_fp4"),
@@ -2005,6 +2130,7 @@ impl Device {
             sparse_attn_rp: ko!(rt, "dsv41_sparse_attn_rp"),
             sparse_attn_orope_rp: ko!(rt, "dsv41_sparse_attn_orope_rp"),
             indexer_topk: km!(rt, "dsv41_indexer_topk"),
+            indexer_topk_rows: ko!(rt, "dsv41_indexer_topk_rows"),
             candidate_blocks: km!(rt, "dsv41_candidate_blocks"),
             compressor: km!(rt, "dsv41_compressor"),
             rope_precompute: km!(rt, "dsv41_rope_precompute"),
@@ -2059,6 +2185,7 @@ impl Device {
             window_idxs: ko!(rt, "dsv41_window_idxs"),
             comp_placeholder: ko!(rt, "dsv41_comp_placeholder"),
             compress_commit: ko!(rt, "dsv41_compress_commit"),
+            compress_commit_rows: ko!(rt, "dsv41_compress_commit_rows"),
             ring_append: ko!(rt, "dsv41_ring_append"),
             apply_rope_q: ko!(rt, "dsv41_apply_rope_q"),
             ring_win_fuse: ko!(rt, "dsv41_ring_win_fuse"),
@@ -2093,6 +2220,7 @@ impl Device {
             moe_align_from_group: ko!(rt, "dsv41_moe_align_from_group"),
             moe_fp4_to_bf16: ko!(rt, "dsv41_moe_fp4_to_bf16"),
             moe_tilelang_gate_up_bs: ko!(rt, "dsv41_moe_tilelang_gate_up_bs"),
+            moe_tilelang_gate_up_bs_dev: ko!(rt, "dsv41_moe_tilelang_gate_up_bs_dev"),
             moe_bs_pack_wsf: ko!(rt, "dsv41_moe_bs_pack_wsf"),
             w2_l2_prewarm: ko!(rt, "dsv41_w2_l2_prewarm"),
             swiglu_limit_batched: ko!(rt, "dsv41_swiglu_limit_batched"),
@@ -3373,6 +3501,56 @@ impl Device {
         self.kerr(rc, "dsv41_quant_fp8")
     }
 
+    /// F7 (`DSV41_F7_QUANT_STRIDE`): is the STRIDED quantiser in this `.so`?
+    ///
+    /// The folded call sites all keep the per-row loop when this is false — a
+    /// stale `.so` resolves the plain `dsv41_quant_fp8` but would silently ignore a
+    /// pitch passed to it, which is exactly the misread the arm removes.
+    pub fn supports_quant_fp8_stride(&self) -> bool {
+        self.kernels.quant_fp8_stride.is_some()
+    }
+
+    /// [`Self::quant_fp8`] with the SOURCE row pitch passed explicitly
+    /// (`src_stride == 0` ⇒ `== cols`, the legacy spelling).
+    ///
+    /// The DESTINATION is always compact at `cols` (that is the layout every
+    /// caller's `xq_r`/`xsc_r` staging promises), so the argument moves nothing but
+    /// the source reads: a `rows = m` call with `src_stride = S` writes exactly the
+    /// bytes `m` single-row calls at `x + r*S`, `y + r*cols`, `scale + r*(cols/32)`
+    /// wrote (the row index only picks base pointers, and the per-32-block amax is
+    /// the row's own reduction).
+    ///
+    /// Fails loudly on a `.so` without the symbol rather than quietly taking the
+    /// `cols` pitch: the caller's gate tests
+    /// [`Self::supports_quant_fp8_stride`] first.
+    pub fn quant_fp8_strided(
+        &self,
+        x: *const f32,
+        y: *mut u8,
+        scale: *mut f32,
+        rows: i32,
+        cols: i32,
+        block: i32,
+        round_scale: bool,
+        src_stride: i32,
+    ) -> Result<()> {
+        let f = self.need(self.kernels.quant_fp8_stride, "dsv41_quant_fp8_stride")?;
+        let rc = unsafe {
+            f(
+                x,
+                y,
+                scale,
+                rows,
+                cols,
+                block,
+                round_scale as i32,
+                src_stride,
+                self.stream,
+            )
+        };
+        self.kerr(rc, "dsv41_quant_fp8_stride")
+    }
+
     pub fn quant_fp4(
         &self,
         x: *const f32,
@@ -3776,7 +3954,71 @@ impl Device {
         self.kerr(rc, "dsv41_indexer_topk")
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// F8 (`DSV41_F8_TOPK_ROWS`): is the block-wide selection in this `.so`?
+    ///
+    /// The arm must test this — the folded call hands the entry a per-row `lens`
+    /// array and an explicit output pitch, and a stale `.so` would take neither.
+    pub fn supports_indexer_topk_rows(&self) -> bool {
+        self.kernels.indexer_topk_rows.is_some()
+    }
+
+    /// [`Self::indexer_topk`] for a WHOLE block: `b = 1, m = rows`, a per-row
+    /// `compress_lens` array, and `out_stride` as the output row pitch.
+    ///
+    /// Every row of the launch is the independent selection its own `m = 1` call
+    /// was: `lens[mm]` bounds row `mm`, the kernel's ceiling is the MAXIMUM of the
+    /// rows (so no row is clamped to row 0's count), and row `mm`'s `min(topk, cl)`
+    /// picks land at `out + mm * out_stride + i` — the address the per-row call
+    /// passed as its `out` base (see the C entry's header for why both had to
+    /// become explicit parameters).
+    ///
+    /// `uses_candidates` must be false (the mask's row pitch is the launch ceiling);
+    /// the C entry declines it rather than guessing.
+    pub fn indexer_topk_rows(
+        &self,
+        q: *const f32,
+        index_k: *const f32,
+        weights: *const f32,
+        candidates: *const u8,
+        compress_lens: *const i32,
+        out: *mut i32,
+        b: i32,
+        m: i32,
+        nh: i32,
+        hd: i32,
+        n_pos: i32,
+        topk: i32,
+        offset: i32,
+        out_stride: i32,
+        softmax_scale: f32,
+        head_scale: f32,
+        uses_candidates: bool,
+    ) -> Result<()> {
+        let f = self.need(self.kernels.indexer_topk_rows, "dsv41_indexer_topk_rows")?;
+        let rc = unsafe {
+            f(
+                q,
+                index_k,
+                weights,
+                candidates,
+                compress_lens,
+                out,
+                b,
+                m,
+                nh,
+                hd,
+                n_pos,
+                topk,
+                offset,
+                out_stride,
+                softmax_scale,
+                head_scale,
+                uses_candidates as i32,
+                self.stream,
+            )
+        };
+        self.kerr(rc, "dsv41_indexer_topk_rows")
+    }
     pub fn candidate_blocks(
         &self,
         logits: *const f32,
@@ -7052,6 +7294,61 @@ impl Device {
         self.kerr(rc, "dsv41_compress_commit")
     }
 
+    /// F10 (`DSV41_F10_CLEN_BLOCK`): is the in-kernel counter snapshot in this `.so`?
+    ///
+    /// The arm MUST test this: the twin is a separate symbol exactly because a stale
+    /// `dsv41_compress_commit` would accept (and ignore) the extra argument, leaving
+    /// `clen_rows_r` at the previous step's counters — a wrong per-row bound for the
+    /// whole block rather than a missing optimisation.
+    pub fn supports_compress_commit_rows(&self) -> bool {
+        self.kernels.compress_commit_rows.is_some()
+    }
+
+    /// [`Self::compress_commit_on`] with the row's counter snapshot written by the
+    /// kernel (`clen_row_out`; null ⇒ this is the entry above, launch for launch).
+    ///
+    /// The store is made by the thread that already bumps `*clen` and reads the same
+    /// location back, so it is ordered behind the commit and carries exactly the
+    /// value a `memcpy_d2d` issued after this launch would have copied — including on
+    /// a row that completes no group, where the counter is unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub fn compress_commit_rows_on(
+        &self,
+        latent: *const f32,
+        cos: *const f32,
+        sin: *const f32,
+        ring: *mut f32,
+        out_rows: *const c_int,
+        clen: *mut c_int,
+        clen_row_out: *mut c_int,
+        hd: i32,
+        rope_dim: i32,
+        half: i32,
+        window: i32,
+        ratio: i32,
+        s: CuStream,
+    ) -> Result<()> {
+        let f = self.need(self.kernels.compress_commit_rows, "dsv41_compress_commit_rows")?;
+        let rc = unsafe {
+            f(
+                latent,
+                cos,
+                sin,
+                ring,
+                out_rows,
+                clen,
+                clen_row_out,
+                hd,
+                rope_dim,
+                half,
+                window,
+                ratio,
+                s,
+            )
+        };
+        self.kerr(rc, "dsv41_compress_commit_rows")
+    }
+
     /// The recency placeholder for the compressed rows (the no-indexer safety
     /// net): idxs[win + j] = win + clen - take + j - replaces an upload.
     pub fn comp_placeholder(
@@ -7518,6 +7815,58 @@ impl Device {
         Ok(true)
     }
 
+    /// TILELANG MoE block-scaled arm — up (gate‖up), the **DEVICE-TABLE** twin
+    /// (`dsv41_moe_tilelang_gate_up_bs_dev`, same `DSV41_MOE_TILELANG_BS` gate).
+    ///
+    /// The twin of [`Self::moe_tilelang_gate_up_bs`] that can run INSIDE a
+    /// CUDA-graph capture: `eid`/`order`/`counts` are DEVICE buffers (the
+    /// `tl_eid`/`tl_order`/`tl_counts` scratch filled by
+    /// [`Self::moe_align_from_group`]) and `nseg` is a DEVICE pointer
+    /// (`tl_nseg`) instead of a value, so the shim performs no H2D upload and no
+    /// D2H read at all — the host `moe_align` round trip is what made the arm
+    /// eager-only. Everything else — the frozen shape gate, the TMA-descriptor
+    /// construction (W/SFW maps cached per expert-pool base), the `grid.y =
+    /// SEG_CAP` launches and the raw gate‖up output layout — is identical, which
+    /// is what makes the host-table entry a valid A/B baseline.
+    ///
+    /// `Ok(false)` on `rc == 2` (declined: shape/alignment, TMA init failure, or
+    /// INIT not done); `Err` on any other rc.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_tilelang_gate_up_bs_dev(
+        &self,
+        xq4: *const u8,
+        xsc4: *const f32,
+        out: *mut f32,
+        w1: *const c_void,
+        w3: *const c_void,
+        sfw1: *const c_void,
+        sfw3: *const c_void,
+        eid: *const c_int,
+        order: *const c_int,
+        counts: *const c_int,
+        nseg: *const c_int,
+        rows: i32,
+        dim: i32,
+        inter: i32,
+        topk: i32,
+    ) -> Result<bool> {
+        let f = self.need(
+            self.kernels.moe_tilelang_gate_up_bs_dev,
+            "dsv41_moe_tilelang_gate_up_bs_dev",
+        )?;
+        let rc = unsafe {
+            f(
+                xq4, xsc4, out, w1, w3, sfw1, sfw3, eid, order, counts, nseg, rows, dim, inter, topk,
+                self.stream,
+            )
+        };
+        if rc == 2 {
+            return Ok(false);
+        }
+        self.kerr(rc, "dsv41_moe_tilelang_gate_up_bs_dev")?;
+        Ok(true)
+    }
+
     /// Load-time ue8m0 repack for the block-scaled arm (one expert's plane per call).
     /// `src` is `[rows, k/32]` row-major u8, `dst` the `[words*rows]` u32 group-major
     /// pool. A byte permutation of already-e8m0 data ⇒ bit-exact; `k % 128 == 0` and
@@ -7566,6 +7915,19 @@ impl Device {
     /// without both — the same build-vs-runtime split as every other arm here.
     pub fn supports_moe_tilelang_bs(&self) -> bool {
         self.kernels.moe_tilelang_gate_up_bs.is_some() && self.kernels.moe_bs_pack_wsf.is_some()
+    }
+
+    /// True when the block-scaled arm's **device-table** set is present: the
+    /// device-side `moe_align` (`dsv41_moe_align_from_group`) **and** the
+    /// `*_dev` shim entry. Probed as a SET for the same reason as
+    /// [`Self::supports_moe_align_from_group`]: a `.so` carrying only part of it
+    /// would fall back to the host tables (or the SIMT launch) while the operator
+    /// believes the in-graph arm ran — the project's #1 measurement-bias trap.
+    /// `supports_moe_tilelang_bs` covers the host-shim / load-time-pack half and is
+    /// checked separately by the caller; both probes are required for the graph arm.
+    pub fn supports_moe_tilelang_bs_dev(&self) -> bool {
+        self.kernels.moe_align_from_group.is_some()
+            && self.kernels.moe_tilelang_gate_up_bs_dev.is_some()
     }
 
     /// True when the `.so` carries the load-time fp4→bf16 dequant

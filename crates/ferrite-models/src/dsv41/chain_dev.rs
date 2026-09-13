@@ -6456,6 +6456,90 @@ impl<'a> DevChain<'a> {
         })
     }
 
+    /// F7 (`DSV41_F7_QUANT_STRIDE`, DEFAULT OFF): the verify's two multi-row
+    /// quantisation LOOPS folded into one strided launch each.
+    ///
+    /// Both loops exist for one reason and no other: `quant_kernel` derived the
+    /// SOURCE row pitch from `cols`, while the source's real row pitch is larger
+    /// (`o_r` is `nh*hd` per row against a `nlh*hd` slice; `wo_r` is `ol_total`
+    /// against an `ol_local` contraction), so a `rows = m` call would have
+    /// quantised bytes from inside row 0's tail for every r >= 1 — the
+    /// verify-value-hunt row-stride defect. `dsv41_quant_fp8_stride` takes the pitch
+    /// explicitly, so each loop collapses to ONE launch with byte-identical rows
+    /// (`r` only picks base pointers, and each row's 32-element-block amax is its
+    /// own reduction — see the C entry's header).
+    ///
+    /// Default OFF: it is a new call shape on a hot path, so "=1" is the bring-up
+    /// arm and a `cargo test` + serve A/B is what flips it, like every other gate
+    /// here. The call sites ALSO require [`Device::supports_quant_fp8_stride`], so
+    /// a stale `.so` keeps the per-row loop verbatim rather than silently ignoring
+    /// the pitch (the ABI gained a trailing default parameter, which a stale symbol
+    /// would accept and disregard).
+    fn f7_quant_stride() -> bool {
+        static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *F.get_or_init(|| {
+            std::env::var("DSV41_F7_QUANT_STRIDE").map(|v| v == "1").unwrap_or(false)
+        })
+    }
+
+    /// F10 (`DSV41_F10_CLEN_BLOCK`, DEFAULT OFF): the per-row counter snapshots the
+    /// block-wide attention arms need are written by the COMMIT launch itself
+    /// (`dsv41_compress_commit_rows`), instead of one `memcpy_d2d` per row.
+    ///
+    /// The loop this replaces is `attention_rows`'s `attn_own_snapshot` arm: the
+    /// block-wide attn launch reads one bound per row (`clen_rows_r[owner][r]`, the
+    /// counter as it stood after row r's own commit), the compressor ran per row,
+    /// and the live counter is a SCALAR that advances between rows — so the caller
+    /// must issue `m` copies of 4 bytes, one graph node each, and NO single
+    /// `memcpy_d2d` can express them (a block copy of `m * 4` bytes needs m distinct
+    /// values at the source, and the source holds one). Passing the slot into the
+    /// commit costs nothing and leaves the same values row for row — see
+    /// [`Device::compress_commit_rows_on`].
+    ///
+    /// Default OFF: "=1" is the bring-up arm (a `cargo test` + serve A/B flips it),
+    /// like every other gate here. The call site ALSO requires
+    /// [`Device::supports_compress_commit_rows`]: the twin is a distinct symbol
+    /// because a stale `.so` would accept the extra argument, ignore it, and leave
+    /// `clen_rows_r` at the PREVIOUS step's counters — the block-wide attention
+    /// launch would then bound every row by a stale count, which is a wrong-results
+    /// failure and not a missing optimisation.
+    fn f10_clen_block() -> bool {
+        static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *F.get_or_init(|| {
+            std::env::var("DSV41_F10_CLEN_BLOCK").map(|v| v == "1").unwrap_or(false)
+        })
+    }
+
+    /// F8 (`DSV41_F8_TOPK_ROWS`, DEFAULT OFF): the verify block's indexer SELECTION
+    /// as ONE `b = 1, m = rows` launch instead of `m` per-row ones.
+    ///
+    /// The grid has always been `dim3(m, b)` and each row of it is an independent
+    /// selection, so nothing about the arithmetic changes — but `b*m > 1` needs two
+    /// things the old ABI could not express, both now explicit in
+    /// `dsv41_indexer_topk_rows`: the launch ceiling has to be the MAXIMUM of the
+    /// per-row counts (the kernels took row 0's, and the verify's counts ascend with
+    /// `r`, so rows 1..m-1 would silently lose their newest groups) and the output
+    /// row pitch has to be the caller's (`idxs_r`: `offset + index_topk`) instead of
+    /// the kernel's runtime `cols = min(topk, cl)`. `indexer_rows_m`'s header spells
+    /// out the same three blockers.
+    ///
+    /// The call site is valid ONLY where the per-row attention is not taken
+    /// (`mrows_attn || orope_mrows_ok`: nothing reads `idxs_r` inside the interleave,
+    /// so deferring the select to just after it is sound) and where every row's bound
+    /// is a DEVICE snapshot (`mrows_own_owner || attn_own_snapshot`, i.e.
+    /// `clen_rows_r` is filled). The per-row key publish stays in the loop — the fold
+    /// must not move it, or the later rows' keys would not exist when an earlier
+    /// row's bound selected over them.
+    ///
+    /// Default OFF: "=1" is the bring-up arm, like every other gate here. The symbol
+    /// check ([`Device::supports_indexer_topk_rows`]) is what keeps a stale `.so` on
+    /// the per-row path — the folded call passes a per-row `lens` array and an
+    /// explicit pitch that an old entry would not take.
+    fn f8_topk_rows() -> bool {
+        static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *F.get_or_init(|| std::env::var("DSV41_F8_TOPK_ROWS").map(|v| v == "1").unwrap_or(false))
+    }
+
     /// True when `DSV41_MROWS_MTILE` is armed (`!= 0`), i.e. `proj_mrows` would
     /// dispatch the MTILE program. Read from the SAME env the C entry reads, and
     /// used ONLY by [`Self::verify_wo_pair_mrows`]'s guard: WO_PAIR-ROWS is a
@@ -13634,9 +13718,30 @@ impl<'a> DevChain<'a> {
                 ist as i32,
             )?;
         }
+        // ---- F8 (`DSV41_F8_TOPK_ROWS`, DEFAULT OFF): the block's SELECTION ----
+        // One `b = 1, m = rows` launch after this loop instead of one per row. Two
+        // preconditions make the deferral sound, and both are structural rather than
+        // tuning terms:
+        //   * `mrows_attn || orope_mrows_ok` — the per-row attention is SKIPPED for
+        //     every row, so nothing inside the loop reads `idxs_r`'s compressed half.
+        //     Deferring the select past a consumer would be a read of an unwritten
+        //     slot, not a reordering.
+        //   * `mrows_own_owner || attn_own_snapshot` — every row's bound is a DEVICE
+        //     snapshot in `clen_rows_r` (the hoisted compressor's, or the per-row
+        //     commit's own store / copy). The folded call hands the kernel the
+        //     per-row array; without it there is nothing to bound rows 1..m-1 by.
+        // The per-row KEY PUBLISH is deliberately NOT folded: it stays in the loop,
+        // in order, so every row's group exists before any row's selection reads it
+        // (`indexer_rows_one` returns before its select when `select` is false).
+        // A stale `.so` (`supports_indexer_topk_rows` false) keeps `m = 1` calls.
+        let f8_select_rows = is_idx_src
+            && m > 1
+            && (mrows_attn || orope_mrows_ok)
+            && (mrows_own_owner || attn_own_snapshot)
+            && Self::f8_topk_rows()
+            && self.dev.supports_indexer_topk_rows();
+        // ---- 4) sparse attention: THIS row, or (W2-MROWS) the whole block ----
         for r in 0..m {
-            // ---- 1) ring append + THIS row's causal window ----
-            // (audit defect #2: the window half.) `window_idxs(r)` must run after
             // row r's append (its own KV is in the window) but BEFORE row r+1's
             // append (which would overwrite the oldest slot row r's window still
             // enumerates — reading the block's future row as history instead). The
@@ -13699,7 +13804,22 @@ impl<'a> DevChain<'a> {
                     // rule is the deterministic one the commit kernel applied.
                     (pos_base + r as i32 + 1) % (comp_ratio as i32) == 0
                 } else {
-                    let committed = self.compress_row(layer, r, pos_base)?;
+                    // F10 (`DSV41_F10_CLEN_BLOCK`, default OFF): when the snapshot is
+                    // needed, hand the slot to the commit launch instead of copying
+                    // the counter after it. `attn_own_snapshot` is exactly the
+                    // predicate that needs it (the block-wide attn/orope arm reading
+                    // `clen_rows_r`), and the gate + symbol check keep the default
+                    // path launch for launch what it always was.
+                    let f10_snap = Self::f10_clen_block()
+                        && self.dev.supports_compress_commit_rows()
+                        && attn_own_snapshot;
+                    let clen_row_out = if f10_snap {
+                        (self.s.clen_rows_r.ptr as *mut std::os::raw::c_int)
+                            .wrapping_add(owner * VERIFY_ROWS + r)
+                    } else {
+                        std::ptr::null_mut()
+                    };
+                    let committed = self.compress_row(layer, r, pos_base, clen_row_out)?;
                     // `attn_own_snapshot`: the per-row arm's device snapshot (see
                     // the `attn_clen` comment above). Taken AFTER row r's commit
                     // whatever that commit did — the counter is unchanged on a row
@@ -13710,7 +13830,15 @@ impl<'a> DevChain<'a> {
                     // block-wide attention launch, and it reads the DEVICE counter,
                     // so a captured graph replays with the current value instead of
                     // a frozen one.
-                    if attn_own_snapshot {
+                    //
+                    // F10: when the commit wrote the snapshot itself (`f10_snap`, and
+                    // the kernel reports success — a decline would have returned an
+                    // error, never a silent no-op) this D2D is the one it replaces.
+                    // The destination, the source VALUE and the stream ordering are
+                    // identical: the snapshot is stored by the thread that bumped the
+                    // counter, inside a launch that is already ordered behind row r's
+                    // pool and ahead of the block-wide attention launch.
+                    if attn_own_snapshot && !f10_snap {
                         self.dev.memcpy_d2d(
                             (self.s.clen_rows_r.ptr as *mut std::os::raw::c_int)
                                 .wrapping_add(owner * VERIFY_ROWS + r)
@@ -13761,7 +13889,20 @@ impl<'a> DevChain<'a> {
                 // order). Publishing per row instead of once per block is what
                 // keeps every group of the block addressable: the key of a group is
                 // written while `latent` still holds that group's pooled row.
-                self.indexer_rows_one(layer, r, win, comp_len, committed, idx_front, clen_row)?;
+                //
+                // F8: `select = false` on the folded arm — the publish (and the q/w
+                // halves) still run here, in order; only the top-k moves out of the
+                // loop, to the ONE block-wide `indexer_select_rows` call below.
+                self.indexer_rows_one(
+                    layer,
+                    r,
+                    win,
+                    comp_len,
+                    committed,
+                    idx_front,
+                    clen_row,
+                    !f8_select_rows,
+                )?;
             } else if !owns_kv && comp_len > 0 {
                 // a non-index consumer reads the owner's selection, which the owner
                 // (an index source, running earlier in the stack) already wrote into
@@ -13873,6 +14014,17 @@ impl<'a> DevChain<'a> {
                     orope_rows[r] = oroped;
                 }
             }
+        }
+
+        // ---- F8: the block's ONE selection launch (see `f8_select_rows`) ----
+        // Issued here, after EVERY row's commit and key publish and before either
+        // block-wide attention arm reads `idxs_r`: each row's bound is its own
+        // `clen_rows_r` snapshot, so row `mm`'s selection sees exactly the keys row
+        // `mm`'s own read point had (later rows publish strictly later slots). The
+        // output is the per-row calls', address for address — `out = idxs_r + win`,
+        // row pitch `ist`.
+        if f8_select_rows {
+            self.indexer_select_rows(layer, m, win, ist)?;
         }
 
         // ---- W2-MROWS: the block's ONE sparse-attention launch ----
@@ -14122,19 +14274,58 @@ impl<'a> DevChain<'a> {
             // with the same per-32-block arithmetic into the same offsets — so it
             // needs no second pass here. The gate's default fuses every row and
             // this loop is skipped entirely.
-            for r in 0..m {
-                if vo && orope_rows[r] {
-                    continue;
+            // F7 (`DSV41_F7_QUANT_STRIDE`, default OFF): `o_r`'s row pitch is
+            // `nh*hd` while the rank's slice (and therefore `cols`) is `nlh*hd`, so
+            // this loop is the OTHER spelling of the same defect the wo_b chain has
+            // (see the gate). With the pitch explicit the whole loop is ONE launch —
+            // `rows = m`, `src_stride = nh*hd` — byte-identical row for row to the
+            // per-row calls (compact destination at `nlh*hd`, unchanged).
+            //
+            // It is only taken when the loop's own skip decision is UNIFORM over the
+            // block: nothing was fused (`orope_rows` all false, the `vo` false and
+            // the "fused launch declined everywhere" cases) — then the loop is the
+            // whole block and one launch replaces it — or every row was fused, in
+            // which case the loop was a no-op and the fold must stay a no-op too. A
+            // MIXED block keeps the per-row loop: the fused rows already carry the
+            // rotated row's fp8 and re-quantising them from `o_r` is a redundant
+            // write, not a wrong one, but keeping the loop makes mixed blocks follow
+            // the path they always did.
+            let some_o_fused = vo && orope_rows[..m].iter().any(|&b| b);
+            let all_o_fused = vo && orope_rows[..m].iter().all(|&b| b);
+            let mut folded_o_quant = false;
+            if Self::f7_quant_stride()
+                && self.dev.supports_quant_fp8_stride()
+                && (all_o_fused || !some_o_fused)
+            {
+                if !all_o_fused {
+                    self.dev.quant_fp8_strided(
+                        self.s.o_r.ptr as *const f32,
+                        self.s.xq_r.ptr as *mut u8,
+                        self.s.xsc_r.ptr as *mut f32,
+                        m as i32,
+                        (nlh * hd) as i32,
+                        32,
+                        true,
+                        (nh * hd) as i32,
+                    )?;
                 }
-                self.dev.quant_fp8(
-                    (self.s.o_r.ptr as *const f32).wrapping_add(r * nh * hd),
-                    (self.s.xq_r.ptr as *mut u8).wrapping_add(r * nlh * hd),
-                    (self.s.xsc_r.ptr as *mut f32).wrapping_add(r * (nlh * hd / 32)),
-                    1,
-                    (nlh * hd) as i32,
-                    32,
-                    true,
-                )?;
+                folded_o_quant = true;
+            }
+            if !folded_o_quant {
+                for r in 0..m {
+                    if vo && orope_rows[r] {
+                        continue;
+                    }
+                    self.dev.quant_fp8(
+                        (self.s.o_r.ptr as *const f32).wrapping_add(r * nh * hd),
+                        (self.s.xq_r.ptr as *mut u8).wrapping_add(r * nlh * hd),
+                        (self.s.xsc_r.ptr as *mut f32).wrapping_add(r * (nlh * hd / 32)),
+                        1,
+                        (nlh * hd) as i32,
+                        32,
+                        true,
+                    )?;
+                }
             }
             // TILELANG (DSV41_GEMM_TILELANG, phase 2): the GROUPED wo_a arm. The
             // activation is the block-wide fp8 staged just above (`s.xq_r`/
@@ -14305,19 +14496,44 @@ impl<'a> DevChain<'a> {
             }
         }
         if !took_wob && mrows {
-            // `quant_rows` derives the SOURCE row stride from `cols`, but `wo_r`'s
+            // `quant_kernel` derives the SOURCE row stride from `cols`, but `wo_r`'s
             // real pitch is `ol_total` (8x `ol_local` under TP8) — a block call
             // quantised garbage from row 0's tail for every r>=1. Pack row by row.
-            for r in 0..m {
-                self.dev.quant_fp8(
-                    (self.s.wo_r.ptr as *const f32).wrapping_add(r * ol_total),
-                    (self.s.xq_r.ptr as *mut u8).wrapping_add(r * ol_local),
-                    (self.s.xsc_r.ptr as *mut f32).wrapping_add(r * (ol_local / 32)),
-                    1,
-                    ol_local as i32,
-                    32,
-                    true,
-                )?;
+            //
+            // F7 (`DSV41_F7_QUANT_STRIDE`, default OFF): with the pitch explicit the
+            // whole loop is ONE `dsv41_quant_fp8_stride` launch — `rows = m`,
+            // `src_stride = ol_total` — writing byte for byte what the m single-row
+            // launches wrote (the destination stays compact at `ol_local`/`ol_local/32`
+            // per row, which is the layout `proj_mrows` below reads). A stale `.so`
+            // (no `dsv41_quant_fp8_stride`) keeps the loop verbatim.
+            let folded_quant =
+                if Self::f7_quant_stride() && self.dev.supports_quant_fp8_stride() {
+                    self.dev.quant_fp8_strided(
+                        self.s.wo_r.ptr as *const f32,
+                        self.s.xq_r.ptr as *mut u8,
+                        self.s.xsc_r.ptr as *mut f32,
+                        m as i32,
+                        ol_local as i32,
+                        32,
+                        true,
+                        ol_total as i32,
+                    )?;
+                    true
+                } else {
+                    false
+                };
+            if !folded_quant {
+                for r in 0..m {
+                    self.dev.quant_fp8(
+                        (self.s.wo_r.ptr as *const f32).wrapping_add(r * ol_total),
+                        (self.s.xq_r.ptr as *mut u8).wrapping_add(r * ol_local),
+                        (self.s.xsc_r.ptr as *mut f32).wrapping_add(r * (ol_local / 32)),
+                        1,
+                        ol_local as i32,
+                        32,
+                        true,
+                    )?;
+                }
             }
             took_wob = self.proj_mrows(
                 ld.wo_b.as_ref().unwrap().as_u8(),
@@ -14706,6 +14922,15 @@ impl<'a> DevChain<'a> {
     /// owner's per-row counter snapshot (`clen_rows_r[owner][r]`), which is the
     /// value the live `*clen` carried at this row's own read point. `None` keeps
     /// the live counter pointer, i.e. the default path verbatim.
+    ///
+    /// `select` (F8, `DSV41_F8_TOPK_ROWS`): `false` skips the per-row SELECTION —
+    /// the key publish and the q/w halves above are unaffected — because
+    /// [`Self::indexer_select_rows`] issues the block's selection in ONE `m`-row
+    /// launch after the interleave. The caller only passes `false` where nothing
+    /// reads `idxs_r` inside the loop (the block-wide attention arms), so the
+    /// publish order — the reason this call is inside the loop at all — is what
+    /// still holds: the folded select runs after EVERY row's publish, and each row's
+    /// bound (`clen_rows_r[owner][r]`) keeps it from seeing the later rows' keys.
     fn indexer_rows_one(
         &mut self,
         layer: usize,
@@ -14715,6 +14940,7 @@ impl<'a> DevChain<'a> {
         publish_key: bool,
         front: (bool, bool),
         mrows_clen: Option<*const std::os::raw::c_int>,
+        select: bool,
     ) -> Result<bool> {
         let cfg = self.cfg;
         let dim = cfg.dim;
@@ -14858,6 +15084,14 @@ impl<'a> DevChain<'a> {
         }
         let scale = 1.0f32 / (idx_hd as f32).sqrt() / (idx_nh as f32).sqrt();
         let key_owner = self.kv_owner(layer);
+        let idx_k_ptr = self.layers[key_owner].index_k.ptr as *const f32;
+        // F8: the selection of the whole block is issued ONCE, after the interleave
+        // (`indexer_select_rows`) — everything above (the key publish, the raw `idx_k`,
+        // the q/w halves) is per row and still runs here. The publish is what forces
+        // this call site's position, and it is untouched by the fold.
+        if !select {
+            return Ok(true);
+        }
         // COMPRESSOR-MROWS: the owner's hoisted block left its LIVE counter at the
         // block-final value, so the selection reads the owner's per-row snapshot
         // instead — the count this row's own read point had.
@@ -14865,7 +15099,6 @@ impl<'a> DevChain<'a> {
             Some(p) => p,
             None => (self.s.clen.ptr as *const std::os::raw::c_int).wrapping_add(key_owner),
         };
-        let idx_k_ptr = self.layers[key_owner].index_k.ptr as *const f32;
         self.dev.indexer_topk(
             (self.s.idx_q_r.ptr as *const f32).wrapping_add(r * idx_nh * idx_hd),
             idx_k_ptr,
@@ -14887,7 +15120,79 @@ impl<'a> DevChain<'a> {
         Ok(true)
     }
 
-    /// The PROJECTION half of the multi-row compressor: this layer's per-row
+    /// F8 (`DSV41_F8_TOPK_ROWS`): the block's indexer SELECTION as ONE
+    /// `b = 1, m = rows` launch — the twin of the `m` per-row
+    /// [`Self::indexer_rows_one`] selections, issued after the interleave.
+    ///
+    /// WHY AFTER THE INTERLEAVE, AND WHY THAT IS SOUND. The per-row call sits inside
+    /// the loop because its key PUBLISH must run before its own selection; the
+    /// selection itself is a pure function of `idx_q_r[mm]` (written by the
+    /// block-wide front), `idx_w_r[mm]`, `index_k[0..cl_mm)` and `idx_lens[mm]`, and
+    /// none of those move after row `mm` has published: later rows' publishes write
+    /// slots `>= cl_mm` (`publish_index_key_rows` names `*clen - 1`, and `clen`
+    /// ascends). So deferring the selection to just after the loop sees exactly the
+    /// state row `mm` saw, PROVIDED each row is given its own bound — which is what
+    /// `clen_rows_r[key_owner]` carries, and why the caller requires
+    /// `mrows_own_owner || attn_own_snapshot`.
+    ///
+    /// The output is the per-row call's, address for address: row `mm`'s
+    /// `min(topk, cl_mm)` picks land at `idxs_r + offset + mm*ist`, `ist` being the
+    /// `idxs_r` block pitch (`offset + index_topk`) the per-row calls spelled as
+    /// `r * (offset + index_topk) + offset`.
+    ///
+    /// `m > 1` only (a single row is the per-row call, launch for launch), and the
+    /// C entry declines a `uses_candidates` call.
+    fn indexer_select_rows(
+        &mut self,
+        layer: usize,
+        m: usize,
+        offset: usize,
+        ist: usize,
+    ) -> Result<bool> {
+        let cfg = self.cfg;
+        let idx_nh = cfg.index_n_heads.max(1);
+        let idx_hd = cfg.index_head_dim.max(1);
+        let ld = &self.w.layers[layer];
+        let (Some(_), Some(_), Some(_), Some(_), Some(_)) = (
+            ld.idx_wq_b.as_ref(),
+            ld.idx_wq_b_scale.as_ref(),
+            ld.idx_wk.as_ref(),
+            ld.idx_k_norm.as_ref(),
+            ld.idx_weights.as_ref(),
+        ) else {
+            return Ok(false);
+        };
+        let key_owner = self.kv_owner(layer);
+        let idx_k_ptr = self.layers[key_owner].index_k.ptr as *const f32;
+        let scale = 1.0f32 / (idx_hd as f32).sqrt() / (idx_nh as f32).sqrt();
+        // The per-row bounds — the owner's device snapshots, the same array
+        // `indexer_rows_one` was handed as `mrows_clen`. The kernel takes the MAXIMUM
+        // of them as its ceiling (row 0's count would clamp the later rows), so the
+        // host value below is only the defensive bound for an array that reads 0.
+        let lens = (self.s.clen_rows_r.ptr as *const std::os::raw::c_int)
+            .wrapping_add(key_owner * VERIFY_ROWS);
+        let n_pos = self.layers[layer].compress_len as i32;
+        self.dev.indexer_topk_rows(
+            self.s.idx_q_r.ptr as *const f32,
+            idx_k_ptr,
+            self.s.idx_w_r.ptr as *const f32,
+            std::ptr::null(),
+            lens,
+            (self.s.idxs_r.ptr as *mut i32).wrapping_add(offset),
+            1,
+            m as i32,
+            idx_nh as i32,
+            idx_hd as i32,
+            n_pos,
+            cfg.index_topk as i32,
+            offset as i32,
+            ist as i32,
+            scale,
+            1.0,
+            false,
+        )?;
+        Ok(true)
+    }
     /// `comp_wkv` (`/` `comp_wgate`) projections, the ratio-1 `scp` zeroing and the
     /// DSV41_SPEC scratch snapshot, all m rows in one go.
     ///
@@ -15032,7 +15337,18 @@ impl<'a> DevChain<'a> {
     /// rejects `b != 1 || seqlen != 1` outright, and the pool+commit pair below is
     /// the path the fused launch is bit-identical to (a parity target, not a
     /// different program).
-    fn compress_row(&mut self, layer: usize, r: usize, pos_base: i32) -> Result<bool> {
+    /// `clen_row_out` (F10, `DSV41_F10_CLEN_BLOCK`): the destination slot for this
+    /// row's counter snapshot, or null. When non-null the commit launch writes the
+    /// snapshot itself (`dsv41_compress_commit_rows`), which is what removes the
+    /// caller's per-row `memcpy_d2d` — see [`Device::compress_commit_rows_on`] for
+    /// why a caller-side block copy cannot express these values.
+    fn compress_row(
+        &mut self,
+        layer: usize,
+        r: usize,
+        pos_base: i32,
+        clen_row_out: *mut std::os::raw::c_int,
+    ) -> Result<bool> {
         let cfg = self.cfg;
         let hd = cfg.head_dim;
         let ratio = cfg.compress_ratio(layer).max(1);
@@ -15059,20 +15375,45 @@ impl<'a> DevChain<'a> {
             cfg.norm_eps,
             st,
         )?;
-        self.dev.compress_commit_on(
-            self.layers[layer].latent.as_f32(),
-            self.cos_comp.as_f32(),
-            self.sin_comp.as_f32(),
-            self.layers[layer].ring.ptr as *mut f32,
-            self.layers[layer].out_rows.ptr as *const std::os::raw::c_int,
-            (self.s.clen.ptr as *mut std::os::raw::c_int).wrapping_add(layer),
-            hd as i32,
-            cfg.rope_head_dim as i32,
-            (cfg.rope_head_dim / 2) as i32,
-            cfg.window_size as i32,
-            ratio_i,
-            st,
-        )?;
+        // F10: when the caller handed a snapshot slot, the commit's own launch fills
+        // it (`dsv41_compress_commit_rows`). The store is made by the thread that
+        // bumps the counter and reads the same location back, so the value is the one
+        // a `memcpy_d2d` issued right here would have copied — but it costs no launch
+        // and no graph node. A null slot is the entry this always used, launch for
+        // launch, and the caller's gate already required the symbol
+        // ([`Device::supports_compress_commit_rows`]).
+        if !clen_row_out.is_null() {
+            self.dev.compress_commit_rows_on(
+                self.layers[layer].latent.as_f32(),
+                self.cos_comp.as_f32(),
+                self.sin_comp.as_f32(),
+                self.layers[layer].ring.ptr as *mut f32,
+                self.layers[layer].out_rows.ptr as *const std::os::raw::c_int,
+                (self.s.clen.ptr as *mut std::os::raw::c_int).wrapping_add(layer),
+                clen_row_out,
+                hd as i32,
+                cfg.rope_head_dim as i32,
+                (cfg.rope_head_dim / 2) as i32,
+                cfg.window_size as i32,
+                ratio_i,
+                st,
+            )?;
+        } else {
+            self.dev.compress_commit_on(
+                self.layers[layer].latent.as_f32(),
+                self.cos_comp.as_f32(),
+                self.sin_comp.as_f32(),
+                self.layers[layer].ring.ptr as *mut f32,
+                self.layers[layer].out_rows.ptr as *const std::os::raw::c_int,
+                (self.s.clen.ptr as *mut std::os::raw::c_int).wrapping_add(layer),
+                hd as i32,
+                cfg.rope_head_dim as i32,
+                (cfg.rope_head_dim / 2) as i32,
+                cfg.window_size as i32,
+                ratio_i,
+                st,
+            )?;
+        }
         // The host MIRROR of the device counter, by the SAME deterministic rule the
         // commit kernel applies ((*pos + 1) % ratio == 0 commits one latent). The
         // two agree by construction, without the download that used to be here.
@@ -16003,14 +16344,14 @@ impl<'a> DevChain<'a> {
     ///   * the activation must be PACKED fp4: the shim's gather reads `xq4`/`xsc4`
     ///     as e2m1 nibbles + per-32 f32 scales, so an `DSV41_EXPERT_ACT_E4M3`
     ///     activation (one byte per value) would be decoded as fp4 — again silent;
-    ///   * `!capturing()`: the arm's shim entry
-    ///     (`dsv41_moe_tilelang_gate_up_bs`) takes the three segment tables as
-    ///     **HOST arrays** and uploads them itself
-    ///     (`cudaMemcpyAsync(..., cudaMemcpyHostToDevice, s)`), so they cost the host
-    ///     `moe_align`'s D2H read of `route_idx_r` — an illegal capture op. The
-    ///     device-table twin the bf16 arm has
-    ///     (`dsv41_moe_tilelang_gate_up_bf16_dev`) does NOT exist for this arm yet,
-    ///     so an armed gate declines inside a graph rather than failing the step.
+    ///   * the **device-table set** must be present
+    ///     ([`Dev::supports_moe_tilelang_bs_dev`]: the device-side `moe_align` plus
+    ///     `dsv41_moe_tilelang_gate_up_bs_dev`). The arm consumes the device tables
+    ///     ([`Self::moe_tilelang_tables_dev`]) and the device shim entry, so there is
+    ///     NO D2H read and NO H2D upload — which is exactly what lets it run inside a
+    ///     CUDA-graph capture. The host-table entry
+    ///     (`dsv41_moe_tilelang_gate_up_bs`) survives as the A/B baseline; a `.so`
+    ///     without the device set declines instead of silently measuring the old path.
     ///
     /// `m`/`topk` bounds are the generated kernel's frozen `SEG_CAP = rows*topk`
     /// geometry; `dim`/`inter_local` are its baked K/N.
@@ -16024,8 +16365,8 @@ impl<'a> DevChain<'a> {
         n_routed: usize,
     ) -> bool {
         crate::dsv41::weights::moe_tilelang_bs()
-            && !self.dev.capturing()
             && self.dev.supports_moe_tilelang_bs()
+            && self.dev.supports_moe_tilelang_bs_dev()
             && !ld.experts_ilv
             && !(expert_act_e4m3() && self.dev.supports_expert_act_e4m3())
             && n_routed == 384
@@ -16486,36 +16827,37 @@ impl<'a> DevChain<'a> {
             let mut bs_gu = false;
             if crate::dsv41::weights::moe_tilelang_bs() && !bs_ready {
                 Self::moe_bs_skipped_note(
-                    "the step is outside the arm's domain (a CUDA-graph capture, an INTERLEAVED \
-                     pool, an e4m3 activation, a frozen-shape mismatch, or the .so lacks the \
-                     blockscaled shim / its load-time SF pack)",
+                    "the step is outside the arm's domain (an INTERLEAVED pool, an e4m3 \
+                     activation, a frozen-shape mismatch, or the .so lacks the blockscaled shim / \
+                     its load-time SF pack / the device-table set)",
                     true,
                 );
             } else if bs_ready && !grp_gu {
-                // The shim takes the segment tables as HOST arrays and uploads them
-                // itself, so this is the host `moe_align` the bf16 arm keeps alive
-                // only as its `DSV41_MOE_TL_HOST_ALIGN` diagnostic — that round trip
-                // is exactly why `moe_tilelang_bs_ready` carries `!capturing()`.
-                let bs_tbl = self.moe_tilelang_tables_host(m, topk)?;
+                // The tables come from the DEVICE (`dsv41_route_group` +
+                // `dsv41_moe_align_from_group`), so this works inside a capture:
+                // no D2H read, no H2D upload. See `moe_tilelang_tables_dev`.
+                let bs_tbl = self.moe_tilelang_tables_dev(m, topk, n_routed)?;
                 let bs_w = Self::moe_bs_weights(ld, dim, inter_local);
-                if let (Some((order, counts, eid, nseg)), Some(w)) = (bs_tbl.as_ref(), bs_w) {
-                    bs_gu = self.dev.moe_tilelang_gate_up_bs(
-                        self.s.xq4_r.as_u8(),
-                        self.s.xsc4_r.as_f32(),
-                        self.s.ex_act_r.ptr as *mut f32,
-                        w.0,
-                        w.1,
-                        w.2,
-                        w.3,
-                        eid.as_ptr(),
-                        order.as_ptr(),
-                        counts.as_ptr(),
-                        *nseg as i32,
-                        m as i32,
-                        dim as i32,
-                        inter_local as i32,
-                        topk as i32,
-                    )?;
+                if bs_tbl {
+                    if let Some(w) = bs_w {
+                        bs_gu = self.dev.moe_tilelang_gate_up_bs_dev(
+                            self.s.xq4_r.as_u8(),
+                            self.s.xsc4_r.as_f32(),
+                            self.s.ex_act_r.ptr as *mut f32,
+                            w.0,
+                            w.1,
+                            w.2,
+                            w.3,
+                            self.s.tl_eid.ptr as *const i32,
+                            self.s.tl_order.ptr as *const i32,
+                            self.s.tl_counts.ptr as *const i32,
+                            self.s.tl_nseg.ptr as *const i32,
+                            m as i32,
+                            dim as i32,
+                            inter_local as i32,
+                            topk as i32,
+                        )?;
+                    }
                 }
                 if bs_w.is_none() {
                     Self::moe_bs_skipped_note(
@@ -16524,10 +16866,10 @@ impl<'a> DevChain<'a> {
                          the .so)",
                         true,
                     );
-                } else if bs_tbl.is_none() {
+                } else if !bs_tbl {
                     Self::moe_bs_skipped_note(
                         "the routing table could not be expressed as <= 36 expert segments of \
-                         <= 16 rows",
+                         <= 16 rows, or the .so lacks the device moe_align / `*_bs_dev` shim entry",
                         false,
                     );
                 } else if !bs_gu {
@@ -20145,9 +20487,9 @@ fn oracle_tap() -> bool {
                 let down_slot = dim as i64;
                 // ---- TILELANG BLOCK-SCALED (DSV41_MOE_TILELANG_BS), eager side -----
                 // The `rows == 1` twin of the arm in `moe_rows`: the SAME gate, the
-                // SAME host tables (`moe_align` over `route_idx[topk]`, one row) and
-                // the SAME shim. It reads the single row's packed fp4 activation
-                // (`xq4`/`xsc4`) and the experts' native fp4 planes plus their
+                // SAME device tables (`dsv41_route_group` + `dsv41_moe_align_from_group`)
+                // and the SAME `_dev` shim. It reads the single row's packed fp4
+                // activation (`xq4`/`xsc4`) and the experts' native fp4 planes plus their
                 // load-time packed ue8m0 words, and writes the RAW gate‖up layout into
                 // `ex_act_b` — exactly the `rows == 1` instance of the multi-row
                 // layout, so the two call sites are bit-for-bit the same computation.
@@ -20157,34 +20499,37 @@ fn oracle_tap() -> bool {
                 let mut bs_gu = false;
                 if crate::dsv41::weights::moe_tilelang_bs() && !bs_ready {
                     Self::moe_bs_skipped_note(
-                        "the step is outside the arm's domain (a CUDA-graph capture, an \
-                         INTERLEAVED pool, an e4m3 activation, a frozen-shape mismatch, or the \
-                         .so lacks the blockscaled shim / its load-time SF pack)",
+                        "the step is outside the arm's domain (an INTERLEAVED pool, an e4m3 \
+                         activation, a frozen-shape mismatch, or the .so lacks the blockscaled \
+                         shim / its load-time SF pack / the device-table set)",
                         true,
                     );
                 } else if bs_ready {
-                    // HOST tables: the shim uploads them itself (see the verify-side
-                    // block and `moe_tilelang_bs_ready`'s `!capturing()` term).
-                    let bs_tbl = self.moe_tilelang_tables_host(1, topk)?;
+                    // The tables come from the DEVICE (`dsv41_route_group` +
+                    // `dsv41_moe_align_from_group`), so this works inside a capture
+                    // too: no D2H read, no H2D upload. See `moe_tilelang_tables_dev`.
+                    let bs_tbl = self.moe_tilelang_tables_dev(1, topk, ne)?;
                     let bs_w = Self::moe_bs_weights(ld, dim, inter_local);
-                    if let (Some((order, counts, eid, nseg)), Some(w)) = (bs_tbl.as_ref(), bs_w) {
-                        bs_gu = self.dev.moe_tilelang_gate_up_bs(
-                            self.s.xq4.as_u8(),
-                            self.s.xsc4.as_f32(),
-                            self.s.ex_act_b.ptr as *mut f32,
-                            w.0,
-                            w.1,
-                            w.2,
-                            w.3,
-                            eid.as_ptr(),
-                            order.as_ptr(),
-                            counts.as_ptr(),
-                            *nseg as i32,
-                            1,
-                            dim as i32,
-                            inter_local as i32,
-                            topk as i32,
-                        )?;
+                    if bs_tbl {
+                        if let Some(w) = bs_w {
+                            bs_gu = self.dev.moe_tilelang_gate_up_bs_dev(
+                                self.s.xq4.as_u8(),
+                                self.s.xsc4.as_f32(),
+                                self.s.ex_act_b.ptr as *mut f32,
+                                w.0,
+                                w.1,
+                                w.2,
+                                w.3,
+                                self.s.tl_eid.ptr as *const i32,
+                                self.s.tl_order.ptr as *const i32,
+                                self.s.tl_counts.ptr as *const i32,
+                                self.s.tl_nseg.ptr as *const i32,
+                                1,
+                                dim as i32,
+                                inter_local as i32,
+                                topk as i32,
+                            )?;
+                        }
                     }
                     if bs_w.is_none() {
                         Self::moe_bs_skipped_note(
@@ -20193,10 +20538,11 @@ fn oracle_tap() -> bool {
                              and rebuild the .so)",
                             true,
                         );
-                    } else if bs_tbl.is_none() {
+                    } else if !bs_tbl {
                         Self::moe_bs_skipped_note(
                             "the routing table could not be expressed as <= 36 expert segments \
-                             of <= 16 rows",
+                             of <= 16 rows, or the .so lacks the device moe_align / `*_bs_dev` \
+                             shim entry",
                             false,
                         );
                     } else if !bs_gu {

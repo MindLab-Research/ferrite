@@ -122,15 +122,26 @@ __device__ __forceinline__ float fast_round_scale(float amax, float max_inv) {
 
 // Block-wise activation quantisation. block = 128 (window KV) or 32/16
 // (compressed KV / indexer). `round_scale` picks the power-of-two scale.
+//
+// `src_stride` (F7, elements) is the SOURCE row pitch. `0` means "== `cols`",
+// which is the historical spelling and the only shape this ABI could express
+// before the parameter existed: the verify's `wo_r` is `[m, ol_total]` while the
+// quantiser's contraction is only `ol_local` wide, so deriving the pitch from
+// `cols` read row 0's unwritten tail for every r >= 1 (the same root cause as the
+// `o_r` row-stride fix below). ONLY the source addressing moves — the
+// destination pitch is always `cols` (every call site's destination is compact),
+// and the per-block arithmetic (`amax`, the scale, the byte) is untouched, so for
+// `src_stride == cols` this is the old kernel bit for bit.
 template <int FP4>
 __global__ void quant_kernel(const float* __restrict__ x, uint8_t* __restrict__ y,
                              float* __restrict__ scale, int rows, int cols, int block,
-                             int round_scale) {
+                             int round_scale, int src_stride) {
     const int nb = cols / block;
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;  // one thread per block
     if (idx >= rows * nb) return;
     const int r = idx / nb, b = idx % nb;
-    const float* src = x + (size_t)r * cols + (size_t)b * block;
+    const int ss = (src_stride > 0) ? src_stride : cols;
+    const float* src = x + (size_t)r * ss + (size_t)b * block;
     // amax over the block (the reference uses a whole block per group)
     float amax = 0.f;
     for (int i = threadIdx.y; i < block; i += blockDim.y) amax = fmaxf(amax, fabsf(src[i]));
@@ -2874,7 +2885,21 @@ __global__ void indexer_score_kernel(const float* __restrict__ q, const float* _
                                      int uses_cand) {
     // `n_pos` is the host fallback; the live device counter wins (same rule as the
     // fused kernel), and the declared bound is a defensive ceiling.
-    if (lens != nullptr && *lens > 0) n_pos = *lens;
+    //
+    // F8 (`dsv41_indexer_topk_rows`): `lens` is a PER-ROW array on the folded call
+    // (one entry per row of this launch), so the ceiling is the MAXIMUM over the
+    // rows — `*lens` is row 0's count, and the counts ASCEND with `r` (a row that
+    // commits a group advances the counter), so row 0's value would clamp every
+    // later row to it and silently drop the groups it just committed. At `m == 1`
+    // this is `*lens`, so the single-row callers are unchanged, bit for bit.
+    if (lens != nullptr) {
+        int mx = 0;
+        for (int i = 0; i < m; ++i) {
+            const int v = lens[i];
+            if (v > mx) mx = v;
+        }
+        if (mx > 0) n_pos = mx;
+    }
     if (n_pos > kIdxMaxPos) n_pos = kIdxMaxPos;
     const int mm = blockIdx.y, bb = blockIdx.z;
     const size_t row = (size_t)bb * m + mm;
@@ -2965,8 +2990,18 @@ __global__ void indexer_score_kernel_v2(const float* __restrict__ q, const float
                                         int n_pos, float softmax_scale, float head_scale,
                                         int uses_cand) {
     // Same live-counter rule as v1 (and the fused kernel): the device counter
-    // wins over the host fallback, the declared bound is a defensive ceiling.
-    if (lens != nullptr && *lens > 0) n_pos = *lens;
+    // wins over the host fallback, the declared bound is a defensive ceiling —
+    // and, on the folded call, the counter is a PER-ROW array whose ceiling is the
+    // MAXIMUM over the rows (see `indexer_score_kernel`'s F8 note; `m == 1` is
+    // `*lens` exactly).
+    if (lens != nullptr) {
+        int mx = 0;
+        for (int i = 0; i < m; ++i) {
+            const int v = lens[i];
+            if (v > mx) mx = v;
+        }
+        if (mx > 0) n_pos = mx;
+    }
     if (n_pos > kIdxMaxPos) n_pos = kIdxMaxPos;
     const int mm = blockIdx.y, bb = blockIdx.z;
     const size_t row = (size_t)bb * m + mm;
@@ -3082,7 +3117,20 @@ __global__ void indexer_topk_kernel(const float* __restrict__ q, const float* __
     // defensive ceiling, never a floor.
     // The ceiling is safe for ANY bound only because the shared memory below is a
     // function of the chunk constant alone - it does not grow with the count.
-    if (lens != nullptr) n_pos = *lens;
+    //
+    // F8 (`dsv41_indexer_topk_rows`): `lens` is a PER-ROW array on the folded call,
+    // so the ceiling is the MAXIMUM over the rows. `*lens` is row 0's count and the
+    // counts ASCEND with `r` (a row that commits a group advances the counter), so
+    // row 0's value would clamp `cl` below for every later row — whose newest groups
+    // would then be unreachable. At `m == 1` this is `*lens` exactly.
+    if (lens != nullptr) {
+        int mx = 0;
+        for (int i = 0; i < m; ++i) {
+            const int v = lens[i];
+            if (v > mx) mx = v;
+        }
+        if (mx > 0) n_pos = mx;
+    }
     if (n_pos > kIdxMaxPos) n_pos = kIdxMaxPos;  // defensive: g_idx_score's extent
     // Nothing committed (a rolled-back replay, or the host's own n_pos <= 0): scan
     // NO slot. The loop below would not run anyway with a bound of 0, but the
@@ -3092,8 +3140,30 @@ __global__ void indexer_topk_kernel(const float* __restrict__ q, const float* __
     // so an untouched `out` is never read past the window half when cl == 0.
     if (n_pos <= 0) return;
     extern __shared__ float smem[];
-    const int cols = topk < n_pos ? topk : n_pos;  // out slots (sparse_attn's stride)
+    // F8: THIS row's own count. `lens[mm]` is the row's bound, clamped by the
+    // launch ceiling (the maximum) rather than by row 0's value. At `m == 1` the
+    // two are the same expression this kernel always evaluated.
+    const int mm = blockIdx.x, bb = blockIdx.y;
+    const size_t row = (size_t)bb * m + mm;
+    int cl = n_pos;
+    if (lens != nullptr) cl = lens[mm];
+    if (cl > n_pos) cl = n_pos;
+    // The written slots are `min(topk, cl)` — for THIS row, not for the launch: the
+    // running set's cap (`keep` below) and this row's write bound are both `cols`,
+    // and the position RANK the kernel assigns each pick is only the consumer's
+    // slot index if the cap is the row's own. With the launch-wide ceiling (the max
+    // over rows) a non-last row would keep extra picks and shift the ranks of the
+    // entries the per-row call wrote. At `m == 1` this `cols` is the old one.
+    const int cols = topk < cl ? topk : cl;        // out slots (this row's)
     const int cap = topk;                          // array capacity: cols <= topk
+    // The OUTPUT row pitch. The kernel used to write `out[row * cols + i]`, which is
+    // right only when `row == 0`: the consumer's block pitch (`idxs_r`:
+    // `offset + index_topk`) is FIXED while `cols` is a runtime value derived from
+    // the live counter, so at `b = 1, m > 1` the two disagree and a row's picks would
+    // land in its neighbour's block. `out_stride == 0` keeps the old expression (the
+    // single-row callers never depended on it, `row == 0`); the folded call passes
+    // the real pitch.
+    const int pitch = out_stride > 0 ? out_stride : cols;
     // The chunk's candidates live as (score, position) pairs, sorted in place by a
     // bitonic network: the value at [2i], the position as float bits at [2i+1].
     // The iterative block argmax this replaces ran one full-chunk scan, two
@@ -3105,17 +3175,14 @@ __global__ void indexer_topk_kernel(const float* __restrict__ q, const float* __
     float* s_rv = s_pair + 2 * kIndexerChunk;         // [cap] running values (key order)
     int* s_rp = (int*)(s_rv + cap);                   // [cap] running positions
     const int tid = threadIdx.x, nthr = blockDim.x;
-    const int mm = blockIdx.x, bb = blockIdx.y;
-    const size_t row = (size_t)bb * m + mm;
     __shared__ int s_nr;  // running-set size (thread 0 owns it; the output reads it)
-
-    int cl = n_pos;
-    if (lens != nullptr) cl = lens[mm];
-    if (cl > n_pos) cl = n_pos;
     if (tid == 0) s_nr = 0;
 
-    for (int base = 0; base < n_pos; base += kIndexerChunk) {
-        const int len = (n_pos - base < kIndexerChunk) ? (n_pos - base) : kIndexerChunk;
+    // The scan covers THIS row's count, not the launch ceiling: the ceiling is only
+    // there to keep a per-row `lens[mm]` from being clamped. At `m == 1` the two are
+    // the same value, so this is the loop that has always run.
+    for (int base = 0; base < cl; base += kIndexerChunk) {
+        const int len = (cl - base < kIndexerChunk) ? (cl - base) : kIndexerChunk;
         // Pad to the network's power of two. The padding pairs carry -INFINITY
         // with a position above the chunk's real ones, so they sort behind every
         // real entry and the first `k <= len` slots of the sorted array are always
@@ -3226,14 +3293,14 @@ __global__ void indexer_topk_kernel(const float* __restrict__ q, const float* __
     // every candidate the direct path used to see is still here.
     for (int i = tid; i < cols; i += nthr) {
         if (i >= s_nr) {
-            out[row * (size_t)cols + i] = -1;
+            out[row * (size_t)pitch + i] = -1;
             continue;
         }
         const int pi = s_rp[i];
         int rank = 0;
         for (int j = 0; j < s_nr; ++j)
             if (s_rp[j] < pi) ++rank;
-        out[row * (size_t)cols + rank] = (pi < cl) ? (pi + offset) : -1;
+        out[row * (size_t)pitch + rank] = (pi < cl) ? (pi + offset) : -1;
     }
 }
 
@@ -3721,15 +3788,41 @@ static inline int dsv41_smem_ceiling(KernPtr /*kern*/) {
 }
 
 extern "C" int dsv41_quant_fp8(const float* x, uint8_t* y, float* scale, int rows, int cols,
-                               int block, int round_scale, cudaStream_t s) {
+                               int block, int round_scale, cudaStream_t s,
+                               // F7 (DSV41_F7_QUANT_STRIDE): the SOURCE row pitch in
+                               // elements. Default `0` = "== cols", i.e. the ABI that
+                               // existed before this parameter — every existing caller
+                               // (including the C++ tests, which pass no argument at
+                               // all) stays on the old path, bit for bit. ONLY the
+                               // source reads move: the destination pitch is `cols`,
+                               // and the per-block arithmetic is unchanged.
+                               int src_stride = 0) {
     if (rows <= 0 || cols % block != 0) return (int)cudaErrorInvalidValue;
+    // A pitch SHORTER than the row would make the block groups overlap (row r's
+    // tail read as row r+1's head). That is a caller error, not a shape to
+    // tolerate: this whole parameter exists to feed a pitch the `cols` spelling
+    // cannot express, and a smaller one is only reachable by a typo.
+    if (src_stride != 0 && src_stride < cols) return (int)cudaErrorInvalidValue;
     dim3 grid((rows * (cols / block) + 255) / 256), blk(1, 256);
     // one thread-block per (row, scale-block) group; the y dim carries the lanes
     const int nb = cols / block;
     blk = dim3(1, (block < 256 ? block : 256));
     grid = dim3(rows * nb);
-    quant_kernel<0><<<grid, blk, 0, s>>>(x, y, scale, rows, cols, block, round_scale);
+    quant_kernel<0><<<grid, blk, 0, s>>>(x, y, scale, rows, cols, block, round_scale, src_stride);
     return (int)cudaGetLastError();
+}
+
+// F7's capability twin. `dsv41_quant_fp8` gained a TRAILING default parameter (so
+// its own callers keep compiling and the old spelling keeps working), which means
+// a stale `.so` resolves the symbol and silently ignores the pitch — the exact
+// silent-wrong-values failure this project avoids by probing a dedicated symbol.
+// This entry carries the SAME kernel, so on a `.so` that has it the Rust arm is a
+// single strided launch; a `.so` without it keeps the per-row loop verbatim.
+// ABI: (x, y, scale, rows, cols, block, round_scale, src_stride, s).
+extern "C" __attribute__((visibility("default"))) int dsv41_quant_fp8_stride(
+    const float* x, uint8_t* y, float* scale, int rows, int cols, int block, int round_scale,
+    int src_stride, cudaStream_t s) {
+    return dsv41_quant_fp8(x, y, scale, rows, cols, block, round_scale, s, src_stride);
 }
 
 // Per-device fp4 quantise scratch (see the comment in dsv41_quant_fp4). Only the
@@ -3785,7 +3878,7 @@ extern "C" int dsv41_quant_fp4(const float* x, uint8_t* y, float* scale, int row
     }
     uint8_t* nib = g_q4nib[dev];
     dim3 blk(1, (block < 256 ? block : 256));
-    quant_kernel<1><<<dim3(rows * nb), blk, 0, s>>>(x, nib, scale, rows, cols, block, round_scale);
+    quant_kernel<1><<<dim3(rows * nb), blk, 0, s>>>(x, nib, scale, rows, cols, block, round_scale, 0);
     fp4_pack_kernel<<<(unsigned)((n / 2 + 255) / 256), 256, 0, s>>>(nib, y, n);
     return (int)cudaGetLastError();
 }
@@ -11376,11 +11469,14 @@ extern "C" int dsv41_sparse_attn_orope_mrows(
                                         row_pitch, kv_rows, s);
 }
 
-extern "C" int dsv41_indexer_topk(const float* q, const float* index_k, const float* weights,
-                                  const uint8_t* candidates, const int32_t* compress_lens,
-                                  int32_t* out, int b, int m, int nh, int hd, int n_pos, int topk,
-                                  int offset, float softmax_scale, float head_scale,
-                                  int uses_candidates, cudaStream_t s) {
+// The launcher body, shared by the two entries below (as in `dsv41_sparse_attn` /
+// `dsv41_sparse_attn_rp`). `out_stride` is F8's explicit OUTPUT row pitch: 0 = the
+// kernel's historical `cols` expression, which is right only at `b*m == 1`.
+static int indexer_topk_impl(const float* q, const float* index_k, const float* weights,
+                             const uint8_t* candidates, const int32_t* compress_lens, int32_t* out,
+                             int b, int m, int nh, int hd, int n_pos, int topk, int offset,
+                             int out_stride, float softmax_scale, float head_scale,
+                             int uses_candidates, cudaStream_t s) {
     if (b <= 0 || m <= 0 || nh <= 0 || hd <= 0 || topk <= 0) return (int)cudaErrorInvalidValue;
     // NO `n_pos <= 0` early-out here any more. `n_pos` is the BAKED (capture-time)
     // count, and the kernels now treat the device counter as the authority -
@@ -11487,8 +11583,58 @@ extern "C" int dsv41_indexer_topk(const float* q, const float* index_k, const fl
     indexer_topk_kernel<<<grid, idx_threads, smem, s>>>(q, index_k, weights, candidates,
                                                         compress_lens, out, m, nh, hd, n_pos, topk,
                                                         offset, softmax_scale, head_scale,
-                                                        uses_candidates);
+                                                        uses_candidates, out_stride);
     return (int)cudaGetLastError();
+}
+
+extern "C" int dsv41_indexer_topk(const float* q, const float* index_k, const float* weights,
+                                  const uint8_t* candidates, const int32_t* compress_lens,
+                                  int32_t* out, int b, int m, int nh, int hd, int n_pos, int topk,
+                                  int offset, float softmax_scale, float head_scale,
+                                  int uses_candidates, cudaStream_t s) {
+    return indexer_topk_impl(q, index_k, weights, candidates, compress_lens, out, b, m, nh, hd,
+                             n_pos, topk, offset, 0, softmax_scale, head_scale, uses_candidates, s);
+}
+
+// F8 (`DSV41_F8_TOPK_ROWS`): the SAME selection for a whole block, ONE launch —
+// `b = 1, m = rows` over a PER-ROW `compress_lens` array and an explicit `out_stride`.
+//
+// The grid has always been `dim3(m, b)` and every row of it is an independent
+// selection, so the fold is real; what the old entry could not express is the two
+// things a `b*m > 1` call needs (and which the folded callers below depend on):
+//   * the launch ceiling. The kernels used to take `n_pos = *lens`, i.e. row 0's
+//     count, and the verify's counts ASCEND with `r` — every later row would have
+//     been clamped to row 0's value and lost its newest groups.
+//   * the output row pitch. The kernel writes `out[row * cols + i]` with
+//     `cols = min(topk, cl)` — a runtime value — while the consumer's block pitch
+//     (`idxs_r`: `offset + index_topk`) is FIXED, and the two differ as soon as one
+//     row has fewer groups than `topk`. `out_stride` is that pitch; a row's picks
+//     land at `out + row * out_stride + i`, exactly where the per-row call put them.
+// Both are no-ops at `b*m == 1` (row 0's count IS the maximum, `row == 0`), which
+// is why the entry above is untouched, launch for launch.
+//
+// CONSTRAINT: `uses_candidates` must be 0. The candidate mask is indexed with the
+// launch ceiling as its row pitch (`cand[row * n_pos + p]`), and with a per-row
+// `lens` the ceiling is a MAXIMUM rather than the row's own count — a mask laid out
+// per row against its own count would be read at the wrong offsets. Every folded
+// call site passes `nullptr, 0` (no candidate mask in the verify block), so this is
+// a shape the entry declines rather than a behaviour it changes.
+// ABI: (q, index_k, weights, candidates, compress_lens, out, b, m, nh, hd, n_pos,
+//       topk, offset, out_stride, softmax_scale, head_scale, uses_candidates, s).
+extern "C" __attribute__((visibility("default"))) int dsv41_indexer_topk_rows(
+    const float* q, const float* index_k, const float* weights, const uint8_t* candidates,
+    const int32_t* compress_lens, int32_t* out, int b, int m, int nh, int hd, int n_pos, int topk,
+    int offset, int out_stride, float softmax_scale, float head_scale, int uses_candidates,
+    cudaStream_t s) {
+    if (uses_candidates != 0) return (int)cudaErrorInvalidValue;
+    // The pitch must hold a whole row's block: `min(topk, cl) <= topk` entries are
+    // written from `out + row*out_stride`. A shorter pitch would let one row's picks
+    // overwrite its neighbour's — the caller's own `idxs_r` pitch (`offset +
+    // index_topk`) is the value this guard is written against.
+    if (out_stride != 0 && out_stride < topk) return (int)cudaErrorInvalidValue;
+    return indexer_topk_impl(q, index_k, weights, candidates, compress_lens, out, b, m, nh, hd,
+                             n_pos, topk, offset, out_stride, softmax_scale, head_scale,
+                             uses_candidates, s);
 }
 
 extern "C" int dsv41_candidate_blocks(const float* logits, const int32_t* compress_lens,
