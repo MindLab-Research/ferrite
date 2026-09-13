@@ -3,6 +3,21 @@
 > 用户指令链：① 参考官方 PyTorch 彻底改好正确性；② MTP block-5 step ≈ 7ms 即达标（同口径 > sglang 873.6 tok/s）；③ eager 之外的算子判垃圾，**照抄 SGLang**（BBuf/sglang@835c3909，V4.1-Flash 真源；master 无 V4.1）；④ 移植→确认正确→优化到比他们快。
 > 验证机：AWS b300-4（ubuntu@43.202.208.136，8×B300，模型 /opt/dlami/nvme/models/DeepSeek-V4.1-Flash）。
 
+## 🎯 当前战况（2026-09-14 下午，正确性收敛中——读这节就够）
+
+**数数红线进展：1..63 全对（此前 35/52 崩）**——逐域对齐官方的效果在累积。
+
+**已落库的修复（全部默认 ON，DSV41_*=0 可回退）**：`bf16_xn`（xn 与官方逐位一致 0.18%→0.00%）、`win_kv_quant_rt`（fp8 往返+bf16 写回）、`bf16_kv`（kv 链两处边界，kv_RT→1.08-1.53%）、`bf16_q`（qr/s.q 两处边界，数数→1..63）、`gate_gemv_f32`（gate 分数官方 f32 域）、kinds 0-6 op 级 dump 探针（teacher-forced 逐算子对拍工具链）。
+
+**当前逐算子发散**：xn 0.00% ✓ / kv_gemm 0.49% ✓ / kv_RT 1.1-1.5% / attn_o 3.5-3.8%（q 链内部融合边界+sparse_attn 内部 bf16 未覆盖）/ **moe_o 4.7-10.9%（专家 e2m1 激活域=最大剩余项）**。
+
+**下一步（按序）**：
+1. **专家域**：官方对 fp4 权重用 **act_quant（fp8 e4m3+幂次 scale, block 32）** 激活（model.py linear()），我们 routed 专家用 e2m1（8× 更粗）——正是 moe_o 的来源。SIMT batched 内核的 a_scale 是 f32 ⇒ quant1 输出可直接对接；改造面=解包 nibble→byte（dsv41_experts_mxf4.cu:610-612）+ 调用方 s.xq4/s.xsc4→s.xq/s.xsc（注意 MOE_DUAL 的 quant1(xn) 共享竞态）。down 输入官方也 act_quant（我们 f32）+ 路由权重时机（官方乘 w2 前，我们在 epilogue）。
+2. sparse_attn 内部 bf16（q/kv/P 都是 BF16，acc_s_cast BF16——kernel.py:328-390）+ q 链内部融合边界。
+3. 数数 1..100 完美 → spec_gt 复测 → S2-S7 性能线（450 tok/s / bench >908.9）。
+
+**关键工具链（远端）**：`~/ref_diff.py`（teacher-forced kinds 0-6 hooks）+ `DSV41_GT_XDUMP`；官方 MP8 分片 `/opt/dlami/nvme/dsv41_mp8`；同口径参考 908.9 tok/s（sglang TP8/acc5.49）。
+
 ## ⚠️ 战况修订（2026-09-13 深夜，实测推翻假设）
 
 1. **tag 的 eager 文本也坏**：port-dspark（=tag）数数 1..51 后跳 60（与 HEAD 同型同位；p50=6.22ms 与文档 6.15 吻合）。tag 时代"好"的判据是四段短文本（max_tokens=48），长程腐蚀从未测过。⇒ **正确性锚不是 tag，是官方 PyTorch 语义**（用户原话的字面执行）。
