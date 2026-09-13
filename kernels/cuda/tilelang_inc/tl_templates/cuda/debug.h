@@ -128,7 +128,10 @@ TL_DEVICE void device_assert_with_msg(bool cond, const char *msg) {
 }
 
 // Specialization for msg-only debug print
-__device__ void debug_print_msg(const char *msg) {
+// [FERRITE PATCH] inline added: this header is included by multiple shim TUs
+// (wkv_shim.cu, moe_bf16_shim.cu, ...) and a non-inline __device__ definition
+// caused a "multiple definition" link error when the TUs joined one .so.
+inline __device__ void debug_print_msg(const char *msg) {
   printf("msg='%s' BlockIdx=(%d, %d, %d), ThreadIdx=(%d, %d, %d)\n", msg,
          blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x, threadIdx.y,
          threadIdx.z);
