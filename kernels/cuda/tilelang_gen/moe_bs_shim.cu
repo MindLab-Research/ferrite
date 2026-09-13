@@ -625,6 +625,16 @@ bool tl_bs_init() {
                                   65536) == cudaSuccess;
         (void)cudaGetLastError();
     }
+    // HANDWRITTEN kernel 的 .scale_vec::1X 运行期选择（asm 必须编译期，两种拼写
+    // 都编进去，这里从 env 选一种）。默认 0 = 无后缀（原拼写）。
+    if (ok) {
+        int sv1x = 0;
+        const char* e = getenv("DSV41_MOE_BS_SCALEVEC1X");
+        if (e != nullptr && e[0] == '1') sv1x = 1;
+        (void)cudaMemcpyToSymbol(g_sv1x, &sv1x, sizeof(int));
+        (void)cudaGetLastError();
+        fprintf(stderr, "[moe-bs] scale_vec::1X = %d\n", sv1x);
+    }
 
     // (b) 常驻 scratch
     if (ok) {

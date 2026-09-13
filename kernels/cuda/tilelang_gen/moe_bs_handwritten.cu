@@ -31,19 +31,35 @@ __device__ __forceinline__ void hw_tc_dealloc(uint32_t tmem, int ncols) {
     asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" :: "r"(tmem), "r"(ncols));
 }
 
-// VERIFIED MMA instruction — memory clobber included, .scale_vec::1X EXCLUDED
-// (the suffix broke eager in previous experiment; clobber-only is the test)
+// Runtime switch for the .scale_vec::1X suffix (set by the shim from
+// DSV41_MOE_BS_SCALEVEC1X before launch; the asm must be compile-time so both
+// spellings are compiled in and chosen at runtime).
+__device__ int g_sv1x = 0;
+
+// VERIFIED MMA instruction — memory clobber included
 __device__ __forceinline__ void hw_tc_mma(uint32_t d_tmem, uint64_t a_desc, uint64_t b_desc,
                                           uint32_t idesc, uint32_t sfa_tmem,
                                           uint32_t sfb_tmem, uint32_t enable_d) {
-    asm volatile(
-        "{\n\t.reg .pred p;\n\t"
-        "setp.ne.b32 p, %6, 0;\n\t"
-        "tcgen05.mma.cta_group::1.kind::mxf8f6f4.block_scale "
-        "[%0], %1, %2, %3, [%4], [%5], p;\n\t}"
-        ::"r"(d_tmem), "l"(a_desc), "l"(b_desc), "r"(idesc),
-          "r"(sfa_tmem), "r"(sfb_tmem), "r"(enable_d)
-        : "memory");
+    if (g_sv1x) {
+        // Repo-verified spelling (dsv41_experts_mxf4.cu:4344)
+        asm volatile(
+            "{\n\t.reg .pred p;\n\t"
+            "setp.ne.b32 p, %6, 0;\n\t"
+            "tcgen05.mma.cta_group::1.kind::mxf8f6f4.block_scale.scale_vec::1X "
+            "[%0], %1, %2, %3, [%4], [%5], p;\n\t}"
+            ::"r"(d_tmem), "l"(a_desc), "l"(b_desc), "r"(idesc),
+              "r"(sfa_tmem), "r"(sfb_tmem), "r"(enable_d)
+            : "memory");
+    } else {
+        asm volatile(
+            "{\n\t.reg .pred p;\n\t"
+            "setp.ne.b32 p, %6, 0;\n\t"
+            "tcgen05.mma.cta_group::1.kind::mxf8f6f4.block_scale "
+            "[%0], %1, %2, %3, [%4], [%5], p;\n\t}"
+            ::"r"(d_tmem), "l"(a_desc), "l"(b_desc), "r"(idesc),
+              "r"(sfa_tmem), "r"(sfb_tmem), "r"(enable_d)
+            : "memory");
+    }
 }
 
 __device__ __forceinline__ void hw_tc_commit(void *mbar) {
