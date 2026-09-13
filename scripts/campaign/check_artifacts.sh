@@ -51,6 +51,8 @@ probe_bin () {  # label, source-grep-file, pattern
 }
 
 probe_so  "SFDUMP accessor in .so"        kernels/cuda/tilelang_gen/moe_bs_shim.cu "dsv41_moe_bs_sfdump_ptr"
+probe_so  "SFDUMP_K gate in .so"          kernels/cuda/tilelang_gen/moe_bs_shim.cu "DSV41_MOE_BS_SFDUMP_K"
+probe_so  "KEEP_STAGE gate in .so"        kernels/cuda/tilelang_gen/moe_bs_shim.cu "DSV41_MOE_BS_KEEP_STAGE"
 probe_so  "STAGE1 gate in .so"            kernels/cuda/tilelang_gen/moe_bs_shim.cu "DSV41_MOE_BS_STAGE1"
 probe_so  "SFST gate in .so"              kernels/cuda/tilelang_gen/moe_bs_shim.cu "DSV41_MOE_BS_SFST"
 probe_so  "LDW gate in .so"               kernels/cuda/tilelang_gen/moe_bs_shim.cu "DSV41_MOE_BS_LDW"
