@@ -107,12 +107,27 @@ LD_LIBRARY_PATH=$HOME/ferrite/kernels/cuda ./target/release/ferrite-serve --back
 - serve 卡住/日志 mtime 停滞 = 挂了（查 `stat -c %y` + pgrep，别等）。
 - 加载错防线（三道 runtime + 三道编译期 + git hooks）见 `docs/agent/` 的加载防线文档。
 
-## 当前状态与下一步（2026-09-14——手写 fp4 MoE BS 臂：参数面已全部证明与官方 PASS 参考一致，缺陷在别处）
+## 当前状态与下一步（2026-09-14 晚——fp4 MoE BS 臂：语义已定谳 + 两个接线缺陷已修；精度按清单逐项转正）
 
 **详细记录一律在 `docs/agent/moe-bs-crash-investigation.md`（§10–§22），本节只放结论与指针。**
 
 - **手写 kernel 的 6 个真 bug 已修**：idesc `b_sf_id` 漏 `<<4`、smem 布局与 descriptor 的 swizzle 声明不匹配、
   K-block 递进单位误判 8×、缺 `fence.proxy.async`、缺 `tcgen05.fence::before/after_thread_sync`（3 处）。
+- **🎯 fp4 语义定谳（§47，硬件实测 relerr=0）**：fp4 操作数是 **packed（2 元素/字节）但放在 16 B 容器里、
+  硬件只读每槽前 8 B**（TMA dtype `16U4_ALIGN16B` = 16 个 4-bit 元素 = 8 B 数据/16 B 容器）⇒ 每行 footprint 128 B、
+  每 stage 16384 B。写公式 `hw_pack_sw128()`（§47）；**描述符/递进/idesc 保持官方原值不变**（`lbo=1,sbo=64,layout=2`、`ki*32 B`）。
+  曾被误判为"unpacked"（§43）——那是 container footprint 与容器内数据的混淆。**默认已转正**（`DSV41_MOE_BS_UNPACKED=1` 可回退对照）。
+- **🎯 两个接线缺陷已修（§62/§65）**：① **swapAB epilogue 输出打包错位**（修复前 640 个输出里 **512 个位置错**，
+  纯算术核验修复后 640/640 正确）；② **`HANDWRITTEN` 分支的 `goto` 跳过 `[NC]` 探针**（已在 `goto` 前接上探针）。
+- **⚠️ 一个我自己造成的回归已回退（§65 M1）**：为定位 `[NC]` 加的 `[NC-TRACE]` 仪器化把独立 `return X;`
+  变成"打印块 + 无条件 return" ⇒ **9 处守卫失效、BS 臂整体死掉、e2e 静默回落老路径** ⇒
+  **F/P/U/E 各回合的文本判据全部作废**（那些"文本更接近计数"的结论建立在错误前提上）。
+  **教训：仪器化只能"加"，绝不能重写控制流；改完必须验证语义（编译通过 ≠ 行为不变）。**
+- **精度（用户硬性要求："不能高也不能低"）**：全算子审计（§61）得 **8 个独立缺陷**（去重），
+  其中 **3 项是"缺失量化"**（A2 窗口 KV / A3 压缩 latent（fp4 block16 + **e4m3 非幂次标度**）/ A4 indexer q/k）。
+  已开三条实现线；另有 1 项**已有补丁**（路由权重时机 + routed-down 输入量化，门控 `DSV41_ROUTED_DOWN_QUANT`）。
+  **⚠️ 出货脚本没开该门**（§63/§64）⇒ 默认臂下仍不对齐。**转正流程已脚本化**：
+  `~/promote_precision.sh "<GATE=1> [DBG=1]"`（DBG 五点回读逐元素差 0 → `~/wq_check.py` 文本红线 → 快速臂无回归），**逐项、一次一个变量**。
 - **⚠️ 旧结论已作废**：曾判定"硬件把 fp4 按 PACKED 读"（旧 §29）——**这是错的**，见 §43。
   我那个冲激探针的"0x02 只剩一半"极可能是**探针自己只写了 64 B/行**造成的假象。
 - **🎯 现在的权威事实（§43）**：另一个 subagent 用官方入口 `T.tcgen05_gemm_blockscaled()` 在本机跑出了
