@@ -6405,7 +6405,7 @@ __global__ void __launch_bounds__(256)
 gemm_fp8_mtile_kernel(const uint8_t* __restrict__ a, const float* __restrict__ a_scale,
                       const uint8_t* __restrict__ w, const uint8_t* __restrict__ w_scale,
                       const float* __restrict__ bias, float* __restrict__ out, int n, int k,
-                      int out_stride, int bn, int a_stride) {
+                      int out_stride, int bn, int a_stride, int n_tiles) {
     constexpr int BM = kMrowsMtileBM;
     // The rows this specialisation actually folds. `RN = M` at every reachable
     // shape (the launcher caps m at 8 == BM), so BLOCK_M = 8 costs NOTHING: it is
@@ -6422,8 +6422,14 @@ gemm_fp8_mtile_kernel(const uint8_t* __restrict__ a, const float* __restrict__ a
     // the axis is still written down because it is the tile coordinate, and the
     // N one is what the warp index resolves to.
     const int n_block = warp;
-    const int row0 = blockIdx.x * nw * bn;          // the block's first output row
-    const int row_base = row0 + n_block * bn;       // this warp's first output row
+    // GRID-STRIDE (P5 §3.2 修法 A, 2026-09-13): one block owns `n_tiles` output-row
+    // TILES of `rows_tile = nw*bn` rows each, and the ACTIVATION prologue below is
+    // staged ONCE for all of them -- that is the whole point (the launch's activation
+    // L2 traffic drops by the tile count; on wkv 8.85 MB -> ~1.1 MB at T=8). `row0`
+    // and `row_base` are now per-TILE and resolved inside the loop; with
+    // `n_tiles == 1` the loop body runs once with `tile == blockIdx.x`, so
+    // `row0 == blockIdx.x * nw * bn` -- the shipped block row, exactly.
+    const int rows_tile = nw * bn;
     // smem: the block's weight tile (`nw*bn` rows of `k` bytes) | the e4m3 table
     // (ONE COPY PER WARP, `nw*256` entries) | the M staged activation scale rows
     // (f32) | the M staged activation rows (fp8 bytes). The last two are
@@ -6484,133 +6490,157 @@ gemm_fp8_mtile_kernel(const uint8_t* __restrict__ a, const float* __restrict__ a
     for (int i = lane; i < 256; i += 32) s_lutw[i] = e4m3_to_f((uint8_t)i);
     __syncwarp();
     if (a16) dsv41_cp_wait_all();
-    // FIX 2 -- the weight rows: THIS WARP'S OWN `bn` rows only (`i = lane`, stride
-    // 32, instead of the previous block-wide flat `i += blockDim.x`). A warp's
-    // slab slots are private to it, so publication is a warp-local `wait_all` +
-    // `__syncwarp` after the barrier -- there is no cross-warp read of `s_w` left,
-    // which is what removes the block-sized DRAM/L2 round trip the bn = 1 control
-    // isolated. Slot addresses, bytes and the 1:1 flat index are unchanged, so the
-    // decode is bit-identical.
-    const uint8_t* __restrict__ wsrc = w + (size_t)row_base * (size_t)k;
-    uint8_t* __restrict__ s_ww = s_w + (size_t)n_block * (size_t)bn * (size_t)k;
-    const bool w16 = dsv41_f4_ok(wsrc) && dsv41_f4_ok(s_ww);   // warp-uniform
-    const int wrows = min(bn, n - row_base);   // rows this warp owns; <= 0 => inactive
-    if (wrows > 0) {
-        if (w16) {
-            const int nflat = wrows * n16;
-            for (int i = lane; i < nflat; i += 32)
-                dsv41_cp_async16(s_ww + ((size_t)i << 4), wsrc + ((size_t)i << 4));
-            dsv41_cp_commit();
-        } else {
-            // k % 16 tail / unaligned arm: unreachable for every launcher (they all
-            // reject `k & 31`, which makes `row_base*k` and the slab 16B multiples).
-            for (int i = lane; i < wrows * k; i += 32) s_ww[i] = wsrc[i];
-        }
-    }
-    // The ACTIVATION's barrier -- the legacy program's own, and now the ONLY block
-    // barrier here. The weight transfer is deliberately left in flight ACROSS it
-    // (retired per warp below), exactly as the legacy prologue leaves its own row.
-    if constexpr (AQ == 0) __syncthreads();
-    if (wrows > 0) {
-        if (w16) dsv41_cp_wait_all();
-        __syncwarp();
-    }
-    if (wrows > 0) {
-        // THE REGISTER TILE: RN activation rows x bn output rows. `acc[q][nn]` is
-        // the element `out[q][row_base + nn]`, and its chain is the legacy chain.
-        float acc[RN][BN_MAX];
-        #pragma unroll
-        for (int q = 0; q < RN; ++q)
-            #pragma unroll
-            for (int nn = 0; nn < BN_MAX; ++nn) acc[q][nn] = 0.f;
-        // Rows this warp actually writes == the rows it staged (`wrows`, computed in
-        // the prologue). Warp-uniform, so the early returns / breaks below are
-        // warp-uniform branches and the `shfl_xor` full mask stays valid.
-        const int nvalid = wrows;
-        #pragma unroll 32
-        for (int kb = 0; kb < nb_k; ++kb) {
-            const int j = kb * 32 + lane;
-            // ONE activation decode per (q, kb), shared by the warp's whole N tile.
-            // FIX 1: the byte comes from the STAGED slab (`s_a`), i.e. the legacy
-            // kernel's own `s_lut[s_a[q*k+j]] * s_as[q*nb_k + (j>>5)]` expression --
-            // an LDS pair with the short dependency chain the L1 `__ldg` form this
-            // kernel first shipped did not have. The LUT (1 LDS) is used rather than
-            // an inline `e4m3_to_f` (the 5a family's form, ~7 ALU ops) precisely
-            // because this kernel HAS a smem block for the slab, so the table is
-            // free -- and because a LUT read is 1 instruction where the inline
-            // decode is seven, which is the quantity this arm is buying.
-            float av[RN];
-            if constexpr (AQ == 0) {
-                #pragma unroll
-                for (int q = 0; q < RN; ++q)
-                    av[q] = s_lutw[s_a[(size_t)q * (size_t)k + j]] *
-                            s_as[(size_t)q * (size_t)nb_k + (j >> 5)];
+    // ---- THE TILE LOOP (grid-stride, P5 §3.2 修法 A) -------------------------
+    // The activation above is staged ONCE for the whole block; each iteration
+    // stages THIS tile's weight rows and consumes them against the resident
+    // activation. `n_tiles == 1` (gate OFF) is the shipped program: one iteration,
+    // `tile == blockIdx.x`, `row0 == blockIdx.x * nw * bn`.
+    for (int t = 0; t < n_tiles; ++t) {
+        const int tile = blockIdx.x + t * gridDim.x;   // this block's t-th tile
+        const int row0 = tile * rows_tile;
+        if (row0 >= n) break;                          // block-uniform tail guard
+        const int row_base = row0 + n_block * bn;      // this warp's first row
+        // FIX 2 -- the weight rows: THIS WARP'S OWN `bn` rows only (`i = lane`,
+        // stride 32, instead of the previous block-wide flat `i += blockDim.x`).
+        // A warp's slab slots are private to it, so publication is a warp-local
+        // `wait_all` + `__syncwarp` after the barrier -- there is no cross-warp
+        // read of `s_w` left, which is what removes the block-sized DRAM/L2 round
+        // trip the bn = 1 control isolated. Slot addresses, bytes and the 1:1 flat
+        // index are unchanged, so the decode is bit-identical. The same slot is
+        // RE-staged on every iteration (see the retire at the bottom of the body).
+        const uint8_t* __restrict__ wsrc = w + (size_t)row_base * (size_t)k;
+        uint8_t* __restrict__ s_ww = s_w + (size_t)n_block * (size_t)bn * (size_t)k;
+        const bool w16 = dsv41_f4_ok(wsrc) && dsv41_f4_ok(s_ww);   // warp-uniform
+        const int wrows = min(bn, n - row_base);   // rows this warp owns; <= 0 => inactive
+        if (wrows > 0) {
+            if (w16) {
+                const int nflat = wrows * n16;
+                for (int i = lane; i < nflat; i += 32)
+                    dsv41_cp_async16(s_ww + ((size_t)i << 4), wsrc + ((size_t)i << 4));
+                dsv41_cp_commit();
             } else {
-                // ---- WO_PAIR-ROWS (AQ == 1): the intermediate quant, in-warp ----
-                // Segment 2 of the verify's wo_a -> wo_b chain is a per-row
-                // `quant_kernel<0>` (block = 32, round_scale = 1) writing
-                // `a`/`a_scale`; the fp8 arm above then reads those bytes back.
-                // THIS warp's 32 lanes already hold exactly the 32 elements of row
-                // `q`'s k-block `[kb*32, kb*32+32)`, so the quantiser's own
-                // reduction tree runs HERE:
-                //   * amax: `fabsf(v)` then the `shfl_xor` 16/8/4/2/1 tree --
-                //     quant_kernel<0> starts from `fmaxf(0.f, |v|)` and runs the
-                //     SAME tree over the SAME 32 values (`|v|` is never negative,
-                //     so the seed is a no-op);
-                //   * scale: `fmaxf(fast_round_scale(amax, 1/448), 1e-30f)`, the
-                //     same device helper and the same `maxv`;
-                //   * byte: `__nv_fp8_e4m3(fminf(fmaxf(v * (1.0f/sc), -448), 448))`
-                //     -- the SAME `1.0f / sc` reciprocal multiply (not a division)
-                //     and the same clamp;
-                //   * operand: `s_lut[byte] * sc`, i.e. exactly the value the fp8
-                //     arm reads from the global `(a, a_scale)` pair the quantiser
-                //     would have written.
-                // Byte for byte, so the fold below is unchanged -- the fused arm's
-                // whole output is bit-identical to the three-launch chain it
-                // replaces (see the launcher header). The byte is deliberately NOT
-                // stored: nothing downstream of this launch reads `xq_r`/`xsc_r`
-                // (the caller's stale-reader note).
-                const float* __restrict__ af = reinterpret_cast<const float*>(a);
-                #pragma unroll
-                for (int q = 0; q < RN; ++q) {
-                    const float v = __ldg(af + (size_t)q * (size_t)a_stride + j);
-                    float am = fabsf(v);
-                    for (int off = 16; off > 0; off >>= 1)
-                        am = fmaxf(am, __shfl_xor_sync(0xFFFFFFFFu, am, off));
-                    const float sc = fmaxf(fast_round_scale(am, 1.0f / 448.0f), 1e-30f);
-                    const float qi = fminf(fmaxf(v * (1.0f / sc), -448.0f), 448.0f);
-                    const __nv_fp8_e4m3 f8 = __nv_fp8_e4m3(qi);
-                    av[q] = s_lutw[*(const uint8_t*)&f8] * sc;
-                }
-            }
-            #pragma unroll
-            for (int nn = 0; nn < BN_MAX; ++nn) {
-                if (nn >= nvalid) break;
-                const int row = row_base + nn;
-                // The weight byte of THIS output row, out of the staged slab (1:1
-                // flat index), decoded once and then folded against all RN rows --
-                // the legacy `wv` hoist (C4).
-                const float sb = ue8m0_to_f(__ldg(w_scale + (size_t)(row >> 5) * (size_t)nb_k + kb));
-                const float wv =
-                    s_lutw[s_w[(size_t)(n_block * bn + nn) * (size_t)k + j]] * sb;
-                #pragma unroll
-                for (int q = 0; q < RN; ++q) acc[q][nn] += av[q] * wv;
+                // k % 16 tail / unaligned arm: unreachable for every launcher (they all
+                // reject `k & 31`, which makes `row_base*k` and the slab 16B multiples).
+                for (int i = lane; i < wrows * k; i += 32) s_ww[i] = wsrc[i];
             }
         }
-        // One `shfl_xor` tree per ELEMENT (the legacy tree, run per (q, nn)).
-        #pragma unroll
-        for (int q = 0; q < RN; ++q)
+        // The ACTIVATION's barrier -- the legacy program's own. It now fires ONCE,
+        // on the first tile: the activation is staged once above and published
+        // here; on later tiles nothing block-wide is written, so the warp-local
+        // retire below is the whole publication. `t == 0` is block-uniform, so the
+        // barrier is not divergent. The weight transfer is deliberately left in
+        // flight ACROSS it (retired per warp below), exactly as the legacy
+        // prologue leaves its own row.
+        if (t == 0) {
+            if constexpr (AQ == 0) __syncthreads();
+        }
+        if (wrows > 0) {
+            if (w16) dsv41_cp_wait_all();
+            __syncwarp();
+        }
+        if (wrows > 0) {
+            // THE REGISTER TILE: RN activation rows x bn output rows. `acc[q][nn]` is
+            // the element `out[q][row_base + nn]`, and its chain is the legacy chain.
+            float acc[RN][BN_MAX];
             #pragma unroll
-            for (int nn = 0; nn < BN_MAX; ++nn) {
-                if (nn >= nvalid) break;
-                float a_q = acc[q][nn];
-                for (int off = 16; off > 0; off >>= 1) a_q += __shfl_xor_sync(0xFFFFFFFFu, a_q, off);
-                if (lane == 0) {
+            for (int q = 0; q < RN; ++q)
+                #pragma unroll
+                for (int nn = 0; nn < BN_MAX; ++nn) acc[q][nn] = 0.f;
+            // Rows this warp actually writes == the rows it staged (`wrows`, computed in
+            // the prologue). Warp-uniform, so the early returns / breaks below are
+            // warp-uniform branches and the `shfl_xor` full mask stays valid.
+            const int nvalid = wrows;
+            #pragma unroll 32
+            for (int kb = 0; kb < nb_k; ++kb) {
+                const int j = kb * 32 + lane;
+                // ONE activation decode per (q, kb), shared by the warp's whole N tile.
+                // FIX 1: the byte comes from the STAGED slab (`s_a`), i.e. the legacy
+                // kernel's own `s_lut[s_a[q*k+j]] * s_as[q*nb_k + (j>>5)]` expression --
+                // an LDS pair with the short dependency chain the L1 `__ldg` form this
+                // kernel first shipped did not have. The LUT (1 LDS) is used rather than
+                // an inline `e4m3_to_f` (the 5a family's form, ~7 ALU ops) precisely
+                // because this kernel HAS a smem block for the slab, so the table is
+                // free -- and because a LUT read is 1 instruction where the inline
+                // decode is seven, which is the quantity this arm is buying.
+                float av[RN];
+                if constexpr (AQ == 0) {
+                    #pragma unroll
+                    for (int q = 0; q < RN; ++q)
+                        av[q] = s_lutw[s_a[(size_t)q * (size_t)k + j]] *
+                                s_as[(size_t)q * (size_t)nb_k + (j >> 5)];
+                } else {
+                    // ---- WO_PAIR-ROWS (AQ == 1): the intermediate quant, in-warp ----
+                    // Segment 2 of the verify's wo_a -> wo_b chain is a per-row
+                    // `quant_kernel<0>` (block = 32, round_scale = 1) writing
+                    // `a`/`a_scale`; the fp8 arm above then reads those bytes back.
+                    // THIS warp's 32 lanes already hold exactly the 32 elements of row
+                    // `q`'s k-block `[kb*32, kb*32+32)`, so the quantiser's own
+                    // reduction tree runs HERE:
+                    //   * amax: `fabsf(v)` then the `shfl_xor` 16/8/4/2/1 tree --
+                    //     quant_kernel<0> starts from `fmaxf(0.f, |v|)` and runs the
+                    //     SAME tree over the SAME 32 values (`|v|` is never negative,
+                    //     so the seed is a no-op);
+                    //   * scale: `fmaxf(fast_round_scale(amax, 1/448), 1e-30f)`, the
+                    //     same device helper and the same `maxv`;
+                    //   * byte: `__nv_fp8_e4m3(fminf(fmaxf(v * (1.0f/sc), -448), 448))`
+                    //     -- the SAME `1.0f / sc` reciprocal multiply (not a division)
+                    //     and the same clamp;
+                    //   * operand: `s_lut[byte] * sc`, i.e. exactly the value the fp8
+                    //     arm reads from the global `(a, a_scale)` pair the quantiser
+                    //     would have written.
+                    // Byte for byte, so the fold below is unchanged -- the fused arm's
+                    // whole output is bit-identical to the three-launch chain it
+                    // replaces (see the launcher header). The byte is deliberately NOT
+                    // stored: nothing downstream of this launch reads `xq_r`/`xsc_r`
+                    // (the caller's stale-reader note).
+                    const float* __restrict__ af = reinterpret_cast<const float*>(a);
+                    #pragma unroll
+                    for (int q = 0; q < RN; ++q) {
+                        const float v = __ldg(af + (size_t)q * (size_t)a_stride + j);
+                        float am = fabsf(v);
+                        for (int off = 16; off > 0; off >>= 1)
+                            am = fmaxf(am, __shfl_xor_sync(0xFFFFFFFFu, am, off));
+                        const float sc = fmaxf(fast_round_scale(am, 1.0f / 448.0f), 1e-30f);
+                        const float qi = fminf(fmaxf(v * (1.0f / sc), -448.0f), 448.0f);
+                        const __nv_fp8_e4m3 f8 = __nv_fp8_e4m3(qi);
+                        av[q] = s_lutw[*(const uint8_t*)&f8] * sc;
+                    }
+                }
+                #pragma unroll
+                for (int nn = 0; nn < BN_MAX; ++nn) {
+                    if (nn >= nvalid) break;
                     const int row = row_base + nn;
-                    const float v = a_q + (bias != nullptr ? bias[row] : 0.f);
-                    out[(size_t)q * (size_t)out_stride + (size_t)row] = v;
+                    // The weight byte of THIS output row, out of the staged slab (1:1
+                    // flat index), decoded once and then folded against all RN rows --
+                    // the legacy `wv` hoist (C4).
+                    const float sb = ue8m0_to_f(__ldg(w_scale + (size_t)(row >> 5) * (size_t)nb_k + kb));
+                    const float wv =
+                        s_lutw[s_w[(size_t)(n_block * bn + nn) * (size_t)k + j]] * sb;
+                    #pragma unroll
+                    for (int q = 0; q < RN; ++q) acc[q][nn] += av[q] * wv;
                 }
             }
+            // One `shfl_xor` tree per ELEMENT (the legacy tree, run per (q, nn)).
+            #pragma unroll
+            for (int q = 0; q < RN; ++q)
+                #pragma unroll
+                for (int nn = 0; nn < BN_MAX; ++nn) {
+                    if (nn >= nvalid) break;
+                    float a_q = acc[q][nn];
+                    for (int off = 16; off > 0; off >>= 1) a_q += __shfl_xor_sync(0xFFFFFFFFu, a_q, off);
+                    if (lane == 0) {
+                        const int row = row_base + nn;
+                        const float v = a_q + (bias != nullptr ? bias[row] : 0.f);
+                        out[(size_t)q * (size_t)out_stride + (size_t)row] = v;
+                    }
+                }
+        }
+        // The slab this warp just read is RE-staged by the next iteration's
+        // cp.async, so retire every lane's reads first -- `__syncwarp` is
+        // warp-uniform (every lane of the warp reaches it) and is required only
+        // ACROSS iterations. Elided on the gate-OFF path (`n_tiles == 1` has no
+        // second stage), so the shipped instruction stream is untouched.
+        if (n_tiles > 1) __syncwarp();
     }
 }
 
@@ -6635,6 +6665,36 @@ static const int g_mrows_mtile_bn = [] {
     int v = atoi(e);
     if (v < 1) v = 1;
     if (v > kMrowsMtileBNMax) v = kMrowsMtileBNMax;
+    return v;
+}();
+// GRIDSTRIDE (DSV41_MTILE_GRIDSTRIDE, 2026-09-13, P5 §3.2 修法 A): the
+// grid-stride RESIDENT-ACTIVATION form of this arm. The activation prologue is
+// staged ONCE per block and the block walks `n_tiles` output-row tiles behind it,
+// so the launch's activation traffic is `grid * m*k` instead of `grid_tiles * m*k`
+// -- it drops by the tile count. This is the P5 verdict's #1 L2 item: on wkv
+// (n=512, nw=1 => 256 one-warp blocks) every block re-stage the whole 33.75 KB
+// activation, i.e. 8.85 MB of activation traffic against 2.62 MB of weight (3.4x);
+// at T=8 that is 8.85 MB -> 1.1 MB.
+//
+// OFF (unset / 0) => `n_tiles == 1`: the loop runs one iteration, the grid is the
+// shipped `ceil(n/(nw*bn))`, and the prologue/consume order is the shipped one,
+// byte for byte. ARMED (any value != 0) => the tile count is
+// `DSV41_MTILE_GRIDSTRIDE_T` (default 8, clamped 1..1024) and the grid shrinks by
+// that factor -- T is a SEPARATE knob (the `DSV41_MROWS_MTILE_BN` shape) so this
+// gate stays the tree's usual "armed?" switch. The grid shrink is the design's
+// §3.4 coverage trade: on a small n a large T starves the SMs, so a caller that
+// needs the blocks back lowers T (T=1 is the OFF program exactly).
+static const int g_mtile_gridstride = [] {
+    const char* e = getenv("DSV41_MTILE_GRIDSTRIDE");
+    if (e == nullptr) return 0;
+    return atoi(e);
+}();
+static const int g_mtile_gridstride_t = [] {
+    const char* e = getenv("DSV41_MTILE_GRIDSTRIDE_T");
+    if (e == nullptr) return 8;               // the P5 verdict's T (wkv: 8.85 -> 1.1 MB)
+    int v = atoi(e);
+    if (v < 1) v = 1;
+    if (v > 1024) v = 1024;
     return v;
 }();
 // 0 = OFF; > 0 = armed. `n` is accepted (and unused) so the resolution helper has
@@ -6769,7 +6829,19 @@ extern "C" int dsv41_gemm_fp8_mrows(const uint8_t* a, const float* a_scale,
                                (size_t)nw * 256 * sizeof(float) +
                                (size_t)m * (size_t)nb_k * sizeof(float) + (size_t)m * (size_t)k;
         const int smrows = nw * bn;
-        const dim3 grid_mt((unsigned)((n + smrows - 1) / smrows));
+        // The launch's total output-row tiles (a tile = this block's `nw*bn` rows).
+        const int tiles_total = (n + smrows - 1) / smrows;
+        // GRIDSTRIDE (DSV41_MTILE_GRIDSTRIDE, P5 §3.2 修法 A): OFF => `n_tiles == 1`
+        // and `grid = tiles_total` -- the shipped launch, and the kernel's tile loop
+        // runs one iteration (its `row0 == blockIdx.x * nw * bn`, exactly). ARMED =>
+        // each block walks `n_tiles` tiles behind ONE activation staging and
+        // `grid = ceil(tiles_total / n_tiles)`, so the activation traffic of the
+        // launch drops by that factor. `n_tiles` never exceeds the launch's own tile
+        // count (a smaller grid would leave blocks idle on the first iteration).
+        int n_tiles = (g_mtile_gridstride != 0) ? g_mtile_gridstride_t : 1;
+        if (n_tiles > tiles_total) n_tiles = tiles_total;
+        if (n_tiles < 1) n_tiles = 1;
+        const dim3 grid_mt((unsigned)((tiles_total + n_tiles - 1) / n_tiles));
         if (smem_mt <= (size_t)dsv41_smem_ceiling(gemm_fp8_mtile_kernel<1>)) {
             if (smem_mt > 48 * 1024) {
                 // Same per-kernel attribute discipline as the other two arms:
@@ -6804,8 +6876,11 @@ extern "C" int dsv41_gemm_fp8_mrows(const uint8_t* a, const float* a_scale,
                 if (reported++ == 0)
                     fprintf(stderr,
                             "[mrows-mtile] ARMED m=%d n=%d k=%d bn=%d nw=%d -> block=%d warps, "
-                            "grid=%d, smem=%zu%s%s\n",
-                            m, n, k, bn, nw, nw, (int)grid_mt.x, smem_mt,
+                            "grid=%d, n_tiles=%d, smem=%zu%s%s%s\n",
+                            m, n, k, bn, nw, nw, (int)grid_mt.x, n_tiles, smem_mt,
+                            (g_mtile_gridstride != 0)
+                                ? "  [DSV41_MTILE_GRIDSTRIDE armed: resident activation]"
+                                : "",
                             (g_mrows_l2bcast != 0)
                                 ? "  [DSV41_MROWS_L2BCAST also armed -> shadowed by this arm]"
                                 : "",
@@ -6814,14 +6889,14 @@ extern "C" int dsv41_gemm_fp8_mrows(const uint8_t* a, const float* a_scale,
             }
             const int blk_mt = nw * 32;
             switch (m) {
-                case 1: gemm_fp8_mtile_kernel<1><<<grid_mt, blk_mt, smem_mt, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, bn, k); break;
-                case 2: gemm_fp8_mtile_kernel<2><<<grid_mt, blk_mt, smem_mt, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, bn, k); break;
-                case 3: gemm_fp8_mtile_kernel<3><<<grid_mt, blk_mt, smem_mt, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, bn, k); break;
-                case 4: gemm_fp8_mtile_kernel<4><<<grid_mt, blk_mt, smem_mt, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, bn, k); break;
-                case 5: gemm_fp8_mtile_kernel<5><<<grid_mt, blk_mt, smem_mt, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, bn, k); break;
-                case 6: gemm_fp8_mtile_kernel<6><<<grid_mt, blk_mt, smem_mt, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, bn, k); break;
-                case 7: gemm_fp8_mtile_kernel<7><<<grid_mt, blk_mt, smem_mt, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, bn, k); break;
-                case 8: gemm_fp8_mtile_kernel<8><<<grid_mt, blk_mt, smem_mt, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, bn, k); break;
+                case 1: gemm_fp8_mtile_kernel<1><<<grid_mt, blk_mt, smem_mt, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, bn, k, n_tiles); break;
+                case 2: gemm_fp8_mtile_kernel<2><<<grid_mt, blk_mt, smem_mt, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, bn, k, n_tiles); break;
+                case 3: gemm_fp8_mtile_kernel<3><<<grid_mt, blk_mt, smem_mt, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, bn, k, n_tiles); break;
+                case 4: gemm_fp8_mtile_kernel<4><<<grid_mt, blk_mt, smem_mt, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, bn, k, n_tiles); break;
+                case 5: gemm_fp8_mtile_kernel<5><<<grid_mt, blk_mt, smem_mt, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, bn, k, n_tiles); break;
+                case 6: gemm_fp8_mtile_kernel<6><<<grid_mt, blk_mt, smem_mt, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, bn, k, n_tiles); break;
+                case 7: gemm_fp8_mtile_kernel<7><<<grid_mt, blk_mt, smem_mt, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, bn, k, n_tiles); break;
+                case 8: gemm_fp8_mtile_kernel<8><<<grid_mt, blk_mt, smem_mt, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, bn, k, n_tiles); break;
                 default: return 2;
             }
             return (int)cudaGetLastError();
@@ -7156,14 +7231,14 @@ extern "C" int dsv41_gemm_fp8_mrows_q_f32(const float* a, int a_stride, const ui
     }
     const int blk = nw * 32;
     switch (m) {
-        case 1: gemm_fp8_mtile_kernel<1, 1><<<grid, blk, smem, s>>>(reinterpret_cast<const uint8_t*>(a), nullptr, w, w_scale, bias, out, n, k, out_stride, bn, a_stride); break;
-        case 2: gemm_fp8_mtile_kernel<2, 1><<<grid, blk, smem, s>>>(reinterpret_cast<const uint8_t*>(a), nullptr, w, w_scale, bias, out, n, k, out_stride, bn, a_stride); break;
-        case 3: gemm_fp8_mtile_kernel<3, 1><<<grid, blk, smem, s>>>(reinterpret_cast<const uint8_t*>(a), nullptr, w, w_scale, bias, out, n, k, out_stride, bn, a_stride); break;
-        case 4: gemm_fp8_mtile_kernel<4, 1><<<grid, blk, smem, s>>>(reinterpret_cast<const uint8_t*>(a), nullptr, w, w_scale, bias, out, n, k, out_stride, bn, a_stride); break;
-        case 5: gemm_fp8_mtile_kernel<5, 1><<<grid, blk, smem, s>>>(reinterpret_cast<const uint8_t*>(a), nullptr, w, w_scale, bias, out, n, k, out_stride, bn, a_stride); break;
-        case 6: gemm_fp8_mtile_kernel<6, 1><<<grid, blk, smem, s>>>(reinterpret_cast<const uint8_t*>(a), nullptr, w, w_scale, bias, out, n, k, out_stride, bn, a_stride); break;
-        case 7: gemm_fp8_mtile_kernel<7, 1><<<grid, blk, smem, s>>>(reinterpret_cast<const uint8_t*>(a), nullptr, w, w_scale, bias, out, n, k, out_stride, bn, a_stride); break;
-        case 8: gemm_fp8_mtile_kernel<8, 1><<<grid, blk, smem, s>>>(reinterpret_cast<const uint8_t*>(a), nullptr, w, w_scale, bias, out, n, k, out_stride, bn, a_stride); break;
+        case 1: gemm_fp8_mtile_kernel<1, 1><<<grid, blk, smem, s>>>(reinterpret_cast<const uint8_t*>(a), nullptr, w, w_scale, bias, out, n, k, out_stride, bn, a_stride, 1); break;
+        case 2: gemm_fp8_mtile_kernel<2, 1><<<grid, blk, smem, s>>>(reinterpret_cast<const uint8_t*>(a), nullptr, w, w_scale, bias, out, n, k, out_stride, bn, a_stride, 1); break;
+        case 3: gemm_fp8_mtile_kernel<3, 1><<<grid, blk, smem, s>>>(reinterpret_cast<const uint8_t*>(a), nullptr, w, w_scale, bias, out, n, k, out_stride, bn, a_stride, 1); break;
+        case 4: gemm_fp8_mtile_kernel<4, 1><<<grid, blk, smem, s>>>(reinterpret_cast<const uint8_t*>(a), nullptr, w, w_scale, bias, out, n, k, out_stride, bn, a_stride, 1); break;
+        case 5: gemm_fp8_mtile_kernel<5, 1><<<grid, blk, smem, s>>>(reinterpret_cast<const uint8_t*>(a), nullptr, w, w_scale, bias, out, n, k, out_stride, bn, a_stride, 1); break;
+        case 6: gemm_fp8_mtile_kernel<6, 1><<<grid, blk, smem, s>>>(reinterpret_cast<const uint8_t*>(a), nullptr, w, w_scale, bias, out, n, k, out_stride, bn, a_stride, 1); break;
+        case 7: gemm_fp8_mtile_kernel<7, 1><<<grid, blk, smem, s>>>(reinterpret_cast<const uint8_t*>(a), nullptr, w, w_scale, bias, out, n, k, out_stride, bn, a_stride, 1); break;
+        case 8: gemm_fp8_mtile_kernel<8, 1><<<grid, blk, smem, s>>>(reinterpret_cast<const uint8_t*>(a), nullptr, w, w_scale, bias, out, n, k, out_stride, bn, a_stride, 1); break;
         default: return 2;
     }
     return (int)cudaGetLastError();
