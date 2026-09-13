@@ -1605,3 +1605,16 @@ grep -E "routed-down-quant" ~/armrun_RQ1.log | head -20     # 5 组值 + 主机�
 ```
 **判据**：①–⑤ 逐元素差为 0（±1 ulp）；随后同 env 跑 `~/verify_correct.sh` 做文本红线（配合 `~/wq_check.py`）。
 ⚠️ 性能数字仍必须来自 **无 DBG** 的快速臂（`~/arm_run_fast.sh`）——DBG 本身会 D2H 回读、污染计时。
+
+## §59 排除：权重 SF 的平面尺寸三方一致（字节 ↔ 词 ↔ TMA 步长）
+
+`chain_dev.rs:moe_bs_weights` 的断言与 kernel/官方三处必须同源，实测**一致** ✓：
+
+| 侧 | 表达式 | 值 |
+|---|---|---|
+| Rust 断言（**字节**） | `moe_bs_sf_words(dim) * inter_local * 4` = `(5120/128) * 320 * 4` | **51200 B** |
+| 官方 TMA 描述符 | `SFW1/SFW3` 的 `gstride[1]`（见 §57 的对照表） | **51200 B** ✓ |
+| kernel 索引（**词**） | `SFW1[e*(40*HW_NP) + k*HW_NP + n_tile*HW_NH + i]` ⇒ 平面 = `40*320` | **12800 词 = 51200 B** ✓ |
+
+⇒ 权重 SF 的**每专家平面尺寸、K 组步长（HW_NP=320 词 = 一组的 inter 行）、行索引**三处自洽 ✓
+（`s_stride`/`t_stride` 也在 Rust 侧被断言等于该值，不满足则不 arm——而臂确实 arm 了 ✓）。
