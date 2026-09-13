@@ -107,94 +107,26 @@ LD_LIBRARY_PATH=$HOME/ferrite/kernels/cuda ./target/release/ferrite-serve --back
 - serve 卡住/日志 mtime 停滞 = 挂了（查 `stat -c %y` + pgrep，别等）。
 - 加载错防线（三道 runtime + 三道编译期 + git hooks）见 `docs/agent/` 的加载防线文档。
 
-## 当前状态与下一步（2026-09-14 深夜——🎉🎉 数值验证完美通过：手写 kernel = TileLang bit-exact）
+## 当前状态与下一步（2026-09-14——手写 fp4 MoE BS 臂：朝向已定，残余一错）
 
-**🎉🎉 完整成功链**：
-1. TileLang pipeline m>1 crash（根因确认：TMA + mbarrier + 3-stage 结构）
-2. 手写 kernel（验证过的 tcgen05 原语 + 顺序执行）→ 0 errors
-3. 输出乱码（row-major vs core matrix 布局不匹配）
-4. Core matrix 修复（addr(m,k) = (m/8)*1024 + (k/16)*128 + (m%8)*16 + (k%16)）
-5. **数值对比 PASS：0/3840 mismatches，bit-exact！**
+**详细记录一律在 `docs/agent/moe-bs-crash-investigation.md`（§10–§22），本节只放结论与指针。**
 
-**手写 kernel 现在可以用于生产**（`DSV41_MOE_BS_HANDWRITTEN=1`）
-- verify = 34.5ms（顺序执行，无 pipeline）
-- 需要 cp.async 双缓冲优化 → ~22ms
-
-**Core Matrix 布局要点**（关键知识）：
-- UMMA smem descriptor 期望 8行×16B 的 core matrix 原子格式
-- `addr(m, k) = (m/8)*1024 + (k/16)*128 + (m%8)*16 + (k%16)`
-- lbo = 16B（原子内行距）= 1（16B 单位）
-- sbo = 1024B（原子间距）= 64（16B 单位）
-- layout = 0（无 swizzle）
-- TileLang 的 TMA 自动写这个布局；手写必须手动实现
-
-**判别实验（在跑）**：
-1. no-swallow（DSV41_SWALLOW_STEP=0）：verify 用 m=5（legacy arm）而非 m=6（swallowed arm）
-2. k-limit=1（kernel 只跑 1 个 k-iteration）：测试流水线深度
-
-**C8 块加宽分析完成**：需改 3 处（DSPARK_DRAFTS + VERIFY_ROWS + **config.json 的 dspark_block_size——运行期无 env 覆盖**）+ 影子常量（ACC_BINS、spec_step M）+ 硬编码（glue.cu m>6）+ TileLang shim cap。核心 0.5 人日。
-
-**已否定假设**（exhaustive）：
-1. ✅relinquish_alloc_permit（修复 d25d5fe 但非根因——JIT 无它也不 crash）
-2. ✅idesc ki-bits（illegal-instr-3 权威位表：[4,6)=b_sf_id 非 k_size，sf_id 选择是故意的）
-3. ✅fast math（NO_FAST_MATH 也 crash——只改变错误类型 illegal instruction↔illegal memory access）
-4. ✅w3 指针（w3-ptr-audit：w1=pool+0, w3=pool+870400, w_stride=2641920 全部正确）
-5. ✅Eid 值域（eid-init-audit：每 rank 全部 384 expert TP-split by inter 非 EP，值域 [0,384) 全合法）
-6. ✅descriptor 参数（desc-param-diff：6 个 descriptor 除有意 stride 差异外全部匹配；dtype 14=16U4_ALIGN16B 验证一致）
-7. ✅内存边界（W1 TMA reach 1,012,674,560 < pool 1,014,497,280 ✓；shared memory 全在 kSmem 内；TMEM 160<512）
-8. ✅JIT vs AOT 源码一致（diff 仅差手加的 relinquish asm）；模板一致；dtype 枚举一致
-
-**关键事实**：
-- JIT（纯布局 gstride=819200 + host descriptor）**不 crash 但读错数据**
-- AOT（块布局 gstride=2641920 + shim descriptor）**crash（illegal memory access）**
-- MMA skip 测试确认 crash 在 MMA kernel 内
-- 8/8 ranks 全部 crash
-
-**Runtime 诊断在途**：
-- Eid DIAG（一次性打印实际值）+ SYNC-DIAG（per-kernel sync 隔离 gather/MMA/scatter）
-- compute-sanitizer 脚本已部署（~/sanitizer_run.sh）——如果 DIAG 不能定位
-- 诊断决策树脚本已部署（~/diag_chain.sh）
-
-**其他交付**（全部已提交）：
-- C5 shared expert TileLang fp8 MMA（gen_sh_exp_aot.py 430行 + sh_exp_shim.cu 303行 + Rust 接线）
-- P5 MTile grid-stride（激活 staging 一次共享，DSV41_MTILE_GRIDSTRIDE gate）
-- H1 draft hc front 别名（DSV41_DRAFT_HC_FRONT）
-- D3 KV block 32（官方 block_size=32，window-KV 当前 raw f32）
-- build.sh 选择性 fast-math（tilelang_gen 无 fast math，其余保持——防 err 900 capture crash）
-- push400_test.sh 已更新含 SH_EXP_TILELANG + MTILE_GRIDSTRIDE_T=8
-
-**当前账**：step ≈28.6ms @ acc 2.24 ⇒ ~104 tok/s。
-**TileLang 预期（全接线后）**：投影 7.4→1.5ms + MoE 10→2.8ms ⇒ verify ~10-12ms ⇒ step ~14-16ms ⇒ **~200-230 tok/s**。
-**在途**：第六次重编（63a0f948：xsc 算术修复 + moe_bs 守卫 + 全部接线）→ DUAL_ARTIFACT_OK 后 T 臂双挂重跑（`~/tl_dual_test.sh` 已部署：GEMM_TILELANG + GEMM_TILELANG_EAGER + 计数 first-51 + 拉丁 + dspark 分解）。
-
-**已判死（勿重试）**：MPAR（两败）、⑤a L2 直读（四档负）、proj-mma（acc 崩 0.02）、p3lite+ALIGN（acc −0.22 + l4 parity FAIL）、GROUPED 布局（+16ms）、g1 union（+0.46ms）、launch 税、复制 eager 重写、M-tile 参数调优（BN 钳 4）、bf16 dequant 显存（+105GiB/rank）。
-
-**T 臂乱码关键教训**（`docs/agent/tl-garbage-verdict.md`）：
-1. **`.max()` 的域比存在本身重要**——放在 `/32` 前面是 no-op，移到后面才是真 floor。
-2. **parity 微基准的输入必须与生产布局同构**——hash 输入验证的是"自洽"而非"同构"。
-3. **"两个谓词是一对"**——A 有 m-predicate 而 ASC 没有，靠 reduce 兜底是隐性耦合。
-4. **m=1 基线对 stride 类缺陷免疫**——out_stride/a_stride/scale pitch 错误只有多行才暴露。
-5. **半挂配置是设计内非法**——接线契约明文规定双侧同换（eager + verify 同挂）。
-
-- **acc 2-3 达标 ✓✓**：S1 tap 越界根因修复（`hc_collapse` per-row pre 契约 vs m-row hook 单行 4-float 越界——Fix A `dspark_pre_mean_r` 复制零成本等价，commit 6f6f513）→ **mean-k 1.34→2.240**（超 lazy 2.120；归因闭环 fix-off=1.38）；TAP_PARITY H 区全 IDENTICAL + COMP_PARITY 19/0（S2 干净）——双嫌疑闭环。
-- **正确性红线通过**：出师表拉丁 = EAGER 对照同现（模型行为）；DIFF_EAGER 48/48 none；计数 first-51 OK 全臂。
-
-**当前账（step ≈28.6ms @ acc 2.24 ⇒ ~104 tok/s）**：verify 24.5（已含 hc −3.4 + ATTN_MROWS −2.98 + SH/COMP/INDEXER 融合）+ draft 3.8 + commit 0.5。
-**在途修复（4 subagent）**：proj-mma 接线（−3.5ms 中央）+ ⑤a L2 广播（−4~6ms，逐位安全）+ tcgen05 gate/up 716（MoE grouped 唯一解锁，−2ms）+ draft parity 套件。
-**已否决（勿重试）**：MPAR warp-并行（二连败）、wo_a nwarps（8 已最优）、p3lite+ALIGN（acc −0.22）、GROUPED 无 TCGEN05（+10.3ms）、COMP/ENGRAM（票面高估 10×）。
-**方法论**：AR_SAFE nsys 表对生产无效；票面必须 nsys 时间占比；mrows 零摊销（⑤a/⑤b 是真解）；env 回读断言必须；step p50 口径 + 出师表红线 + [sh-gate] 回执。
-
-
-**Session 成果（783+ commits，107 知识文件）**：
-- **范式转移**：所有"损坏"判定是模型行为（EAGER 对照确认）。验证协议 v2：计数只对前 61 行有效；退化与 EAGER 一致 = 干净。
-- **lazy 干净栈：91.1 tok/s（+15.6%）**：R2(+10.2%) + MARKOV(+3.2%) + VERIFY_FORK(+1.5%) + RING_WIN(+0.3%)
-- **🎉 SWALLOW 完全解锁！**（11 次修复：OOB 根因（staging 被越界清零→canary 抓到！）→ OOB 修复（guard band + bounds check）→ engram slot 修复（147456 ≥ payload）→ **300 token 正常生成 + 出师表红线通过（零拉丁 ✓）+ 全 gate 58.3 tok/s**）
-- **AR Step 2 (A1a) 教训**：+665 行 store fold 在两条路径破坏数值（lazy 90.9/输出退化 + SWALLOW 7.1/8× 退化）——**AR_STORE_FUSE 永久 OFF**
-- **400 路线（⛔ 终局订正 2026-09-13，旧口径作废）**：**正确模型 = MTP verify 摊薄**（`docs/agent/mtp-verify-amortization-model.md`，必读）：单并发 decode 是 memory-bound，**verify(m 行) 应 ≈ eager(1 行)+ε**（权重读共享）⇒ **400 = step ~8ms + acc 2-3**（375-500 tok/s）。实测 verify=28.17ms = eager 6.33ms 的 **4.45× = 实现未摊薄的病**（不是物理极限）——主战场 = **逐 kernel 对比 eager(1) vs verify(6)，找出所有 ~6× 未摊薄项**（MoE per-row 路由展开 / per-row kernel 未进 m=6 块 / 图 launch 结构 / attention per-row 计算）并批量化修复。~~"L4/L5 25-40 人日唯一路径"~~ 作废重估。A0 判决（AR 无肉，nsys 78µs 是自旋假象）保留有效；**任何提案引用 nsys 的 AR µs 数必须先过 A0 探针复测**
-- **tcgen05 根因已定谳（第 5 轮判定实验）**（`docs/agent/tcgen05-rank7-verdict.md §10`）：**8/8 ranks 同文本 cuda error 716**（"只有 rank 7"= serve.rs 上报竞态，正式作废）+ ALIGN_AUDIT 唯一 violation = **w2 SF 行 pitch 10B**（rank 对称）⇒ 根修 = SF 行 stride 与逻辑 k/32 解耦（行间 padding + 内核索引参数化，inter/world 需被 512 整除），属 L4-3/L4-4 收尾
-
-**400 的诚实判定**：lazy 上限 ~145；SWALLOW 需要全部优化兑现（mrows + hc/B6 + tcgen05 + AR 重设计 + L4/L5）；60% 兑现 → ~300 tok/s；**先钉死 S0 步时（28ms）是 G2 的全部意义**。
-
-**验证纪律（v2）**：EAGER 对照必须；前 61 行判据；三探针（数字+拉丁+k_acc）缺一不可；**gate ON vs OFF 逐字节一致**（A1a 的教训）。
-
-**下一 session 前 30 分钟**：读 handover 的 SWALLOW 部分 → mrows Phase A 状态检查 → 起一臂测试 → 5 个决策（A1a 修或弃 / hc arm / 路由 / tcgen05 / 400 口径）。
+- **手写 kernel 的 6 个真 bug 已修**：idesc `b_sf_id` 漏 `<<4`、smem 布局与 descriptor 的 swizzle 声明不匹配、
+  K-block 递进单位误判 8×、缺 `fence.proxy.async`、缺 `tcgen05.fence::before/after_thread_sync`（3 处）。
+- **朝向是主因**：`DSV41_MOE_BS_SWAPAB=1`（A=权重 e2m1 / B=激活 e4m3，idesc a_fmt=5/b_fmt=0，epilogue 转置）
+  把 e2e 输出从**随机乱码**推进到**递减的连续数字**（`5 4 3 2 1 6 5 4`）。树内唯一"GPU 已验证"的 mxf8f6f4
+  配置（PH0 探针、`tc5::e4`）用的正是这个朝向。**残余一个系统性误差**待钉死。
+- **头号假设 = SF 字节序**（硬件可能 MSB-first：byte j 携带 K-block `3-j`；我们两侧都按 LSB-first 打包）。
+  门控 `DSV41_MOE_BS_SFREV=1` 用一行 idesc 改动（`sf_id = 3-ki`）同时修正权重侧与激活侧。
+- **门控一览**（全默认 OFF）：`DSV41_MOE_BS_{HANDWRITTEN,CANON,SCALEVEC1X,SWAPAB,SFREV,NUMCHECK}`。
+- **诊断纪律（踩过的坑）**：
+  1. `NUMCHECK` 需 **`DSV41_GRAPH_STEP=0`** 才触发（whole-step graph 捕获期 shim 一律 decline）；
+  2. **16 组合微基准的 FAIL 不作数**（换布局结果逐位相同 = 物理上不可能）；
+  3. in-tree **PH0 探针在本机跑不过它自己的金标准**（"已验证原语"的前提需重验）；
+  4. 编译检查要编 **shim**（`moe_bs_handwritten.cu` 被 `moe_bs_shim.cu` `#include`，单独编必假报错）。
+- **精度对齐（用户硬性要求）已审计，两处待修**（见 §14/§21，**等 BS 臂正确后一次改一个变量**）：
+  ① 路由权重我方在 w2 epilogue 乘、官方在 w2 **之前**乘；② routed 的 down 输入我方是 **f32**、官方是 **e4m3(block32) 量化**
+  （⇒ 我方精度偏高）。激活量化本身与官方**逐字节一致**。
+- **现成远端工具**：`~/arm_run.sh <name> [ENV...]`（单臂 e2e + 开关回执 + [NC]）、
+  `~/sfrev_round.sh`（SFREV 三臂决定性实验）、`~/next_round.sh`（微基准 + swapAB 矩阵）、
+  `~/verify_correct.sh <port> <label>`（1..100 前 61 行 + 拉丁探针 + step p50）。
