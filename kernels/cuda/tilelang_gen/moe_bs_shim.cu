@@ -651,6 +651,15 @@ bool tl_bs_init() {
         (void)cudaGetLastError();
         fprintf(stderr, "[moe-bs] canon layout = %d\n", canon);
     }
+    // g_packgeom: packed-fp4 geometry selector (0 = §30 guess, 1 = candidate B)
+    if (ok) {
+        int pg = 0;
+        const char* e = getenv("DSV41_MOE_BS_PACKGEOM");
+        if (e != nullptr && e[0] == '1') pg = 1;
+        (void)cudaMemcpyToSymbol(g_packgeom, &pg, sizeof(int));
+        (void)cudaGetLastError();
+        fprintf(stderr, "[moe-bs] pack geometry = %d\n", pg);
+    }
     // g_packed: stage the fp4 operand PACKED (two K elements per byte, the way the
     // hardware reads it) instead of unpacked
     if (ok) {

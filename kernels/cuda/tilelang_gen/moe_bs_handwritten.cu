@@ -64,7 +64,17 @@ __device__ int g_packed = 0;
 // four 16-byte chunks are XOR-permuted by the row index. The empirical calibration
 // (subagent bs-packed-geometry, judged by relerr==0 on a dense parity) is authoritative —
 // if its formula differs, replace THIS FUNCTION only.
-__device__ __forceinline__ int hw_pack_idx(int row, int col /* p acked byte index, 0..63 */) {
+// g_packgeom selects between the two candidate geometries (see §32):
+//   0 = §30 guess   : lbo=1 (16 B), sbo=64 (1024 B), layout=2, 16 B chunks swizzled by row
+//   1 = candidate B : lbo=8 (128 B), sbo=32 (512 B), layout=0, kb (= k/32) is the K-block
+// The empirical calibration (relerr==0 on a dense parity) is authoritative.
+__device__ int g_packgeom = 0;
+
+__device__ __forceinline__ int hw_pack_idx(int row, int col /* packed byte index, 0..63 */) {
+    if (g_packgeom == 1) {
+        // candidate B: byte(row, kb) = (row%8)*16 + kb*128 + (row/8)*512, kb = col/16
+        return (row & 7) * 16 + (col >> 4) * 128 + (row >> 3) * 512 + (col & 15);
+    }
     const int chunk = col >> 4;          // 16-byte chunk inside the row (0..3)
     const int within = col & 15;         // byte inside the chunk
     return (row >> 3) * 512 + (row & 7) * 64 +
@@ -388,10 +398,16 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
             // own W descriptor numbers apply — lbo=1 (16 B), sbo=64 (1024 B), layout=2.
             const bool a_packed = g_packed && g_swapab;
             const bool b_packed = g_packed && !g_swapab;
-            const uint64_t a_desc_base = a_packed ? hw_make_desc(A_sh, 1, 64, 2)
+            // packed-fp4 descriptor: geometry 0 -> lbo=1/sbo=64/layout=2; candidate B ->
+            // lbo=8/sbo=32/layout=0 (§32)
+            const uint64_t a_pk = (g_packgeom == 1) ? hw_make_desc(A_sh, 8, 32, 0)
+                                                    : hw_make_desc(A_sh, 1, 64, 2);
+            const uint64_t b_pk = (g_packgeom == 1) ? hw_make_desc(B_sh, 8, 32, 0)
+                                                    : hw_make_desc(B_sh, 1, 64, 2);
+            const uint64_t a_desc_base = a_packed ? a_pk
                                      : (g_canon ? hw_make_desc(A_sh, 8, 16, 0)    // canonical SWIZZLE_NONE
                                                 : hw_make_desc(A_sh, 1, 64, 2));  // TileLang SW128
-            const uint64_t b_desc_base = b_packed ? hw_make_desc(B_sh, 1, 64, 2)
+            const uint64_t b_desc_base = b_packed ? b_pk
                                      : (g_canon ? hw_make_desc(B_sh, 8, 16, 0)
                                                 : hw_make_desc(B_sh, 1, 64, 2));
 
@@ -411,8 +427,11 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
                 // Tcgen05SMemDescriptor::operator+ does `reg32_[0] += offset >> 4`
                 // (offset in BYTES). So the advance is ki*32 bytes = ki*2 units.
                 // packed fp4: a K-block is 16 B = 1 unit, so the advance is ki*1
-                const uint64_t a_desc = a_desc_base + (uint64_t)(ki * (a_packed ? 1 : (g_canon ? 256 : 2)));
-                const uint64_t b_desc = b_desc_base + (uint64_t)(ki * (b_packed ? 1 : (g_canon ? 256 : 2)));
+                // packed K-block advance: geometry 0 -> 16 B = 1 unit; candidate B -> 128 B = 8
+                const uint64_t a_pkadv = (g_packgeom == 1) ? 8 : 1;
+                const uint64_t b_pkadv = (g_packgeom == 1) ? 8 : 1;
+                const uint64_t a_desc = a_desc_base + (uint64_t)(ki * (a_packed ? a_pkadv : (g_canon ? 256 : 2)));
+                const uint64_t b_desc = b_desc_base + (uint64_t)(ki * (b_packed ? b_pkadv : (g_canon ? 256 : 2)));
                 // enable_d: 0 for first MMA (clear accumulator), 1 for rest
                 const uint32_t enable_d = (k == 0 && ki == 0) ? 0 : 1;
 
