@@ -4988,6 +4988,15 @@ fn hc_tail_split() -> bool {
             }
         }
 
+        // op-level diagnostic: s.o after the routed loop (pre-AR, pre-shared)
+        // — kind 9 — the routed experts' total contribution, for the e4m3
+        // bisection against the e2m1 baseline.
+        if let Ok(xdp) = std::env::var("DSV41_GT_XDUMP") {
+            if layer == 0 {
+                self.gt_dump_vec(&xdp, 9, self.s.o.ptr, 32)?;
+            }
+        }
+
         // shared expert: fp8, every token. Its weights are replicated, so under
         // a collective exactly one rank may contribute it — otherwise the
         // all-reduce below would sum it `world` times. (`shared_rank` is computed
