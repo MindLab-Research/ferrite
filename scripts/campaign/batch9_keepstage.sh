@@ -14,16 +14,8 @@
 set -uo pipefail
 cd "$HOME/ferrite"
 
-echo "=== rebuild BOTH artefacts + freshness gate ==="
-# The batch must do its own fetch/reset AND force a real rebuild: build.sh has its own up-to-date
-# logic and has silently skipped a changed shim before, which is exactly the stale-artefact class
-# check_artifacts.sh exists to catch (it did, aborting the previous batch9 before any arm ran).
-git fetch -q origin && git reset -q --hard origin/main
-touch kernels/cuda/*.cu kernels/cuda/tilelang_gen/*.cu 2>/dev/null || true
-(cd kernels/cuda && set -o pipefail; bash build.sh 103a 2>&1 | tail -2; echo KERNEL_RC=${PIPESTATUS[0]})
-source "$HOME/.cargo/env"
-(set -o pipefail; cargo build --release 2>&1 | tail -2; echo CARGO_RC=${PIPESTATUS[0]})
-bash "$HOME/check_artifacts.sh" || { echo "ARTIFACTS_STALE — aborting"; exit 1; }
+echo "=== build (hash-gated: skips when the .cu content is unchanged) ==="
+bash "$HOME/ensure_built.sh"
 git log --oneline -1
 
 run () {
