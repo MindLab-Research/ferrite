@@ -871,6 +871,18 @@ extern "C" int dsv41_moe_tilelang_gate_up_bs_dev(
         xq4, xsc4, g_a, g_sfa, order_dev, counts_dev, kDim, kDim / 32, kSfWords, (int)topk, nseg_dev);
     cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) return (int)e;
+    // SYNC-DIAG (DSV41_MOE_BS_SYNC_DIAG=1): per-kernel sync to isolate which
+    // kernel faults. Default OFF (sync kills perf). Enable for debugging only.
+    static const bool g_sync_diag = []() {
+        const char* v = getenv("DSV41_MOE_BS_SYNC_DIAG");
+        return v != nullptr && v[0] != '0';
+    }();
+    if (g_sync_diag) {
+        e = cudaStreamSynchronize(s);
+        fprintf(stderr, "[moe-bs][SYNC-DIAG] gather done: %s\n",
+                e == cudaSuccess ? "OK" : cudaGetErrorString(e));
+        if (e != cudaSuccess) return (int)e;
+    }
 
     // (2) block-scaled grouped GEMM（生成物）。ABI 与 host-table 入口一字不差 ——
     //     权威配方见那里的长注释（C 是描述符、SFA 是裸指针、W 排在最后）。
@@ -907,11 +919,22 @@ extern "C" int dsv41_moe_tilelang_gate_up_bs_dev(
         g_tmap_a, g_tmap_c, eid_dev, g_sfa, g_tmap_sfw1, g_tmap_sfw3, g_tmap_w1, g_tmap_w3);
     e = cudaGetLastError();
     if (e != cudaSuccess) return (int)e;
+    if (g_sync_diag) {
+        e = cudaStreamSynchronize(s);
+        fprintf(stderr, "[moe-bs][SYNC-DIAG] MMA done: %s\n",
+                e == cudaSuccess ? "OK" : cudaGetErrorString(e));
+        if (e != cudaSuccess) return (int)e;
+    }
 
     // (3) scatter：RAW gate‖up 写回 out（swiglu 由既有 kernel 做，与本臂无关）
     tl_moe_bs_scatter_kernel<<<dim3((unsigned)kBm, (unsigned)kSegCap), kMovThreads, 0, s>>>(
         g_c, out, order_dev, counts_dev, kNup, topk * kNup, topk, nseg_dev);
     e = cudaGetLastError();
+    if (g_sync_diag) {
+        cudaError_t es = cudaStreamSynchronize(s);
+        fprintf(stderr, "[moe-bs][SYNC-DIAG] scatter done: %s\n",
+                es == cudaSuccess ? "OK" : cudaGetErrorString(es));
+    }
     return (int)e;
 }
 
