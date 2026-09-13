@@ -136,6 +136,30 @@ random 4k/1k、**模拟 accept 5.5**）。**详情与 16 步阶梯见 `docs/agen
   `.cu` 改动攒批（每次改动都触发 ~3.5 分钟全量重编）✓。
 - 详细过程：`docs/agent/moe-bs-crash-investigation.md` §141–§155。
 
+## §156 【400 tok/s 的账本】verify 是"提交开销"瓶颈，不是算力
+
+代码注释（`chain_dev.rs` 的 DSpark verify 图化块）给出**确切数字**：
+
+- **verify = ~7000 次流式发射/次**（40 层 × ~170 节点 ✓），每次流式发射在图上加 **~2.9µs 提交时间**
+  ⇒ **≈ 20.3ms** —— 也就是 verify 28.17ms 里**几乎全部**都是**提交开销**（不是算力）✓；
+- 同一注释给出解药：**整块 verify 是"一张图"**，节点分发 floor **~0.4µs/node** ⇒ 7000×0.4 ≈ **2.8ms** ✓✓；
+- 为了"replay 精确"，每步的输入（token id / 行位置）都在**捕获之外**刷新到 **device 缓冲** ⇒ 无 host 参数变化 ✓
+  （槽位池 `verify_graphs` 按行数一槽 ✓，`VERIFY_GRAPH_SLOTS=3` ✓）。
+
+**⇒ 预算推算（BS 臂 OFF 的正确路径）**：
+
+| 配置 | step 预算 | 折算 |
+|---|---|---|
+| 现状 | 32.5ms（draft 3.87 + verify 28.17 + commit 0.47） | 3.24/0.0325 ≈ **100 tok/s** |
+| **P1 = + `DSV41_VERIFY_GRAPH=1`**（单变量） | verify 28.17 → ~5ms（2.8 + 计算）⇒ step ≈ **9.5ms** | ≈ **340 tok/s** |
+| **P2 = P1 + `MOE_TILELANG=1`**（70µs/层 = 250µs 的 28% ⇒ 省 ~7.2ms）+ `GATE_MROWS[_ROUTE]` + MROWS 家族 | step ≈ **8ms** | ≈ **400+ tok/s** ✅ |
+| P3（若还要） | + `DSV41_GRAPH_STEP=1`（decode 侧同一图化思路） | 更贴近 450 ✓ |
+
+**纪律**：P1/P2/P3 **各是一个单变量步**，每步都看 `[dsv41] step pos` 的 **p50**（禁吞吐反推）+ **1..100 前 61 行 = 1..61**（红线）；
+现成工具 `~/run_to_400.sh`（把 P1→P2 串起来、零空转，并打印观测到的 accept）✓。
+**注意**：verify 图化与"惰性初始化"的臂有冲突（`cudaMalloc`/`cudaFuncSetAttribute` 不能在捕获内 ✗）⇒
+凡是有 lazy INIT 的臂（如 down BS 臂）**必须先在不捕获的调用里初始化过**（`*_INITED` 一次性闩 ✓）才可进图 ✓。
+
 - **症状**：serve 能启动/加载/武装 BS 臂，但**首个请求时卡死** —— 日志刷 `[ar5-hang] … TIMEOUT -> PARK`
   且**整轮 0 个 `[dsv41] step pos`**；`curl` 拿不到响应（`http=000`）。**用户锚点："之前从来没卡过"** ⇒ 是回归。
 - **已排除**（有证据）：**环境**（把 COMMON 恢复成改动前的形态、单臂对照 `S1` **照样卡** ✗）；
