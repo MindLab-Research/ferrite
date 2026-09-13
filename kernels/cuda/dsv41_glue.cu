@@ -475,6 +475,133 @@ __global__ void gemv_bf16_v1_mrows_kernel(const __nv_bfloat16* __restrict__ w,
 }
 
 // ---------------------------------------------------------------------------
+// ⓘ `DSV41_HEAD_MTILE` (default OFF): the SAME v1-order m-row fold, with the N
+// axis (the head's vocabulary rows) as a warp-local tile of `bn` rows.
+// ---------------------------------------------------------------------------
+// THE LESION (the M-into-the-GEMM-tile argument, docs/agent/mrows-mtile-design.md
+// §1-§3, applied to the bf16 head). The kernel above folds the m activation rows
+// into ONE pass over the weight, which removes the m-fold WEIGHT re-read -- but
+// every output row is still its OWN warp, so the whole `M x k` f32 activation
+// slab is re-walked by each of the `n` warps: a block of `nwarp` warps reads the
+// same `M*k` values `nwarp` times per row-chunk. The activation is f32 (4 B)
+// against the weight's bf16 (2 B), so per output row the activation stream is
+// `2*M` times the weight stream -- the `proj-head` "摊薄失效" lesion
+// (verify-amortization-lesion-audit.md §10.2), which the HEAD_ACT_F32VEC arm
+// above attacks from the staging side.
+//
+// THE FIX (bit-safe by construction -- the SAME re-arrangement theorem the mtile
+// family is built on: only WHICH warp computes WHICH element changes; the
+// element program is untouched). Warp `w` of the block owns `bn` CONSECUTIVE
+// output rows `[row_base, row_base+bn)` and all `M` activation rows, i.e. a
+// (M x bn) register tile `acc[r][nn]`. For each k column it decodes the M
+// activation values ONCE and folds them against all `bn` weight rows -- so one
+// activation read now serves `bn` output rows. The block covers `nwarp*bn` rows
+// and the grid is `ceil(n/(nwarp*bn))`, so the activation read count falls from
+// `n*M` to `n*M/bn` while the WEIGHT read count is UNCHANGED (`n*k` either way:
+// each output row's weight is still read exactly once, by exactly one warp).
+// Instruction account at the head's M = 6 (per warp per k column): legacy
+// `1 + M` loads + `M` FMA = `1 + 2M`; mtile `M` act loads + `bn` weight loads +
+// `M*bn` FMA. Over the grid: legacy `n(1+2M)`, mtile `n(M + M/bn + 1)`, i.e.
+// 1.00x (bn = 1, the control) / 0.77x (bn = 2) / 0.65x (bn = 4).
+//
+// WHY THE HEAD IS WORTH IT ANYWAY (honest scope note): the head's `n*k*2` = 165 MB
+// weight stream (seg = 16160 at world = 8) dominates its DRAM traffic and this
+// arm does NOT change it -- so the ticket here is the INSTRUCTION side (the mrows
+// mtile's issue-bound bet), not the byte side. If the GPU shows the head is
+// purely weight-DRAM-bound, this arm is a wash; that is the experiment.
+//
+// BIT-IDENTITY (the C1-C6 of the kernel above, unchanged). The ONLY thing that
+// moves is the row -> warp mapping, which is not part of the contract (the
+// kernel above states it: "rows are independent, so which warp computes a row
+// cannot change it"):
+//   * the k walk is v1's VERBATIM `for (c = lane; c < k; c += 32)` -- including
+//     its NO-#pragma-unroll choice, the one the kernel above pinned
+//     (13.39 vs 13.30ms): adding a pragma here would change the contraction the
+//     two kernels must share;
+//   * `acc[r][nn] += wv * xv[r]` IS `acc += wv * x[r*k + c]` for the output row
+//     `row_base + nn`: the SAME operand order (weight first), the SAME single
+//     accumulator, the SAME ascending-c chain. Each `(r, nn)` accumulator is
+//     independent -- nothing is ever combined across r or nn (C4), and there is
+//     no K-split and no cross-row recombination (C5);
+//   * `xv[r]` is the very same `x[r*k + c]` load, hoisted out of the `nn` loop
+//     because it is a per-(r, c) value: the SAME bytes from the SAME global
+//     address, reused `bn` times, which cannot change any row's value (the mrows
+//     mtile's `av[q]` hoist, verbatim -- the header of `gemv_bf16_v1_mrows_kernel`
+//     records that this kind of hoist "cannot change any row's value");
+//   * `wv = __bfloat162float(w[row*k + c])` is the same decode of the same bytes
+//     at the same position;
+//   * the reduction is v1's `__shfl_xor_sync(0xFFFFFFFFu, a, off)` tree over the
+//     SAME off = 16,8,4,2,1 sequence, run once per (r, nn) element (one tree per
+//     element);
+//   * the epilogue is v1's `if (lane == 0) out[r*n + row] = a` (no bias -- the
+//     head passes none and this entry has no bias parameter, as the kernel above).
+// ⚠️ NO VECTOR BODY, NO UNROLL OF THE c LOOP. Vectorising the consume loop would
+// change which lane owns which c and therefore every partial sum -- that is
+// `gemv_bf16_nt_kernel`'s v2 program, the lookalike that failed the verify
+// (b8b67c0: ~1e-3 off, 33% echo; see the note on `gemv_bf16_v1_mrows_kernel`).
+// This arm keeps v1's scalar body, in v1's order.
+//
+// GEOMETRY. `bn` is the tile's N extent (`DSV41_HEAD_MTILE_BN`, 1..BN_MAX,
+// default 2); `nwarp` is the launcher's block width (8, the same 256 threads the
+// kernel above launches). `grid = ceil(n/(nwarp*bn))` -- NO strided row walk is
+// needed because a block owns its `nwarp*bn` rows outright. The last block's
+// warps whose `row_base >= n` take the guard's false side; `row_base` and
+// `nvalid` are warp-uniform, so the early-out, the `break` and the
+// `__shfl_xor_sync` full mask all stay valid.
+template <int M, int BN_MAX = 4>
+__global__ void __launch_bounds__(256)
+gemv_bf16_v1_mtile_kernel(const __nv_bfloat16* __restrict__ w,
+                          const float* __restrict__ x,
+                          float* __restrict__ out, int n, int k, int bn) {
+    constexpr int RN = M;
+    const int lane = threadIdx.x & 31;
+    const int wid = threadIdx.x >> 5;
+    const int nwarp = (int)(blockDim.x >> 5);
+    const int row0 = blockIdx.x * nwarp * bn;
+    const int row_base = row0 + wid * bn;       // this warp's first output row
+    if (row_base < n) {
+        float acc[RN][BN_MAX];
+        #pragma unroll
+        for (int r = 0; r < RN; ++r)
+            #pragma unroll
+            for (int nn = 0; nn < BN_MAX; ++nn) acc[r][nn] = 0.f;
+        // Rows this warp actually writes (the n tail). Warp-uniform, so the
+        // `break` below and the shfl full mask stay valid.
+        const int nvalid = min(bn, n - row_base);
+        // v1's loop VERBATIM -- including its NO-#pragma-unroll choice.
+        for (int c = lane; c < k; c += 32) {
+            // ONE activation decode per r for the warp's whole N tile (the mtile
+            // `av[q]` hoist). Same bytes, same address as the legacy load.
+            float xv[RN];
+            #pragma unroll
+            for (int r = 0; r < RN; ++r) xv[r] = x[(size_t)r * (size_t)k + c];
+            #pragma unroll
+            for (int nn = 0; nn < BN_MAX; ++nn) {
+                if (nn >= nvalid) break;
+                const int row = row_base + nn;
+                // The weight of THIS output row, decoded once and folded against
+                // all RN activation rows -- the legacy `wv` hoist (C4).
+                const float wv = __bfloat162float(w[(size_t)row * (size_t)k + c]);
+                #pragma unroll
+                for (int r = 0; r < RN; ++r) acc[r][nn] += wv * xv[r];
+            }
+        }
+        // v1's `__shfl_xor_sync(0xFFFFFFFFu, a, off)` tree, once per element.
+        #pragma unroll
+        for (int r = 0; r < RN; ++r)
+            #pragma unroll
+            for (int nn = 0; nn < BN_MAX; ++nn) {
+                if (nn >= nvalid) break;
+                float a = acc[r][nn];
+                #pragma unroll
+                for (int off = 16; off > 0; off >>= 1)
+                    a += __shfl_xor_sync(0xFFFFFFFFu, a, off);
+                if (lane == 0) out[(size_t)r * (size_t)n + (size_t)(row_base + nn)] = a;
+            }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ① `DSV41_HEAD_ACT_F32VEC` (default OFF): the SAME v1-order m-row fold, with the
 // f32 activation READ PATH staged through shared memory.
 // ---------------------------------------------------------------------------
@@ -1492,6 +1619,54 @@ extern "C" int dsv41_gemv_bf16_v1_mrows(const void* w, const float* x, float* ou
         if (v == nullptr || v[0] == '\0') return 0;
         return atoi(v) != 0 ? 1 : 0;
     }();
+    // ⓘ DSV41_HEAD_MTILE (default OFF): the M-into-the-GEMM-tile programme --
+    // `gemv_bf16_v1_mtile_kernel` above, the N axis (the head rows) as a
+    // warp-local tile of `bn`, the M activation rows folded once (one activation
+    // read serves `bn` output rows; the weight read count is unchanged).
+    // `DSV41_HEAD_MTILE_BN` (1..4, default 2) is the tile's N extent.
+    // PRECEDENCE: MTILE > ① (HEAD_ACT_F32VEC) > v1_mrows. A shadowed arm is
+    // NAMED in the receipt rather than silently dropped (this tree's "armed but
+    // inert" phantom-gate discipline).
+    static const int head_mtile_env = [] {
+        const char* v = getenv("DSV41_HEAD_MTILE");
+        if (v == nullptr || v[0] == '\0') return 0;
+        return atoi(v) != 0 ? 1 : 0;
+    }();
+    static const int head_mtile_bn_env = [] {
+        const char* v = getenv("DSV41_HEAD_MTILE_BN");
+        if (v == nullptr || v[0] == '\0') return 2;   // the design's default N extent
+        int x = atoi(v);
+        if (x < 1) x = 1;
+        if (x > 4) x = 4;                             // the kernel's BN_MAX
+        return x;
+    }();
+    if (head_mtile_env != 0) {
+        const int bn = head_mtile_bn_env;
+        const int nwarp = 8;                          // the kernel above's 256-thread block
+        const unsigned mblocks = (unsigned)((n + nwarp * bn - 1) / (nwarp * bn));
+        // ACTIVITY RECEIPT (the `[mrows-mtile]` precedent): ONE line per process
+        // on the first armed launch, naming the geometry resolved to. Gate unset
+        // (the shipped default) => nothing is printed.
+        static int reported = 0;
+        if (reported++ == 0)
+            fprintf(stderr,
+                    "[head-mtile] ARMED m=%d n=%d k=%d bn=%d nwarp=%d -> grid=%u x 256 "
+                    "threads%s\n",
+                    m, n, k, bn, nwarp, mblocks,
+                    head_act_f32vec_env != 0 ? " [遮蔽: DSV41_HEAD_ACT_F32VEC]" : "");
+        switch (m) {
+            case 1: gemv_bf16_v1_mtile_kernel<1><<<mblocks, 256, 0, s>>>(wb, x, out, n, k, bn); break;
+            case 2: gemv_bf16_v1_mtile_kernel<2><<<mblocks, 256, 0, s>>>(wb, x, out, n, k, bn); break;
+            case 3: gemv_bf16_v1_mtile_kernel<3><<<mblocks, 256, 0, s>>>(wb, x, out, n, k, bn); break;
+            case 4: gemv_bf16_v1_mtile_kernel<4><<<mblocks, 256, 0, s>>>(wb, x, out, n, k, bn); break;
+            case 5: gemv_bf16_v1_mtile_kernel<5><<<mblocks, 256, 0, s>>>(wb, x, out, n, k, bn); break;
+            case 6: gemv_bf16_v1_mtile_kernel<6><<<mblocks, 256, 0, s>>>(wb, x, out, n, k, bn); break;
+            case 7: gemv_bf16_v1_mtile_kernel<7><<<mblocks, 256, 0, s>>>(wb, x, out, n, k, bn); break;
+            case 8: gemv_bf16_v1_mtile_kernel<8><<<mblocks, 256, 0, s>>>(wb, x, out, n, k, bn); break;
+            default: return (int)cudaErrorInvalidValue;
+        }
+        return (int)cudaGetLastError();
+    }
     if (head_act_f32vec_env != 0) {
         // M rows x KT = 1024 floats: 32 KB at the largest M, i.e. UNDER the 48 KB
         // default dynamic limit -- no `cudaFuncSetAttribute` dance and no

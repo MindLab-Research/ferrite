@@ -8258,6 +8258,186 @@ wo_a_grouped_gemv_kernel(const uint8_t* __restrict__ a,
     }
 }
 
+// ===========================================================================
+// ⓘ `DSV41_WO_A_MTILE` (default OFF): the M-into-the-GEMM-tile wo_a --
+// `wo_a_grouped_mtile_kernel<M>` below, the SAME element program as
+// `wo_a_grouped_gemv_kernel` above with the N axis staged as a warp-local tile
+// of `bn` output rows.
+// ===========================================================================
+// THE LESION (the M-into-the-GEMM-tile argument, docs/agent/mrows-mtile-design.md
+// §2-§3, applied to the grouped wo_a). The kernel above is already a weight-
+// stationary m-row fold: each warp stages ONE weight row of the group and folds
+// all M activation rows against it, so the weight read is amortised over M. But
+// every output row still owns its OWN warp, so the M activation rows' decode
+// (`s_lut[s_a[j]] * s_as[j>>5]`, and the `s_a`/`s_as` staging behind it) is
+// re-done by each of the `n/`-many warps of the group, once per output row.
+//
+// THE FIX (bit-safe by construction -- only WHICH warp computes WHICH element
+// changes; the element program is untouched). Warp `w` of the block owns `bn`
+// CONSECUTIVE output rows `[row_base, row_base+bn)` and all M activation rows,
+// i.e. a (M x bn) register tile `acc[q][nn]`. It stages all `bn` of its weight
+// rows into shared memory (cp.async16, the same rule the kernel above uses for
+// its single row) and, for each (r, kb), decodes the activation ONCE and folds
+// it against all `bn` weight rows. The block covers `nwarps*bn` rows and the
+// grid is `ceil(n/(nwarps*bn))`, so the activation decode + staging is amortised
+// over `bn` output rows while the WEIGHT bytes are unchanged (`n*k` either way;
+// total smem for the weight tile is identical, just distributed differently).
+// Instruction account (per warp per (r, kb)): legacy `av` (1 LUT LDS + 1 `s_a`
+// LDS + 1 `s_as` LDS + 1 FMUL) + `wv` (1 LDS + 1 LDG + 1 LUT LDS + 1 FMUL) + 1
+// FMA; mtile `av` once + `bn` x (`wv` + 1 FMA). Over the grid: legacy `n*10`,
+// mtile `n*(4/bn + 6)`, i.e. 1.00x (bn = 1, the control) / 0.80x (bn = 2) /
+// 0.70x (bn = 4).
+//
+// BIT-IDENTITY (C1-C6 of the kernel above, unchanged). The only thing that moves
+// is the row -> warp mapping, which is NOT part of the contract (a row's dot
+// product does not depend on who owns it -- the kernel above states this):
+//   * the K walk is the kernel above's VERBATIM `#pragma unroll 32` `kb = 0 ..
+//     nb_k-1` ascending, with `j = kb*32 + lane` (C1);
+//   * `acc[q][nn] += av * wv` with `wv = s_lut[row_s[j]] * sb` IS the kernel
+//     above's `acc += av * (s_lut[row_s[j]] * sb)` for the output row
+//     `row_base+nn` -- the SAME operand order, the SAME single serial chain, one
+//     independent accumulator per (q, nn), nothing combined across q or nn (C4),
+//     no K-split and no split accumulator (C5);
+//   * `av = s_lut[s_a[j]] * s_as[j>>5]` is the same expression on the same
+//     staged bytes, hoisted out of the `nn` loop because it is a per-(r, kb)
+//     value: the SAME value reused `bn` times cannot change any row's result
+//     (this is the mrows mtile's `av[q]` hoist, verbatim);
+//   * `sb = ue8m0_to_f(wsg[((row>>5)*nb_k) + kb])` is the kernel above's
+//     `ue8m0_to_f(wsr[kb])` for its own row's `wsr` -- the SAME `w_scale` word;
+//   * the reduction is the kernel above's `__shfl_xor_sync(0xFFFFFFFFu, acc,
+//     off)` tree over the SAME off = 16,8,4,2,1 sequence, once per (q, nn);
+//   * the epilogue is the kernel above's `og[r*out_stride + row] = acc + (bias ?
+//     bias[row] : 0.f)` (including its `-0.0 + 0.f` corner).
+// The staged weight slot holds the SAME bytes from the SAME global address as
+// the kernel above's single-row staging (a pure copy), and the activation
+// staging is byte-identical: `s_a[i] = ar[i]` (or the cp.async16 arm), no
+// arithmetic of any kind. So every output bit is identical -- and hence the
+// kernel's bit-identity with the m=1 `dsv41_gemm_fp8_mx` decode it replaces
+// (C1-C6 of the header above) is preserved by construction.
+//
+// GEOMETRY / BARRIER SAFETY. The `__syncthreads()`s are BLOCK-wide and sit
+// OUTSIDE the `active` guard, so a warp whose `row_base >= n` (the n tail) still
+// reaches every barrier -- no deadlock. `row_base`/`active`/`nvalid` are
+// warp-uniform, so the guard, the `break` and the shfl full mask all stay valid.
+// `bin` = the tile N extent (`DSV41_WO_A_MTILE_BN`, 1..BN_MAX, default 2). The
+// grid is `ceil(n/(nwarps*bn))` (no divisibility requirement: the tail is
+// predicated), and the launcher shrinks `nwarps` so that both `grid >= SM` and
+// the weight tile fit the 48 KB static budget.
+template <int M, int BN_MAX = 4>
+__global__ void __launch_bounds__(256)
+wo_a_grouped_mtile_kernel(const uint8_t* __restrict__ a,
+                          const float* __restrict__ a_scale,
+                          const uint8_t* __restrict__ w,
+                          const uint8_t* __restrict__ w_scale,
+                          const float* __restrict__ bias,
+                          float* __restrict__ out, int n, int k,
+                          int a_stride, int out_stride, int bn, int act_cp16) {
+    constexpr int RN = M;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int nwarps = (blockDim.x + 31) >> 5;
+    const int nb_k = k >> 5;
+    const int g = blockIdx.y;                             // this block's group
+    const int row0 = blockIdx.x * nwarps * bn;            // the block's first row
+    const int row_base = row0 + warp * bn;                // this warp's first row
+    const bool active = row_base < n;
+    const int nvalid = active ? min(bn, n - row_base) : 0;
+    // This group's weight block / scale block / output columns.
+    const uint8_t* __restrict__ wg = w + (size_t)g * (size_t)n * (size_t)k;
+    const uint8_t* __restrict__ wsg =
+        w_scale + (((size_t)g * (size_t)n) >> 5) * (size_t)nb_k;
+    float* __restrict__ og = out + (size_t)g * (size_t)n;
+    // smem layout: the block's weight tile | the 256-entry e4m3 table | this
+    // row's f32 activation scales | the staged activation row (fp8 bytes).
+    extern __shared__ uint8_t smem[];
+    uint8_t* s_w = smem;
+    float* s_lut = reinterpret_cast<float*>(s_w + (size_t)nwarps * (size_t)bn * (size_t)k);
+    float* s_as = s_lut + 256;
+    uint8_t* s_a = reinterpret_cast<uint8_t*>(s_as + nb_k);
+    for (int i = threadIdx.x; i < 256; i += blockDim.x) s_lut[i] = e4m3_to_f((uint8_t)i);
+    // Stage this warp's `bn` weight rows ONCE (cp.async16, the kernel above's
+    // rule). The bytes and the addresses are the legacy single-row staging's,
+    // row for row; only the warp -> row ownership moved.
+    {
+        for (int nn = 0; nn < BN_MAX; ++nn) {
+            if (nn >= nvalid) break;
+            uint8_t* row_s = s_w + ((size_t)warp * (size_t)bn + (size_t)nn) * (size_t)k;
+            const uint8_t* __restrict__ wr = wg + (size_t)(row_base + nn) * (size_t)k;
+            const int n16 = k >> 4;
+            for (int i = lane; i < n16; i += 32) dsv41_cp_async16(row_s + (i << 4), wr + (i << 4));
+            for (int i = (n16 << 4) + lane; i < k; i += 32) row_s[i] = wr[i];
+        }
+        dsv41_cp_commit();
+    }
+    __syncthreads();
+    dsv41_cp_wait_all();
+    __syncwarp();
+    // Activation staging: the SAME rule the kernel above uses (cp.async16 where
+    // the gate is on and the pair is 16B-aligned, else the scalar byte walk).
+    const bool a16 = (act_cp16 != 0) && dsv41_f4_ok(a) && dsv41_f4_ok(s_a);
+    for (int r = 0; r < RN; ++r) {
+        // Row r's activation: the group's k-element segment `a_stride` bytes
+        // after the previous row's, with its own f32 scale row.
+        const uint8_t* __restrict__ ar = a + (size_t)r * (size_t)a_stride + (size_t)g * (size_t)k;
+        const float* __restrict__ asr =
+            a_scale + ((size_t)r * (size_t)a_stride + (size_t)g * (size_t)k) / 32;
+        for (int i = threadIdx.x; i < nb_k; i += blockDim.x) s_as[i] = asr[i];
+        if (a16) {
+            const int n16 = k >> 4;
+            for (int i = threadIdx.x; i < n16; i += blockDim.x)
+                dsv41_cp_async16(s_a + (i << 4), ar + (i << 4));
+            for (int i = (n16 << 4) + threadIdx.x; i < k; i += blockDim.x) s_a[i] = ar[i];
+            dsv41_cp_commit();
+            dsv41_cp_wait_all();
+        } else {
+            for (int i = threadIdx.x; i < k; i += blockDim.x) s_a[i] = ar[i];
+        }
+        __syncthreads();
+        if (active) {
+            float acc[RN][BN_MAX];
+            #pragma unroll
+            for (int q = 0; q < RN; ++q)
+                #pragma unroll
+                for (int nn = 0; nn < BN_MAX; ++nn) acc[q][nn] = 0.f;
+            #pragma unroll 32
+            for (int kb = 0; kb < nb_k; ++kb) {
+                const int j = kb * 32 + lane;
+                // ONE activation decode per (r, kb), shared by the warp's whole N
+                // tile -- the SAME expression on the SAME staged bytes.
+                const float av = s_lut[s_a[j]] * s_as[j >> 5];
+                #pragma unroll
+                for (int nn = 0; nn < BN_MAX; ++nn) {
+                    if (nn >= nvalid) break;
+                    const int row = row_base + nn;
+                    const float sb = ue8m0_to_f(wsg[((size_t)(row >> 5) * (size_t)nb_k) + kb]);
+                    const uint8_t* row_s =
+                        s_w + ((size_t)warp * (size_t)bn + (size_t)nn) * (size_t)k;
+                    const float wv = s_lut[row_s[j]] * sb;
+                    #pragma unroll
+                    for (int q = 0; q < RN; ++q) acc[q][nn] += av * wv;
+                }
+            }
+            // One `shfl_xor` tree per ELEMENT (the kernel above's tree, per (q, nn)).
+            #pragma unroll
+            for (int q = 0; q < RN; ++q)
+                #pragma unroll
+                for (int nn = 0; nn < BN_MAX; ++nn) {
+                    if (nn >= nvalid) break;
+                    float a_q = acc[q][nn];
+                    for (int off = 16; off > 0; off >>= 1)
+                        a_q += __shfl_xor_sync(0xFFFFFFFFu, a_q, off);
+                    if (lane == 0) {
+                        const int row = row_base + nn;
+                        const float v = a_q + (bias != nullptr ? bias[row] : 0.f);
+                        og[(size_t)q * (size_t)out_stride + row] = v;
+                    }
+                }
+        }
+        // The next r restages `s_a`/`s_as`: no warp may still be consuming them.
+        __syncthreads();
+    }
+}
+
 // See the kernel header above for the layout and the bit-identity argument.
 // Returns 0 (launched) or 2 (declined: the caller keeps the per-(group, row)
 // loop, whose numerics are the same by construction).
@@ -8312,11 +8492,6 @@ extern "C" int dsv41_wo_a_grouped_fp8(const uint8_t* a, const float* a_scale,
     // different expression entirely.
     static const bool no_gemv = getenv("DSV41_NO_GEMV_FP8") != nullptr;
     if (no_gemv) return 2;
-    // No opt-in dynamic-smem attribute on this path: the draft's shape (k=4096)
-    // fits the 48 KB static budget, anything larger declines to the old path.
-    const size_t smem = (size_t)nwarps * (size_t)k + (size_t)256 * sizeof(float) +
-                        (size_t)(k >> 5) * sizeof(float) + (size_t)k;
-    if (smem > 48 * 1024) return 2;
     // ② DSV41_WO_A_CPASYNC (default OFF): stage the activation row with
     // `dsv41_cp_async16` instead of the byte-per-lane loop. Read on the HOST
     // (the gate cannot live in device scope -- the `DSV41_MROWS_ACT_CPASYNC`
@@ -8326,6 +8501,87 @@ extern "C" int dsv41_wo_a_grouped_fp8(const uint8_t* a, const float* a_scale,
         if (v == nullptr || v[0] == '\0') return 0;
         return atoi(v) != 0 ? 1 : 0;
     }();
+    // ⓘ DSV41_WO_A_MTILE (default OFF): the M-into-the-GEMM-tile wo_a --
+    // `wo_a_grouped_mtile_kernel<M>` above, warp tile (M x bn): the SAME element
+    // program as `wo_a_grouped_gemv_kernel`, with one activation decode serving
+    // `bn` output rows of the group. `DSV41_WO_A_MTILE_BN` (1..4, default 2) is
+    // the tile's N extent. PRECEDENCE: MTILE > legacy. On decline (even nwarps=1
+    // cannot fit the 48 KB static budget) the legacy kernel runs instead.
+    static const int wo_a_mtile_env = [] {
+        const char* v = getenv("DSV41_WO_A_MTILE");
+        if (v == nullptr || v[0] == '\0') return 0;
+        return atoi(v) != 0 ? 1 : 0;
+    }();
+    static const int wo_a_mtile_bn_env = [] {
+        const char* v = getenv("DSV41_WO_A_MTILE_BN");
+        if (v == nullptr || v[0] == '\0') return 2;   // the design's default N extent
+        int x = atoi(v);
+        if (x < 1) x = 1;
+        if (x > 4) x = 4;                             // the kernel's BN_MAX
+        return x;
+    }();
+    if (wo_a_mtile_env != 0) {
+        const int bn = wo_a_mtile_bn_env;
+        // The weight tile is `nwarps*bn*k` bytes; the LUT (1 KB) + the activation
+        // scale row + the staged activation row make up the rest (the layout the
+        // kernel above uses). This helper is the whole smem account.
+        auto mt_smem = [&](int w) {
+            return (size_t)w * (size_t)bn * (size_t)k + (size_t)256 * sizeof(float) +
+                   (size_t)(k >> 5) * sizeof(float) + (size_t)k;
+        };
+        // "THE WIDEST BLOCK THAT STILL COVERS THE SMs" (the mrows-mtile coverage
+        // rule, mrows-mtile-design.md §2.4): a block covers `nwarps*bn` rows, so
+        // `nwarps <= n/(bn*SM)` keeps `grid = ceil(n/(nwarps*bn)) >= SM`. Never
+        // wider than the block the legacy path resolved, never below 1, and
+        // shrunk further while the weight tile does not fit 48 KB.
+        int mw = nwarps;
+        int cover = n / (bn * dsv41_sm_count());
+        if (cover < 1) cover = 1;
+        if (mw > cover) mw = cover;
+        while (mw > 1 && mt_smem(mw) > 48 * 1024) mw >>= 1;
+        if (mt_smem(mw) > 48 * 1024) {
+            static int reported_over = 0;
+            if (reported_over++ == 0)
+                fprintf(stderr,
+                        "[wo-a-mtile] ARMED but DECLINED rows=%d groups=%d n=%d k=%d bn=%d: "
+                        "smem=%zu > 48KB -> the legacy kernel runs\n",
+                        rows, groups, n, k, bn, mt_smem(1));
+            return 2;
+        }
+        const size_t msmem = mt_smem(mw);
+        const dim3 mgrid((unsigned)((n + mw * bn - 1) / (mw * bn)), (unsigned)groups);
+        const dim3 mblock(mw * 32);
+        const int act16 = wo_a_cpasync_env;
+        // ACTIVITY RECEIPT (the `[mrows-mtile]` precedent): ONE line per process
+        // on the first armed launch, naming the geometry resolved to. Gate unset
+        // (the shipped default) => nothing is printed.
+        {
+            static int reported = 0;
+            if (reported++ == 0)
+                fprintf(stderr,
+                        "[wo-a-mtile] ARMED rows=%d groups=%d n=%d k=%d bn=%d nwarps=%d -> "
+                        "block=%d warps, grid=(%d,%d), smem=%zu, act_cp16=%d\n",
+                        rows, groups, n, k, bn, mw, mw, (int)mgrid.x, (int)mgrid.y, msmem,
+                        act16);
+        }
+        switch (rows) {
+            case 1: wo_a_grouped_mtile_kernel<1><<<mgrid, mblock, msmem, s>>>(a, a_scale, w, w_scale, bias, out, n, k, a_stride, out_stride, bn, act16); break;
+            case 2: wo_a_grouped_mtile_kernel<2><<<mgrid, mblock, msmem, s>>>(a, a_scale, w, w_scale, bias, out, n, k, a_stride, out_stride, bn, act16); break;
+            case 3: wo_a_grouped_mtile_kernel<3><<<mgrid, mblock, msmem, s>>>(a, a_scale, w, w_scale, bias, out, n, k, a_stride, out_stride, bn, act16); break;
+            case 4: wo_a_grouped_mtile_kernel<4><<<mgrid, mblock, msmem, s>>>(a, a_scale, w, w_scale, bias, out, n, k, a_stride, out_stride, bn, act16); break;
+            case 5: wo_a_grouped_mtile_kernel<5><<<mgrid, mblock, msmem, s>>>(a, a_scale, w, w_scale, bias, out, n, k, a_stride, out_stride, bn, act16); break;
+            case 6: wo_a_grouped_mtile_kernel<6><<<mgrid, mblock, msmem, s>>>(a, a_scale, w, w_scale, bias, out, n, k, a_stride, out_stride, bn, act16); break;
+            case 7: wo_a_grouped_mtile_kernel<7><<<mgrid, mblock, msmem, s>>>(a, a_scale, w, w_scale, bias, out, n, k, a_stride, out_stride, bn, act16); break;
+            case 8: wo_a_grouped_mtile_kernel<8><<<mgrid, mblock, msmem, s>>>(a, a_scale, w, w_scale, bias, out, n, k, a_stride, out_stride, bn, act16); break;
+            default: return 2;
+        }
+        return (int)cudaGetLastError();
+    }
+    // No opt-in dynamic-smem attribute on this path: the draft's shape (k=4096)
+    // fits the 48 KB static budget, anything larger declines to the old path.
+    const size_t smem = (size_t)nwarps * (size_t)k + (size_t)256 * sizeof(float) +
+                        (size_t)(k >> 5) * sizeof(float) + (size_t)k;
+    if (smem > 48 * 1024) return 2;
     // ACTIVITY RECEIPT (the `[mrows-act-cp16]` precedent): ONE line per process
     // on the first armed launch, naming the geometry that launch resolved to and
     // which staging rule actually ran. The device's own guard also tests
