@@ -11,6 +11,7 @@
 #include <tl_templates/cuda/barrier.h>
 #include <tl_templates/cuda/copy_sm90.h>
 #include <tl_templates/cuda/copy_sm100.h>
+#include <tl_templates/cuda/cuda_fp8.h>
 #include <tl_templates/cuda/reduce.h>
 #include <tl_templates/cuda/scan.h>
 #include <tl_templates/cuda/ldsm.h>
@@ -84,8 +85,8 @@ extern "C" __global__ void __launch_bounds__(128, 1) main_kernel(__grid_constant
     for (int g = 0; g < 40; ++g) {
       consumed[(g % 6)].wait((((g / 6) & 1) ^ 1));
       if (tl::tl_shuffle_elect<32>()) {
-        loaded[(g % 6)].expect_transaction(8192);
-        tl::tma_load(A_desc, loaded[(g % 6)], (&(((uint8_t*)A_sh)[((g % 6) * 16384)])), (g * 128), (((int)blockIdx.y) * 128));
+        loaded[(g % 6)].expect_transaction(16384);
+        tl::tma_load(A_desc, loaded[(g % 6)], (&(((fp8_e4_t*)A_sh)[((g % 6) * 16384)])), (g * 128), (((int)blockIdx.y) * 128));
         loaded[(g % 6)].expect_transaction(4096);
         tl::tma_load(W1_desc, loaded[(g % 6)], (&(((uint8_t*)B_sh)[((g % 6) * 16384)])), (g * 128), (((int)blockIdx.x) * 64), e);
         loaded[(g % 6)].expect_transaction(4096);
@@ -112,13 +113,13 @@ extern "C" __global__ void __launch_bounds__(128, 1) main_kernel(__grid_constant
         {
           tl::Tcgen05SMemDescriptor desc_a;
           tl::Tcgen05SMemDescriptor desc_b;
-          tl::initialize_tcgen05_descriptor(desc_a, (&(((uint8_t*)A_sh)[0])), 1, 64, 0, 0, 2);
+          tl::initialize_tcgen05_descriptor(desc_a, (&(((fp8_e4_t*)A_sh)[0])), 1, 64, 0, 0, 2);
           tl::increase_descriptor_offset<int>(desc_a, ((k % 6) * 16384));
           tl::initialize_tcgen05_descriptor(desc_b, (&(((uint8_t*)B_sh)[0])), 1, 64, 0, 0, 2);
           tl::increase_descriptor_offset<int>(desc_b, ((k % 6) * 16384));
           #pragma unroll
           for (int ki = 0; ki < 4; ++ki) {
-            tl::tcgen05mma_blockscaled_ss<tl::DataType::kFloat4_e2m1fn, false>(uint64_t(desc_a + (ki * 32)), uint64_t(desc_b + (ki * 32)), (*reinterpret_cast<uint32_t*>(C_tmem)) + 0, ((0 < ki) ? 1 : ((k == 0) ? 0 : 1)), static_cast<uint32_t>(((144709248 | (ki << 29)) | (ki << 4))), (*reinterpret_cast<uint32_t*>(sfa_data)) + 0, (*reinterpret_cast<uint32_t*>(sfa_data)) + 4);
+            tl::tcgen05mma_blockscaled_ss<tl::DataType::kFloat8_e4m3, false>(uint64_t(desc_a + (ki * 32)), uint64_t(desc_b + (ki * 32)), (*reinterpret_cast<uint32_t*>(C_tmem)) + 0, ((0 < ki) ? 1 : ((k == 0) ? 0 : 1)), static_cast<uint32_t>(((144708608 | (ki << 29)) | (ki << 4))), (*reinterpret_cast<uint32_t*>(sfa_data)) + 0, (*reinterpret_cast<uint32_t*>(sfa_data)) + 4);
           }
           tl::tcgen05_mma_arrive((&(consumed[(k % 6)])));
         }

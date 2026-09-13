@@ -204,10 +204,8 @@ int32_t __tvm_ffi_main(void* self_handle, void* args, int32_t num_args, void* re
   }
   void* main_Eid_strides = (((DLTensor*)Eid_handle)[0].strides);
   void* Eid = (((DLTensor*)Eid_handle)[0].data);
-  if (!(((((((uint64_t)(((DLTensor*)A_handle)[0].dtype.bits)) * ((uint64_t)(((DLTensor*)A_handle)[0].dtype.lanes))) * ((uint64_t)((int64_t*)main_A_shape)[0])) * ((uint64_t)((int64_t*)main_A_shape)[1])) == (uint64_t)94371840))) {
-    char __tvm_assert_msg_buf[512];
-    snprintf(__tvm_assert_msg_buf, 512, "%s; expected: %lld, got: %lld", "kernel main input A is a subtype, but total bits mismatch violates packed ABI constraint", (long long)((((((uint64_t)(((DLTensor*)A_handle)[0].dtype.bits)) * ((uint64_t)(((DLTensor*)A_handle)[0].dtype.lanes))) * ((uint64_t)((int64_t*)main_A_shape)[0])) * ((uint64_t)((int64_t*)main_A_shape)[1]))), (long long)((uint64_t)94371840));
-    TVMFFIErrorSetRaisedFromCStr("RuntimeError", __tvm_assert_msg_buf);
+  if (!(((((((DLTensor*)A_handle)[0].dtype.code) == (uint8_t)10) && ((((DLTensor*)A_handle)[0].dtype.bits) == (uint8_t)8)) && ((((DLTensor*)A_handle)[0].dtype.lanes) == (uint16_t)1)))) {
+    TVMFFIErrorSetRaisedFromCStr("RuntimeError", "kernel main input A dtype mismatch, expected float8_e4m3fn");
     return -1;
   }
   if (!((((int32_t)((int64_t*)main_A_shape)[0]) == 4608))) {
@@ -216,22 +214,22 @@ int32_t __tvm_ffi_main(void* self_handle, void* args, int32_t num_args, void* re
     TVMFFIErrorSetRaisedFromCStr("RuntimeError", __tvm_assert_msg_buf);
     return -1;
   }
-  if (!(((((int32_t)((int64_t*)main_A_shape)[1]) * 2) == 5120))) {
+  if (!((((int32_t)((int64_t*)main_A_shape)[1]) == 5120))) {
     char __tvm_assert_msg_buf[512];
-    snprintf(__tvm_assert_msg_buf, 512, "%s; expected: %lld, got: %lld", "kernel main input A shape[1] violates packed ABI constraint", (long long)((((int32_t)((int64_t*)main_A_shape)[1]) * 2)), (long long)(5120));
+    snprintf(__tvm_assert_msg_buf, 512, "%s; expected: %lld, got: %lld", "kernel main input A shape[1] violates packed ABI constraint", (long long)(((int32_t)((int64_t*)main_A_shape)[1])), (long long)(5120));
     TVMFFIErrorSetRaisedFromCStr("RuntimeError", __tvm_assert_msg_buf);
     return -1;
   }
   int32_t condval;
   if ((main_A_strides == NULL)) {
-    condval = 0;
+    condval = 1;
   } else {
     condval = ((int32_t)((int64_t*)main_A_strides)[1]);
   }
   if (!((condval == 1))) {
     int32_t condval_1;
     if ((main_A_strides == NULL)) {
-      condval_1 = 0;
+      condval_1 = 1;
     } else {
       condval_1 = ((int32_t)((int64_t*)main_A_strides)[1]);
     }
@@ -242,19 +240,19 @@ int32_t __tvm_ffi_main(void* self_handle, void* args, int32_t num_args, void* re
   }
   int32_t condval_2;
   if ((main_A_strides == NULL)) {
-    condval_2 = 0;
+    condval_2 = 1;
   } else {
     condval_2 = ((int32_t)((int64_t*)main_A_strides)[0]);
   }
-  if (!(((condval_2 * 2) == 5120))) {
+  if (!((condval_2 == 5120))) {
     int32_t condval_3;
     if ((main_A_strides == NULL)) {
-      condval_3 = 0;
+      condval_3 = 1;
     } else {
       condval_3 = ((int32_t)((int64_t*)main_A_strides)[0]);
     }
     char __tvm_assert_msg_buf[512];
-    snprintf(__tvm_assert_msg_buf, 512, "%s; expected: %lld, got: %lld", "kernel main input A strides[0] violates packed ABI constraint", (long long)((condval_3 * 2)), (long long)(5120));
+    snprintf(__tvm_assert_msg_buf, 512, "%s; expected: %lld, got: %lld", "kernel main input A strides[0] violates packed ABI constraint", (long long)(condval_3), (long long)(5120));
     TVMFFIErrorSetRaisedFromCStr("RuntimeError", __tvm_assert_msg_buf);
     return -1;
   }
@@ -874,7 +872,7 @@ int32_t __tvm_ffi_main(void* self_handle, void* args, int32_t num_args, void* re
   (((TVMFFIAny*)stack_ffi_any)[0].v_ptr) = A_desc;
   (((TVMFFIAny*)stack_ffi_any)[1].type_index) = 1;
   (((TVMFFIAny*)stack_ffi_any)[1].zero_padding) = 0;
-  (((TVMFFIAny*)stack_ffi_any)[1].v_int64) = ((int64_t)14);
+  (((TVMFFIAny*)stack_ffi_any)[1].v_int64) = ((int64_t)0);
   (((TVMFFIAny*)stack_ffi_any)[2].type_index) = 1;
   (((TVMFFIAny*)stack_ffi_any)[2].zero_padding) = 0;
   (((TVMFFIAny*)stack_ffi_any)[2].v_int64) = ((int64_t)2);
@@ -897,7 +895,7 @@ int32_t __tvm_ffi_main(void* self_handle, void* args, int32_t num_args, void* re
   (((TVMFFIAny*)stack_ffi_any)[6].v_int64) = ((int64_t)1);
   (((TVMFFIAny*)stack_ffi_any)[7].type_index) = 1;
   (((TVMFFIAny*)stack_ffi_any)[7].zero_padding) = 0;
-  (((TVMFFIAny*)stack_ffi_any)[7].v_int64) = ((int64_t)2560);
+  (((TVMFFIAny*)stack_ffi_any)[7].v_int64) = ((int64_t)5120);
   (((TVMFFIAny*)stack_ffi_any)[8].type_index) = 1;
   (((TVMFFIAny*)stack_ffi_any)[8].zero_padding) = 0;
   (((TVMFFIAny*)stack_ffi_any)[8].v_int64) = ((int64_t)128);
