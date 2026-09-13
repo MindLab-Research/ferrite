@@ -91,6 +91,18 @@ LD_LIBRARY_PATH=$HOME/ferrite/kernels/cuda ./target/release/ferrite-serve --back
 | `DSV41_SF_STRIDE_PAD=0` | w2 SF 根修逃生门（默认 ON） | — |
 | `DSV41_AR_PROBE=1` + site 分流 | AR device 探针（attn/moe 分桶符号 `ferrite_p2p_ar_v5_attn/_moe`） | 无 |
 
+## 合并纪律（2026-09-14 事故复盘，必守）
+
+1. **合并后必须用项目自身的构建验收**（`bash build.sh 103a`），**不能只靠单文件编译**：
+   本次 `glue_e2m1_encode` 重复定义让**完整构建失败**，而单文件检查报 RC=0（标志/上下文不同）。
+2. **看到 `build failed`，那一轮的任何 e2e 结果都不能用**（二进制陈旧 ⇒ 跑的不是你以为的代码，
+   与"测量偏置陷阱"同类）。
+3. **多 subagent 汇入同一大文件时，新增辅助函数必须带唯一前缀**（如 `a2_`/`a3_`/`i3_`），
+   否则极易同名重复定义——给 subagent 的 brief 里要写明这一条。
+4. 合并 subagent 的 worktree 改动：**导出未提交 diff**（排除 docs）再 `git apply`；
+   冲突时用 `patch -p1 -F3`；并**三项确认**（新符号计数 / `diff --stat` 与报告一致 / 我此前的修复仍在），
+   且确认**无 `.rej`/`.orig` 残留**。`git merge <worktree-branch>` 无效（改动通常未提交）。
+
 ## 测量与工具纪律（用户裁决 2026-09-13，防遗忘）
 
 1. **step time 必须真实测量且看 p50**：`[dsv41] step pos=` 行的 **p50**（中位数，最后 200 步——用户裁决 2026-09-13）；**禁止吞吐反推**（受 prefill/accept 污染）。**⚠️ `[dspark] steps=` 的 draft/verify/commit 分解是累积均值，不是 per-step 真实值——verify 可以比 step 还长（含 prefill 污染），不能用它做性能判断（用户裁决 2026-09-14：verify > step 一定是错的）**。**每次 nsys 分析完必须给用户当前的时间 breakdown 表**（各项 ms/步 + 占比 + 修复载体 + 修复后目标——用户裁决 2026-09-13）。
