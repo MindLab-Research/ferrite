@@ -17935,6 +17935,7 @@ impl<'a> DevChain<'a> {
     #[allow(clippy::too_many_arguments)]
     fn gateup_dump_once(
         &self,
+        tag: &str,
         act: *mut f32,
         m: usize,
         topk: usize,
@@ -17946,9 +17947,14 @@ impl<'a> DevChain<'a> {
         rw: *mut f32,
         dim: usize,
     ) {
-        let Some(dir) = gateup_dump_path() else {
+        let Some(base) = gateup_dump_path() else {
             return;
         };
+        // `tag` keeps the single-row (`eager`) and multi-row (`rows`) dumps apart in one run: both
+        // latch independently, and the multi-row one is the only place the D row mapping is
+        // observable at all (with one live row the live D row is row 0 by construction, so a
+        // wrong per-warp lane base cannot change it).
+        let dir = format!("{base}/{tag}");
         if let Err(e) = std::fs::create_dir_all(&dir) {
             eprintln!("[gateup-dump] mkdir {dir}: {e}");
         }
@@ -17972,7 +17978,7 @@ impl<'a> DevChain<'a> {
                 Err(e) => eprintln!("[gateup-dump] read {name}: {e}"),
             }
         }
-        eprintln!("[gateup-dump] done (m={m} topk={topk} act_slot={act_slot} dim={dim})");
+        eprintln!("[gateup-dump] done (tag={tag} m={m} topk={topk} act_slot={act_slot} dim={dim})");
     }
 
     /// `DSV41_MOE_BS_SFDUMP=<dir>` (opt-in, one-shot, blocking D2H): write the hand-written
@@ -18996,6 +19002,7 @@ impl<'a> DevChain<'a> {
                 static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
                 if ONCE.set(()).is_ok() {
                     self.gateup_dump_once(
+                        "rows",
                         self.s.ex_act_r.ptr as *mut f32,
                         m,
                         topk,
@@ -23990,6 +23997,7 @@ fn oracle_tap() -> bool {
                     static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
                     if ONCE.set(()).is_ok() {
                         self.gateup_dump_once(
+                            "eager",
                             self.s.ex_act_b.ptr as *mut f32,
                             1,
                             topk,

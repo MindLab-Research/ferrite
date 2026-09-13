@@ -3717,6 +3717,58 @@ slot 0: bs[0:3]=[-0.2141 -0.1492 0.0401]  old[0:3]=[0.0048 0.0041 -0.0058]
 
 ### 5. 官方精度口径（`precision-official` 审计的逐项表，见 §142）
 
+## §144 【关键】TMEM 读的 lane 字段是**绝对坐标** ⇒ 我们生产默认写法错（已修）；SF 链与 DeepGEMM 逐项一致
+
+### 1. 已定谳的 bug（已修为默认）：`tcgen05.ld` 的 taddr 必须加 `warp*32`
+
+| 证据源 | 结论 |
+|---|---|
+| **PTX ISA 9.7.18.1.1** Tensor Memory Addressing | taddr = `(lane << 16) \| column` ⇒ lane 是**绝对 lane 坐标**（不是装饰位） |
+| **PTX ISA 9.7.18.8.1** Access restrictions | warp w 只能访问 lane `w*32 .. w*32+31`；`.32x32b` 一次读 32 lanes ⇒ 实际访问 `taddr.lane + lane_id` |
+| **CUTLASS** `cute/atom/copy_traits_sm100.hpp` | warp 分区 atom（4 个 warp 的地址相差 32 lane）+ 运行期断言 `warp%4 == ((tmem_addr>>16)/32)%4` |
+| **Triton** `TensorMemoryToLLVM.cpp` | `tmemBase += (warpId&3) << (5+16)`（ld 与 st 共用同一 lowering） |
+| 隔离仪器 `tests_bs_impulse.cu:411` | 一直用 `((warp*32)<<16) \| (D_tmem + 8q)` —— 唯一 PASS 过的写法 ✓ |
+
+⇒ 生产默认用的 `tl::tcgen05_ld_32dp32bNx<128,false>(C_tmem, 0, C_reg)`（lane 字段恒 0，TileLang helper 内部不加偏移）
+**让 warp1..3 去访问不属于它们的分区** ⇒ D 的 **rows 32..127（3/4 的 tile）被误读**。
+**已修**：新增仪器形态分支并**设为默认**（`g_ldw=1`：`.32x32b.x8` ×16 + `hw_tc_wait_ld()`），
+逃生门 `DSV41_MOE_BS_LDW=0` 可退回旧写法 ✓。
+
+⚠️ **对 m=1（本批 dump 点）不可见**：只有一个活行时活行就是第 0 行（warp0 的分区）⇒ 该 bug **无法解释 m=1 的 gate|up 全错** ✗；
+它的主战场是 **m>1（verify/spec）**——那里段内活行可到 6 行、且行号随位置漂移 ⇒ **直接造成 verify 错值** ✓。
+⇒ 判据必须包含 `moe_rows`（verify）路径的 dump（本批已在做）。
+
+### 2. 已排除：SF 转置的 `^ (lane>>3)`（**我一度误读，勿再犯**）
+
+TileLang 的 `tcgen05_sf_warp_transpose` 与我们的 `hw_sf_transpose` 是**读写各施加一次** `^ (lane>>3)`：
+`post[lane*4 + (i^(l>>3))] = pre[(i^(l>>3))*32 + lane]` ⇒ 令 `j = i^(l>>3)` 得 `post[lane*4+j] = pre[j*32+lane]`
+——**与 DeepGEMM 的无 XOR 形态（`utccp_required_smem_warp_transpose`）逐点等价** ✓。
+只删一处 XOR 才会破坏对称 ✗（我在提交里试过并已撤销 ✓；现存活那份函数的注释里写明了这条推导）。
+
+### 3. SF 链 vs DeepGEMM（SGLang 在 SM100/103 跑同款模型的**生产实现**）逐项对照
+
+| 环节 | DeepGEMM | 我们 | 判定 |
+|---|---|---|---|
+| global SF 打包 | 每 32-K 块 1 字节、4 块打包 u32、**LSB = 最小 K**、MN-major + 对齐 128（`smxx_layout.cuh:181-188`） | gather/pack 同约定（LSB=组内最低 K、group-major u32） | ✓ |
+| smem 布局 | 每 128 行一个 u32、行主（TMA box 内维 = MN） | `sfa[g*m + row]` 行主、每行一个 u32 | ✓ |
+| 前置转置 | `out[lane*4+j] = in[j*32+lane]`，**单 warp** | 同上（XOR 抵消） | ✓ |
+| smem→TMEM | `tcgen05.cp.cta_group::1.32x128b.warpx4`（`SM100_UTCCP_4x32dp128bit_1cta`），每次 copy 占 4 个 TMEM 列 | `hw_tc_cp` 同 | ✓ |
+| SF 描述符 | `SWIZZLE_NONE`、**SBO = 128 B**、LBO = 0、version 1（`mma/sm100.cuh:43-49`） | `hw_make_sf_desc`：`SBO>>4 = 8`、LBO=0、version1、layout0 | ✓ |
+| fence | 转置后 `fence_view_async_shared()` | 每 stage `fence.proxy.async.shared::cta`（全线程） | ✓ |
+
+⇒ **SF 投递链与生产实现逐项一致** ✓（其"从未被独立验证"的缺口由此被外部证据补上 ✓）。
+SGLang 侧的实现路径（供性能/精度对照）：DeepGEMM `fp8_fp4_gemm_nt` → `sm100_fp8_fp4_gemm_1d1d`
+（MoE 变体 `sm100_fp8_fp4_mega_moe`）；**host 侧必须先把 checkpoint 的 e8m0 尺度 repack 成 packed-UE8M0 MN-major**
+（`transform_sf_into_required_layout`）；公开踩坑含"ue8m0 打包必须屏蔽 mantissa，否则静默错值"、
+"SF 双重交错"、CUTLASS `smem_atom_layoutSFB` 用错 major 等 ✓。
+
+### 4. 仍在手的关键矛盾（下一批要判）
+
+1. **m=1 的 gate|up 全错**（corr 0.012/0.018，88% 元素差）**无法**由 lane 字段解释 ⇒ 必须另有原因；
+2. 候选：SF 投递（现由 DeepGEMM 证据支持"没错"✗）、**staged 内容**（`DSV41_MOE_BS_SFDUMP` + `sfdump_check.py` 判）、
+   或 **m>1 路径的活行/行映射**（lane 修复后 m=6 是否变对 ⇒ 反过来检验 m=1 是否另有其因）；
+3. ⇒ 下一批四臂（OLD / BS默认 / LDW=0 正对照 / SFST）**必须同时给**：eager(m=1) 与 verify(m=6) 的 dump、
+   官方 PyTorch 判决、我方 numpy 官方参考、以及 staged 内容校验 ✓。
 **除已修的 G2/G3 外，还有一条实质不一致**：`quant_kernel`（激活量化，被 o/wo/qr/engram/KV 复用）
 把下限加在**标度**上（`fmaxf(s,1e-30)`，且会产出**非 2 的幂**），官方把下限加在 **amax** 上
 （`max(amax,1e-4)` ⇒ `s ≥ 2^-22`）。routed 激活（amax~O(1)）不触发 ✓，但窄幅块会触发 ⇒ 属于
