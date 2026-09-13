@@ -36,14 +36,23 @@
 > 注：`arm_run.sh` 的 COMMON 里 `DSV41_VERIFY_GRAPH=0`/`DSV41_GRAPH_STEP=0`（在 `GRAPH_OFF` 内），
 > 传在**后面**的 env 会覆盖它们 ✓。
 
+### 2.1 精度裁决（`precision-completeness`，决定 P2 的构成）——**必读**
+
+- **`DSV41_MOE_TILELANG=1` 判定"不可用"** ✗：它的**激活侧完全不量化**（`moe_bf16_shim.cu:213-227` 直接 `__float2bfloat16`），
+  而官方是 `act_quant(...,32,ue8m0)` → **e4m3**（rel ≤ 6.3%），该臂是 bf16 直舍（rel ≤ 0.2%）⇒ **精度高约 32×** ✗；
+  输出累加器还是 **f32**（官方是 bf16 ✗）。**这是数据格式层面的差异，任何门都补不回来**，且会**系统性改变近 tie 的 argmax/文本** ✗。
+  （权重侧无偏差 ✓：`fp4 → bf16` 是**位级无损**的，因为 e2m1 幅值只有 ≤2 位有效位、标度是纯 2 的幂。）
+  同格式的替代 `DSV41_MOE_TILELANG_BS` 就是**会毁模型的手写臂** ✗ ⇒ **那 7.2ms 暂时拿不到** ✗。
+- **`head-term-audit` 判定 head 不是"那 20ms"** ✗：默认臂下 head 只剩 **~0.23–0.33ms**（verify 的 ~1%）⇒ 别在这里找鲸鱼 ✗。
+- ⇒ **剩余的鲸鱼只有一条：流式发射的提交时间** ✓ ⇒ **图化（verify + step 两侧）是唯一的大杠杆** ✓。
+
 ## 3. 若还差（按收益排序的后备杠杆）
 
-1. **head/logits 的词表读**（`DSV41_VERIFY_HEAD_SLICED` 默认 ON；关掉会回到每行读全量 **1262MB**）
-   ⇒ 见 `head-term-audit` 的字节/launch 表；这是 verify 里可能的**最后一条大鲸鱼** ✓
-2. **draft 段融合**：`DSV41_DRAFT_P3LITE_{SEED,KV,ATTN}=1`（单变量可切）
-3. **AR 形态**：`DSV41_AR_V5` / `FERRITE_P2P`（注意 nsys 轮的死锁规避组合与普通轮不同）
-4. `DSV41_MOE_DOWN_BS=1`（down 臂 blockscaled，已接线、默认 OFF；**用前必须先在不捕获的调用里完成 lazy INIT**，
+1. **draft 段融合**：`DSV41_DRAFT_P3LITE_{SEED,KV,ATTN}=1`（单变量可切）—— 已并入 P2 的折叠族 ✓
+2. **AR 形态**：`DSV41_AR_V5` / `FERRITE_P2P`（注意 nsys 轮的死锁规避组合与普通轮不同）
+3. `DSV41_MOE_DOWN_BS=1`（down 臂 blockscaled，已接线、默认 OFF；**用前必须先在不捕获的调用里完成 lazy INIT**，
    否则捕获内 `cudaMalloc` 会让 `cudaStreamEndCapture` 失败）
+4. ~~head 的词表读~~ ✗（已判定只剩 ~1%）
 
 ## 4. 精度（用户硬规则：与官方 PyTorch 完全对齐，fp4/fp8 不能高也不能低）
 
