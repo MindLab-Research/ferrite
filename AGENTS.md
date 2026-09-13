@@ -107,36 +107,33 @@ LD_LIBRARY_PATH=$HOME/ferrite/kernels/cuda ./target/release/ferrite-serve --back
 - serve 卡住/日志 mtime 停滞 = 挂了（查 `stat -c %y` + pgrep，别等）。
 - 加载错防线（三道 runtime + 三道编译期 + git hooks）见 `docs/agent/` 的加载防线文档。
 
-## 当前状态与下一步（2026-09-14 上午——fp4 MoE 首次 ARMED + cuda 700 诊断中 + Phase B/C 全线推进）
+## 当前状态与下一步（2026-09-14 上午——fp4 MoE 非法指令五路会审完毕 + relinquish 修复在测）
 
 **里程碑**：
-- **fp4 MoE blockscaled 首次 FULLY ARMED ✓✓**——TMA nullptr 修复（elementStrides/globalStrides 传非 NULL）解锁了 cuTensorMapEncodeTiled；kernel 启动成功（grid=(5,36)×128, smem=200704, BM=128/BN=128/BK=128）。
-- **cuda 700（illegal access）诊断中**——gather row_div 修复（flat assignment index → row division）已提交但 crash 未消除。MMA skip 隔离测试在跑（4f8e20a）。BF16_TRUNCATE=0 排除法确认 crash 来自 BS arm 本身。
-- **Phase B 全部提交**：P3 MegaKernel（hc/norm/rope/quant 13→3 发/层 −2.7ms）+ Fusion P2（F7/F10/F8 −1.0ms）+ C4-H1 head M-tile（位级同，0 数值债）+ C4-H3 head TileLang（已接线，需 AOT）+ Orope（−0.2ms）。
-- **Phase C 设计完成**：C1 MoE down blockscaled（K-pad 320→384，--down flag）+ C5 shared expert TileLang fp8 + C2 P5 流水（设计 subagent 在飞）+ C8 accept（块加宽 DSPARK_DRAFTS 5→6 唯一到 acc 4.6 的路）。
-- **D1 bf16 截断 ✓✓**：17 个 round-trip 落点 + 8 个融合 decline 互斥（319f7bb，默认 OFF）。
-- **R0 acc 诊断 ✓✓**：p1=1.00、mean-k=3.92、tail_q=0.917——acc 不是瓶颈，step 时间是唯一瓶颈。
+- **fp4 MoE blockscaled FULLY ARMED ✓✓ + cuda 700→illegal instruction 五路会审完毕**：
+  - **根因 #1（已修）**：`tcgen05.dealloc` 前缺 `relinquish_alloc_permit`（PTX ISA 前置条件违反 → 硬件 trap）。TileLang 0.1.14 codegen 完全不生成此调用（tl_templates 无此原语）。修复：生成物手补 asm + gen 脚本 _dump() 自动注入（幂等，防重生成回滚）。
+  - **根因 #2（误判已撤销）**：idesc 的 `(ki<<4)|(ki<<29)` 不是 k_size 损坏——是 **a_sf_id/b_sf_id 字段**（选择 4 字节 SF 字中的第 ki 字节，与原型 "sf_id=ki" 逐字一致）。illegal-instr-2 的 CUTLASS 位图解读被 illegal-instr-3 的仓库自有位表（dsv41_experts_mxf4.cu:58-71）推翻。
+  - **风险 #3（待 GPU 证据）**：`a_format=0 (E4M3) × b_format=5 (E2M1)` 组合在本仓从未上过 GPU（已验证组合是它的转置 a=5×b=0，swapAB 约定）。理论上 mxf8f6f4 的 W4A8 标准形态就是 A=e4m3×B=e2m1，应该合法。
+  - **次要点**：tcgen05.ld 的 lane 字段全 0（4 warp 读同一 lane 组——可能静默错值）；W 侧 expect_transaction(4096) vs smem 8192B（半写竞态风险）。
+- **Phase B 全部提交**：P3 MegaKernel + Fusion P2 + C4-H1 head M-tile + C4-H3 head TileLang + Orope。
+- **Phase C 设计完成**：C1 down K-pad 384、C5 shared expert TileLang（27KB 设计）、C2 P5 MTile grid-stride（已实现 6bc4421）、C8 accept 块加宽判决。
+- **D1 bf16 截断 + D3 KV block 32 ✓✓**（D3 发现 window-KV 当前存 raw f32——block_size 是声明值非活调用）。
 
-**fp4 MoE 调试链**（6 个独立 bug 修复，全部已提交）：
-1. TMA elementStrides nullptr → 传 kElemStrideOnes
-2. BS 段表 BM=16→128（bf16 的 TILELANG_BM 不适用于 BS mover）
-3. spec_w UINT8→16U4_ALIGN16B（dtype/gdim/box 与权威 dump 对齐）
-4. kSmem 202752→268288→200704（stages 6→4 适配 B300 227KB smem 限制）
-5. BS gather flat-idx→row division（idx/topk）
-6. spec_c box[0] kBn→kBn/4（f32 元素 vs 字节单位）
+**五路会审方法论**（用户指令：5 个相同 prompt 的 subagent 独立排查）：
+- 产出：3 个严重发现（relinquish、idesc 误判、格式组合风险）+ 6 个一般/建议 + 大量"已排除"清单（mbarrier 计数、grid_constant、smem 越界、C/A 别名等 9+ 项）
+- **关键教训**：位域解读必须用仓库自有的权威位表（dsv41_experts_mxf4.cu），不能用记忆中的 CUTLASS 布局——两者在 [4,6) 位段的语义不同（b_sf_id vs k_size）
+- **结构性张力**："库缺原语 + 生成物不许手改"必然逼出手改生成物——正确解法是 gen 脚本 post-process 注入（已实现）
 
-**400 tok/s 路线图**（post-fp4-roadmap 完整判决）：
+**400 tok/s 路线图**（不变）：
 ```
-Phase A: fp4 MoE ARMED → −4.7~7.1ms → 229 tok/s（crash 修复中）
-Phase B: P3+P2+orope+head → −3.9ms → 279 tok/s（已提交，待测试）
-Phase C: C1 down + C5 shared + C2 P5 + C8 accept → −5.3ms → 400 tok/s
-  C2 P5（−3~4ms）是唯一单挑项；不兑现 → 328-351 tok/s 需 C8 acc 补门槛
+Phase A: fp4 MoE（relinquish 修复验证中）→ 229 tok/s
+Phase B: P3+P2+orope+head → 279 tok/s（已提交待测）
+Phase C: C1 down + C5 shared + C2 P5 + C8 → 400 tok/s
 ```
 
 **用户红线**：
-- 精度完全对齐官方 PyTorch（D1 bf16 ✓ / D2 e4m3 ✓ / D3 KV block 32 在修 / D5 attention operand / D7 latent）
+- 精度完全对齐官方 PyTorch（D1 bf16 ✓ / D2 e4m3 ✓ / D3 KV block 32 ✓ / D5 attention operand / D7 latent）
 - 必须 fp4、无 hack、无反量化
-- step time 不计算 graph capture
 - decode step 必须一个完整 graph、无 H2D
 
 **当前账**：step ≈28.6ms @ acc 2.24 ⇒ ~104 tok/s。
