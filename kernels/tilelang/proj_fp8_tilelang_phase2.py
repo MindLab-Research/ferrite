@@ -38,6 +38,7 @@
 import struct
 import sys
 
+import numpy as np
 import torch
 import tilelang
 import tilelang.language as T
@@ -365,6 +366,110 @@ def determinism(bN=128, ks=8, thr=128):
     return allok
 
 
+# ============================================================ 与老 kernel 对拍
+# 输入生成必须与 kernels/cuda/dump_proj_old.cu 的 h()/fill_* **逐字节一致**。
+
+
+def _hash_idx(n):
+    i = np.arange(n, dtype=np.uint64)
+    x = i * np.uint64(0x9E3779B97F4A7C15) + np.uint64(0x0123456789ABCDEF)
+    return (x >> np.uint64(32)).astype(np.uint32)
+
+
+def _hash_bytes(n):
+    r = _hash_idx(n)
+    return ((r % np.uint32(127)) | (((r >> np.uint32(20)) & np.uint32(1)) << np.uint32(7))
+            ).astype(np.uint8)
+
+
+def _hash_scales(n):
+    return (0.5 + (_hash_idx(n) % np.uint32(8)).astype(np.float64) * 0.125).astype(np.float32)
+
+
+def _hash_wsc(n):
+    return (np.uint8(0x7B) + (_hash_idx(n) % np.uint32(6)).astype(np.uint8))
+
+
+def _zeros_fp8(shape):
+    return torch.zeros(*shape, device="cuda").to(torch.float8_e4m3fn)
+
+
+def _hash_inputs_dense(N, K, m):
+    A = _zeros_fp8((MPAD, K))
+    A[:m] = torch.from_numpy(_hash_bytes(m * K).reshape(m, K)).view(torch.float8_e4m3fn).cuda()
+    ASC = torch.zeros(MPAD, K // 32, device="cuda")
+    ASC[:m] = torch.from_numpy(_hash_scales(m * (K // 32)).reshape(m, K // 32)).cuda()
+    W = torch.from_numpy(_hash_bytes(N * K).reshape(N, K)).view(torch.float8_e4m3fn).cuda()
+    WSC = torch.from_numpy(_hash_wsc((N // 32) * (K // 32)).reshape(N // 32, K // 32)
+                           ).view(torch.float8_e8m0fnu).cuda()
+    return A, ASC, W, WSC
+
+
+def _hash_inputs_woa(G, N, K, ASTRIDE, m):
+    A = _zeros_fp8((MPAD, ASTRIDE))
+    A[:m] = torch.from_numpy(_hash_bytes(m * ASTRIDE).reshape(m, ASTRIDE)
+                             ).view(torch.float8_e4m3fn).cuda()
+    ASC = torch.zeros(MPAD, ASTRIDE // 32, device="cuda")
+    ASC[:m] = torch.from_numpy(_hash_scales(m * (ASTRIDE // 32)).reshape(m, ASTRIDE // 32)).cuda()
+    W = torch.from_numpy(_hash_bytes(G * N * K).reshape(G, N, K)
+                         ).view(torch.float8_e4m3fn).cuda()
+    WSC = torch.from_numpy(_hash_wsc((G * N // 32) * (K // 32)).reshape(G, N // 32, K // 32)
+                           ).view(torch.float8_e8m0fnu).cuda()
+    return A, ASC, W, WSC
+
+
+def _rel(out, ref):
+    out = out.double(); ref = ref.double()
+    d = (out - ref).abs()
+    rel = d / ref.abs().clamp_min(1e-30)
+    m = ref.abs() > (0.05 * ref.abs().max())
+    r = rel[m]
+    return dict(max_abs=d.max().item(), p50=r.median().item(),
+                p99=r.quantile(0.99).item(), max_rel=r.max().item(), mean_rel=r.mean().item())
+
+
+def compare_old(outdir, bN=128, ks=8, ns=3, thr=128):
+    """⑤ 数值形态：TileLang route A vs **真实 ferrite kernel**（dump_proj_old 的输出）。
+
+    口径：元素级 `(tilelang - ferrite) / ferrite`，只统计 `|ferrite| > 0.05·max`
+    （排除 near-zero 分母放大，与 proto.md §4 同规）。这是 EAGER 对照要用的那个数。
+    """
+    import os
+    print("== ⑤ route A vs ferrite kernel（同输入 hash 生成，m=6）==")
+    print(f"  {'shape':10} {'max_abs':>10} {'p50_rel':>10} {'p99_rel':>10} "
+          f"{'max_rel':>10} {'mean_rel':>10}")
+    res = {}
+    for name, N, K in DENSE:
+        A, ASC, W, WSC = _hash_inputs_dense(N, K, 6)
+        kp = proj_fp8_partial(N, K, bN, ks, thr, ns)
+        kr = proj_fp8_reduce(ks, N)
+        P = torch.zeros(ks, MPAD, N, device="cuda")
+        C = torch.zeros(MPAD, N, device="cuda")
+        kp(A, ASC, W, WSC, P)
+        kr(P, C)
+        oldf = os.path.join(outdir, f"old_{name}.f32")
+        ref = torch.from_numpy(np.fromfile(oldf, dtype=np.float32).reshape(6, N)).cuda()
+        s = _rel(C[:6], ref)
+        res[name] = s
+        print(f"  {name:10} {s['max_abs']:10.3e} {s['p50']:10.3e} {s['p99']:10.3e} "
+              f"{s['max_rel']:10.3e} {s['mean_rel']:10.3e}")
+    for name, G, N, K, ASTRIDE in WOA:
+        A, ASC, W, WSC = _hash_inputs_woa(G, N, K, ASTRIDE, 6)
+        kp = wo_a_grouped_partial(G, N, K, ASTRIDE, bN, ks, thr, ns)
+        kr = wo_a_grouped_reduce(ks, G, N)
+        P = torch.zeros(ks, G, MPAD, N, device="cuda")
+        C = torch.zeros(MPAD, G * N, device="cuda")
+        kp(A, ASC, W, WSC, P)
+        kr(P, C)
+        oldf = os.path.join(outdir, f"old_{name}.f32")
+        ref = torch.from_numpy(np.fromfile(oldf, dtype=np.float32).reshape(6, G * N)).cuda()
+        s = _rel(C[:6], ref)
+        res[name] = s
+        print(f"  {name:10} {s['max_abs']:10.3e} {s['p50']:10.3e} {s['p99']:10.3e} "
+              f"{s['max_rel']:10.3e} {s['mean_rel']:10.3e}")
+    return res
+
+
 # ============================================================ benchmark
 
 
@@ -444,9 +549,12 @@ if __name__ == "__main__":
         determinism()
     elif what == "bench":
         benchmark()
+    elif what == "cmp":
+        compare_old(sys.argv[2] if len(sys.argv) > 2 else ".")
     elif what == "all":
         selftest()
         determinism()
+        compare_old(sys.argv[2] if len(sys.argv) > 2 else ".")
         benchmark()
     else:
-        print(f"usage: {sys.argv[0]} [selftest|det|bench|all]")
+        print(f"usage: {sys.argv[0]} [selftest|det|bench|cmp <outdir>|all <outdir>]")
