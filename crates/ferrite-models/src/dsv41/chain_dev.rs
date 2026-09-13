@@ -15984,6 +15984,127 @@ impl<'a> DevChain<'a> {
         Some((up.0.ptr() as *const std::ffi::c_void, dn.0.ptr() as *const std::ffi::c_void))
     }
 
+    /// Whether the BLOCK-SCALED (native fp4) TileLang arm can serve THIS step
+    /// (`DSV41_MOE_TILELANG_BS`; the gate lives in
+    /// `crate::dsv41::weights::moe_tilelang_bs` because the LOADER reads it too —
+    /// see `load.rs`'s packed-SF block. One definition, both users, no drift).
+    ///
+    /// Same three families of terms as [`Self::moe_tilelang_ready`], with the four
+    /// differences this arm has by construction:
+    ///
+    ///   * the **load-time packed-SF pool** (`DevExpert::wsf1` / `wsf3`) replaces the
+    ///     bf16 copies: the arm streams the experts' fp4 weight planes AS-IS (zero
+    ///     dequant, zero weight copy), so `DSV41_MOE_BF16_DEQUANT` is NOT a
+    ///     precondition and no bf16 pool is needed;
+    ///   * `DSV41_EXPERT_ILV` must be OFF: under ILV the `w1` view aliases the
+    ///     doubled interleaved region, so `w1` is not a clean `[NP, K/2]` gate plane
+    ///     and the shim would read interleaved bytes as one — a SILENT wrong answer,
+    ///     not a fault (the loader refuses to build the SF pool then either);
+    ///   * the activation must be PACKED fp4: the shim's gather reads `xq4`/`xsc4`
+    ///     as e2m1 nibbles + per-32 f32 scales, so an `DSV41_EXPERT_ACT_E4M3`
+    ///     activation (one byte per value) would be decoded as fp4 — again silent;
+    ///   * `!capturing()`: the arm's shim entry
+    ///     (`dsv41_moe_tilelang_gate_up_bs`) takes the three segment tables as
+    ///     **HOST arrays** and uploads them itself
+    ///     (`cudaMemcpyAsync(..., cudaMemcpyHostToDevice, s)`), so they cost the host
+    ///     `moe_align`'s D2H read of `route_idx_r` — an illegal capture op. The
+    ///     device-table twin the bf16 arm has
+    ///     (`dsv41_moe_tilelang_gate_up_bf16_dev`) does NOT exist for this arm yet,
+    ///     so an armed gate declines inside a graph rather than failing the step.
+    ///
+    /// `m`/`topk` bounds are the generated kernel's frozen `SEG_CAP = rows*topk`
+    /// geometry; `dim`/`inter_local` are its baked K/N.
+    fn moe_tilelang_bs_ready(
+        &self,
+        ld: &LayerDev,
+        m: usize,
+        topk: usize,
+        dim: usize,
+        inter_local: usize,
+        n_routed: usize,
+    ) -> bool {
+        crate::dsv41::weights::moe_tilelang_bs()
+            && !self.dev.capturing()
+            && self.dev.supports_moe_tilelang_bs()
+            && !ld.experts_ilv
+            && !(expert_act_e4m3() && self.dev.supports_expert_act_e4m3())
+            && n_routed == 384
+            && dim == 5120
+            && inter_local == 320
+            && (1..=6).contains(&topk)
+            && (1..=6).contains(&m)
+            && ld.experts.len() >= 2
+            && ld.experts[0].wsf1.is_some()
+            && ld.experts[1].wsf1.is_some()
+            && ld.experts[0].wsf3.is_some()
+            && ld.experts[1].wsf3.is_some()
+    }
+
+    /// The routed experts' **fp4 gate/up planes** and their **load-time packed SF**,
+    /// as the four bases the shim indexes (`w1 + e*NP*K/2`, `sfw1 + e*sf_words*NP`).
+    /// `None` when any pool is missing or the per-expert stride is not exactly the
+    /// frozen `NP*K/2` / `sf_words*NP*4` bytes: the shim derives each expert's offset
+    /// ARITHMETICALLY, so a non-uniform pool would be a SILENT wrong answer, not a
+    /// fault. Declining is the only safe answer — same argument as
+    /// [`Self::moe_tilelang_weights`], one pool wider.
+    fn moe_bs_weights(
+        ld: &LayerDev,
+        dim: usize,
+        inter_local: usize,
+    ) -> Option<(
+        *const std::ffi::c_void,
+        *const std::ffi::c_void,
+        *const std::ffi::c_void,
+        *const std::ffi::c_void,
+    )> {
+        let (a, b) = (&ld.experts[0], &ld.experts[1]);
+        let (s1, s3) = (a.wsf1.as_ref()?, b.wsf1.as_ref()?);
+        let (t1, t3) = (a.wsf3.as_ref()?, b.wsf3.as_ref()?);
+        let (w1, w3) = (a.w1.ptr(), b.w1.ptr());
+        let (u1, u3) = (a.w3.ptr(), b.w3.ptr());
+        let w_expect = (inter_local * (dim / 2)) as i64;
+        let sf_expect =
+            (crate::dsv41::weights::moe_bs_sf_words(dim) * inter_local * 4) as i64;
+        if sf_expect == 0
+            || (w3 as i64) - (w1 as i64) != w_expect
+            || (u3 as i64) - (u1 as i64) != w_expect
+            || (s3.ptr() as i64) - (s1.ptr() as i64) != sf_expect
+            || (t3.ptr() as i64) - (t1.ptr() as i64) != sf_expect
+        {
+            return None;
+        }
+        Some((w1, u1, s1.ptr(), t1.ptr()))
+    }
+
+    /// One-shot notice for an ARMED `DSV41_MOE_TILELANG_BS` that did not fire — the
+    /// project's #1 measurement-bias trap, with its OWN latch so the two TileLang
+    /// arms cannot mask each other's notice. `hard` marks the refusals that mean the
+    /// operator's configuration is inconsistent (missing SF pool / a stale `.so`)
+    /// rather than a runtime shape the arm simply does not cover.
+    fn moe_bs_skipped_note(reason: &str, hard: bool) {
+        static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        let tag = if hard { "REFUSED" } else { "skipped" };
+        if ONCE.set(()).is_ok() {
+            eprintln!("[moe-bs] ARMED but {tag}: {reason} -> this run measures the OLD path");
+        }
+    }
+
+    /// One-shot notice for the pair (`DSV41_MOE_TILELANG` + `DSV41_MOE_TILELANG_BS`):
+    /// the block-scaled arm WINS and the bf16 arm is shadowed. They read different
+    /// weight pools with different lifetimes, so arming both would pay the bf16
+    /// mirror (`DSV41_MOE_BF16_DEQUANT`, ~105 GiB/rank) for no gain — and, worse,
+    /// would leave the operator believing the measured arm was the bf16 one.
+    fn moe_bs_shadowed_note() {
+        static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        if ONCE.set(()).is_ok() {
+            eprintln!(
+                "[moe-bs] DSV41_MOE_TILELANG and DSV41_MOE_TILELANG_BS are BOTH armed -> the \
+                 BLOCK-SCALED (native fp4) arm serves the routed gate/up and the bf16 arm is \
+                 shadowed (this run does NOT measure DSV41_MOE_TILELANG)"
+            );
+        }
+    }
+
     /// The multi-row MoE: the m-row twin of [`Self::moe`], ending in the MoE
     /// all-reduce over the block's rows. Returns whether that AR took the
     /// `DSV41_VERIFY_AR_FOLD` fold, i.e. its pubred epilogue already wrote this
@@ -16339,6 +16460,94 @@ impl<'a> DevChain<'a> {
             }
             let ids_base = self.s.route_idx_r.ptr as *const i32;
             let rw_base = self.s.route_w_r.ptr as *const f32;
+            // ---- TILELANG BLOCK-SCALED (DSV41_MOE_TILELANG_BS): native fp4 --------
+            // The fp4 twin of the bf16 arm below, and MUTUALLY EXCLUSIVE with it:
+            // the SAME table chain, but it feeds the block-scaled grouped MMA the
+            // **fp4 activation bytes** (`xq4_r` / `xsc4_r` — the very buffers the
+            // proven batched launch reads; NOT `xn_r`) plus the experts' **native fp4
+            // weight planes** and their load-time packed ue8m0 words (`wsf1`/`wsf3`).
+            // Zero dequant, zero weight copy — hence no bf16 mirror at all
+            // (`DSV41_MOE_BF16_DEQUANT` is not involved).
+            //
+            // It slots in EXACTLY where the bf16 arm sits: the shim writes the RAW
+            // gate‖up layout, so the separate swiglu pass below stays enabled and the
+            // down stride stays the raw `2*inter` pitch — nothing downstream of
+            // `ex_act_r` can tell which arm filled it (which is what makes the A/B
+            // parity checkable, wiring §6.5).
+            //
+            // Priority: BS > bf16 > the proven launches. Both gates armed means THIS
+            // arm serves and the bf16 arm is shadowed (reported once): the two read
+            // different weight pools with different lifetimes, so running both would
+            // pay ~105 GiB/rank of bf16 mirror for nothing.
+            //
+            // Every refusal is a DECLINE into the proven launches (plus a one-shot
+            // notice): an armed gate must never silently measure the OLD path.
+            let bs_ready = self.moe_tilelang_bs_ready(ld, m, topk, dim, inter_local, n_routed);
+            let mut bs_gu = false;
+            if crate::dsv41::weights::moe_tilelang_bs() && !bs_ready {
+                Self::moe_bs_skipped_note(
+                    "the step is outside the arm's domain (a CUDA-graph capture, an INTERLEAVED \
+                     pool, an e4m3 activation, a frozen-shape mismatch, or the .so lacks the \
+                     blockscaled shim / its load-time SF pack)",
+                    true,
+                );
+            } else if bs_ready && !grp_gu {
+                // The shim takes the segment tables as HOST arrays and uploads them
+                // itself, so this is the host `moe_align` the bf16 arm keeps alive
+                // only as its `DSV41_MOE_TL_HOST_ALIGN` diagnostic — that round trip
+                // is exactly why `moe_tilelang_bs_ready` carries `!capturing()`.
+                let bs_tbl = self.moe_tilelang_tables_host(m, topk)?;
+                let bs_w = Self::moe_bs_weights(ld, dim, inter_local);
+                if let (Some((order, counts, eid, nseg)), Some(w)) = (bs_tbl.as_ref(), bs_w) {
+                    bs_gu = self.dev.moe_tilelang_gate_up_bs(
+                        self.s.xq4_r.as_u8(),
+                        self.s.xsc4_r.as_f32(),
+                        self.s.ex_act_r.ptr as *mut f32,
+                        w.0,
+                        w.1,
+                        w.2,
+                        w.3,
+                        eid.as_ptr(),
+                        order.as_ptr(),
+                        counts.as_ptr(),
+                        *nseg as i32,
+                        m as i32,
+                        dim as i32,
+                        inter_local as i32,
+                        topk as i32,
+                    )?;
+                }
+                if bs_w.is_none() {
+                    Self::moe_bs_skipped_note(
+                        "the routed experts' packed-SF pool is missing or is not a contiguous \
+                         [E, sf_words*NP] pool (load with DSV41_MOE_TILELANG_BS=1 and rebuild \
+                         the .so)",
+                        true,
+                    );
+                } else if bs_tbl.is_none() {
+                    Self::moe_bs_skipped_note(
+                        "the routing table could not be expressed as <= 36 expert segments of \
+                         <= 16 rows",
+                        false,
+                    );
+                } else if !bs_gu {
+                    Self::moe_bs_skipped_note(
+                        "the blockscaled shim declined the up shape (see its shape gate)",
+                        false,
+                    );
+                }
+                if bs_gu {
+                    if moe_tilelang() {
+                        // The bf16 arm is NOT running: say so once, so this run cannot
+                        // be mistaken for a `DSV41_MOE_TILELANG` measurement.
+                        Self::moe_bs_shadowed_note();
+                    }
+                    // Raw gate‖up: keep the separate swiglu launch and the raw
+                    // downstream slot stride (the same trade the bf16 arm makes).
+                    gateup_fused = false;
+                    act_slot = 2 * inter_local;
+                }
+            }
             // ---- TILELANG grouped GEMM (DSV41_MOE_TILELANG) ----------------------
             // The expert-centric replacement for the per-(row, slot) GEMV sweep:
             // `moe_align` groups the assignments by expert (host side — see
@@ -16365,7 +16574,7 @@ impl<'a> DevChain<'a> {
                      the device moe_align / `*_dev` shim set, or the bf16 expert copies missing)",
                     true,
                 );
-            } else if tl_ready && !grp_gu {
+            } else if tl_ready && !grp_gu && !bs_gu {
                 // The tables come from the DEVICE (`dsv41_route_group` +
                 // `dsv41_moe_align_from_group`), so this works inside a capture:
                 // no D2H read, no H2D upload. See `moe_tilelang_tables_dev`.
@@ -16446,7 +16655,7 @@ impl<'a> DevChain<'a> {
             // path's — that is precisely the "armed gate measured as the OLD path"
             // failure this dispatch exists to avoid. `grp_gu == false` is the
             // fallback: this launch answers the step, unchanged.
-            if !grp_gu && !tl_gu {
+            if !grp_gu && !tl_gu && !bs_gu {
                 let (qa, qs) = (self.s.xq4_r.as_u8(), self.s.xsc4_r.as_f32());
                 self.dev.expert_gate_up_fp4_batched(
                     qa,
@@ -19934,6 +20143,79 @@ fn oracle_tap() -> bool {
                     (2 * inter_local) as i64
                 };
                 let down_slot = dim as i64;
+                // ---- TILELANG BLOCK-SCALED (DSV41_MOE_TILELANG_BS), eager side -----
+                // The `rows == 1` twin of the arm in `moe_rows`: the SAME gate, the
+                // SAME host tables (`moe_align` over `route_idx[topk]`, one row) and
+                // the SAME shim. It reads the single row's packed fp4 activation
+                // (`xq4`/`xsc4`) and the experts' native fp4 planes plus their
+                // load-time packed ue8m0 words, and writes the RAW gate‖up layout into
+                // `ex_act_b` — exactly the `rows == 1` instance of the multi-row
+                // layout, so the two call sites are bit-for-bit the same computation.
+                // Mutually exclusive with the bf16 arm below; this one WINS when both
+                // gates are armed (see the verify-side block).
+                let bs_ready = self.moe_tilelang_bs_ready(ld, 1, topk, dim, inter_local, ne);
+                let mut bs_gu = false;
+                if crate::dsv41::weights::moe_tilelang_bs() && !bs_ready {
+                    Self::moe_bs_skipped_note(
+                        "the step is outside the arm's domain (a CUDA-graph capture, an \
+                         INTERLEAVED pool, an e4m3 activation, a frozen-shape mismatch, or the \
+                         .so lacks the blockscaled shim / its load-time SF pack)",
+                        true,
+                    );
+                } else if bs_ready {
+                    // HOST tables: the shim uploads them itself (see the verify-side
+                    // block and `moe_tilelang_bs_ready`'s `!capturing()` term).
+                    let bs_tbl = self.moe_tilelang_tables_host(1, topk)?;
+                    let bs_w = Self::moe_bs_weights(ld, dim, inter_local);
+                    if let (Some((order, counts, eid, nseg)), Some(w)) = (bs_tbl.as_ref(), bs_w) {
+                        bs_gu = self.dev.moe_tilelang_gate_up_bs(
+                            self.s.xq4.as_u8(),
+                            self.s.xsc4.as_f32(),
+                            self.s.ex_act_b.ptr as *mut f32,
+                            w.0,
+                            w.1,
+                            w.2,
+                            w.3,
+                            eid.as_ptr(),
+                            order.as_ptr(),
+                            counts.as_ptr(),
+                            *nseg as i32,
+                            1,
+                            dim as i32,
+                            inter_local as i32,
+                            topk as i32,
+                        )?;
+                    }
+                    if bs_w.is_none() {
+                        Self::moe_bs_skipped_note(
+                            "the routed experts' packed-SF pool is missing or is not a \
+                             contiguous [E, sf_words*NP] pool (load with DSV41_MOE_TILELANG_BS=1 \
+                             and rebuild the .so)",
+                            true,
+                        );
+                    } else if bs_tbl.is_none() {
+                        Self::moe_bs_skipped_note(
+                            "the routing table could not be expressed as <= 36 expert segments \
+                             of <= 16 rows",
+                            false,
+                        );
+                    } else if !bs_gu {
+                        Self::moe_bs_skipped_note(
+                            "the blockscaled shim declined the up shape (see its shape gate)",
+                            false,
+                        );
+                    }
+                    if bs_gu {
+                        if moe_tilelang() {
+                            // See the verify-side block: the bf16 arm is shadowed.
+                            Self::moe_bs_shadowed_note();
+                        }
+                        // RAW gate‖up: the separate swiglu launch below stays enabled
+                        // (the re-derived `gateup_fused` carries the `&& !bs_gu` term)
+                        // and the downstream slot stride stays the raw `2*inter`.
+                        act_slot = (2 * inter_local) as i64;
+                    }
+                }
                 // ---- TILELANG grouped GEMM (DSV41_MOE_TILELANG), eager side --------
                 // The single-row twin of the arm in `moe_rows`: the SAME gate, the
                 // SAME tables (`moe_align` over `route_idx[topk]`, one row) and the
@@ -20001,7 +20283,7 @@ fn oracle_tap() -> bool {
                         act_slot = (2 * inter_local) as i64;
                     }
                 }
-                if !ran_tc && !tl_gu {
+                if !ran_tc && !tl_gu && !bs_gu {
                     // ONE pass: `xq4`/`xsc4` hold the activation in whichever form
                     // the quantisation above produced (e4m3 bytes when `e4m3` is
                     // set, packed e2m1 otherwise) and `act_e4m3` tells the kernel
@@ -20086,6 +20368,7 @@ fn oracle_tap() -> bool {
                 // the separate swiglu launch.
                 let gateup_fused = !ran_tc
                     && !tl_gu
+                    && !bs_gu
                     && gateup_fuse()
                     && self.dev.supports_gateup_fuse()
                     && expert_fp4_mode() == 2
