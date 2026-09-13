@@ -79,7 +79,7 @@ LD_LIBRARY_PATH=$HOME/ferrite/kernels/cuda ./target/release/ferrite-serve --back
 
 1. **step time 必须真实测量**：`[dspark] steps=` 的 draft/verify/commit 分解或 nsys per-kernel；**禁止吞吐反推**（受 prefill/accept 污染）。
 2. **NCU 只跑特定 kernel 的 micro bench**（tests_*.cu 二进制），**不能 e2e**。
-3. **nsys 多跑**（per-kernel 时间唯一来源），**nsys 必须 sudo**（`sudo -E nsys profile ...` / `sudo nsys stats ...`——非 root 的 perf 访问受限，report 静默不写，NCU 同理）；**死锁规避必带**：`DSV41_AR_V5=0 DSV41_GRAPH_STEP=0` + `env -u FERRITE_P2P` + `NCCL_NVLS_ENABLE=0` + 5 分钟 SIGINT 硬帽；nsys 轮只看 kernel 相对倍数（AR 形态已变），吞吐数字必须来自非 nsys 轮。**坑**：远端清理进程时 `pkill -f "nsys profile"` 会匹配到自己的 ssh 命令行（自杀）——用 `pkill -x nsys`/`pkill -x ferrite-serve`。
+3. **nsys 多跑**（per-kernel 时间唯一来源）。**成功配方（v6，实测验证 116MB rep）**：对常驻 serve 用 `nsys profile --trace=cuda --sample=none --duration=<秒> --kill=SIGTERM -o <rep>`（vLLM/SGLang 社区标准）——duration 到时 nsys 自动停采集并杀 serve → finalize → rep 落盘；脚本侧再 `POST /shutdown` 双保险 + 轮询 rep 文件出现（finalize 大 rep 要几分钟，116MB 正常）。**无 sudo 可行**（--trace=cuda --sample=none 免 perf 权限；wave1 与 v6 双重实证）。**禁用外部 SIGINT**（多进程架构下单播 INT 破坏 finalize，四连败教训）；清理进程用 `pkill -x nsys`/`pkill -x ferrite-serve`（`pkill -f nsys` 会匹配 ssh 自身命令行自杀）。**死锁规避必带**：`DSV41_AR_V5=0 DSV41_GRAPH_STEP=0` + `env -u FERRITE_P2P` + `NCCL_NVLS_ENABLE=0`；nsys 轮只看 kernel 相对倍数（AR 形态已变），吞吐数字必须来自非 nsys 轮。
 4. **所有 e2e 必须 background 模式**（serve 启动的 ssh 会挂住前台）。
 5. **MTP 性能模型（用户裁决，勿再犯）**：单并发 decode 是 memory-bound ⇒ **verify(m 行) ≈ eager(1 行)+ε**；**400 = step ~8ms + acc length 2-3**。任何"verify 4-5× eager 是结构性代价"的理论都是错的（详见 `docs/agent/mtp-verify-amortization-model.md` + `verify-amortization-lesion-audit.md`）。
 
