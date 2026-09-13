@@ -4461,6 +4461,15 @@ fn hc_tail_split() -> bool {
                 2, // sqrtsoftplus, per the checkpoint's routing
             )?;
         }
+        // op-level diagnostic: the routing decision (kind 3 = the selected
+        // expert ids, i32 bits carried as f32 — the compare side reinterprets;
+        // kind 4 = the routing weights), n = topk.
+        if let Ok(xdp) = std::env::var("DSV41_GT_XDUMP") {
+            if layer == 0 {
+                self.gt_dump_vec(&xdp, 3, self.s.route_idx.ptr, topk)?;
+                self.gt_dump_vec(&xdp, 4, self.s.route_w.ptr, topk)?;
+            }
+        }
         // DEVICE-side dispatch: the routing stays on the device and the expert
         // kernels read `ids[slot]` themselves. Both downloads here were blocking
         // cudaMemcpy calls (download_f32 uses the synchronous memcpy), i.e. a
