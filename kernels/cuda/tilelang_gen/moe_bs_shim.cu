@@ -1100,6 +1100,21 @@ extern "C" int dsv41_moe_tilelang_gate_up_bs_dev(
     }
 
     // (3) scatter：RAW gate‖up 写回 out（swiglu 由既有 kernel 做，与本臂无关）
+    // MMA-DIAG: one-shot dump of g_c (MMA output) first 16 f32 values
+    static bool g_mma_diag_done = false;
+    if (!g_mma_diag_done) {
+        g_mma_diag_done = true;
+        cudaStreamCaptureStatus csm = cudaStreamCaptureStatusNone;
+        cudaStreamIsCapturing(s, &csm);
+        if (csm == cudaStreamCaptureStatusNone) {
+            float gc_h[16];
+            cudaMemcpyAsync(gc_h, g_c, 16 * sizeof(float), cudaMemcpyDeviceToHost, s);
+            cudaStreamSynchronize(s);
+            fprintf(stderr, "[moe-bs][MMA-DIAG] g_c[0..15]:");
+            for (int i = 0; i < 16; ++i) fprintf(stderr, " %.4f", gc_h[i]);
+            fprintf(stderr, "\n");
+        }
+    }
 scatter_launch:
     tl_moe_bs_scatter_kernel<<<dim3((unsigned)kBm, (unsigned)kSegCap), kMovThreads, 0, s>>>(
         g_c, out, order_dev, counts_dev, kNup, topk * kNup, topk, nseg_dev);
