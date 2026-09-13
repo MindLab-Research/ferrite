@@ -105,9 +105,18 @@ LD_LIBRARY_PATH=$HOME/ferrite/kernels/cuda ./target/release/ferrite-serve --back
 - serve 卡住/日志 mtime 停滞 = 挂了（查 `stat -c %y` + pgrep，别等）。
 - 加载错防线（三道 runtime + 三道编译期 + git hooks）见 `docs/agent/` 的加载防线文档。
 
-## 当前状态与下一步（2026-09-13 400 攻坚——acc 半边已落地，step 优化进行时）
+## 当前状态与下一步（2026-09-13 400 攻坚——SGLang 对比判决后，主战场转移）
 
 **里程碑**：
+- **acc 2-3 达标 ✓✓**（S1 tap 越界修复，mean-k 2.240 超 lazy；TAP_PARITY H 区 IDENTICAL + COMP_PARITY 19/0）。
+- **SGLang 对比判决（新主战场依据）**：SGLang/vLLM 的 verify = **一次 forward、m 是 batch 维**（M=bs×m GEMM / moe_align_block_size expert 去重 / unified append attention）——**实测 1.2-1.3× eager**。**ferrite 4× = 系统性零摊销**（`docs/agent/sglang-verify-model.md`）。
+
+**当前账**：step ≈28.6ms @ acc 2.24 ⇒ ~104 tok/s。verify 24.5 构成：R-time mrows 串行 20% + MoE 36 sweep 21% + R-launch 税 + 未融合 pair 形式。
+
+**修复路线（G1/G3/G2，SGLang 抄作业，全部在途）**：G3 per-row 批量化组合（launch 税归零）/ G1 MoE expert 去重纯调度（36→|active|，−1.5-2.5ms）/ G2 M 进 GEMM tile（−4~6ms，4×→1.3× 机制来源）。
+
+**已判死**：MPAR（二连败）、⑤a L2 直读（四档负向）、proj-mma（acc 崩 0.02）、p3lite+ALIGN（acc −0.22 + l4 parity FAIL 证伪）、GROUPED 无拆门（+10.3ms）、wo_a nwarps（8 最优）。
+
 - **acc 2-3 达标 ✓✓**：S1 tap 越界根因修复（`hc_collapse` per-row pre 契约 vs m-row hook 单行 4-float 越界——Fix A `dspark_pre_mean_r` 复制零成本等价，commit 6f6f513）→ **mean-k 1.34→2.240**（超 lazy 2.120；归因闭环 fix-off=1.38）；TAP_PARITY H 区全 IDENTICAL + COMP_PARITY 19/0（S2 干净）——双嫌疑闭环。
 - **正确性红线通过**：出师表拉丁 = EAGER 对照同现（模型行为）；DIFF_EAGER 48/48 none；计数 first-51 OK 全臂。
 
