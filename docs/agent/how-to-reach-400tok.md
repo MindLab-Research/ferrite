@@ -232,3 +232,23 @@ DSV41_MOE_TILELANG_BS=0 DSV41_MOE_BS_HANDWRITTEN=0
 ```
 （前两者决定 spec 是否真跑；后三者决定图与 AR 形态；最后两者是那条"永远对"的正确路径。）
 **判定口径**：`tok/步 = 打印的 tok/s × step_ms / 1000` 必须 ≈ `mean-k + 1`（≈3.2）；若 ≈1.0 ⇒ **没武装** ✗。
+
+## 12. 🔴 当前真正的拦路缺陷：`44 / 77 / 1010` 的**周期-3 数字重复**（用户判断被证实）
+
+**原文（`~/armrun_VDIFF.txt` 的 OUT 行，`DSV41_DIFF_EAGER=1 DSV41_TOKTRACE=1` 那次）**：
+```
+1 2 3 44 5 6 77 8 9 1010        ← 4→"44"、7→"77"、10→"1010"
+```
+- **重复的编号是 4、7、10 ⇒ 步长 3 ⇒ 周期-3 模式** ✓（不是随机错字 ✗）。
+- **同一次运行里 `[diff] first_mismatch=none` 全场** ⇒ **m 行 verify 与单行 eager 逐 token 一致** ✓
+  ⇒ 也就是说 **两条路都错、且错得一样** ✗ ⇒ **缺陷在"两条路共用的那段前向"**，不在 spec/verify 取值 ✓。
+- 因此 `sids_writeback()` 注释里说的 "the blocker is verify's values" **不是当前这个现象的原因** ✗（verify 与 eager 一致 ✓）。
+- AGENTS.md 记录的参照是 **"数字任务…EAGER 对照完美 1..100"** ✓ ⇒ 所以这是**树内/eager 路的回归或某个 flag 造成的** ✓。
+
+**判据与下一步（已备脚本）**：
+1. `~/eager_min.sh`（**用户建议的最小 eager 臂**：`SPEC=0 DSPARK=0`、BS 臂 OFF、无图、把 COMMON 压到最小）
+   ⇒ 文本**完美** ⇒ 是某个 flag ✗（逐项二分）；文本**仍重复** ⇒ 共用前向在树内坏了 ✗。
+2. `~/run_to_400.sh`（`EXP_ORACLE` 臂先跑）⇒ BS 臂 OFF 下 gate/up dump vs 已与官方逐位相同的 `gu_numpy_ref.py`
+   ⇒ 一致 ⇒ 缺陷在 attention/head；不一致 ⇒ SIMT MoE 路也有份。
+3. 拿到 `cat -A ~/num100_last.txt` 的**字节级**文本（`num100.sh` 已加落盘 ✓）⇒ 区分"模型真重复" vs "反分词/拼接"。
+
