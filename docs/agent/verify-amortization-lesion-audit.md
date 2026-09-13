@@ -143,7 +143,7 @@ B1 系三臂的断崖都在 line 52（1..51 正确然后跳 62）+ mean-k 0.64-0
 **§10.4 acc 口径定谳（P0 实验，DSPARK_DEBUG k_acc 直方图，2026-09-13 02:35）**：
 - 计数 66 token（30 步）的 k_acc 直方图：**17 步 × 0（57%）+ 6 步 × 5（20%）+ 7 步 × 1-4**；均值 ≈1.73（与 [dspark] mean-k 1.14+1 吻合）。
 - **acc 是双峰（0 或 5）而非稳态 2-3**——400 的 acc 判据需要分布平坦化（大多数步 k_acc 2-3），不只是任务形态。
-- k_acc=0 的 17 步根因待查（warm-up 步？数字 token 边界错位？draft 质量？）。
+- k_acc=0 的 17 步根因**已定位（token 模式交互）**：k_acc=5 的步 drafts 以 201（换行 token）开头——draft 善于预测分隔符；k_acc=0 的步 drafts 以数字 token 开头（14/15/16/17...）——draft 对数字序列预测差。计数任务 = [数字,换行] 交替 ⇒ acc 天然双峰。**非 bug 非 warm-up**——acc 2-3 稳态需要 draft 在非分隔 token 上的预测质量（模型能力/tap 输入质量）。
 - 出师表 300 拉丁：EAGER 对照同出（biochemicalutan/protato 等）⇒ 模型行为非回归，红线通过。
 
 **双门禁**：每个优化臂必须同时报告 `step_ms`（[dspark] 分解）**AND** `mean-k`（A0 基线 1.34；掉了 = 数值回归，立即弃用该 gate）。
