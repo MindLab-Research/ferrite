@@ -184,20 +184,39 @@ echo "$BUILD_ID" > "$(dirname "$0")/.build_id"
 # .o files are linked into one .so.
 TL_OBJS=()
 OTHER_SRCS=()
+# The TileLang shims are INDEPENDENT translation units, so compile them in parallel. This loop was
+# serial and it is the entire build time (~5 minutes for the shim set on a 192-core box) -- the user
+# noticed the asymmetry directly: a hand-written-only build took about two minutes. Only the final
+# link has to be serial. FERRITE_BUILD_JOBS overrides the width (default 8; each nvcc is itself
+# multi-threaded, so more is not always faster).
+CUTLASS_INC=""
+[ -d "/opt/dlami/nvme/dsv41_venv/lib/python3.12/site-packages/tilelang/3rdparty/cutlass/include" ] \
+    && CUTLASS_INC="-I /opt/dlami/nvme/dsv41_venv/lib/python3.12/site-packages/tilelang/3rdparty/cutlass/include"
+compile_shim () {
+    local f="$1" obj="${1%.cu}.no_fm.o"
+    "$NVCC" -O3 -c -Xcompiler -fPIC -std=c++20 \
+        -gencode "arch=compute_${ARCH},code=sm_${ARCH}" \
+        -I "$DIR/tilelang_inc" $CUTLASS_INC \
+        -o "$obj" "$f"
+}
+SHIM_JOBS=()
 for f in "${SRCS[@]}"; do
     case "$f" in
         */tilelang_gen/*_shim.cu)
             obj="${f%.cu}.no_fm.o"
-            "$NVCC" -O3 -c -Xcompiler -fPIC -std=c++20 \
-                -gencode "arch=compute_${ARCH},code=sm_${ARCH}" \
-                -I "$DIR/tilelang_inc" \
-                $( [ -d "/opt/dlami/nvme/dsv41_venv/lib/python3.12/site-packages/tilelang/3rdparty/cutlass/include" ] && echo "-I /opt/dlami/nvme/dsv41_venv/lib/python3.12/site-packages/tilelang/3rdparty/cutlass/include" ) \
-                -o "$obj" "$f" || exit 1
             TL_OBJS+=("$obj")
+            SHIM_JOBS+=("$f")
             ;;
         *) OTHER_SRCS+=("$f") ;;
     esac
 done
+if [ "${#SHIM_JOBS[@]}" -gt 0 ]; then
+    export -f compile_shim
+    export NVCC ARCH DIR CUTLASS_INC
+    printf '%s\n' "${SHIM_JOBS[@]}" \
+        | xargs -P "${FERRITE_BUILD_JOBS:-8}" -I{} bash -c 'compile_shim "$@"' _ {} \
+        || { echo "error: shim compilation failed"; exit 1; }
+fi
 
 "$NVCC" -O3 -shared -Xcompiler -fPIC $FAST_MATH_FLAG \
     -std=c++20 \
