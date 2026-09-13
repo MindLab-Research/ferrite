@@ -1527,11 +1527,11 @@ struct Kernels {
             *const c_int,
             *const c_int,
             c_int,
+            c_int,
+            c_int,
+            c_int,
+            c_int,
             i64,
-            c_int,
-            c_int,
-            c_int,
-            c_int,
             CuStream,
         ) -> c_int,
     >,
@@ -1563,11 +1563,11 @@ struct Kernels {
             *const c_int,
             *const c_int,
             *const c_int,
+            c_int,
+            c_int,
+            c_int,
+            c_int,
             i64,
-            c_int,
-            c_int,
-            c_int,
-            c_int,
             CuStream,
         ) -> c_int,
     >,
@@ -7841,8 +7841,8 @@ impl Device {
         )?;
         let rc = unsafe {
             f(
-                xq4, xsc4, out, w1, w3, sfw1, sfw3, eid, order, counts, nseg, w_stride as i64, rows,
-                dim, inter, topk, self.stream,
+                xq4, xsc4, out, w1, w3, sfw1, sfw3, eid, order, counts, nseg, rows,
+                dim, inter, topk, w_stride as i64, self.stream,
             )
         };
         if rc == 2 {
@@ -7898,8 +7898,8 @@ impl Device {
         )?;
         let rc = unsafe {
             f(
-                xq4, xsc4, out, w1, w3, sfw1, sfw3, eid, order, counts, nseg, w_stride as i64, rows,
-                dim, inter, topk, self.stream,
+                xq4, xsc4, out, w1, w3, sfw1, sfw3, eid, order, counts, nseg, rows,
+                dim, inter, topk, w_stride as i64, self.stream,
             )
         };
         if rc == 2 {
