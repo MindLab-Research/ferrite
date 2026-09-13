@@ -1281,8 +1281,12 @@ pub(crate) fn routed_down_quant_dbg() -> bool {
 pub(crate) fn compress_latent_quant() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *F.get_or_init(|| {
+        // Convention fix: every other gate in this file (and the A2/A4 ones) accepts the
+        // value only when it STARTS WITH '1'. The original `v != "0"` here would have
+        // enabled the gate for an empty string or any junk value, which is the opposite of
+        // the project's "regressions/experiments default OFF" discipline.
         std::env::var("DSV41_COMPRESS_LATENT_QUANT")
-            .map(|v| v != "0")
+            .map(|v| v.starts_with('1'))
             .unwrap_or(false)
     })
 }
