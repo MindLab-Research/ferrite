@@ -120,7 +120,8 @@ __device__ __forceinline__ float fast_round_scale(float amax, float max_inv) {
 
 // ---------------------------------------------------------------------- quant
 
-// Block-wise activation quantisation. block = 128 (window KV) or 32/16
+// Block-wise activation quantisation. block = 32 (window KV, the official
+// `fp8_block_size`; see `ops::KV_QUANT_BLOCK`) or 32/16
 // (compressed KV / indexer). `round_scale` picks the power-of-two scale.
 //
 // `src_stride` (F7, elements) is the SOURCE row pitch. `0` means "== `cols`",

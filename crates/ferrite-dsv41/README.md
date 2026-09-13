@@ -24,7 +24,7 @@ GLM-5.3-Flash code paths are untouched; the kernels are linked into the same
    * dense weights are fp8 e4m3 *in the checkpoint* and stay fp8 —
      `mma.sync.m16n8k32.f32.e4m3.e4m3.f32` (that is their native format; the
      reference computes them the same way in `fp8_gemm_kernel`).
-   * runtime activations stay in their own formats (window KV fp8/128,
+   * runtime activations stay in their own formats (window KV fp8/32,
      compressed KV fp4/16, indexer q,k fp4/32; the expert inputs are fp4).
 3. **Block scales are applied in the epilogue**, per k-block, with a separate
    accumulator — exactly the reference `fp8_gemm_kernel` scheme

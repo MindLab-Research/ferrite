@@ -865,13 +865,55 @@ pub fn rmsnorm(x: &[f32], w: &[f32], rows: usize, cols: usize, eps: f32) -> Vec<
     out
 }
 
-/// fp8 e4m3 row quantisation (window KV: block 128, power-of-two scale).
+/// The official window-KV activation-quantisation block: **32**.
+///
+/// `ref_inference/model.py:27` pins `fp8_block_size = 32` and hands it unchanged to
+/// every window-KV `act_quant`: the backbone's `_window_kv` (`model.py:707`) and the
+/// DSpark draft's seed row (`:1042`) and block row (`:1062`). One fp8 e4m3 scale
+/// therefore covers **32** consecutive elements of the post-RoPE KV vector (RoPE tail
+/// included), not 128. The historical ferrite value (128) shared one scale across a
+/// 4x-wider span — the D3 precision defect ("per-128 scale vs official per-32").
+///
+/// `DSV41_KV_BLOCK` overrides it (any positive multiple of [`KV_QUANT_BLOCK`]);
+/// unset, `0`, unparsable or a non-multiple falls back to this default with a
+/// one-shot notice.
+pub const KV_QUANT_BLOCK: usize = 32;
+
+/// The window-KV quantisation block in force: [`KV_QUANT_BLOCK`] (32) unless
+/// `DSV41_KV_BLOCK` selects another 32-multiple (see [`KV_QUANT_BLOCK`]).
+pub fn kv_quant_block() -> usize {
+    static F: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *F.get_or_init(|| kv_block_select(std::env::var("DSV41_KV_BLOCK").ok().as_deref()))
+}
+
+/// [`kv_quant_block`]'s selection rule, split out so it is unit-testable without
+/// the process-global `OnceLock` (env can only be read once per process).
+fn kv_block_select(raw: Option<&str>) -> usize {
+    match raw.and_then(|v| v.parse::<usize>().ok()) {
+        None => KV_QUANT_BLOCK,
+        Some(b) if b > 0 && b % KV_QUANT_BLOCK == 0 => b,
+        Some(b) => {
+            eprintln!(
+                "warning: DSV41_KV_BLOCK={b} is not a positive multiple of {KV_QUANT_BLOCK}; \
+                 keeping the official window-KV block {KV_QUANT_BLOCK} \
+                 (ref_inference/model.py:27 fp8_block_size)"
+            );
+            KV_QUANT_BLOCK
+        }
+    }
+}
+
+/// fp8 e4m3 row quantisation (window KV: block [`KV_QUANT_BLOCK`] = 32, power-of-two
+/// scale). `block == 0` selects [`kv_quant_block()`].
 pub fn kv_quant_fp8(x: &[f32], block: usize, round_scale: bool) -> (Vec<u8>, Vec<f32>) {
+    let block = if block == 0 { kv_quant_block() } else { block };
     quant::act_quant_fp8(x, block, round_scale)
 }
 
-/// fp4 quantisation (compressed KV: block 16 / indexer q,k: block 32).
+/// fp4 quantisation (compressed KV: block 16 / indexer q,k: block 32). `block == 0`
+/// selects [`kv_quant_block()`] (the window-KV default).
 pub fn kv_quant_fp4(x: &[f32], block: usize, round_scale: bool) -> (Vec<u8>, Vec<f32>) {
+    let block = if block == 0 { kv_quant_block() } else { block };
     quant::act_quant_fp4(x, block, round_scale)
 }
 
@@ -886,6 +928,30 @@ pub fn is_dspark_target(cfg: &Dsv41Config, layer: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// D3: the window-KV quantisation block is the OFFICIAL 32
+    /// (`ref_inference/model.py:27`), and `DSV41_KV_BLOCK` can only widen it to a
+    /// multiple of 32 — a coarser (or invalid) value falls back to 32.
+    #[test]
+    fn kv_quant_block_is_official_32() {
+        assert_eq!(KV_QUANT_BLOCK, 32);
+        // unset / empty / non-numeric => default
+        assert_eq!(kv_block_select(None), 32);
+        assert_eq!(kv_block_select(Some("")), 32);
+        assert_eq!(kv_block_select(Some("abc")), 32);
+        // 0 / non-numeric / non-multiple => default (no silent coarsening)
+        assert_eq!(kv_block_select(Some("0")), 32);
+        assert_eq!(kv_block_select(Some("17")), 32);
+        // explicit multiples are honoured — 128 is allowed only as a DELIBERATE
+        // override (to reproduce the pre-D3 value in an A/B), never the default
+        assert_eq!(kv_block_select(Some("32")), 32);
+        assert_eq!(kv_block_select(Some("64")), 64);
+        assert_eq!(kv_block_select(Some("128")), 128);
+        // block == 0 selects the gate (default 32) for the KV primitives
+        let x: Vec<f32> = (0..64).map(|i| (i as f32 - 32.0) * 0.5).collect();
+        let (_, s) = kv_quant_fp8(&x, 0, true);
+        assert_eq!(s.len(), 64 / 32, "per-32 scales, not per-128");
+    }
 
     #[test]
     fn window_idxs_prefill_matches_reference() {

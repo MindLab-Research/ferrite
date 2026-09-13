@@ -43,7 +43,7 @@
 //! * Block scales (ue8m0) are applied per k-block in the epilogue with a
 //!   separate accumulator, exactly like the reference `fp8_gemm_kernel`:
 //!   `acc += dot(a_k, b_k) * scale_a[row, kblk] * scale_b[nblk, kblk]`.
-//! * Runtime activations stay fp8/fp4 (window KV fp8/128, compressed KV fp4/16,
+//! * Runtime activations stay fp8/fp4 (window KV fp8/32, compressed KV fp4/16,
 //!   indexer q,k fp4/32).
 
 #![allow(non_snake_case)]

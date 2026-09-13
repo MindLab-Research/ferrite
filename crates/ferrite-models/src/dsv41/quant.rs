@@ -7,7 +7,7 @@
 //! | dense weights (attn/engram-wkv/shared experts/mtp) | fp8 e4m3 | ue8m0, **32x32 blocks** |
 //! | routed experts | **fp4 e2m1**, 2 per byte (I8) | ue8m0, **per row x 32-col block** |
 //! | engram tables | fp8 e4m3 | ue8m0, per row x 32-col block |
-//! | window KV (runtime) | fp8 e4m3 | block 128, power-of-2 (`round_scale`) |
+//! | window KV (runtime) | fp8 e4m3 | block **32** ([`crate::dsv41::ops::KV_QUANT_BLOCK`]), power-of-2 (`round_scale`) |
 //! | compressed KV (runtime) | **fp4** | block 16, e4m3 scales |
 //! | indexer q/k (runtime) | **fp4** | block 32, e8m0 scales |
 //!

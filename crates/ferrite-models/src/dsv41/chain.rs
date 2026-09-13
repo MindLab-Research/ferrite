@@ -68,8 +68,8 @@ impl SharedAttnState {
 pub struct LayerState {
     /// Ring buffer of `window_size` KV rows. This struct is the *CPU reference*
     /// state (f32); the device path keeps the same cache quantised to fp8
-    /// (block 128, power-of-two scale) in a separate packed buffer next to a
-    /// per-row scale array.
+    /// (block 32 = the official `fp8_block_size`, power-of-two scale) in a
+    /// separate packed buffer next to a per-row scale array.
     pub window_kv: Vec<f32>,
     pub window_kv_scale: Vec<f32>,
     /// The layer's own compressed-KV cache (only kv sources own one). Device:
