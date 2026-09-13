@@ -1458,3 +1458,21 @@ F 回合 = 修复落地后的两条 e2e 臂（`~/arm_run.sh`，5 图门全关）
 而票面远高于此（best1 −1.14 / best2 −2.98 / MPAR 二连败）。已判死清单见 roadmap（MPAR、⑤a L2 直读、
 proj-mma、p3lite+ALIGN、GROUPED 系列、launch 税、M-tile 调参、bf16 dequant 显存、MROWS_FOLD_R/AR_STORE_FUSE/AR_SINGLE_POLL）
 ——**勿再投入**。
+
+## §53 精度补丁的 OFF 路径安全性 —— 已逐行核实 ✓
+
+`git show 16d9953 -- crates/ferrite-models/src/dsv41/chain_dev.rs | grep '^-'` 显示被删除/改写的行**只有三处**：
+```
+rw_base,                                        ×2   ← down 调用的 row_weight 实参
+self.bf16_snap(self.s.ex_act_b.ptr as *mut f32, topk*act_slot as usize)?;   ← bf16 边界调用
+self.s.route_w.ptr as *const f32,               ×2   ← 路由权重实参
+```
+⇒ 补丁只改写了**这三个调用点的实参/调用**，并把它们包进 `if <gate> { … } else { 原样 }` 分支。
+**门控 OFF 时**：`rw_base` 照传、`route_w.ptr` 照传、`bf16_snap` 照跑 ⇒ **与改动前逐字节等价** ✓
+（与 subagent 的论证 + `cargo check --workspace` 通过互相印证 ✓）。
+
+**顺带说明该补丁要修的正是这三处**（对应 §14/§21 的两处不对齐 + 其载体）：
+① 路由权重必须**在 bf16/e4m3 边界之前**乘（官方 `model.py:849`）⇒ 门控 ON 时由新内核在融合步里施加，
+   调用方不再传 `row_weight`（避免乘两次）；
+② down 的输入必须是 **e4m3(block32) 量化后再反量化**的值（复现官方 w2 看到的操作数）；
+③ 因此原有的 `bf16_snap` 在门控 ON 时**必须跳过**（否则会对加权前的值多舍入一次，与官方单次舍入不符）。
