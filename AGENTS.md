@@ -105,22 +105,27 @@ LD_LIBRARY_PATH=$HOME/ferrite/kernels/cuda ./target/release/ferrite-serve --back
 - serve 卡住/日志 mtime 停滞 = 挂了（查 `stat -c %y` + pgrep，别等）。
 - 加载错防线（三道 runtime + 三道编译期 + git hooks）见 `docs/agent/` 的加载防线文档。
 
-## 当前状态与下一步（2026-09-13 深夜——SGLang 判决 + copy-eager 判决 + 第五路 A，4 修复在途）
+## 当前状态与下一步（2026-09-14 凌晨——TileLang 战役：全部接线完成 + T 臂乱码根因定谳 + 双挂重跑在途）
 
 **里程碑**：
-- **acc 2-3 达标 ✓✓**（S1 tap 越界修复，mean-k 2.240）。
-- **SGLang 对比判决**：verify = 一次 forward、m 是 batch 维（M=bs×m GEMM / expert 去重 grouped / unified append attention）——实测 **1.2-1.3× eager**。SGLang 的 MoE 摊薄**完全依赖 tensor core（tl.dot→MMA）**——SIMT 复制不了。
-- **copy-eager 判决**："复制 eager 改 batch"在 kernel 层**早已完成**（57 个 rows 孪生）——不可抄的是 3 个 m>1 语义约束（ring 翻转/compressor 跨行/indexer per-row）+ 12 件 verify 粘合层（~1700 行）。**渐进路线完胜**（15 个默认 OFF gate = 0 行 vs 4400 行重写）。
-- **4.45× 的精确分解**：MoE 36-sweep 恒等式（6× eager，SIMT FMA-issue bound）+ M-in-register GEMM（3.8× 指令）+ 3 语义约束的 ~54 发/层。
-- **第五路 A（新发现）**：同一 MoE kernel 的 m=1（0.88 条/value）vs m=6（1.46 条/value）**效率差 1.66×** ⇒ 可量化 **−4ms**（routed 10.0→6.0ms）——moe-eff-parity 实施中。
-- **launch 税三度证伪**：verify 地板 = 40 层串行链长 × 每环固定延迟——减发数不动链长。
-- **M-tile 判决**：BN1-4 全负向（+1.9~+3.1ms）；bn=1 对照锁定病灶 = 激活 __ldg 直读 + block 级 barrier（**非 issue-bound**——砍半指令只换 0.68ms）；参数调不出正号（10-15% 置信）——逻辑修复（激活 smem staging + 去 barrier）在途。
+- **TileLang 全部接线完成 ✓✓**（六件：五形状投影 wq_a/wq_b/wo_b/wo_a + MoE bf16 + MoE blockscaled fp4 + head bf16 + capture guard 全 shim）——13 TU + 7 tilelang 符号。
+- **T 臂 e2e 首验失败（line 2 乱码）→ 根因定谳**（两份审计交叉确认，`docs/agent/tl-garbage-verdict.md`）：**xsc/xsc_r 的 `.max()` 放在 `/32` 之前 = 算术 no-op**（~6KB 确定性越界读——修了 98f50e8）+ phase-2 四形状零 GPU 实测 + out_stride row-0 免疫 + g_part 单例竞写 + 半挂配置非法。
+- **GPU 纪律铁律**（用户裁决 2026-09-13）：**subagent 禁止远端一切 GPU 操作**（micro bench / tilelang 运行 / AOT / 任何 GPU 占用）——GPU 测量是主 agent 专属职责。
+- **SGLang 对比判决**（保留有效）：verify = 一次 forward、m 是 batch 维——实测 1.2-1.3× eager；MoE 摊薄完全依赖 tensor core。
+- **tcgen05 blockscaled fp4 判决**（保留有效）：0.62× bf16 + 显存收益独立成立（零 dequant——解决 +105GiB）+ 0.1.14 上游 bug 2 行 shim 绕过。
 
 **当前账**：step ≈28.6ms @ acc 2.24 ⇒ ~104 tok/s。
-**在途修复（4 subagent）**：mtile-logic-fix（激活 staging + per-warp slab）/ moe-eff-parity（第五路 A −4ms）/ v2-headfold-fix（draft head argmax 修复）/ orope-hang-debug（orope 首次 e2e 挂起——fusion 交付的阻塞）。
-**全兑现预期**：verify ~10-14ms ⇒ step ~14-18ms ⇒ **~180-230 tok/s**。到 8ms（400）需图/算子级链长压缩或 MoE 第五路 A 超额。
+**TileLang 预期（全接线后）**：投影 7.4→1.5ms + MoE 10→2.8ms ⇒ verify ~10-12ms ⇒ step ~14-16ms ⇒ **~200-230 tok/s**。
+**在途**：第六次重编（63a0f948：xsc 算术修复 + moe_bs 守卫 + 全部接线）→ DUAL_ARTIFACT_OK 后 T 臂双挂重跑（`~/tl_dual_test.sh` 已部署：GEMM_TILELANG + GEMM_TILELANG_EAGER + 计数 first-51 + 拉丁 + dspark 分解）。
 
-**已判死（勿重试）**：MPAR（两败）、⑤a L2 直读（四档负）、proj-mma（acc 崩 0.02）、p3lite+ALIGN（acc −0.22 + l4 parity FAIL）、GROUPED 布局（+16ms）、g1 union（+0.46ms——FMA 数不变）、launch 税、复制 eager 重写、M-tile 参数调优（BN 钳 4）。
+**已判死（勿重试）**：MPAR（两败）、⑤a L2 直读（四档负）、proj-mma（acc 崩 0.02）、p3lite+ALIGN（acc −0.22 + l4 parity FAIL）、GROUPED 布局（+16ms）、g1 union（+0.46ms）、launch 税、复制 eager 重写、M-tile 参数调优（BN 钳 4）、bf16 dequant 显存（+105GiB/rank）。
+
+**T 臂乱码关键教训**（`docs/agent/tl-garbage-verdict.md`）：
+1. **`.max()` 的域比存在本身重要**——放在 `/32` 前面是 no-op，移到后面才是真 floor。
+2. **parity 微基准的输入必须与生产布局同构**——hash 输入验证的是"自洽"而非"同构"。
+3. **"两个谓词是一对"**——A 有 m-predicate 而 ASC 没有，靠 reduce 兜底是隐性耦合。
+4. **m=1 基线对 stride 类缺陷免疫**——out_stride/a_stride/scale pitch 错误只有多行才暴露。
+5. **半挂配置是设计内非法**——接线契约明文规定双侧同换（eager + verify 同挂）。
 
 - **acc 2-3 达标 ✓✓**：S1 tap 越界根因修复（`hc_collapse` per-row pre 契约 vs m-row hook 单行 4-float 越界——Fix A `dspark_pre_mean_r` 复制零成本等价，commit 6f6f513）→ **mean-k 1.34→2.240**（超 lazy 2.120；归因闭环 fix-off=1.38）；TAP_PARITY H 区全 IDENTICAL + COMP_PARITY 19/0（S2 干净）——双嫌疑闭环。
 - **正确性红线通过**：出师表拉丁 = EAGER 对照同现（模型行为）；DIFF_EAGER 48/48 none；计数 first-51 OK 全臂。
