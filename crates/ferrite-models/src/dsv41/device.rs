@@ -6272,6 +6272,13 @@ impl Device {
             return Ok(false);
         };
         let rc = unsafe { f(idxs, pos_rows, window, m, idx_stride, self.stream) };
+        // SENTINEL FIX (orope-hang-debug): rc==1 is a SHAPE-family decline from
+        // the C entry — the per-row wrapper treats 1..=3 as Ok(false) (silent
+        // fallback); this mrows wrapper must agree or the same shape that the
+        // old arm tolerated becomes a hard abort here.
+        if (1..=3).contains(&rc) {
+            return Ok(false);
+        }
         self.kerr(rc, "dsv41_window_idxs_mrows")?;
         Ok(true)
     }
@@ -6293,6 +6300,10 @@ impl Device {
             return Ok(false);
         };
         let rc = unsafe { f(ring, kv_rows, pos_rows, window, hd, m, self.stream) };
+        // SENTINEL FIX (orope-hang-debug): same decline contract as above.
+        if (1..=3).contains(&rc) {
+            return Ok(false);
+        }
         self.kerr(rc, "dsv41_ring_append_mrows")?;
         Ok(true)
     }

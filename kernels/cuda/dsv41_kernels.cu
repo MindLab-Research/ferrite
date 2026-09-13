@@ -2188,8 +2188,12 @@ __global__ void window_idxs_mrows_kernel(int32_t* __restrict__ idxs,
 
 extern "C" int dsv41_window_idxs_mrows(int32_t* idxs, const int* pos_rows, int window, int m,
                                        int idx_stride, cudaStream_t s) {
-    if (window <= 0 || idxs == nullptr || pos_rows == nullptr) return (int)cudaSuccess;
-    if (m <= 0 || idx_stride < window) return (int)cudaSuccess;
+    // SILENT-SKIP FIX (orope-hang-debug): a guard trip must DECLINE (2), not
+    // report success — the caller skips its per-row `window_idxs` on the
+    // strength of Ok(true), so "success without a launch" leaves idxs_r
+    // poisoned while the fused attention still reads it.
+    if (window <= 0 || idxs == nullptr || pos_rows == nullptr) return 2;
+    if (m <= 0 || idx_stride < window) return 2;
     window_idxs_mrows_kernel<<<dim3((unsigned)((window + 127) / 128), (unsigned)m), 128, 0, s>>>(
         idxs, pos_rows, window, m, idx_stride);
     return (int)cudaGetLastError();
@@ -2216,8 +2220,9 @@ __global__ void ring_append_mrows_kernel(float* __restrict__ ring,
 
 extern "C" int dsv41_ring_append_mrows(float* ring, const float* kv_rows, const int* pos_rows,
                                        int window, int hd, int m, cudaStream_t s) {
-    if (ring == nullptr || kv_rows == nullptr || pos_rows == nullptr) return (int)cudaSuccess;
-    if (hd <= 0 || window <= 0 || m <= 0) return (int)cudaSuccess;
+    // SILENT-SKIP FIX (orope-hang-debug): same decline-not-success contract.
+    if (ring == nullptr || kv_rows == nullptr || pos_rows == nullptr) return 2;
+    if (hd <= 0 || window <= 0 || m <= 0) return 2;
     const int total = m * hd;
     ring_append_mrows_kernel<<<(unsigned)((total + 127) / 128), 128, 0, s>>>(
         ring, kv_rows, pos_rows, window, hd, m);
