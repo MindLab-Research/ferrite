@@ -35,6 +35,22 @@ __device__ __forceinline__ void hw_tc_dealloc(uint32_t tmem, int ncols) {
 // DSV41_MOE_BS_SCALEVEC1X before launch; the asm must be compile-time so both
 // spellings are compiled in and chosen at runtime).
 __device__ int g_sv1x = 0;
+// Runtime switch for the smem layout family:
+//   0 = TileLang's SW128 (layout_type=2, lbo=1, sbo=64, advance ki*32B)
+//   1 = repo-verified canonical interleave (layout_type=0, lbo=8, sbo=16, advance ki*4096B)
+__device__ int g_canon = 0;
+
+// smem index for a (row, kk) element of a 128-row x 128-K(tiles) operand tile.
+__device__ __forceinline__ int hw_smem_idx(int row, int kk, int canon) {
+    if (canon) {
+        // canonical UMMA K-major interleave (dsv41_experts_mxf4.cu:24-38):
+        //   unit16(row,kb) = (row%8) + 8*kb + 16*(row/8); atom(K=32) = 4096 B block
+        return (kk >> 5) * 4096 + (row >> 3) * 256 + (row & 7) * 16 +
+               (((kk & 31) >> 4) * 128) + (kk & 15);
+    }
+    // SW128: addr(r,c) = (r/8)*1024 + (r%8)*128 + (((c/16) ^ (r%8))*16) + (c%16)
+    return (row >> 3) * 1024 + (row & 7) * 128 + ((((kk >> 4) ^ (row & 7))) << 4) + (kk & 15);
+}
 
 // VERIFIED MMA instruction — memory clobber included
 __device__ __forceinline__ void hw_tc_mma(uint32_t d_tmem, uint64_t a_desc, uint64_t b_desc,
@@ -224,7 +240,7 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
             const uint8_t val = A[(int64_t)(seg * HW_BM + m) * HW_K + k * HW_BK + kk];
             // SW128 (CU_TENSOR_MAP_SWIZZLE_128B) — MUST match TileLang's TMA layout:
             //   addr(r,c) = (r/8)*1024 + (r%8)*128 + (((c/16) ^ (r%8))*16) + (c%16)
-            A_sh[(m >> 3) * 1024 + (m & 7) * 128 + ((((kk >> 4) ^ (m & 7))) << 4) + (kk & 15)] = val;
+            A_sh[hw_smem_idx(m, kk, g_canon)] = val;
         }
 
         // (2) 所有线程协同加载 B tile (W1 前 64 行 + W3 后 64 行)
@@ -249,8 +265,8 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
             const int k0 = col * 2;      // first element K index
             const int k1 = col * 2 + 1;  // second element K index
             // SW128 swizzled write (same layout as TileLang's TMA)
-            B_sh[(row >> 3) * 1024 + (row & 7) * 128 + ((((k0 >> 4) ^ (row & 7))) << 4) + (k0 & 15)] = packed & 0xF;
-            B_sh[(row >> 3) * 1024 + (row & 7) * 128 + ((((k1 >> 4) ^ (row & 7))) << 4) + (k1 & 15)] = packed >> 4;
+            B_sh[hw_smem_idx(row, k0, g_canon)] = packed & 0xF;
+            B_sh[hw_smem_idx(row, k1, g_canon)] = packed >> 4;
         }
         for (int i = tid; i < HW_NH * 64; i += 128) {
             const int row = i >> 6;
@@ -260,8 +276,8 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
             const int m = HW_NH + row;  // W3 rows are after W1
             const int k0 = col * 2;
             const int k1 = col * 2 + 1;
-            B_sh[(m >> 3) * 1024 + (m & 7) * 128 + ((((k0 >> 4) ^ (m & 7))) << 4) + (k0 & 15)] = packed & 0xF;
-            B_sh[(m >> 3) * 1024 + (m & 7) * 128 + ((((k1 >> 4) ^ (m & 7))) << 4) + (k1 & 15)] = packed >> 4;
+            B_sh[hw_smem_idx(m, k0, g_canon)] = packed & 0xF;
+            B_sh[hw_smem_idx(m, k1, g_canon)] = packed >> 4;
         }
 
         // (3) 加载 SF
@@ -297,8 +313,10 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
             // smem descriptors for A and B tiles
             // layout=0 (no swizzle), LBO=1 (16B = core matrix row stride), SBO=64 (1024B = 8-row atom stride)
             // (数据已按 core matrix 布局写入，无需 swizzle)
-            const uint64_t a_desc_base = hw_make_desc(A_sh, 1, 64, 2);  // TileLang exact: lbo=1, sbo=64, SW128(layout=2)
-            const uint64_t b_desc_base = hw_make_desc(B_sh, 1, 64, 2);  // TileLang exact: lbo=1, sbo=64, SW128(layout=2)
+            const uint64_t a_desc_base = g_canon ? hw_make_desc(A_sh, 8, 16, 0)    // canonical SWIZZLE_NONE
+                                     : hw_make_desc(A_sh, 1, 64, 2);   // TileLang SW128
+            const uint64_t b_desc_base = g_canon ? hw_make_desc(B_sh, 8, 16, 0)
+                                     : hw_make_desc(B_sh, 1, 64, 2);
 
             for (int ki = 0; ki < 4; ++ki) {
                 // idesc: M=128, N=128, a_fmt=0 (E4M3), b_fmt=5 (E2M1), sf_id=ki
@@ -306,8 +324,8 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
                 // K-block descriptor advance: TileLang's `desc_a + (ki*32)` where
                 // Tcgen05SMemDescriptor::operator+ does `reg32_[0] += offset >> 4`
                 // (offset in BYTES). So the advance is ki*32 bytes = ki*2 units.
-                const uint64_t a_desc = a_desc_base + (uint64_t)(ki * 2);
-                const uint64_t b_desc = b_desc_base + (uint64_t)(ki * 2);
+                const uint64_t a_desc = a_desc_base + (uint64_t)(ki * (g_canon ? 256 : 2));
+                const uint64_t b_desc = b_desc_base + (uint64_t)(ki * (g_canon ? 256 : 2));
                 // enable_d: 0 for first MMA (clear accumulator), 1 for rest
                 const uint32_t enable_d = (k == 0 && ki == 0) ? 0 : 1;
 
