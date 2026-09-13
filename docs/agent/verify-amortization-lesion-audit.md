@@ -162,6 +162,43 @@ B1 系三臂的断崖都在 line 52（1..51 正确然后跳 62）+ mean-k 0.64-0
 - **同 pos drafts 分叉**（pos=52：lazy [201,511,201,397,201] k_acc=5 vs SWALLOW [426,397,201,20,201] k_acc=0；pos=64 同样）——**draft 的第一个预测就不同** ⇒ **(d) 成立：draft 输入状态差**（env 全同 + draft kernel 同族 ⇒ tap/latent 的系统性差异）。注意同 pos 的 token 历史已因前面 accept 差而不同——但 lazy 在数字位也预测对（换行开头）而 SWALLOW 预测错，方向性明确：**SWALLOW 的 tap 让 draft 变差**。
 - **E2 的 hc 三门不改变 tap 写出**（它们只改 hc 前端 kernel）——**tap 写出端的块/行分叉**（:10767-10793 块写 tap_r+(slot*VERIFY_ROWS)*dim vs lazy staging+lazy_tap_commit）才是 S1 的正身。**TAP_PARITY 护栏（hc-tap-parity-fix 实施中）是下一步定位的关键**。
 
+**§10.8 S2 护栏交付 + 静态分叉候选清单（comp-parity，2026-09-13 04:00）**：
+- **交付**：`DSV41_COMP_PARITY=1`（默认 OFF，strict `=="1"`，与 `DSV41_TAP_PARITY` 同规）。入口 `dspark_commit`（chain_dev.rs:10277）——replay 之后、`set_pos_ctr` 之前（:10301），即正好夹住"replay 装好的那个状态"。探针 `comp_parity_probe`（:10577），取/放助手 `comp_state_take`/`comp_state_put`（:10472/:10502）。
+- **它测什么**：把 SWALLOW 的**块快照+replay**状态（replay 是 **layer-major**：每层的 keep 行跑完再下一层，:10331）与**同块按 lazy 方式重放**的状态（**row-major**：每行过全部 compress source 再下一行，:10683）**逐位**比较（`to_bits`，不合并 -0.0/NaN）。两跑喂**同一份投影**（`spec_snap_kvp/scp`），所以报出的分歧在**状态机**（顺序、复原精确性、跨层活性、计数器），不在投影——投影那半是 S1（E1/E3）。
+- **为什么非空转**：顺序是实体差异（layer-major vs row-major），且没有任何断言保证两者等价；replay 的正确性还依赖`dspark_rollback_keep(keep=m)`的复原精确性与"`state_kv`/`state_score`/`latent` 均按层私有、无跨层耦合"这一隐含前提。全部由这一跑直测。
+- **tier-2 `proj-live`**：同一 take 里把 `spec_snap_kvp/scp[last]` 与**活的** `kvp_r/scp_r` 逐位比（最后一个 compress source 的块行在 commit 时仍是它自己的活值——层循环升序 `for layer in 0..n_layers` 已核实）。这直测 **replay 消费的快照 == 块自产出的逐行投影**（S2 的"来路"接线），且是**最后一个 compress source 上的 S1 采样探针**：若此处不等 ⇒ 该层的 m 行投影与逐行投影本身不同（S1 在压缩器输入端实锤）。
+- **纪律**：take(状态+接线) → `dspark_rollback_keep(pos_base,m,m)`（`keep=m` 使 ring 复原循环为空 ⇒ 保住已接受前缀的 KV；压缩器复原无条件 ⇒ 整块回滚，:8108-8166）→ row-major 参考跑（`publish=false`，不碰 `index_k`）→ 读回 → **无条件 put-back**（三个 payload + device clen + out_rows + host mirror）→ 才比较/打印。replay 或下载失败一律在 put-back **之后**报 `Err`（照 `diff_eager_probe` 的 take/put-back 纪律）。`pos_ctr` 两跑都不写（pair 读 `pos_rows`）。ring 的 compressed rows 不复原：状态相等时参考跑在相同槽位写相同字节；不等时已打印 MISMATCH（诊断）。
+- **成本/用法**：两趟全 source D2H + 每 spec round 多一次 keep 行重放。**只在独占进程跑，绝不进 A/B 计时臂**。启动收据新增一行 `[sh-gate] startup (diagnostic guards): COMP_PARITY=...`（env 回读纪律，§10.1）。
+- **实现注记**：`compress_replay` 的每行体内提为 `compress_replay_row`（:10386）——launch/参数/顺序逐字不变（活路径逐位不变），护栏用 row-major 驱动**同一程序**，这是"非空转"的前提。
+
+**§10.9 sweep1 完整判定（2026-09-13 04:05，四个新交付项的 A/B）**：
+| 臂 | verify | 判定 |
+|---|---|---|
+| p3b（p3lite 段 B） | 25.41 | **无效**——R1 前置漏设 ATTN_PROJ_ALIGN=1（段 B 未发射；draft 3.79 无变化）；完整验证需 ALIGN 同臂 + tap 修复后重测 |
+| woa4（wo_a nwarps=4） | 26.21 | **负向 +1.72ms** |
+| woa2（wo_a nwarps=2） | 27.38 | **负向 +2.89ms**（梯度确认 nwarps=8 已是局部最优） |
+| mpar2（MPAR 回炉 auto） | 25.77 | **负向 +1.28ms——MPAR 二连败**（rpb=1 +0.52 → 回炉后 +1.28；warp-M-并行的 1.59× 指令代价 > 收益，结构性天花板确认） |
+| fence（fence 修复验证） | 24.62 | **✓ decline 消失验证通过**（无 "left no device snapshot" 行 + ARMED 全打 + mean-k 1.380 健康；只解锁 layer 20 一层故 +0.1ms 内符合预期） |
+
+**步时优化的战略判定**：四个新交付项三负一无——**剩余有效路径**：①tap 修复（+0.78 acc = +33% 吞吐——最大杠杆，TAP_PARITY/COMP_PARITY 护栏已交付待跑）②MoE grouped（−1.5-2.5ms，716 修复中）③mrows 摊薄的真解 = tensor core 路线（m=6 fp8 mma——设计进行中）④draft 减肥（p3lite 全套——tap 修复后重测）。
+
+**静态逐项比对（`compress_replay`+`compress_replay_row` :10331/:10386 vs `compress_row` :13675）——S2 分叉候选清单**：
+
+| # | 候选点 | 位置（file:line） | 判定 |
+|---|---|---|---|
+| C1 | 遍历顺序：replay **layer-major** vs lazy **row-major**（每行一次 `step_rows(m=1)` → 全层） | :10341-10362 vs :13675 / 层循环 :11737 | 每层状态私有，`pos_rows`/`clen`/`out_rows` 均按层切片 ⇒ 理论上顺序无关；**无断言**——**tier-1 直测此点** |
+| C2 | 投影来源：`spec_snap_kvp/scp`（replay）vs 活 `kvp_r/scp_r`（lazy 每行） | 写 :13638-13652（**仅 `spec_capture` 下写**）；消费 :10386 / :13675 | 同层同 stride（`layer*VERIFY_ROWS*hd + r*hd`）；**tier-2 proj-live 直测**（限最后一个 source） |
+| C3 | 位置双源：`start_pos`（host `pos_base+r`）与 `pos_ctr`（device `pos_rows[r]`）是同一行的**两个独立来源** | pool 调用 :10414-10417 / :13695-13698；仅 row 0 有断言 `inv_pos_rows_first` :11177 | replay 重传 `pos_rows`（:10339）自洽；**m 行块 r>0 无断言** ⇒ 结构化候选 |
+| C4 | **S3**：`comp_side` 被 `spec_capture` 排除 ⇒ SWALLOW 的投影走主 stream，lazy 可走 `side_stream3` | :11935-11942（+ fork/join :11946, :11933） | 同 kernel 同参数、仅 stream 不同 + `compress_side_join` ⇒ 数值应同，但**两栈的投影路径结构性不同源** |
+| C5 | `publish_index_key` 位置：replay 内联在每行 commit 后 vs lazy 由调用方在 commit 与 select 之间 | :10450-10458 vs :11880 区 | `index_k` 不在护栏比较范围（护栏显式跳过 publish）；`clen` 按同一确定性规则推进 ⇒ 等价 |
+| C6 | ring 的 compressed rows（`window+*clen`）不被 rollback 复原，由 replay 重写 keep 行 | :8108（只复原 window 行） | `clen` 复原后 `>= clen` 的槽不可达（`sparse_attn` 只读 `< clen`）⇒ 等价（已文档化） |
+| C7 | m 行 hoisted `compress_rows_fused`（`fused_mrows` 单 launch）vs m 次 pair | :13782 vs :10386 | **本护栏不覆盖**（m≥2 字节被 replay 覆盖，§10.5 已判不泄漏）；需"pair-vs-fused"第三腿另立 |
+| C8 | 单行 decode 真身 `compress_on`（fused，读 `cache.kvp/scp`，counter 用活 `pos_ctr`）vs pair（读 `s.kvp_r/scp_r`，counter 用 `pos_rows+r`） | :17500 vs :13675 | 两个不同 scratch + 两个不同 counter 源；`compressor_fused_on` "与 pair 逐位相同"仅为**文档断言、无护栏** |
+| — | 层集合：`compress_sources()`（:7814-7818）vs `is_comp_src`（:11713） | — | 同一谓词（`compress_ratio>0 && is_kv_source`）⇒ **已核实等价** |
+
+- **判决读法**：`[comp-parity] IDENTICAL` ⇒ S2 的**状态机**干净（顺序/复原/计数器/活性全等价）⇒ 剩余嫌疑回到 **S1（投影本身）**，E1/E3 正身；`MISMATCH layer/seg/row/elem` ⇒ S2 实锤，按坐标定位。
+- **编译/测试**：`cargo check --workspace --all-targets` **EXIT=0**；`cargo test -p ferrite-models --lib` **92 passed / 0 failed**。`cargo test --workspace --lib` 有两处**与本改动无关的既存失败**：① `ferrite-exec` lib-test 链接失败（dev profile 未链 CUDA driver，`cudaSetDevice`/`cudaMalloc` undefined——`ferrite-kernel/cuda.rs`，非本次触碰）；② `ferrite-model::weights::tests::layout_production_counts` 断言 38287 vs 37398（该文件 `git diff` 为 0 行、纯 config 计数、与本改动不同 crate）。
+
 **双门禁**：每个优化臂必须同时报告 `step_ms`（[dspark] 分解）**AND** `mean-k`（A0 基线 1.34；掉了 = 数值回归，立即弃用该 gate）。
 
 1. **重编**：subagent 交付的 .cu/chain_dev 改动 → `build.sh 103a` + `cargo build --release`（双产物）+ 符号三证。
