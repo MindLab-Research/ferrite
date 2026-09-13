@@ -2892,3 +2892,25 @@ descriptor `lbo=1/sbo=64/layout=2`、K 块递进 `ki*32 B`。
 2. **GPU 上跑对拍 harness**（新旧 down 在同一批输入上逐元素比 ⇒ relerr 应 ≈0）——**验证必须在接线之前**；
 3. 通过后**再**做 Rust 侧分发（门控默认 OFF，走 §87 的性能门判据：先逐位一致、再看 p50）；
 4. 因为它是**步时削减**（§106：450 是 step 问题），预期对 **verify 总时间**有直接贡献（该核当前 1.00ms/步）。
+
+## §113 down 对拍 harness 的**待修状态**（已定界，供一键修复）
+
+`kernels/cuda/tests_dn_bs_parity.cu` 目前**编译不过**（4 个 error，全部同一类 ABI 漂移）：
+```
+tests_dn_bs_parity.cu(347)/(359): error: argument of type "cudaStream_t" is incompatible with parameter of type "int"
+tests_dn_bs_parity.cu(347)/(359): error: too few arguments in function call
+```
+- 一处**已修**：`dsv41_expert_down_reduce_fp4_batched`（SIMT 参考）在 `DSV41_SEQ_ALIGN` 合并（#5）后**多了一个 `seq_align` 形参**
+  ⇒ harness 写于该 ABI 变更之前 ⇒ 已补 `0` ✓（279/306 行）。
+- **剩余两处（347/359）**：调用**新 shim 的入口** `dsv41_moe_bs_down_dev`（`moe_bs_dn_shim.cu:244`）时同样少传参数/类型不符
+  ⇒ 修法：**照 `moe_bs_dn_shim.cu:244` 的完整形参表补齐这两处调用**（并确认 `cudaStream_t` 作为最后一个实参）。
+- **编译命令（口径已定，别再试错）**：必须**从 `tilelang_gen/` 目录**编，并带三个 `-I`：
+  ```bash
+  cd <repo>/kernels/cuda/tilelang_gen
+  nvcc -c ../tests_dn_bs_parity.cu -o /tmp/dnp.o -gencode arch=compute_103a,code=sm_103a \
+       -O2 -std=c++17 -I. -I.. -I../tilelang_inc
+  ```
+  （根因：harness 以相对路径 `#include "moe_bs_dn_shim.cu"`，而 shim 又 include 其兄弟 kernel 与 `../tilelang_inc/*`；
+   只在 `kernels/cuda` 或只加 `-Itilelang_gen` 都会得到假错误。）
+- **教训**：**合并顺序会静默作废先前的调用方**——一个后到的 ABI 变更（#5 加形参）让先前写好的 harness 失效，
+  而 `grep` 不到、只有**用真实口径编译**才会暴露 ✓（与 §83/§110 同一条原则）。
