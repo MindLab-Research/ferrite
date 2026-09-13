@@ -2443,3 +2443,53 @@ W 回合（`83c08750`）的配置特征：
 
 ⇒ 因此 W 回合**不需要"正确"才有价值**：它是把"间歇挂死"二值化的一次实验。
 （已同时把 `DSV41_VERIFY_GRAPH=0 DSV41_DRAFT_GRAPH=0` 钉进 `arm_run.sh` 的 `GRAPH_OFF`，见 §91。）
+
+## §97 【基准】SGLang 官方博客（DeepSeek-V4.1-Flash kernel 优化）与我们进度的对照
+
+来源：`https://www.sglang.io/blog/deepseek-v4.1-flash-kernel-optimization`
+（"from 35 to 873 tokens/s"，**4× GB300、BS=1、attention TP4、MoE TP4**、random 4k/1k、**模拟 accept 5.5**）
+
+### 16 步阶梯（他们自己的编号与实测 tok/s）
+| # | 步骤 | tok/s |
+|---|---|---|
+| 1 | 首个可跑版本 | 35.2 |
+| 2 | **MXFP8 GEMM（修量化块/scale 布局不匹配，直接吃到 Blackwell MXFP8 kernel）** | **117.8** |
+| 3 | RoPE + FP4 融合 | 133.5 |
+| 4 | mHC 按输入行选 tile | 141.1 |
+| 5 | Reduce + Sinkhorn 融合 | 146.5 |
+| 6 | **跨层共享 scratch（不再每层重建请求索引/缓冲）** | 148.4 |
+| 7 | C2 pooling 融合 | 152.1 |
+| 8 | mHC 统计与 attention/MoE **重叠（双流）** | 186.4 |
+| 9 | 快路径默认开 | 186.6 |
+| 10 | GEMV / norm / Engram gate | 203.3 |
+| **11** | **DSpark（spec）打开** | **558.2** ← 单步最大跃升（×3） |
+| 12 | verify / MoE 融合与重叠 | 718.8 |
+| 13 | 小批量投影 / mHC 融合 | 761.7 |
+| 14 | indexer 后处理 / Q-RoPE / WO-A 量化融合 | 802.4 |
+| 15 | C2 verify 压缩融合（L2/L8/L14 的 pair-pool+norm+rope+quant+KV写 合一） | 853.5 |
+| 16 | **MoE 从 EP4 改 TP4 + padding**（inter 576→640） | **873.6**（+2.22%） |
+
+### 三条**直接适用于我们**的结论（重点）
+1. **第 2 步是本战役的镜子**：他们 35→118 靠的是"**量化块/scale 布局与后端期望不匹配 ⇒ 走了慢速回退 GEMM**"，
+   并明确总结：**"bringing up a new model 时，确认一个 GEMM 实际 dispatch 到哪个 kernel，通常比调 tile 更值钱"** ✓
+   ⇒ 这正是我们 fp8/fp4 **scale 布局**（`SF` 行 pitch、容器语义 §47）工作的同一类杠杆，且是**最大单项** ✓。
+2. **第 11 步证明 spec/MTP 是最大杠杆**（186→558）✓ ⇒ 我们"先把 BS 臂搞对、再做 verify 融合"的方向正确 ✓；
+   他们的**第 12 步（verify/MoE 融合）** 正是我们 BS 臂（tcgen05 fp4 MoE）要吃的部分 ✓。
+3. **测试口径应对齐**：他们用 **random 4k/1k + 模拟 accept 5.5** 作为可复现基准，
+   并用"accept 长度由 server 配置控制、每版同输入"来保证可比 ✓
+   ⇒ **我们的 push400/对比也应该统一到同一口径**（否则无法与 sglang 数字对齐）✓。
+
+### 与我们现状的对应（粗略）
+| 他们的步骤 | 我们的对应物 | 状态 |
+|---|---|---|
+| 2 MXFP8 布局 | fp4/fp8 的 scale/容器布局（§47 定谳、§83 构建） | **本轮主攻** ✓ |
+| 3/7/14 融合 | 我们的 RoPE-quant 融合、compressor、indexer 融合（多条已落地） | 部分 ✓ |
+| 6 跨层共享 scratch | 我们的跨层 scratch/常驻 buffer | 已做 ✓ |
+| 8/12 重叠（双流） | 我们的 mHC/verify 重叠门（`DSV41_*_FUSE`/`*_MROWS` 系列） | 部分 ✓ |
+| **11 DSpark** | 我们的 `DSV41_SPEC`/`DSPARK` 路径 | **已实现，正在修正确性** ✓ |
+| 12 verify/MoE 融合 | **BS 臂（tcgen05 fp4 MoE）+ cp.async 双缓冲** | **本轮主攻** ✓ |
+| 16 MoE TP4+padding | 我们是单机 TP8（拓扑不同，需按我们自己的 `TP` 重新评估） | 待议 |
+
+⇒ **行动**：(a) 把 `push400_hw_test.sh` 的口径对齐到 **random 4k/1k + 模拟 accept 5.5**（可复现、可对比）；
+(b) 继续按"**先正确性、再融合/重叠、最后 MoE kernel**"的顺序推进（与他们的阶梯一致）；
+(c) 记住他们的 A/B 方法：**同轮背靠背、一次一个变量、accept 长度固定**。
