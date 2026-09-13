@@ -2919,3 +2919,30 @@ tests_dn_bs_parity.cu(347)/(359): error: too few arguments in function call
    只在 `kernels/cuda` 或只加 `-Itilelang_gen` 都会得到假错误。）
 - **教训**：**合并顺序会静默作废先前的调用方**——一个后到的 ABI 变更（#5 加形参）让先前写好的 harness 失效，
   而 `grep` 不到、只有**用真实口径编译**才会暴露 ✓（与 §83/§110 同一条原则）。
+
+## §114 【优先级校准 + 一个前提冲突】draft 侧不是主战场；`ATTN_PROJ_ALIGN` 的对齐前提会被出货配置破坏
+
+来源：subagent `draft-side-kernelization`（纯 CPU 只读，结论带 file:line）。
+
+### (a) 量级校准：**draft 侧最多只有 0.2–0.5 ms/步**（主战场仍是 verify）
+- **draft 整段 ≈ 3.87 ms**（占 step 32.5 ms 的 **12%**）；
+- MoE 占 draft 发射的 **52%**，而其中 **routed 三发只占 15/50**；
+- ⇒ 即使把 draft 的 routed gate/up **完全换核**（换成 tcgen05/BS），**上限约 0.2–0.5 ms/步** ✗
+  而 §106 要求 step **32.5 → 7.2 ms**（要削 25 ms）⇒ **draft 侧杠杆排在 verify(28.17ms) 之后** ✓。
+- 其"M大则多行化不省字节"的观察（`draft-perf-ledger.md` §2）也支持这一点。
+
+### (b) ⚠️ 前提冲突：`DSV41_ATTN_PROJ_ALIGN` 的"对齐"在**出货配置下不成立**
+该门的设计意图是"让 draft 的四投影与 verify **走同一个程序**"（§103）。但：
+- draft 侧 `proj_attn_mrows`（`dspark_dev.rs:4282`）**直连 `gemm_fp8_mrows`**；
+- verify 侧 `proj_mrows`（`chain_dev.rs:7403`）在 **`DSV41_GEMM_TILELANG` / `DSV41_PROJ_MMA` / `DSV41_MROWS_MPAR`**
+  armed 时**会走别的程序**（TileLang 等）；
+- 而 **出货脚本 `~/push400_hw_test.sh` 恰恰设了 `DSV41_GEMM_TILELANG=1`**（§100 已读）；
+  subagent 只查了**仓库内** `scripts/*.sh`（未设）⇒ 两边结论不冲突，但**判读必须写明**：
+  **在出货配置下开 `ATTN_PROJ_ALIGN` 并不会让两侧同程序** ✗ ⇒ 要么在验证臂上**同时关掉** `DSV41_GEMM_TILELANG`
+  去测该门的**纯效果**，要么把"对齐"重新定义为"verify 侧也回落到 `mrows`"。
+
+### (c) 其它逐项结论（**draft 侧无可搬项** ✓）
+rmsnorm / norm+rope / rope-mrows / q-chain 融合 / hc 链 / head 在 draft 与 verify（主链）**已是同一程序**（file:line 见报告）；
+engram 在 draft 侧**不存在**。⇒ **draft 侧真正的可动项只有 (a) 的四投影（现成门）、(a′) `wo_b`→`mrows_f32`（现成门
+`DSV41_VERIFY_WOB_MROWS_F32`）、以及 (b)/(c) 的 MoE 换核（需新代码，且杠杆小）** ✓。
+⇒ **结论：把精力继续压在 verify（28.17 ms）与 precision 转正上** ✓（与 §102 路线一致）。
