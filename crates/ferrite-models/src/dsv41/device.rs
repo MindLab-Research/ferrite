@@ -1505,11 +1505,15 @@ struct Kernels {
     /// pool and its e8m0 scales **as-is** (zero dequant, zero bf16 copy), which is
     /// the whole point: it does not need `DSV41_MOE_BF16_DEQUANT` and its
     /// `+105 GiB/rank` bf16 mirror. Args:
-    /// `(xq4, xsc4, out, w1, w3, sfw1, sfw3, eid, order, counts, nseg, rows, dim,
-    ///   inter, topk, stream)` — `xq4`/`xsc4` are the routed fp4 activations
-    /// (`[rows*topk][dim/2]` packed e2m1 and `[rows*topk][dim/32]` f32 scales),
-    /// `w1`/`w3` the expert pool's gate/up planes, `sfw1`/`sfw3` the LOAD-TIME
-    /// group-major packed scale words (see [`Self::moe_bs_pack_wsf`]).
+    /// `(xq4, xsc4, out, w1, w3, sfw1, sfw3, eid, order, counts, nseg, w_stride,
+    ///   rows, dim, inter, topk, stream)` — `xq4`/`xsc4` are the routed fp4
+    /// activations (`[rows*topk][dim/2]` packed e2m1 and `[rows*topk][dim/32]` f32
+    /// scales), `w1`/`w3` the expert pool's gate/up planes, `sfw1`/`sfw3` the
+    /// LOAD-TIME group-major packed scale words (see [`Self::moe_bs_pack_wsf`]).
+    /// `w_stride` is the **measured per-expert block stride** in bytes (the pool
+    /// packs each expert as one 128 B aligned six-plane block, so consecutive
+    /// experts' `w1` are a whole block apart — NOT `NP*K/2`); it becomes the
+    /// `gstride[1]` of the W1/W3 TMA descriptors.
     moe_tilelang_gate_up_bs: Option<
         unsafe extern "C" fn(
             *const u8,
@@ -1523,6 +1527,7 @@ struct Kernels {
             *const c_int,
             *const c_int,
             c_int,
+            i64,
             c_int,
             c_int,
             c_int,
@@ -1540,6 +1545,11 @@ struct Kernels {
     /// ⇒ the whole sequence is legal inside a CUDA-graph capture, which is what
     /// lets the native-fp4 arm enter the verify graph. The host-table entry is
     /// kept as the A/B baseline. Same `rc` contract (2 = DECLINED).
+    ///
+    /// `w_stride` is the measured per-expert **block stride** in bytes (see
+    /// [`Self::moe_tilelang_gate_up_bs`]); it is the `gstride[1]` of both W1/W3
+    /// TMA descriptors. It is required (not defaulted): the pool layout is the
+    /// loader's private per-layer quantity, so only the caller can measure it.
     moe_tilelang_gate_up_bs_dev: Option<
         unsafe extern "C" fn(
             *const u8,
@@ -1553,6 +1563,7 @@ struct Kernels {
             *const c_int,
             *const c_int,
             *const c_int,
+            i64,
             c_int,
             c_int,
             c_int,
@@ -7799,6 +7810,11 @@ impl Device {
     ///
     /// Returns `Ok(false)` on `rc == 2` (DECLINED) so the caller keeps the proven
     /// SIMT launch, and an `Err` on any other non-zero rc.
+    ///
+    /// `w_stride` is the per-expert **block stride** in bytes (the pool packs each
+    /// expert as one 128 B aligned six-plane block), measured by the caller from
+    /// the expert pool's pointers. It is the `gstride[1]` of the W1/W3 TMA
+    /// descriptors; deriving it from `NP*K/2` was the 2026-09-13 bug.
     #[allow(clippy::too_many_arguments)]
     pub fn moe_tilelang_gate_up_bs(
         &self,
@@ -7813,6 +7829,7 @@ impl Device {
         order: *const c_int,
         counts: *const c_int,
         nseg: i32,
+        w_stride: u64,
         rows: i32,
         dim: i32,
         inter: i32,
@@ -7824,8 +7841,8 @@ impl Device {
         )?;
         let rc = unsafe {
             f(
-                xq4, xsc4, out, w1, w3, sfw1, sfw3, eid, order, counts, nseg, rows, dim, inter, topk,
-                self.stream,
+                xq4, xsc4, out, w1, w3, sfw1, sfw3, eid, order, counts, nseg, w_stride as i64, rows,
+                dim, inter, topk, self.stream,
             )
         };
         if rc == 2 {
@@ -7851,6 +7868,10 @@ impl Device {
     ///
     /// `Ok(false)` on `rc == 2` (declined: shape/alignment, TMA init failure, or
     /// INIT not done); `Err` on any other rc.
+    ///
+    /// `w_stride` is the measured per-expert **block stride** in bytes — the
+    /// `gstride[1]` of the W1/W3 TMA descriptors, same contract as
+    /// [`Self::moe_tilelang_gate_up_bs`].
     #[allow(clippy::too_many_arguments)]
     pub fn moe_tilelang_gate_up_bs_dev(
         &self,
@@ -7865,6 +7886,7 @@ impl Device {
         order: *const c_int,
         counts: *const c_int,
         nseg: *const c_int,
+        w_stride: u64,
         rows: i32,
         dim: i32,
         inter: i32,
@@ -7876,8 +7898,8 @@ impl Device {
         )?;
         let rc = unsafe {
             f(
-                xq4, xsc4, out, w1, w3, sfw1, sfw3, eid, order, counts, nseg, rows, dim, inter, topk,
-                self.stream,
+                xq4, xsc4, out, w1, w3, sfw1, sfw3, eid, order, counts, nseg, w_stride as i64, rows,
+                dim, inter, topk, self.stream,
             )
         };
         if rc == 2 {

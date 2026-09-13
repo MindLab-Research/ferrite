@@ -65,8 +65,11 @@
 //   A   : [SEG_CAP*BM, K/2] u8   -- **已 gather + 每段 pad 到 BM 行**的 fp4 激活。
 //                                  e2m1 打包规则与 ferrite 一致：低 4 位 = 偶 k。
 //                                  **pad 行必须真的全 0**（内核不做 mask）。
-//   W1  : [E, NP, K/2]      u8   -- gate 面（ferrite 池里的 w1.weight，K 连续）
+//   W1  : [E, NP, K/2]      u8   -- gate 面（ferrite 池里的 w1.weight，面内 K 连续）
 //   W3  : [E, NP, K/2]      u8   -- up 面（w3.weight）
+//   ⚠️ expert 之间的步长是**调用方测量的 block stride**（`w_stride` 形参），**不是**
+//      `NP*K/2`：ferrite 的池是「每 expert 一个 128 B 对齐的 6 面 block」布局。
+//      面内行距 = K/2 不变（一个面内部是干净的 [NP, K/2] 连续块）。
 //   SFW1: [E, sf_words*NP]  u32  -- 装载期 pack（group-major）
 //   SFW3: [E, sf_words*NP]  u32
 //   SFA : [sf_words*SEG_CAP*BM] u32 -- 每次调用 pack（group-major）
@@ -296,7 +299,14 @@ TmapSpec spec_a(const void* a) {
 }
 
 // W1/W3: [E, NP, K] fp4 packed ⇒ UINT8 [E, NP, K/2]
-TmapSpec spec_w(const void* w, const char* what) {
+//
+// `w_stride` = **相邻 expert 的同一权重面之间的距离（字节）** —— 由调用方测量后传入。
+// 它不是 `NP*K/2`：装载期把每个 expert 放成**一个 128 B 对齐的 block**，里面装 6 个
+// 面（w1 | w1.scale | w3 | w3.scale | w2 | w2.scale），所以相邻 expert 的 w1 隔着一整个
+// block（生产几何实测 2,641,920 B，是 `NP*K/2` = 819,200 B 的 3.225 倍）。
+// **写死 `NP*K/2` 会让 TMA 从错地址取第 2 个 expert 起的权重 —— 静默错值**，
+// 这是 2026-09-13 修复的根因。所以 stride 只能由知道池布局的调用方给。
+TmapSpec spec_w(const void* w, int64_t w_stride, const char* what) {
     TmapSpec s{};
     s.dtype = CU_TENSOR_MAP_DATA_TYPE_UINT8;
     s.rank = 3;
@@ -305,7 +315,7 @@ TmapSpec spec_w(const void* w, const char* what) {
     s.gdim[1] = (cuuint64_t)kNp;
     s.gdim[2] = (cuuint64_t)kE;
     s.gstride[0] = (cuuint64_t)(kDim / 2);              // 行距（K 连续）
-    s.gstride[1] = (cuuint64_t)kNp * (kDim / 2);        // expert 面 stride
+    s.gstride[1] = (cuuint64_t)w_stride;                // expert 面 stride = block stride
     s.box[0] = kABox;
     s.box[1] = (cuuint32_t)kNh;                         // 半块：64 行
     s.box[2] = 1;
@@ -398,12 +408,15 @@ bool encode_fixed_tmaps() {
 }
 
 const void* g_w_base[4] = {nullptr, nullptr, nullptr, nullptr};  // w1, w3, sfw1, sfw3
+int64_t g_w_stride = -1;  // 与 g_w_base 同批：池基址变了 block stride 也会变
 
-bool ensure_w_tmaps(const void* w1, const void* w3, const void* sfw1, const void* sfw3) {
-    if (g_w_base[0] == w1 && g_w_base[1] == w3 && g_w_base[2] == sfw1 && g_w_base[3] == sfw3)
+bool ensure_w_tmaps(const void* w1, const void* w3, const void* sfw1, const void* sfw3,
+                    int64_t w_stride) {
+    if (g_w_base[0] == w1 && g_w_base[1] == w3 && g_w_base[2] == sfw1 && g_w_base[3] == sfw3 &&
+        g_w_stride == w_stride)
         return true;  // 同一层的重复调用（eager 每步都会来一次）
-    const bool ok = encode_one(&g_tmap_w1, spec_w(w1, "W1[E, NP, K/2] u8")) &&
-                    encode_one(&g_tmap_w3, spec_w(w3, "W3[E, NP, K/2] u8")) &&
+    const bool ok = encode_one(&g_tmap_w1, spec_w(w1, w_stride, "W1[E, NP, K/2] u8")) &&
+                    encode_one(&g_tmap_w3, spec_w(w3, w_stride, "W3[E, NP, K/2] u8")) &&
                     encode_one(&g_tmap_sfw1, spec_sfw(sfw1, "SFW1[E, sf_words*NP] u32")) &&
                     encode_one(&g_tmap_sfw3, spec_sfw(sfw3, "SFW3[E, sf_words*NP] u32"));
     if (!ok) return false;
@@ -411,15 +424,17 @@ bool ensure_w_tmaps(const void* w1, const void* w3, const void* sfw1, const void
     g_w_base[1] = w3;
     g_w_base[2] = sfw1;
     g_w_base[3] = sfw3;
+    g_w_stride = w_stride;
     if (getenv("DSV41_MOE_BS_DEBUG") != nullptr) {
         const TmapSpec sa = spec_a(g_a);
-        const TmapSpec sw = spec_w(w1, "W1");
+        const TmapSpec sw = spec_w(w1, w_stride, "W1");
         const TmapSpec sc = spec_c(g_c);
         fprintf(stderr,
-                "[moe-bs] tmaps (re)built for pool %p: A box=(%u,%u) swz=%d | "
-                "W box=(%u,%u,%u) swz=%d | SFA box=BM | C box=(%u,%u) swz=%d\n",
-                w1, sa.box[0], sa.box[1], (int)sa.swz, sw.box[0], sw.box[1], sw.box[2],
-                (int)sw.swz, sc.box[0], sc.box[1], (int)sc.swz);
+                "[moe-bs] tmaps (re)built for pool %p (W expert stride=%lld B): "
+                "A box=(%u,%u) swz=%d | W box=(%u,%u,%u) swz=%d | SFA box=BM | C box=(%u,%u) "
+                "swz=%d\n",
+                (void*)w1, (long long)w_stride, sa.box[0], sa.box[1], (int)sa.swz, sw.box[0],
+                sw.box[1], sw.box[2], (int)sw.swz, sc.box[0], sc.box[1], (int)sc.swz);
     }
     return true;
 }
@@ -606,20 +621,23 @@ void bs_init_failed_note(int rows, int dim, int inter) {
 // ===========================================================================
 // w1 / w3 = ferrite 专家池里该专家的 gate / up 权重面基址（**零拷贝、零 dequant**）；
 // sfw1 / sfw3 = 装载期 pack 出来的 group-major u32 面基址（每 expert 一份）。
+// w_stride = **相邻 expert 的同一权重面之间的距离（字节）**，由调用方测量后传入 ——
+// 池是「每 expert 一个 6 面 block」布局，所以这个 stride 是 block stride，不是
+// `NP*K/2`（见 spec_w 的长注释）。SF 池是另一块分配（分段连续），stride 不需要传。
 // 本臂不接受 `DSV41_EXPERT_ILV`（交错布局把 w1/w3 混在一个区域里，w1 指针不再是一个
 // 干净的 [NP, K/2] 面）—— 交错时由调用方 decline（见 wiring §5，与 bf16 臂同一条互斥）。
 extern "C" int dsv41_moe_tilelang_gate_up_bs(
     const uint8_t* xq4,      // [rows*topk][dim/2] u8 —— routed 的 fp4 打包激活（行距 dim/2）
     const float* xsc4,       // [rows*topk][dim/32] f32 —— routed 的 per-(row,32) 标度
     float* out,              // [rows][topk][2*inter] f32（RAW gate‖up；swiglu 仍走既有 pass）
-    const void* w1,          // u8 [E, NP, K/2]（浅指一个 expert 面；shim 用 base + e*NP*K/2）
+    const void* w1,          // u8 [E, NP, K/2]（expert 0 的面；expert e 在 base + e*w_stride）
     const void* w3,          // u8 [E, NP, K/2]
     const void* sfw1,        // u32 [E, sf_words*NP]
     const void* sfw3,        // u32 [E, sf_words*NP]
     const int* eid,          // [SEG_CAP] i32 —— HOST 数组
     const int* order,        // [SEG_CAP*BM] i32 —— HOST 数组（pad = -1）
     const int* counts,       // [SEG_CAP] i32 —— HOST 数组
-    int nseg, int rows, int dim, int inter, int topk, cudaStream_t s) {
+    int nseg, int rows, int dim, int inter, int topk, int64_t w_stride, cudaStream_t s) {
     if (xq4 == nullptr || xsc4 == nullptr || out == nullptr || w1 == nullptr || w3 == nullptr ||
         sfw1 == nullptr || sfw3 == nullptr || eid == nullptr || order == nullptr ||
         counts == nullptr)
@@ -628,6 +646,9 @@ extern "C" int dsv41_moe_tilelang_gate_up_bs(
     if (topk < 1 || topk > kTopkMax) return 2;
     if (rows < 1 || rows > kRowsMax) return 2;
     if (nseg < 1 || nseg > kSegCap) return 2;
+    // block stride：`cuTensorMapEncodeTiled` 要求 gstride 是 16 B 的倍数且为正。
+    // 不合规一律 decline（返回 2）—— 绝不建一个静默错值的描述符。
+    if (w_stride <= 0 || (w_stride % 16) != 0) return 2;
     // 16B 对齐：A/W 走 TMA（必需），out 是 float2 store。
     if ((((uintptr_t)xq4 & 0xF) != 0) || (((uintptr_t)w1 & 0xF) != 0) ||
         (((uintptr_t)w3 & 0xF) != 0) || (((uintptr_t)out & 0x1F) != 0))
@@ -653,7 +674,7 @@ extern "C" int dsv41_moe_tilelang_gate_up_bs(
     // W/SFW 的 map 按专家池基址缓存重建（池是每层一份 ⇒ 基址每层都变）。
     if (g_encode == nullptr) load_driver();
     if (g_encode == nullptr || !encode_fixed_tmaps() ||
-        !ensure_w_tmaps(w1, w3, sfw1, sfw3)) {
+        !ensure_w_tmaps(w1, w3, sfw1, sfw3, w_stride)) {
         static int once = 0;
         if (once++ == 0)
             fprintf(stderr,
@@ -741,7 +762,7 @@ extern "C" int dsv41_moe_tilelang_gate_up_bs_dev(
     const uint8_t* xq4,      // [rows*topk][dim/2] u8 —— routed 的 fp4 打包激活（行距 dim/2）
     const float* xsc4,       // [rows*topk][dim/32] f32 —— routed 的 per-(row,32) 标度
     float* out,              // [rows][topk][2*inter] f32（RAW gate‖up；swiglu 仍走既有 pass）
-    const void* w1,          // u8 [E, NP, K/2]（浅指一个 expert 面；shim 用 base + e*NP*K/2）
+    const void* w1,          // u8 [E, NP, K/2]（expert 0 的面；expert e 在 base + e*w_stride）
     const void* w3,          // u8 [E, NP, K/2]
     const void* sfw1,        // u32 [E, sf_words*NP]
     const void* sfw3,        // u32 [E, sf_words*NP]
@@ -749,7 +770,7 @@ extern "C" int dsv41_moe_tilelang_gate_up_bs_dev(
     const int* order_dev,    // [SEG_CAP*BM] i32 —— **DEVICE**（pad = -1）
     const int* counts_dev,   // [SEG_CAP] i32 —— **DEVICE**
     const int* nseg_dev,     // [1] i32 —— **DEVICE**（dsv41_moe_align_from_group 的输出）
-    int rows, int dim, int inter, int topk, cudaStream_t s) {
+    int rows, int dim, int inter, int topk, int64_t w_stride, cudaStream_t s) {
     if (xq4 == nullptr || xsc4 == nullptr || out == nullptr || w1 == nullptr || w3 == nullptr ||
         sfw1 == nullptr || sfw3 == nullptr || eid_dev == nullptr || order_dev == nullptr ||
         counts_dev == nullptr || nseg_dev == nullptr)
@@ -758,6 +779,9 @@ extern "C" int dsv41_moe_tilelang_gate_up_bs_dev(
     if (topk < 1 || topk > kTopkMax) return 2;
     if (rows < 1 || rows > kRowsMax) return 2;
     // nseg 的形状检查在这里**不存在**（device 上的值 host 读不到）——见上方文件头。
+    // block stride：`cuTensorMapEncodeTiled` 要求 gstride 是 16 B 的倍数且为正
+    // （与 host-table 入口同一条闸；见 spec_w 的长注释）。
+    if (w_stride <= 0 || (w_stride % 16) != 0) return 2;
     // 16B 对齐：A/W 走 TMA（必需），out 是 float2 store。
     if ((((uintptr_t)xq4 & 0xF) != 0) || (((uintptr_t)w1 & 0xF) != 0) ||
         (((uintptr_t)w3 & 0xF) != 0) || (((uintptr_t)out & 0x1F) != 0))
@@ -784,7 +808,7 @@ extern "C" int dsv41_moe_tilelang_gate_up_bs_dev(
     // 都是 host 侧动作（无 stream 操作、无 INIT 期动作）⇒ capture 内合法。
     if (g_encode == nullptr) load_driver();
     if (g_encode == nullptr || !encode_fixed_tmaps() ||
-        !ensure_w_tmaps(w1, w3, sfw1, sfw3)) {
+        !ensure_w_tmaps(w1, w3, sfw1, sfw3, w_stride)) {
         static int once = 0;
         if (once++ == 0)
             fprintf(stderr,

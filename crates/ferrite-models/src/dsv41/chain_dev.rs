@@ -16506,12 +16506,29 @@ impl<'a> DevChain<'a> {
     }
 
     /// The routed experts' **fp4 gate/up planes** and their **load-time packed SF**,
-    /// as the four bases the shim indexes (`w1 + e*NP*K/2`, `sfw1 + e*sf_words*NP`).
-    /// `None` when any pool is missing or the per-expert stride is not exactly the
-    /// frozen `NP*K/2` / `sf_words*NP*4` bytes: the shim derives each expert's offset
-    /// ARITHMETICALLY, so a non-uniform pool would be a SILENT wrong answer, not a
-    /// fault. Declining is the only safe answer — same argument as
-    /// [`Self::moe_tilelang_weights`], one pool wider.
+    /// as the bases the shim indexes, plus the **measured per-expert block stride**.
+    /// The tuple is `(w1, w3, sfw1, sfw3, w_stride)`: `w1`/`w3` are expert 0's
+    /// gate/up plane bases and `sfw1`/`sfw3` expert 0's packed-SF bases.
+    ///
+    /// `w_stride` is the distance between expert 0's and expert 1's `w1`, i.e. the
+    /// **block stride**: the loader lays each expert out as ONE 128 B aligned block
+    /// holding all six planes (`w1 | w1.scale | w3 | w3.scale | w2 | w2.scale`), so
+    /// consecutive experts' planes are a whole block apart — NOT `NP*K/2`. The shim
+    /// previously derived that offset arithmetically from `NP*K/2` and put it into
+    /// its W1/W3 TMA descriptors' `gstride[1]`; at the production shape the real
+    /// block is 3.225x larger, so every expert >= 1 was fetched from the wrong
+    /// address (the 2026-09-13 REFUSED-by-wrong-descriptor bug). The block size is
+    /// the loader's private per-layer quantity, so it is MEASURED here and handed
+    /// to the shim rather than re-derived.
+    ///
+    /// `None` when a pool is missing or the **SF** per-expert stride is not exactly
+    /// the frozen `sf_words*NP*4` bytes: the SF pool is a SEPARATE allocation (all
+    /// `wsf1` then all `wsf3`, see `load.rs`), so consecutive experts' SF planes
+    /// really are exactly `sf_words*NP*4` apart and a non-uniform pool would be a
+    /// SILENT wrong answer, not a fault. Declining is the only safe answer — same
+    /// argument as [`Self::moe_tilelang_weights`], one pool wider. The W strides are
+    /// NOT used as a contiguity predicate (under the block layout they legitimately
+    /// differ from `NP*K/2`); they only feed the measured `w_stride`.
     fn moe_bs_weights(
         ld: &LayerDev,
         dim: usize,
@@ -16521,36 +16538,36 @@ impl<'a> DevChain<'a> {
         *const std::ffi::c_void,
         *const std::ffi::c_void,
         *const std::ffi::c_void,
+        u64,
     )> {
         let (a, b) = (&ld.experts[0], &ld.experts[1]);
         let (s1, s3) = (a.wsf1.as_ref()?, b.wsf1.as_ref()?);
         let (t1, t3) = (a.wsf3.as_ref()?, b.wsf3.as_ref()?);
         let (w1, w3) = (a.w1.ptr(), b.w1.ptr());
         let (u1, u3) = (a.w3.ptr(), b.w3.ptr());
-        let w_expect = (inter_local * (dim / 2)) as i64;
         let sf_expect =
             (crate::dsv41::weights::moe_bs_sf_words(dim) * inter_local * 4) as i64;
-        // [DIAG-W] one-shot: print actual strides to identify which pool check fails
-        static DIAGW: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        // The per-expert BLOCK stride the shim's W1/W3 TMA descriptors must use:
+        // expert 0 -> expert 1 along each plane. Under the loader's six-plane block
+        // layout this is a whole block, not `NP*K/2` (see the doc comment above).
         let w_stride = (w3 as i64) - (w1 as i64);
         let u_stride = (u3 as i64) - (u1 as i64);
         let s_stride = (s3.ptr() as i64) - (s1.ptr() as i64);
         let t_stride = (t3.ptr() as i64) - (t1.ptr() as i64);
+        // [DIAG-W] one-shot: the measured block stride handed to the shim, plus the
+        // SF strides (which ARE validated below).
+        static DIAGW: std::sync::OnceLock<()> = std::sync::OnceLock::new();
         let _ = DIAGW.get_or_init(|| {
             eprintln!(
-                "[moe-bs-w] w_stride={} (want {}) u_stride={} (want {}) sf1_stride={} (want {}) sf3_stride={} (want {})",
-                w_stride, w_expect, u_stride, w_expect, s_stride, sf_expect, t_stride, sf_expect
+                "[moe-bs-w] measured block w_stride={} u_stride={} (block layout, not NP*K/2) \
+                 sf1_stride={} (want {}) sf3_stride={} (want {})",
+                w_stride, u_stride, s_stride, sf_expect, t_stride, sf_expect
             );
         });
-        if sf_expect == 0
-            || w_stride != w_expect
-            || u_stride != w_expect
-            || s_stride != sf_expect
-            || t_stride != sf_expect
-        {
+        if sf_expect == 0 || w_stride <= 0 || s_stride != sf_expect || t_stride != sf_expect {
             return None;
         }
-        Some((w1, u1, s1.ptr(), t1.ptr()))
+        Some((w1, u1, s1.ptr(), t1.ptr(), w_stride as u64))
     }
 
     /// One-shot notice for an ARMED `DSV41_MOE_TILELANG_BS` that did not fire — the
@@ -16988,6 +17005,7 @@ impl<'a> DevChain<'a> {
                             self.s.tl_order.ptr as *const i32,
                             self.s.tl_counts.ptr as *const i32,
                             self.s.tl_nseg.ptr as *const i32,
+                            w.4,
                             m as i32,
                             dim as i32,
                             inter_local as i32,
@@ -20768,6 +20786,7 @@ fn oracle_tap() -> bool {
                                 self.s.tl_order.ptr as *const i32,
                                 self.s.tl_counts.ptr as *const i32,
                                 self.s.tl_nseg.ptr as *const i32,
+                                w.4,
                                 1,
                                 dim as i32,
                                 inter_local as i32,
