@@ -90,6 +90,13 @@
 
 ## ROOT CAUSE 分析（2026-09-14 下午更新）
 
+**变量拆分测试结果（用户方法论指令）**：
+- **crash 不是数据依赖的——是结构性的！**
+- ZERO_SF：❌ 仍 crash（SF 数据不是触发器）
+- ZERO_A：❌ 仍 crash（激活数据不是触发器）
+- ZERO_EID：❌ 仍 crash（expert ID 不是触发器）
+- ZERO-DIAG 消息确认代码执行
+
 **SYNC-DIAG 带捕获守卫的最终判决**：
 - `.scale_vec::1X` + `"memory"` clobber 实验：**打破 eager 路径**（之前 MMA OK → 现在 ALL MMA illegal instruction）——**已撤销（4a28cdc）**
 - 手写验证代码的 `.scale_vec::1X` 适用于它的探针数据布局，但不适用于我们的 TileLang 生产布局
@@ -98,6 +105,10 @@
 - MMA kernel 的错误是 **"illegal instruction"**（不是 "illegal memory access"）
 - 之前看到的 "illegal memory access" 是 context poisoning 的二级效应
 - eager 路径（m=1）MMA 正常，spec 路径（m=6 verify）MMA illegal instruction
+
+**结构性触发的剩余候选**（判别实验在跑）：
+1. SWALLOW_STEP 机制 → no-swallow 测试
+2. 流水线深度（40 k-iterations）→ k-limit=1 测试
 
 **关键待解问题**：什么导致 MMA 在 spec 路径（m=6 / CUDA graph capture）下遇到 illegal instruction？
 - 可能：idesc 的 sf_id 字段在真实 SF 数据下的行为
