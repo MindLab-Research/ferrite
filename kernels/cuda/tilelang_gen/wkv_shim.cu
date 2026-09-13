@@ -137,6 +137,20 @@ extern "C" int dsv41_gemm_fp8_tilelang_wkv(const uint8_t* a, const float* a_scal
     if (n != kTLN || k != kTLK) return 2;
     // reduce 的 store 以行 stride == n 写 `out`（生成物 bake 的），所以 out_stride
     // 必须恰为 n；否则会写错位置。不满足就 decline（调用方用自己的 kernel）。
+    // [DIAG] one-shot call trace: is this shim even being reached? where does it decline?
+    static int diag_calls = 0;
+    if (diag_calls < 3) {
+        diag_calls++;
+        fprintf(stderr,
+                "[tl-diag] wkv call#%d: m=%d n=%d k=%d out_stride=%d bias=%p | "
+                "a=%p(al:%d) a_scale=%p(al:%d) w=%p(al:%d) w_scale=%p(al:%d) out=%p(al:%d)\n",
+                diag_calls, m, n, k, out_stride, (void*)bias,
+                (void*)a, (int)((uintptr_t)a & 0xF),
+                (void*)a_scale, (int)((uintptr_t)a_scale & 0xF),
+                (void*)w, (int)((uintptr_t)w & 0xF),
+                (void*)w_scale, (int)((uintptr_t)w_scale & 0xF),
+                (void*)out, (int)((uintptr_t)out & 0x1F));
+    }
     if (out_stride != n) return 2;
     if (a == nullptr || a_scale == nullptr || w == nullptr || w_scale == nullptr || out == nullptr)
         return 2;
