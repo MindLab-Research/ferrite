@@ -5881,6 +5881,166 @@ static inline int dsv41_mrows_mpar_for(int m, int n = 0) {
     return rpb;
 }
 
+// ===========================================================================
+// ⑤a L2-BROADCAST (DSV41_MROWS_L2BCAST, 2026-09-13): the M-into-GRID shape of
+// the multi-row fp8 GEMV WITHOUT the private smem weight staging --
+// `gemm_fp8_mrows_l2_kernel<M>` below.
+// ===========================================================================
+// Design: docs/agent/tensorcore-proj-design.md §5.1 (deliverable ⑤a).
+// Lesions it answers: verify-amortization-lesion-audit.md §2 (the fold_r 6x
+// regression) and §10.9 (MPAR's two consecutive losses).
+//
+// WHY (what this closes, and what it deliberately does NOT do).
+//
+// Two M-amortisation programs have already failed:
+//   * `fold_r` (M into the GRID via `gemm_fp8_mrows_kernel<M>`'s `ng` axis)
+//     measured 63.8 -> 10.3 tok/s, a 6x REGRESSION -- because every one of the
+//     `ng` blocks re-`cp.async16`-stages the SAME weight row into a PRIVATE smem
+//     slab: the weight's DRAM round trip is paid `ng` times, not amortised
+//     (audit §2). The repeated quantity is the PROLOGUE, not the bytes.
+//   * MPAR (M as a WARP axis, `gemm_fp8_mrows_mp_kernel<M>`) lost twice (rpb=1
+//     +0.52 ms, coverage-aware auto a cumulative +1.28 ms): its LUT build and
+//     slab staging are replicated `grid` times, and its per-element instruction
+//     count is ~1.59x the m = 1 program (mrows-mpar-design.md §2.3, audit §10.9).
+//
+// ⑤a removes BOTH of MPAR's cost terms at once while keeping the fold_r
+// parallelism: M goes back into the GRID (warps in flight scale x M), but the
+// weight is NEVER staged through smem -- each warp reads its own row's fp8 bytes
+// STRAIGHT from global (`__ldg` -> `ld.global.nc`, served by L1 then L2). There
+// is no `cp.async`, no slab, no e4m3 decode table, and no activation slab: the
+// kernel has ZERO shared memory, hence no `__syncthreads` and NO per-M
+// `cudaFuncSetAttribute` (the per-M smem-ceiling trap the legacy launcher has to
+// work around does not exist here).
+//
+// WHY THE WEIGHT STILL COSTS 1x IN DRAM. The grid is laid out so the `ng` blocks
+// reading the SAME weight tile are ADJACENT in `blockIdx` (`g` varies fastest,
+// `it = blockIdx.x / ng`), so they are resident in the same wave and their reads
+// of the same addresses become ONE DRAM fetch plus (ng-1) L2 hits. The tile is a
+// few MB against B300's ~126 MB L2 (wo_b's whole 5.2 MB weight fits outright), so
+// residency is not in question. The duplicated requests DO cost L2 bandwidth
+// (x ng) -- that is the trade, and it is the acceptance criterion: DRAM bytes
+// 1x, L2 requests ~ng x (see the verification manual).
+//
+// WHY IT IS BIT-IDENTICAL. This kernel is `gemm_fp8_mrows_kernel<M>` with the two
+// smem slots deleted and their reads redirected to the very global addresses the
+// staging loops copied FROM:
+//   * C1 (same K walk): `kb` ascends 0..nb_k-1, `j = kb*32 + lane` -- the
+//     order-preserving walk (the launcher's `mode >= 3` gate, unchanged);
+//   * C2 (same operands, same bytes): `s_lut[b] == e4m3_to_f(b)` BY CONSTRUCTION
+//     (`s_lut` is built from `e4m3_to_f`), so decoding inline is the same value;
+//     `s_w[warp*k+j]` is a PURE COPY of `w[row*k+j]` and `s_a[q*k+j]` a pure copy
+//     of `a[(r0+q)*k+j]` -- a copy's width is not observable (the legacy header's
+//     verbatim argument), so reading the source is the same byte; `s_as` / `wsr`
+//     are the same `a_scale` / `w_scale` words. The activation operand is the
+//     single INLINE form `e4m3_to_f(a[..]) * a_scale[..]` -- one FMUL, the same
+//     expression the legacy kernel's a32=1 and a32=0 arms both emit (its header:
+//     "Both arms are the same expression"), so the output is bit-identical at
+//     EITHER setting of DSV41_GEMV_A32. The gate is therefore deliberately not
+//     re-read here, exactly as the MPAR kernel documented;
+//   * C3 (same reduction tree): `shfl_xor` off = 16,8,4,2,1, once per
+//     (warp, activation row);
+//   * C4/C5 (no cross-row / cross-K recombination): `acc[q]` is the same
+//     independent serial chain, nothing is combined across `q`, no K-split;
+//   * C6 (codegen pin): the same `acc[q] += av * wv` with `#pragma unroll 32`.
+// The ONLY things that move are WHICH warp computes WHICH element and WHERE the
+// bytes come from: rows are independent (the legacy header: "the block geometry
+// does not enter the parity argument"), and the byte source is that same byte.
+//
+// ABI: (a, a_scale, w, w_scale, bias, out, n, k, out_stride, fold_r). Same
+// pointers and meaning as `gemm_fp8_mrows_kernel`; `fold_r` is the ACTIVATION
+// ROWS PER BLOCK (the same quantity the legacy kernel calls `fold_r`), and the
+// grid is `ceil(n/nwarps) * ceil(m/fold_r)`. `fold_r = 1` is the maximal-
+// parallelism endpoint (~m x the warps in flight, one activation row per block);
+// `fold_r = m` degenerates to the legacy geometry with the staging removed.
+// The launcher declines unless `fold_r >= 1` and `k % 32 == 0`.
+template <int M>
+__global__ void __launch_bounds__(256)
+gemm_fp8_mrows_l2_kernel(const uint8_t* __restrict__ a, const float* __restrict__ a_scale,
+                         const uint8_t* __restrict__ w, const uint8_t* __restrict__ w_scale,
+                         const float* __restrict__ bias, float* __restrict__ out, int n, int k,
+                         int out_stride, int fold_r) {
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int nwarps = (int)(blockDim.x >> 5);
+    const int nb_k = k >> 5;
+    // GRID LAYOUT -- the L2 argument. `ng` activation-row groups (M into the
+    // grid, `fold_r` rows each) and `nt` output-row tiles (from n). The GROUP
+    // INDEX VARIES FASTEST so the `ng` blocks sharing one weight tile (`it`) are
+    // neighbouring `blockIdx` values -> same wave -> one DRAM fetch + (ng-1) L2
+    // hits. Reversing the two indices would scatter the sharers `nt` apart (up
+    // to 640 at wo_b): L2 would still likely serve them, but with no locality
+    // guarantee.
+    const int nt = (n + nwarps - 1) / nwarps;
+    const int ng = (M + fold_r - 1) / fold_r;
+    const int g = blockIdx.x % ng;
+    const int it = blockIdx.x / ng;
+    const int r0 = g * fold_r;
+    const int rn = min(fold_r, M - r0);
+    // This warp's output row. `row` is UNIFORM within a warp (it depends on the
+    // warp index only), so the early return below is a warp-uniform branch and
+    // the `shfl_xor` tree's full mask stays valid. There is no smem and no
+    // barrier in this kernel, so an early return is safe here -- unlike the
+    // legacy kernel, which must keep every thread inside the `active` arm.
+    const int row = it * nwarps + warp;
+    if (row >= n) return;
+    const uint8_t* __restrict__ wr = w + (size_t)row * (size_t)k;
+    const uint8_t* __restrict__ wsr = w_scale + (size_t)(row >> 5) * (size_t)nb_k;
+    float acc[M];
+    #pragma unroll
+    for (int q = 0; q < M; ++q) acc[q] = 0.f;
+    #pragma unroll 32
+    for (int kb = 0; kb < nb_k; ++kb) {
+        const float sb = ue8m0_to_f(__ldg(wsr + kb));
+        const int j = kb * 32 + lane;
+        // The weight byte, straight out of L1/L2: L1 hit for the sibling warps of
+        // this block reading the same tile, L2 hit for the sibling BLOCKS of the
+        // other `ng-1` groups. ONE decode for all `rn` activation rows -- the
+        // same hoist the legacy kernel's `wv` performs (C4).
+        const float wv = e4m3_to_f(__ldg(wr + j)) * sb;
+        #pragma unroll
+        for (int q = 0; q < M; ++q) {
+            if (q >= rn) break;
+            const float av = e4m3_to_f(__ldg(a + (size_t)(r0 + q) * (size_t)k + j)) *
+                             __ldg(a_scale + (size_t)(r0 + q) * (size_t)nb_k + (j >> 5));
+            acc[q] += av * wv;
+        }
+    }
+    #pragma unroll
+    for (int q = 0; q < M; ++q) {
+        if (q >= rn) break;
+        float a_q = acc[q];
+        for (int off = 16; off > 0; off >>= 1) a_q += __shfl_xor_sync(0xFFFFFFFFu, a_q, off);
+        if (lane == 0) {
+            const float v = a_q + (bias != nullptr ? bias[row] : 0.f);
+            out[(size_t)(r0 + q) * (size_t)out_stride + row] = v;
+        }
+    }
+}
+
+// ⑤a gate (DSV41_MROWS_L2BCAST, 2026-09-13). `=N` (N >= 1) selects
+// `gemm_fp8_mrows_l2_kernel` with N ACTIVATION ROWS per block -- the `fold_r` of
+// that kernel, NOT MPAR's output-rows-per-block (the two arms use the same
+// letter for different quantities; this one is the legacy `fold_r` analogue).
+// Unset / `=0` is OFF, i.e. the M-in-register program, byte for byte.
+//   1   = one activation row per block (maximal parallelism: ~m x warps in flight)
+//   2/3 = two / three rows per block (fewer blocks, more work per warp)
+// Clamped to [1, m]; read ONCE (the launcher runs a few hundred times per step,
+// so a per-call getenv is the slip every other gate in this file avoids).
+// See the kernel header above for the bit-identity argument and
+// docs/agent/tensorcore-proj-design.md §5.1 for the L2 analysis + risks.
+static const int g_mrows_l2bcast = [] {
+    const char* e = getenv("DSV41_MROWS_L2BCAST");
+    if (e == nullptr) return 0;
+    return atoi(e);
+}();
+static inline int dsv41_mrows_l2bcast_for(int m) {
+    if (g_mrows_l2bcast <= 0) return 0;  // OFF: today's program
+    int fold_r = g_mrows_l2bcast;
+    if (fold_r > m) fold_r = m;
+    if (fold_r < 1) fold_r = 1;
+    return fold_r;
+}
+
 // See the kernel header above for the layout and the bit-identity argument (C1-C6).
 // Returns 0 (launched) or 2 (declined: the caller keeps its per-row loop, whose
 // numerics are the same by construction).
@@ -5960,6 +6120,56 @@ extern "C" int dsv41_gemm_fp8_mrows(const uint8_t* a, const float* a_scale,
     // the mpar arm then declines and the legacy arm runs (loudly, see the
     // receipt below).
     const int mpar = dsv41_mrows_mpar_for(m, n);
+    // ⑤a L2-BROADCAST (DSV41_MROWS_L2BCAST, 2026-09-13): the alternative program
+    // `gemm_fp8_mrows_l2_kernel<M>` -- M back into the GRID (the fold_r shape),
+    // but the weight read straight from L1/L2 instead of staged through a private
+    // smem slab. The kernel header above has the full argument. It is launched
+    // INSTEAD of either other program; `l2rpb == 0` (the shipped default) leaves
+    // everything below byte-for-byte what it was.
+    //
+    // Like MPAR it requires `fold_r == m`: this kernel carries the M axis in its
+    // OWN grid dimension, so the legacy `fold_r` must stay OFF or the two M folds
+    // would compose (a weight tile read `ng_l2 * ng_legacy` times).
+    //
+    // PRECEDENCE. If BOTH ⑤a and MPAR are armed, ⑤a runs and the receipt says so
+    // -- two alternative programs may not run at once, and this tree has been
+    // bitten by the "armed but inert" phantom-gate shape often enough that the
+    // shadowed arm is named rather than silently dropped.
+    //
+    // NO SMEM: the kernel has no dynamic (or static) shared memory, so unlike the
+    // MPAR arm below it needs NO per-M `cudaFuncSetAttribute` -- there is no
+    // smem ceiling to cross at any shape.
+    const int l2rpb = dsv41_mrows_l2bcast_for(m);
+    if (l2rpb > 0 && fold_r == m) {
+        const int ng_l2 = (m + l2rpb - 1) / l2rpb;
+        // ACTIVITY RECEIPT (the act_cp16 / mpar precedent, same reason): the arm
+        // has its own kernel NAME, but the DECLINE branch (`l2rpb > 0 && fold_r
+        // != m`) has none. ONE line per process, on the first ARMED launch,
+        // naming the geometry that launch resolved to.
+        {
+            static int reported = 0;
+            if (reported++ == 0)
+                fprintf(stderr,
+                        "[mrows-l2] ARMED m=%d n=%d k=%d fold_r=%d -> ng=%d x nt=%d = %d blocks "
+                        "x %d threads, smem=0 (weights via LDG/L1/L2, no staging)%s\n",
+                        m, n, k, l2rpb, ng_l2, nt, ng_l2 * nt, nwarps * 32,
+                        mpar > 0 ? "  [DSV41_MROWS_MPAR also armed -> shadowed by this arm]" : "");
+        }
+        const dim3 grid_l2((unsigned)(nt * ng_l2));
+        const int blk_l2 = nwarps * 32;
+        switch (m) {
+            case 1: gemm_fp8_mrows_l2_kernel<1><<<grid_l2, blk_l2, 0, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, l2rpb); break;
+            case 2: gemm_fp8_mrows_l2_kernel<2><<<grid_l2, blk_l2, 0, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, l2rpb); break;
+            case 3: gemm_fp8_mrows_l2_kernel<3><<<grid_l2, blk_l2, 0, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, l2rpb); break;
+            case 4: gemm_fp8_mrows_l2_kernel<4><<<grid_l2, blk_l2, 0, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, l2rpb); break;
+            case 5: gemm_fp8_mrows_l2_kernel<5><<<grid_l2, blk_l2, 0, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, l2rpb); break;
+            case 6: gemm_fp8_mrows_l2_kernel<6><<<grid_l2, blk_l2, 0, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, l2rpb); break;
+            case 7: gemm_fp8_mrows_l2_kernel<7><<<grid_l2, blk_l2, 0, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, l2rpb); break;
+            case 8: gemm_fp8_mrows_l2_kernel<8><<<grid_l2, blk_l2, 0, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, l2rpb); break;
+            default: return 2;
+        }
+        return (int)cudaGetLastError();
+    }
     if (mpar > 0 && fold_r == m) {
         // weight rows (rpb*k) + the e4m3 table. NO activation slab: the MPAR
         // kernel reads each activation row from global once per kb (see the

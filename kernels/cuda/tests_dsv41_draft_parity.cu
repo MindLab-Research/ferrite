@@ -190,7 +190,6 @@ struct Buf {
         if (p) cudaFree(p);
         p = nullptr;
     }
-    void* add(size_t off) const { return (void*)((char*)p + off); }
 };
 
 bool dp_upload(Buf& d, const void* h, size_t n) {
