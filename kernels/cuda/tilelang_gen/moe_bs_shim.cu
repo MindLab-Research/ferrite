@@ -878,10 +878,16 @@ extern "C" int dsv41_moe_tilelang_gate_up_bs_dev(
         return v != nullptr && v[0] != '0';
     }();
     if (g_sync_diag) {
-        e = cudaStreamSynchronize(s);
-        fprintf(stderr, "[moe-bs][SYNC-DIAG] gather done: %s\n",
-                e == cudaSuccess ? "OK" : cudaGetErrorString(e));
-        if (e != cudaSuccess) return (int)e;
+        // FIX: skip sync during CUDA graph capture — sync inside capture is
+        // illegal (cuda error 900) and poisons the whole request
+        cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+        cudaStreamIsCapturing(s, &cs);
+        if (cs == cudaStreamCaptureStatusNone) {
+            e = cudaStreamSynchronize(s);
+            fprintf(stderr, "[moe-bs][SYNC-DIAG] gather done: %s\n",
+                    e == cudaSuccess ? "OK" : cudaGetErrorString(e));
+            if (e != cudaSuccess) return (int)e;
+        }
     }
 
     // (2) block-scaled grouped GEMM（生成物）。ABI 与 host-table 入口一字不差 ——
@@ -921,10 +927,14 @@ extern "C" int dsv41_moe_tilelang_gate_up_bs_dev(
     e = cudaGetLastError();
     if (e != cudaSuccess) return (int)e;
     if (g_sync_diag) {
-        e = cudaStreamSynchronize(s);
-        fprintf(stderr, "[moe-bs][SYNC-DIAG] MMA done: %s\n",
-                e == cudaSuccess ? "OK" : cudaGetErrorString(e));
-        if (e != cudaSuccess) return (int)e;
+        cudaStreamCaptureStatus cs2 = cudaStreamCaptureStatusNone;
+        cudaStreamIsCapturing(s, &cs2);
+        if (cs2 == cudaStreamCaptureStatusNone) {
+            e = cudaStreamSynchronize(s);
+            fprintf(stderr, "[moe-bs][SYNC-DIAG] MMA done: %s\n",
+                    e == cudaSuccess ? "OK" : cudaGetErrorString(e));
+            if (e != cudaSuccess) return (int)e;
+        }
     }
 
     // (3) scatter：RAW gate‖up 写回 out（swiglu 由既有 kernel 做，与本臂无关）
@@ -932,9 +942,13 @@ extern "C" int dsv41_moe_tilelang_gate_up_bs_dev(
         g_c, out, order_dev, counts_dev, kNup, topk * kNup, topk, nseg_dev);
     e = cudaGetLastError();
     if (g_sync_diag) {
-        cudaError_t es = cudaStreamSynchronize(s);
-        fprintf(stderr, "[moe-bs][SYNC-DIAG] scatter done: %s\n",
-                es == cudaSuccess ? "OK" : cudaGetErrorString(es));
+        cudaStreamCaptureStatus cs3 = cudaStreamCaptureStatusNone;
+        cudaStreamIsCapturing(s, &cs3);
+        if (cs3 == cudaStreamCaptureStatusNone) {
+            cudaError_t es = cudaStreamSynchronize(s);
+            fprintf(stderr, "[moe-bs][SYNC-DIAG] scatter done: %s\n",
+                    es == cudaSuccess ? "OK" : cudaGetErrorString(es));
+        }
     }
     return (int)e;
 }
