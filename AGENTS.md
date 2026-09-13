@@ -105,15 +105,16 @@ LD_LIBRARY_PATH=$HOME/ferrite/kernels/cuda ./target/release/ferrite-serve --back
 - serve 卡住/日志 mtime 停滞 = 挂了（查 `stat -c %y` + pgrep，别等）。
 - 加载错防线（三道 runtime + 三道编译期 + git hooks）见 `docs/agent/` 的加载防线文档。
 
-## 当前状态与下一步（2026-09-13 400 攻坚进行时——MTP 摊薄修复批 + accept 损失调查）
+## 当前状态与下一步（2026-09-13 400 攻坚——acc 半边已落地，step 优化进行时）
 
-**本轮实测与判决（详见 `docs/agent/verify-amortization-lesion-audit.md` §6-§10）**：
-- **最优栈 verify=24.49ms**（p50 全步 28.14）：真基线 ~32 → hc split fallthrough −3.4（hc0 对照）→ 1b/ROPE/ATTN_MROWS −4.1；SH_PAIR/COMPRESSOR/INDEXER 融合 ARMED（[sh-gate] 回执判死，收益已含）。
-- **正确性红线通过**：出师表 300 拉丁 = EAGER 对照同现（模型行为）；DIFF_EAGER 48 行全 none（块数值与逐行一致）。
-- **accept 损失 0.78（重大调查中）**：lazy 2.120 vs SWALLOW 1.34（同模型同任务）——spec_accept 是统一前缀匹配（判定相同）、DIFF_EAGER 数值一致 ⇒ **损失聚焦 drafts 构造差异**（两条栈的 draft 链 gate 不同 → 1ULP 翻转嫌疑）。
-- **acc 现状**：计数 1.34（k_acc 双峰 0/5——draft 善换行差数字）、chat 0.74、python 0.58——**无任务稳态 2-3**；用户校准的 2-3 来自 lazy。
-- **已交付待 sweep**：p3lite 段 B（l4/K2）+ wo_a nwarps 可调 + MPAR 回炉（prologue 重排+coverage-aware auto）+ attn-fence（166b038）+ MoE grouped-down；tcgen05 gate/up 716 修复中。
-- **方法论修正**：AR_SAFE nsys 表对生产模式无效（side-stream 前置 decline）；票面必须 nsys 时间占比（COMP/ENGRAM 高估 10×）；**mrows 零摊销**（52µs/5行=5× 单行）——MPAR 是 SH 族收益前提；env 回读断言必须（/proc/pid/environ）。
+**里程碑**：
+- **acc 2-3 达标 ✓✓**：S1 tap 越界根因修复（`hc_collapse` per-row pre 契约 vs m-row hook 单行 4-float 越界——Fix A `dspark_pre_mean_r` 复制零成本等价，commit 6f6f513）→ **mean-k 1.34→2.240**（超 lazy 2.120；归因闭环 fix-off=1.38）；TAP_PARITY H 区全 IDENTICAL + COMP_PARITY 19/0（S2 干净）——双嫌疑闭环。
+- **正确性红线通过**：出师表拉丁 = EAGER 对照同现（模型行为）；DIFF_EAGER 48/48 none；计数 first-51 OK 全臂。
+
+**当前账（step ≈28.6ms @ acc 2.24 ⇒ ~104 tok/s）**：verify 24.5（已含 hc −3.4 + ATTN_MROWS −2.98 + SH/COMP/INDEXER 融合）+ draft 3.8 + commit 0.5。
+**在途修复（4 subagent）**：proj-mma 接线（−3.5ms 中央）+ ⑤a L2 广播（−4~6ms，逐位安全）+ tcgen05 gate/up 716（MoE grouped 唯一解锁，−2ms）+ draft parity 套件。
+**已否决（勿重试）**：MPAR warp-并行（二连败）、wo_a nwarps（8 已最优）、p3lite+ALIGN（acc −0.22）、GROUPED 无 TCGEN05（+10.3ms）、COMP/ENGRAM（票面高估 10×）。
+**方法论**：AR_SAFE nsys 表对生产无效；票面必须 nsys 时间占比；mrows 零摊销（⑤a/⑤b 是真解）；env 回读断言必须；step p50 口径 + 出师表红线 + [sh-gate] 回执。
 
 
 **Session 成果（783+ commits，107 知识文件）**：
