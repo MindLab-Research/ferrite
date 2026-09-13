@@ -3421,3 +3421,17 @@ OUT = '\n-\t\t\t\t\t\t. 7. 1. 0. 1. 0. 1.0.0.0(1.0.0.0'
 1. `A2`（**默认朝向**）⇒ 若不是 swapAB 就正确，则缺陷在 swapAB 分支 ✓；
 2. `D1 = DSV41_DIFF_EAGER=1`（逐轮重放每个 emitted token 为单行 forward）⇒ 给出**第一个 mismatch 的 token 绝对位置** ✓
    —— 这是把"哪里错"从"整段文本"缩小到"第几个 token / 第几个位置"的最省时手段 ✓。
+
+## §136 就绪：**kernel 级隔离仪器**已可编译（下一步的判据来源）
+
+```
+cd ~/ferrite/kernels/cuda && nvcc -gencode arch=compute_103a,code=sm_103a -O2 -std=c++17 \
+   -o /tmp/bsimp tests_bs_impulse.cu -I. -Itilelang_gen -Itilelang_inc     ⇒ 1140248 B ✓
+```
+它是当初把 fp4 容器语义定标到 **relerr=0** 的那件仪器 ✓，`argv[1] = sweep` ✓。
+
+**为什么现在要用它**：§135 已把缺陷锁定在 BS 臂 ✓。而缺陷可能在 **(a) kernel 内部** 或 **(b) 接线/取数** 两者之一 ✗。
+用这个仪器可以直接回答：
+- 若 `const`（BSB=0x22）/稠密 `random` 仍 **relerr≈0** ✓ ⇒ **kernel 内部无罪** ⇒ 缺陷在**接线/取数**（gather/SF 表/eid/order/pitch）✗；
+- 若 relerr 变差 ✗ ⇒ **kernel 自身**在此构建下已退化（例如 §62/§117/§119 的改动影响）⇒ 回到 kernel 层查 ✓。
+⇒ **这是一次 1–2 分钟的 GPU 判定，比继续静态推断省时得多** ✓（且不依赖 e2e）。
