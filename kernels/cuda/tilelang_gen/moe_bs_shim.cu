@@ -651,6 +651,15 @@ bool tl_bs_init() {
         (void)cudaGetLastError();
         fprintf(stderr, "[moe-bs] canon layout = %d\n", canon);
     }
+    // g_sfrev: SF word byte order (0 = LSB-first, 1 = MSB-first -> sf_id = 3-ki)
+    if (ok) {
+        int sr = 0;
+        const char* e = getenv("DSV41_MOE_BS_SFREV");
+        if (e != nullptr && e[0] == '1') sr = 1;
+        (void)cudaMemcpyToSymbol(g_sfrev, &sr, sizeof(int));
+        (void)cudaGetLastError();
+        fprintf(stderr, "[moe-bs] sf byte order reversed = %d\n", sr);
+    }
     // g_swapab: operand orientation (0 = A=activation/B=weight, 1 = A=weight/B=activation)
     if (ok) {
         int sw = 0;

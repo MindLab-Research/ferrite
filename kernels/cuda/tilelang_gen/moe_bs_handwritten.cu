@@ -45,6 +45,10 @@ __device__ int g_canon = 0;
 // two implementations that use the opposite orientation (TileLang's generated kernel,
 // err 700 at INIT) and this kernel (garbage) both fail.
 __device__ int g_swapab = 0;
+// SFREV: read the SF word MSB-first (byte j holds K-block 3-j) instead of LSB-first.
+// A one-line test of the only hypothesis that explains a systematic error shared by
+// every layout / orientation / SF-delivery combination: the sf_id byte order.
+__device__ int g_sfrev = 0;
 
 // smem index for a (row, kk) element of a 128-row x 128-K(tiles) operand tile.
 __device__ __forceinline__ int hw_smem_idx(int row, int kk, int canon) {
@@ -357,8 +361,15 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
             for (int ki = 0; ki < 4; ++ki) {
                 // idesc: M=128, N=128, a_fmt=0 (E4M3), b_fmt=5 (E2M1), sf_id=ki
                 // swapAB: A operand = weights (E2M1=5), B operand = activations (E4M3=0)
-                const uint32_t idesc = g_swapab ? hw_make_idesc(HW_BM, HW_BN, 5, 0, ki)
-                                                : hw_make_idesc(HW_BM, HW_BN, 0, 5, ki);
+                // SFREV: if the hardware reads the SF word MSB-first (i.e. byte j holds the
+                // scale for K-block 3-j) then selecting byte (3-ki) for K-atom ki corrects
+                // BOTH the weight side (pack_wsf) and the activation side (gather) at once,
+                // because both pack byte j = K-block j. This is the cheapest test of the one
+                // hypothesis that can explain a systematic error present in EVERY
+                // layout/orientation/SF-delivery combination.
+                const int sf_id = g_sfrev ? (3 - ki) : ki;
+                const uint32_t idesc = g_swapab ? hw_make_idesc(HW_BM, HW_BN, 5, 0, sf_id)
+                                                : hw_make_idesc(HW_BM, HW_BN, 0, 5, sf_id);
                 // K-block descriptor advance: TileLang's `desc_a + (ki*32)` where
                 // Tcgen05SMemDescriptor::operator+ does `reg32_[0] += offset >> 4`
                 // (offset in BYTES). So the advance is ki*32 bytes = ki*2 units.
