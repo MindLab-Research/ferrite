@@ -2186,6 +2186,13 @@ __global__ void window_idxs_mrows_kernel(int32_t* __restrict__ idxs,
     orow[c] = (int)idx;
 }
 
+// FIX(orope-export): these two launchers live INSIDE the file's anonymous
+// namespace — nvcc compiles `extern "C"` functions in an anonymous namespace
+// to LOCAL symbols (lowercase 't' in nm), which dlsym cannot find. The
+// non-mrows versions (dsv41_window_idxs / dsv41_ring_append) are OUTSIDE the
+// namespace and export fine (uppercase 'T'). The visibility attribute forces
+// export regardless of the enclosing namespace.
+__attribute__((visibility("default")))
 extern "C" int dsv41_window_idxs_mrows(int32_t* idxs, const int* pos_rows, int window, int m,
                                        int idx_stride, cudaStream_t s) {
     // SILENT-SKIP FIX (orope-hang-debug): a guard trip must DECLINE (2), not
@@ -2218,6 +2225,7 @@ __global__ void ring_append_mrows_kernel(float* __restrict__ ring,
     ring[(size_t)slot * (size_t)hd + (size_t)i] = kv_rows[(size_t)e];
 }
 
+__attribute__((visibility("default")))
 extern "C" int dsv41_ring_append_mrows(float* ring, const float* kv_rows, const int* pos_rows,
                                        int window, int hd, int m, cudaStream_t s) {
     // SILENT-SKIP FIX (orope-hang-debug): same decline-not-success contract.
