@@ -504,28 +504,34 @@ __global__ void tl_moe_bs_gather_kernel(const uint8_t* __restrict__ xq4,
                                         uint8_t* __restrict__ a, uint32_t* __restrict__ sfa,
                                         const int* __restrict__ order,
                                         const int* __restrict__ counts, int abytes, int nsc,
-                                        int sf_words, const int* nseg) {
+                                        int sf_words, int row_div, const int* nseg) {
     const int seg = blockIdx.y;
     if (seg >= *nseg) return;
     const int r = blockIdx.x;
     const int row = seg * kBm + r;
     const int64_t m = (int64_t)kSegCap * kBm;
-    const int live = counts[seg];
+    const int live = counts[seg] < kBm ? counts[seg] : kBm;
     const int idx = (r < live) ? order[seg * kBm + r] : -1;
+    // ⚠️ order stores the FLAT assignment index (row*topk + slot); activations
+    //    are quantized PER ROW (xq4 is [rows][dim], NOT [rows*topk][dim]).
+    //    Source row = idx / row_div (= topk). The bf16 twin (moe_bf16_shim.cu:225)
+    //    and the grouped gather (dsv41_route.cu:341) both do this division —
+    //    the BS gather was the only one missing it.
+    const int src_row = (idx < 0) ? -1 : (idx / row_div);
 
     // (a) e4m3 直读（1 B/value ⇒ `abytes == dim`，纯 memcpy 语义）
     uint8_t* adst = a + (int64_t)row * abytes;
-    if (idx < 0) {
+    if (src_row < 0) {
         for (int i = threadIdx.x; i < abytes; i += kMovThreads) adst[i] = 0;
     } else {
-        const uint8_t* asrc = xq4 + (int64_t)idx * abytes;
+        const uint8_t* asrc = xq4 + (int64_t)src_row * abytes;
         for (int i = threadIdx.x; i < abytes; i += kMovThreads) adst[i] = asrc[i];
     }
     // (b) 标度：f32 -> ue8m0，4 字节装一个字；group-major（字 g 覆盖 128 个 K）
     for (int g = threadIdx.x; g < sf_words; g += kMovThreads) {
         uint32_t w = 0u;
-        if (idx >= 0) {
-            const float* s = xsc4 + (int64_t)idx * nsc + g * 4;
+        if (src_row >= 0) {
+            const float* s = xsc4 + (int64_t)src_row * nsc + g * 4;
             w = (uint32_t)tl_bs_f_pow2_to_ue8m0(s[0]) |
                 ((uint32_t)tl_bs_f_pow2_to_ue8m0(s[1]) << 8) |
                 ((uint32_t)tl_bs_f_pow2_to_ue8m0(s[2]) << 16) |
@@ -738,7 +744,7 @@ extern "C" int dsv41_moe_tilelang_gate_up_bs(
 
     // (1) gather + 激活 SF pack：fp4 nibble + f32 标度 -> ue8m0 group-major u32
     tl_moe_bs_gather_kernel<<<dim3((unsigned)kBm, (unsigned)kSegCap), kMovThreads, 0, s>>>(
-        xq4, xsc4, g_a, g_sfa, g_order, g_counts, kDim, kDim / 32, kSfWords, g_nseg);
+        xq4, xsc4, g_a, g_sfa, g_order, g_counts, kDim, kDim / 32, kSfWords, (int)topk, g_nseg);
     e = cudaGetLastError();
     if (e != cudaSuccess) return (int)e;
 
@@ -861,7 +867,7 @@ extern "C" int dsv41_moe_tilelang_gate_up_bs_dev(
 
     // (1) gather + 激活 SF pack：fp4 nibble + f32 标度 -> ue8m0 group-major u32
     tl_moe_bs_gather_kernel<<<dim3((unsigned)kBm, (unsigned)kSegCap), kMovThreads, 0, s>>>(
-        xq4, xsc4, g_a, g_sfa, order_dev, counts_dev, kDim, kDim / 32, kSfWords, nseg_dev);
+        xq4, xsc4, g_a, g_sfa, order_dev, counts_dev, kDim, kDim / 32, kSfWords, (int)topk, nseg_dev);
     cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) return (int)e;
 
