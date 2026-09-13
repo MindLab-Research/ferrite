@@ -105,17 +105,22 @@ LD_LIBRARY_PATH=$HOME/ferrite/kernels/cuda ./target/release/ferrite-serve --back
 - serve 卡住/日志 mtime 停滞 = 挂了（查 `stat -c %y` + pgrep，别等）。
 - 加载错防线（三道 runtime + 三道编译期 + git hooks）见 `docs/agent/` 的加载防线文档。
 
-## 当前状态与下一步（2026-09-13 400 攻坚——SGLang 对比判决后，主战场转移）
+## 当前状态与下一步（2026-09-13 深夜——SGLang 判决 + copy-eager 判决 + 第五路 A，4 修复在途）
 
 **里程碑**：
-- **acc 2-3 达标 ✓✓**（S1 tap 越界修复，mean-k 2.240 超 lazy；TAP_PARITY H 区 IDENTICAL + COMP_PARITY 19/0）。
-- **SGLang 对比判决（新主战场依据）**：SGLang/vLLM 的 verify = **一次 forward、m 是 batch 维**（M=bs×m GEMM / moe_align_block_size expert 去重 / unified append attention）——**实测 1.2-1.3× eager**。**ferrite 4× = 系统性零摊销**（`docs/agent/sglang-verify-model.md`）。
+- **acc 2-3 达标 ✓✓**（S1 tap 越界修复，mean-k 2.240）。
+- **SGLang 对比判决**：verify = 一次 forward、m 是 batch 维（M=bs×m GEMM / expert 去重 grouped / unified append attention）——实测 **1.2-1.3× eager**。SGLang 的 MoE 摊薄**完全依赖 tensor core（tl.dot→MMA）**——SIMT 复制不了。
+- **copy-eager 判决**："复制 eager 改 batch"在 kernel 层**早已完成**（57 个 rows 孪生）——不可抄的是 3 个 m>1 语义约束（ring 翻转/compressor 跨行/indexer per-row）+ 12 件 verify 粘合层（~1700 行）。**渐进路线完胜**（15 个默认 OFF gate = 0 行 vs 4400 行重写）。
+- **4.45× 的精确分解**：MoE 36-sweep 恒等式（6× eager，SIMT FMA-issue bound）+ M-in-register GEMM（3.8× 指令）+ 3 语义约束的 ~54 发/层。
+- **第五路 A（新发现）**：同一 MoE kernel 的 m=1（0.88 条/value）vs m=6（1.46 条/value）**效率差 1.66×** ⇒ 可量化 **−4ms**（routed 10.0→6.0ms）——moe-eff-parity 实施中。
+- **launch 税三度证伪**：verify 地板 = 40 层串行链长 × 每环固定延迟——减发数不动链长。
+- **M-tile 判决**：BN1-4 全负向（+1.9~+3.1ms）；bn=1 对照锁定病灶 = 激活 __ldg 直读 + block 级 barrier（**非 issue-bound**——砍半指令只换 0.68ms）；参数调不出正号（10-15% 置信）——逻辑修复（激活 smem staging + 去 barrier）在途。
 
-**当前账**：step ≈28.6ms @ acc 2.24 ⇒ ~104 tok/s。verify 24.5 构成：R-time mrows 串行 20% + MoE 36 sweep 21% + R-launch 税 + 未融合 pair 形式。
+**当前账**：step ≈28.6ms @ acc 2.24 ⇒ ~104 tok/s。
+**在途修复（4 subagent）**：mtile-logic-fix（激活 staging + per-warp slab）/ moe-eff-parity（第五路 A −4ms）/ v2-headfold-fix（draft head argmax 修复）/ orope-hang-debug（orope 首次 e2e 挂起——fusion 交付的阻塞）。
+**全兑现预期**：verify ~10-14ms ⇒ step ~14-18ms ⇒ **~180-230 tok/s**。到 8ms（400）需图/算子级链长压缩或 MoE 第五路 A 超额。
 
-**修复路线（G1/G3/G2，SGLang 抄作业，全部在途）**：G3 per-row 批量化组合（launch 税归零）/ G1 MoE expert 去重纯调度（36→|active|，−1.5-2.5ms）/ G2 M 进 GEMM tile（−4~6ms，4×→1.3× 机制来源）。
-
-**已判死**：MPAR（二连败）、⑤a L2 直读（四档负向）、proj-mma（acc 崩 0.02）、p3lite+ALIGN（acc −0.22 + l4 parity FAIL 证伪）、GROUPED 无拆门（+10.3ms）、wo_a nwarps（8 最优）。
+**已判死（勿重试）**：MPAR（两败）、⑤a L2 直读（四档负）、proj-mma（acc 崩 0.02）、p3lite+ALIGN（acc −0.22 + l4 parity FAIL）、GROUPED 布局（+16ms）、g1 union（+0.46ms——FMA 数不变）、launch 税、复制 eager 重写、M-tile 参数调优（BN 钳 4）。
 
 - **acc 2-3 达标 ✓✓**：S1 tap 越界根因修复（`hc_collapse` per-row pre 契约 vs m-row hook 单行 4-float 越界——Fix A `dspark_pre_mean_r` 复制零成本等价，commit 6f6f513）→ **mean-k 1.34→2.240**（超 lazy 2.120；归因闭环 fix-off=1.38）；TAP_PARITY H 区全 IDENTICAL + COMP_PARITY 19/0（S2 干净）——双嫌疑闭环。
 - **正确性红线通过**：出师表拉丁 = EAGER 对照同现（模型行为）；DIFF_EAGER 48/48 none；计数 first-51 OK 全臂。
