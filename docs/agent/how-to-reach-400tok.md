@@ -153,3 +153,18 @@ W = **原生 fp4 nibble + ue8m0 标度面**（与官方 `fp4_gemm` 完全同格�
    （预期：图化后 verify 从 24.5–26.7 → ~10–12ms ⇒ step ~14–16ms ⇒ **200–230 tok/s** ✗，离 450 还差执行时间那一半）。
 2. **要 450**：回到 BS 臂（或任何**同格式**的快速 MoE），先把②的非确定性根因做掉
    （首选判据：`DSV41_MOE_BS_PRECLEAR=1` 预清零 / `ZERO_ASF`(mode 5) 干净零乘积 / `gc_all` 原始 tile 对比）。
+
+## 8. ⚠️ 口径陷阱（`graph-safety-audit` 抓到的，直接影响此前所有臂的数字）
+
+- **`DSV41_GRAPH_STEP` 默认 ON**（`chain_dev.rs:8955` 的 `unwrap_or(true)`，自 2026-09-11），
+  但 **`arm_run.sh` 的 `GRAPH_OFF` 把它显式设成 0** ✗ ⇒ **本会话此前的臂全部是"整步图关闭"的配置** ✗。
+- **`GRAPH_STEP=0` 还有副作用：它顺带关掉 `ar_v5`** ✗ ⇒ 一次动两个变量。
+  ⇒ **这解释了"我的臂 10.19ms/步"与"用户记得的 eager 6.3ms/步"的差异** ✓（6.3ms 是**带整步图**的生产默认）。
+- **`DSV41_MOE_BATCH` 默认 ON**（`chain_dev.rs:764` 的 `unwrap_or(true)`）⇒ eager 参照**也是**批量专家路
+  ⇒ 它**不是**差异来源（我此前的怀疑不成立）✓。
+- `DSV41_VERIFY_GRAPH` **默认 OFF**，只作用于 **spec 的 verify 段**；在非 spec 路径上**惰性** ✓。
+- `DSV41_GRAPH_MOE` 是**死路径**（`moe_graph_armed` 无赋值点，恒 false）✗。
+- `GRAPH_STEP` **没有回退**（`capture_begin()?` 直接传播错误，`cd.rs:8978,8980`），而 verify 图**有**响亮 decline + 永久闩 + 回退直发 ✓。
+- 生效判据：**`[verify_graph] captured …` 缺行 = 图一次都没 engage** ✓；有 captured 但 replays 少 = 反复 unanimity 失败 ✓。
+
+⇒ **结论：凡是要和生产口径比的臂，必须显式 `DSV41_VERIFY_GRAPH=1 DSV41_GRAPH_STEP=1`**（覆盖 COMMON 的 0）✓。
