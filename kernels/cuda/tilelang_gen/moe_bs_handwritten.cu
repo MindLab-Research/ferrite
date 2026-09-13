@@ -58,6 +58,10 @@ __device__ int g_sfrev = 0;
 // lbo=1 (16 B) / sbo=64 (1024 B) / layout_type=2 (SWIZZLE_128B). See
 // docs/agent/moe-bs-crash-investigation.md §29-§31.
 __device__ int g_sfst = 0;     // 1 = deliver the SF with tcgen05.st (isolated-instrument path)
+// 1 = keep the TileLang copy's `^ (lane>>3)` XOR in the pre-UTCCP transpose. DEFAULT 0 (no XOR),
+// which is DeepGEMM's shape (`out[lane*4+j] = in[j*32+lane]`) — the only external, production
+// implementation of this exact chain on this hardware. Escape hatch: DSV41_MOE_BS_SFXOR=1.
+__device__ int g_sfxor = 0;
 __device__ int g_ldw = 1;      // 1 (DEFAULT) = read D with the per-warp TMEM lane address, which
                                // PTX ISA 9.7.18.1.1 + CUTLASS + Triton all require (the address's
                                // lane field is an ABSOLUTE lane coordinate and a warp may only
@@ -282,6 +286,27 @@ __device__ __forceinline__ void hw_tc_ld_x8(uint32_t taddr, uint32_t *v) {
 }
 __device__ __forceinline__ void hw_tc_wait_ld() {
     asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+}
+
+// SF 的 smem→TMEM 前置换：把"每行一个 u32"的 smem 转成 UTCCP(`32x128b.warpx4`) 要的形状。
+//
+// ⚠️ 形态必须与 DeepGEMM（SGLang 在 SM100/103 上跑同款模型的**生产实现**）一致：
+//     out[lane*4 + j] = in[j*32 + lane]        （`sm100_fp8_fp4_gemm_1d1d.cuh` 的
+//                                              `utccp_required_smem_warp_transpose`）
+// 我们此前用的是 TileLang 模板 `tcgen05_sf_warp_transpose` 的版本，它对源下标多了一个
+// `^ (lane>>3)` 的 XOR ⇒ 对 lane ≥ 8 的行（即 3/4 的行）会把 4 个 32-K 块的标度互相错位。
+// 该 XOR 路径从未被独立验证（隔离仪器走 `tcgen05.st`，完全绕过本函数），而 DeepGEMM 的
+// 无 XOR 版本是外部生产证据 ⇒ **默认改成无 XOR**。`DSV41_MOE_BS_SFXOR=1` 可退回旧形态。
+__device__ __forceinline__ void hw_sf_transpose(uint32_t* smem_ptr) {
+    const int lane = threadIdx.x & 31;
+    uint32_t values[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        values[i] = smem_ptr[(g_sfxor ? (i ^ (lane >> 3)) : i) * 32 + lane];
+    }
+    __syncwarp();
+#pragma unroll
+    for (int i = 0; i < 4; ++i) smem_ptr[lane * 4 + i] = values[i];
 }
 
 // SF copy to TMEM（从 TileLang tcgen05_cp 复制——32x128b.warpx4 shape）
