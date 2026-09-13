@@ -133,7 +133,11 @@ B1 系三臂的断崖都在 line 52（1..51 正确然后跳 62）+ mean-k 0.64-0
 - wo_a_grouped<5> 4.5%（2.49ms/步）：verify 40 发 grid 仅 128×1（<148 SM）——latency/占用率病（72GB/s ≈ 1% 峰值）；修法 = nwarps 可调（:7234 写死 8）+ WO_PAIR 未接 mrows。
 - gemv_bf16_v1_mrows<5>（draft head 1.36ms）：AR_SAFE 下未切片 1.323GB/发；摊薄失效根因 = f32 激活 2× 权重字节 + 行重读。
 - VERIFY_HEAD_MROWS 在 v6 轮也 env 断（v1 逐行 6 发/步为证）。
-- draft 4 投影走 16-row tile（69% 浪费，m=5 用 16 行）→ ATTN_PROJ_ALIGN 转 mrows（需与 WOB_F32 同开 + 双门禁）。
+**§10.3 生产模式 gate 生效判死（shgate 臂，2026-09-13 02:15，[sh-gate] 回执）**：
+- **SH 族在生产模式全部 ARMED**：`SH_PAIR_M=1: ARMED fused（ONE dsv41_gemm_fp8_sh_exp_fused<m> for the whole block, epi_add folding the w2 add）` + `COMPRESSOR_MROWS=1: ARMED（ONE fused launch）` + `INDEXER_MROWS=1: ARMED on 8 index-source layers`——**共享专家/压缩器/索引器的折叠收益已含在 verify 24.49-24.53 里**。
+- **AR_SAFE nsys 表的"SH 幻影/raw hc_mixes 30272 发/sparse 3.2×"全是 AR_SAFE 口径的假象**（side-stream/event 前置在 AR_SAFE 下 decline）——nsys 病灶表对生产模式无效。
+- **生产模式剩余已知病灶**：①ATTN_MROWS 的 compressor-snapshot fence（"commits per row and left no device snapshot"——部分块仍 decline）②wo_a 2.49ms（AR_SAFE 口径，生产待测）③MoE grouped 716（修复中）④MPAR（回炉中）⑤draft 3.62ms（p3lite）。
+- **生产账（A/B 差分）**：真基线 ~32ms verify → hc −3.4 → 1b/ROPE/ATTN −4.1 = **24.49ms**（含 SH/COMPRESSOR/INDEXER 融合）。
 
 **双门禁**：每个优化臂必须同时报告 `step_ms`（[dspark] 分解）**AND** `mean-k`（A0 基线 1.34；掉了 = 数值回归，立即弃用该 gate）。
 
