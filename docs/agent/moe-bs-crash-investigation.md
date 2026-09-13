@@ -2869,3 +2869,26 @@ OUT-LINE OK (wq_check can parse this) ✓
 | 9 | **三处脚本 bug**：`sed "$d"` / `GRAPH_OFF` 拆行 / **花括号破坏 python 引号** | 逐处修 + **真实执行验证** | §110/§111 |
 
 ⇒ **九项全部清除** ⇒ 下一次 arm 运行应当**首次产出可信判据**（有效文本 或 可读诊断）。
+
+## §112 【最大结构性缺口已落地】MoE **down** 方向的 tcgen05 fp4 blockscaled 实现（待 GPU 对拍）
+
+§100 认定"**down 没有 blockscaled 实现**"是最大结构性缺口（SIMT fp4、**1.00 ms/步、占 10.3%**、占用率受限）。
+`moe-down-blockscaled` 线已交付并入库（**未接 Rust 分发 ⇒ 当前为惰性、只增符号**）：
+
+| 产物 | 路径 | 规模 |
+|---|---|---|
+| down 的手写 kernel | `kernels/cuda/tilelang_gen/moe_bs_dn_handwritten.cu` | 654 行 |
+| down 的 host shim | `kernels/cuda/tilelang_gen/moe_bs_dn_shim.cu` | 329 行 |
+| **GPU 对拍 harness** | `kernels/cuda/tests_dn_bs_parity.cu` | — |
+| 纯 CPU 数值参考 | `scripts/campaign/dn_bs_cpu_ref.py` | — |
+| 设计文档 | `docs/agent/moe-down-bs-design.md` | — |
+
+**复用已定谳语义**（§47）：packed 数据 + 16 B 容器只用前 8 B、`hw_pack_sw128`、
+descriptor `lbo=1/sbo=64/layout=2`、K 块递进 `ki*32 B`。
+**自动收编**：`build.sh:63` 用通配符 `tilelang_gen/*_shim.cu` ⇒ 新 shim 无需手工登记 ✓。
+
+**下一步（按纪律的顺序）**：
+1. **用真实标志编译验证**（本轮在跑；失败则先修）；
+2. **GPU 上跑对拍 harness**（新旧 down 在同一批输入上逐元素比 ⇒ relerr 应 ≈0）——**验证必须在接线之前**；
+3. 通过后**再**做 Rust 侧分发（门控默认 OFF，走 §87 的性能门判据：先逐位一致、再看 p50）；
+4. 因为它是**步时削减**（§106：450 是 step 问题），预期对 **verify 总时间**有直接贡献（该核当前 1.00ms/步）。
