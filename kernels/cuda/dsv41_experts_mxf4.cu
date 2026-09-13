@@ -118,6 +118,55 @@ constexpr int kSfaCols = kStageAtoms * (kMTile / 32);    //  4 per atom -> 16
 constexpr int kDCols = kNTile;                           // 64
 constexpr int kTmemCols = 128;     // power-of-two alloc >= kDCols + kSfaCols + kSfbCols
 
+// -------------------------------------------------------- expert SF row pitch
+// THE w2 "10-byte row" FIX (2026-09-13, docs/agent/tcgen05-rank7-verdict.md §10).
+//
+// The routed experts' w2 e8m0 plane is `[dim, padded_inter(inter/world)/32]`,
+// i.e. 10 bytes per row at the production shape (9 real + 1 pad). The kernels
+// indexed it as `sc[row * (k/32) + kblock]` with k = the K_ATOM-padded
+// `inter/world` (320), so the LOGICAL row width is 10 — and row r started at
+// `base + r*10`, which is on the 16 B grid only for r == 0. `cp.async.bulk*`,
+// `LDG.128` and every `uint4` operand path demand 16 B, so every row past the
+// first of that plane was unaddressable: 8/8 ranks reported `cuda error 716`
+// (misaligned address) at the first prefill, and `DSV41_ALIGN_AUDIT=1` named
+// exactly this pitch as the expert pool's ONLY 16 B violation.
+//
+// The fix DECOUPLES the physical row stride from the logical `k/32`: the loader
+// (`weights::sf_plane_pitch`, the mirror of this function) lays the plane out
+// with rows padded to the next 16 B multiple (10 -> 16) and every kernel below
+// addresses the scale rows with the EXPLICIT `sf_pitch` argument instead of
+// `k >> 5`. Numerically identical — a kernel reads only the first `k/32` bytes
+// of each row, the pad bytes are never touched and take no part in any
+// dot-product; only the addresses move.
+//
+// `k` is the kernel's own reduction dim: the K_ATOM-padded `inter/world` for the
+// down direction (320 -> align16(10) = 16, THE fix) and `dim` for gate/up
+// (5120 -> align16(160) = 160, a no-op — `check_bulk_geometry` pins
+// dim % 512 == 0, which is what keeps the w1/w3 scale planes' `dim/32` pitch
+// 16 B-aligned and unchanged).
+//
+// `DSV41_SF_STRIDE_PAD=0` restores the historical 10-byte layout on BOTH sides.
+// This is a bug fix, not an optimisation, so the default is ON (any value but a
+// leading '0'); the escape hatch exists so the fix can be A/B'd in one process.
+// Read ONCE: the kernel argument derived from it must match the loader's layout,
+// so it may not change mid-run.
+static inline bool dsv41_sf_stride_pad_enabled() {
+    static const bool on = [] {
+        const char* e = getenv("DSV41_SF_STRIDE_PAD");
+        return !(e != nullptr && e[0] == '0');
+    }();
+    return on;
+}
+
+// The PHYSICAL row stride (bytes) of an expert e8m0 scale plane whose row holds
+// `k/32` scale columns. MIRROR of `weights::sf_plane_pitch`: the two MUST agree,
+// or the rows are read 6 bytes early — a silent wrong answer, and precisely the
+// failure mode this fix removes.
+static inline int dsv41_sf_pitch(int k) {
+    const int cols = k >> 5;
+    return dsv41_sf_stride_pad_enabled() ? ((cols + 15) & ~15) : cols;
+}
+
 // ------------------------------------------------------------------ helpers
 __device__ __forceinline__ uint32_t smem_addr(const void* p) {
     return static_cast<uint32_t>(__cvta_generic_to_shared(p));
@@ -394,7 +443,12 @@ __global__ void __launch_bounds__(kThreads) mxf4_gemm_kernel(
     const uint8_t* __restrict__ b_hi,     // second half (split >= 0), else same as b
     const uint8_t* __restrict__ b_hi_scale,
     float* __restrict__ out,              // [rows, n_out]
-    int rows, int n_total, int k, int b_split, int epi_mode, float limit,
+    int rows, int n_total, int k,
+    // PHYSICAL row stride of the B e8m0 scale planes, in bytes (the fix: see
+    // `dsv41_sf_pitch`). == k/32 for every plane but `w2.scale`, whose rows are
+    // laid out 16 B wide while the LOGICAL indexing width stays k/32. The bound
+    // checks below keep using `nk_blk = k >> 5` — that is the logical width.
+    int b_sf_pitch, int b_split, int epi_mode, float limit,
     const float* __restrict__ row_weight,
     // ---- indirect (graph-friendly) B addressing -------------------------
     // Given the per-layer pools' bases and per-expert strides plus a device
@@ -583,7 +637,10 @@ __global__ void __launch_bounds__(kThreads) mxf4_gemm_kernel(
                             const int brel = 4 * pr + t;
                             if (brel >= 2 * natoms) break;
                             const int bb = abase + brel;
-                            if (bb < nk_blk) v[t] = sc[(size_t)row * nk_blk + bb];
+                            // PHYSICAL row stride (b_sf_pitch), not the logical
+                            // k/32: the plane's rows are 16 B-aligned after the
+                            // w2 SF-pitch fix. Same bytes, same value.
+                            if (bb < nk_blk) v[t] = sc[(size_t)row * (size_t)b_sf_pitch + bb];
                         }
                     }
                 }
@@ -698,7 +755,8 @@ __global__ void expert_gemv_fp4_kernel(const float* __restrict__ a_f32,
                                        const uint8_t* __restrict__ b_scale,
                                        const uint8_t* __restrict__ b_hi,
                                        const uint8_t* __restrict__ b_hi_scale,
-                                       float* __restrict__ out, int n_total, int k, int b_split,
+                                       float* __restrict__ out, int n_total, int k, int b_sf_pitch,
+                                       int b_split,
                                        int epi_mode, float limit, const float* __restrict__ row_weight,
                                        const uint8_t* __restrict__ b_base, long b_stride,
                                        const uint8_t* __restrict__ bs_base, long bs_stride,
@@ -722,7 +780,9 @@ __global__ void expert_gemv_fp4_kernel(const float* __restrict__ a_f32,
     // weights, which is what pinned this kernel at 38 GB/s (0.5 percent).
     extern __shared__ float s_act[];   // k floats (20 KB at k=5120)
     const int kbytes = k >> 1;   // packed bytes per row
-    const int ksc = k >> 5;      // scales per row (f32 for the activation)
+    const int ksc = k >> 5;      // LOGICAL width: scales per row (f32 for the activation)
+    [[maybe_unused]] const int ksc_logical_rows = ksc;  // the B scales' logical k/32; the
+                                                        // PHYSICAL stride is b_sf_pitch
     // DSV41_EXPERT_ACT_E4M3 (direct e4m3, official semantics): `a` holds ONE
     // e4m3 byte per value (no packing), so the row is `k` bytes; `a_scale` is
     // the quantiser's own f32 per 32 (`dsv41_quant_fp8(block=32)`). Same float
@@ -756,7 +816,10 @@ __global__ void expert_gemv_fp4_kernel(const float* __restrict__ a_f32,
         const uint8_t* bb = hi ? bhi_use : b_use;
         const uint8_t* bb_s = hi ? bhs_use : bsc_use;
         const uint8_t* brow = bb + (size_t)r * kbytes;
-        const uint8_t* srow = bb_s + (size_t)r * ksc;
+        // PHYSICAL scale row stride (the w2 SF-pitch fix): `ksc == k/32` is the
+        // LOGICAL width the indexing below uses, `b_sf_pitch` is what the plane
+        // is actually laid out with (16 B for w2.scale, k/32 everywhere else).
+        const uint8_t* srow = bb_s + (size_t)r * b_sf_pitch;
 
         float acc = 0.f;
         for (int j = lane * 2; j < k; j += 64) {
@@ -1282,7 +1345,8 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
                                                const uint8_t* __restrict__ a,
                                                const float* __restrict__ a_scale,
                                                float* __restrict__ out, long out_slot_stride,
-                                               int n_total, int k, int b_split, int epi_mode,
+                                               int n_total, int k, int b_sf_pitch, int b_split,
+                                               int epi_mode,
                                                float limit, const float* __restrict__ row_weight,
                                                long rw_stride, const uint8_t* __restrict__ b_base,
                                                long b_stride, const uint8_t* __restrict__ bs_base,
@@ -1380,7 +1444,8 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
     // dynamic-smem size (and occupancy).
     float2* s_ks = reinterpret_cast<float2*>(s_pf + (size_t)nwarps * kGateUpPfBytes * PDEPTH);
     const int kbytes = k >> 1;   // packed bytes per row
-    const int ksc = k >> 5;      // e8m0 scales per row
+    const int ksc = k >> 5;      // e8m0 scales per row (the ACTIVATION's own pitch; the
+                                 // weight planes use the PHYSICAL b_sf_pitch)
     // PDL (DSV41_PDL, see dsv41_experts_pdl_or_plain above): the launcher may
     // have launched this grid with programmatic stream serialization, so the
     // grid is already resident here and this call is what makes the PRODUCER's
@@ -1642,8 +1707,11 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
             // from the gate pointer (the `b_hi` base is not read at all).
             const uint8_t* g_row = b_use + (size_t)row_c * (ILV ? (kbytes << 1) : kbytes);
             const uint8_t* u_row = ILV ? g_row : (bhi_use + (size_t)row_c * kbytes);
-            const uint8_t* g_srow = bsc_use + (size_t)row_c * ksc;
-            const uint8_t* u_srow = bhs_use + (size_t)row_c * ksc;
+            // PHYSICAL scale row stride (the w2 SF-pitch fix): the plane's rows
+            // are laid out `b_sf_pitch` bytes apart, while every `j >> 5` index
+            // below is the LOGICAL k/32 column. Same bytes, same values.
+            const uint8_t* g_srow = bsc_use + (size_t)row_c * b_sf_pitch;
+            const uint8_t* u_srow = bhs_use + (size_t)row_c * b_sf_pitch;
             // nv2f (k>>9 groups per row, no tail because k % 512 == 0) and
             // g_begin are the PROLOGUE's copies - the P4 prefetch needs them
             // there, so they are defined once, above, and reused here.
@@ -1900,7 +1968,8 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
         const uint8_t* bb = hi ? bhi_use : b_use;
         const uint8_t* bb_s = hi ? bhs_use : bsc_use;
         const uint8_t* brow = bb + (size_t)r * kbytes;
-        const uint8_t* srow = bb_s + (size_t)r * ksc;
+        // PHYSICAL scale row stride (the w2 SF-pitch fix) — see g_srow above.
+        const uint8_t* srow = bb_s + (size_t)r * b_sf_pitch;
 
         float acc = 0.f;
         if (vec == 2) {
@@ -2190,7 +2259,7 @@ __global__ void expert_gemv_fp4_down_reduce_kernel(
     const float* __restrict__ act_base, long act_stride, float* __restrict__ out, int n_total,
     int k, int slots, const float* __restrict__ row_weight, long rw_stride,
     const uint8_t* __restrict__ w2_base, long w2_stride, const uint8_t* __restrict__ w2s_base,
-    long w2s_stride, const int* __restrict__ ids, int vec) {
+    long w2s_stride, int w2s_pitch, const int* __restrict__ ids, int vec) {
     // STAGED: s_smem is [slots][k] slot-major (slot s starts at s_smem + s*k) and
     // the 256-entry LUT follows it. Fallback: the LUT alone lives in smem and
     // each slot's activation is read straight from global - same numbers, more
@@ -2198,9 +2267,9 @@ __global__ void expert_gemv_fp4_down_reduce_kernel(
     // device's opt-in smem ceiling).
     extern __shared__ float s_smem[];
     float2* s_lut2 = reinterpret_cast<float2*>(s_smem + (STAGED ? (size_t)slots * (size_t)k : 0));
-    const int kbytes = k >> 1;   // packed bytes per row
-    const int ksc = k >> 5;      // e8m0 scales per row
-    const int nwarps = (blockDim.x + 31) >> 5;
+    const int kbytes = k >> 1;        // packed bytes per row
+    const int ksc = k >> 5;           // LOGICAL e8m0 scales per row
+    [[maybe_unused]] const int ksc_logical = ksc;  // the PHYSICAL stride is w2s_pitch
     // PDL (DSV41_PDL, see dsv41_experts_pdl_or_plain above): the launcher may
     // have launched this grid with programmatic stream serialization, so the
     // grid is already resident here and this call is what makes the PRODUCER's
@@ -2278,7 +2347,9 @@ __global__ void expert_gemv_fp4_down_reduce_kernel(
                                         : 1.f;
             const size_t e = (size_t)ids[slot0 + (size_t)slot];
             const uint8_t* brow = w2_base + e * (size_t)w2_stride + (size_t)row * kbytes;
-            const uint8_t* srow = w2s_base + e * (size_t)w2s_stride + (size_t)row * ksc;
+            // PHYSICAL w2 e8m0 row stride (the SF-pitch fix): `w2s_pitch` is 16
+            // for the padded plane, `ksc == k/32` for the escape-hatch layout.
+            const uint8_t* srow = w2s_base + e * (size_t)w2s_stride + (size_t)row * w2s_pitch;
 
             float acc = 0.f;
             if (vec == 3) {
@@ -2473,25 +2544,31 @@ inline cudaError_t launch_mxf4(const uint8_t* a, const float* a_scale, const flo
         const int warps = 8;
         const int cta = warps * 32;
         const int blocks = (n_total + warps - 1) / warps;
+        // The B scale planes' PHYSICAL row stride (the w2 SF-pitch fix, see
+        // `dsv41_sf_pitch`): `k/32` for every plane but the padded `w2.scale`.
+        // Same for both directions — for gate/up k = dim and align16 is a no-op.
+        const int b_sf_pitch = dsv41_sf_pitch(k);
         expert_gemv_fp4_kernel<<<blocks, cta, (size_t)k * sizeof(float), s>>>(
-            a_f32, a, a_scale, b, b_scale, b_hi, b_hi_scale, out, n_total, k, b_split, epi_mode,
-            limit, row_weight, nullptr, 0, nullptr, 0, nullptr, 0, nullptr, 0, nullptr, 0,
+            a_f32, a, a_scale, b, b_scale, b_hi, b_hi_scale, out, n_total, k, b_sf_pitch, b_split,
+            epi_mode, limit, row_weight, nullptr, 0, nullptr, 0, nullptr, 0, nullptr, 0, nullptr, 0,
             /*act_e4m3=*/0);
         return cudaGetLastError();
     }
     const dim3 grid((unsigned)((n_total + kNTile - 1) / kNTile),
                     (unsigned)((rows + kMTile - 1) / kMTile));
+    const int b_sf_pitch = dsv41_sf_pitch(k);
     if (aq)
         mxf4_gemm_kernel<true><<<grid, kThreads, 0, s>>>(a, a_scale, a_f32, b, b_scale, b_hi,
-                                                         b_hi_scale, out, rows, n_total, k, b_split,
-                                                         epi_mode, limit, row_weight, nullptr, 0,
-                                                         nullptr, 0, nullptr, 0, nullptr, 0, nullptr, 0);
+                                                         b_hi_scale, out, rows, n_total, k,
+                                                         b_sf_pitch, b_split, epi_mode, limit,
+                                                         row_weight, nullptr, 0, nullptr, 0,
+                                                         nullptr, 0, nullptr, 0, nullptr, 0);
     else
         mxf4_gemm_kernel<false><<<grid, kThreads, 0, s>>>(a, a_scale, a_f32, b, b_scale, b_hi,
                                                           b_hi_scale, out, rows, n_total, k,
-                                                          b_split, epi_mode, limit, row_weight,
-                                                          nullptr, 0, nullptr, 0, nullptr, 0,
-                                                          nullptr, 0, nullptr, 0);
+                                                          b_sf_pitch, b_split, epi_mode, limit,
+                                                          row_weight, nullptr, 0, nullptr, 0,
+                                                          nullptr, 0, nullptr, 0, nullptr, 0);
     return cudaGetLastError();
 }
 
@@ -2604,24 +2681,27 @@ inline cudaError_t launch_mxf4_indirect(const uint8_t* a, const float* a_scale, 
     if (rows == 1 && getenv("DSV41_NO_GEMV_FP4") == nullptr) {
         const int warps = 8;
         const int blocks = (n_total + warps - 1) / warps;
+        // PHYSICAL B-scale row stride (the w2 SF-pitch fix) — see launch_mxf4.
+        const int b_sf_pitch = dsv41_sf_pitch(k);
         expert_gemv_fp4_kernel<<<blocks, warps * 32, (size_t)k * sizeof(float), s>>>(
-            a_f32, a, a_scale, nullptr, nullptr, nullptr, nullptr, out, n_total, k, b_split,
-            epi_mode, limit, row_weight, b_base, b_stride, bs_base, bs_stride, bh_base, bh_stride,
-            bhs_base, bhs_stride, ids, slot, act_e4m3);
+            a_f32, a, a_scale, nullptr, nullptr, nullptr, nullptr, out, n_total, k, b_sf_pitch,
+            b_split, epi_mode, limit, row_weight, b_base, b_stride, bs_base, bs_stride, bh_base,
+            bh_stride, bhs_base, bhs_stride, ids, slot, act_e4m3);
         return cudaGetLastError();
     }
     const dim3 grid((unsigned)((n_total + kNTile - 1) / kNTile),
                     (unsigned)((rows + kMTile - 1) / kMTile));
+    const int b_sf_pitch = dsv41_sf_pitch(k);
     if (aq)
         mxf4_gemm_kernel<true><<<grid, kThreads, 0, s>>>(
-            a, a_scale, a_f32, nullptr, nullptr, nullptr, nullptr, out, rows, n_total, k, b_split,
-            epi_mode, limit, row_weight, b_base, b_stride, bs_base, bs_stride, bh_base, bh_stride,
-            bhs_base, bhs_stride, ids, slot);
+            a, a_scale, a_f32, nullptr, nullptr, nullptr, nullptr, out, rows, n_total, k, b_sf_pitch,
+            b_split, epi_mode, limit, row_weight, b_base, b_stride, bs_base, bs_stride, bh_base,
+            bh_stride, bhs_base, bhs_stride, ids, slot);
     else
         mxf4_gemm_kernel<false><<<grid, kThreads, 0, s>>>(
-            a, a_scale, a_f32, nullptr, nullptr, nullptr, nullptr, out, rows, n_total, k, b_split,
-            epi_mode, limit, row_weight, b_base, b_stride, bs_base, bs_stride, bh_base, bh_stride,
-            bhs_base, bhs_stride, ids, slot);
+            a, a_scale, a_f32, nullptr, nullptr, nullptr, nullptr, out, rows, n_total, k, b_sf_pitch,
+            b_split, epi_mode, limit, row_weight, b_base, b_stride, bs_base, bs_stride, bh_base,
+            bh_stride, bhs_base, bhs_stride, ids, slot);
     return cudaGetLastError();
 }
 
@@ -2834,11 +2914,15 @@ extern "C" int dsv41_expert_gate_up_fp4_batched(
     // path does not apply the kernel's default arguments, so every trailing slot
     // is spelled out.
     auto gateup_launch = [&](auto kern) -> cudaError_t {
+        // `dsv41_sf_pitch(dim)`: the w1/w3 e8m0 planes' PHYSICAL row stride (the
+        // w2 SF-pitch fix; align16(dim/32) is a no-op here, check_bulk_geometry
+        // pins dim % 512 == 0 — passing it keeps ONE formula for every arm).
         return dsv41_experts_pdl_or_plain(kern, grid, dim3(block_threads), smem, stream, nullptr, 0,
-                                          a, a_scale, out, out_slot_stride, n_total, dim, inter, 1,
-                                          limit, nullptr, 0, w1_base, w1_stride, w1s_base, w1s_stride,
-                                          w3_base, w3_stride, w3s_base, w3s_stride, ids,
-                                          g_expert_fp4_mode, fuse, ksplit, pf, act_e4m3);
+                                          a, a_scale, out, out_slot_stride, n_total, dim,
+                                          dsv41_sf_pitch(dim), inter, 1, limit, nullptr, 0, w1_base,
+                                          w1_stride, w1s_base, w1s_stride, w3_base, w3_stride,
+                                          w3s_base, w3s_stride, ids, g_expert_fp4_mode, fuse,
+                                          ksplit, pf, act_e4m3);
     };
     cudaError_t le;
     // ONE depth (1) x 2 ILV instantiations. The former 5-way depth cascade
@@ -2883,9 +2967,10 @@ extern "C" int dsv41_expert_down_fp4_batched(
     cudaError_t le = dsv41_experts_pdl_or_plain(
         expert_gemv_fp4_batched_kernel<false, 1>, grid, dim3(warps * 32),
         (size_t)inter * sizeof(float) + 256 * sizeof(float2), stream, act_base, act_stride, nullptr,
-        nullptr, out, out_slot_stride, dim, inter, -1, 2, 0.f, row_weight, rw_stride, w2_base,
-        w2_stride, w2s_base, w2s_stride, w2_base, w2_stride, w2s_base, w2s_stride, ids,
-        g_down_fp4_mode, /*fuse_swiglu=*/0, /*ksplit=*/1, /*pf=*/0, /*act_e4m3=*/0);
+        nullptr, out, out_slot_stride, dim, inter, dsv41_sf_pitch(inter), -1, 2, 0.f, row_weight,
+        rw_stride, w2_base, w2_stride, w2s_base, w2s_stride, w2_base, w2_stride, w2s_base,
+        w2s_stride, ids, g_down_fp4_mode, /*fuse_swiglu=*/0, /*ksplit=*/1, /*pf=*/0,
+        /*act_e4m3=*/0);
     if (le != cudaSuccess) { (void)cudaGetLastError(); return (int)le; }
     return (int)cudaGetLastError();
 }
@@ -2974,16 +3059,19 @@ extern "C" int dsv41_expert_down_reduce_fp4_batched(
     // kernel's entry sync gates the activation staging (STAGED) and the per-slot
     // reads of the non-staged fallback.
     cudaError_t le;
+    // The w2 e8m0 plane's PHYSICAL row stride (the w2 SF-pitch fix): 16 for the
+    // padded plane the loader lays out, `inter/32` under DSV41_SF_STRIDE_PAD=0.
+    const int w2s_pitch = dsv41_sf_pitch(inter);
     if (staged_bytes <= cap) {
         le = dsv41_experts_pdl_or_plain(
             expert_gemv_fp4_down_reduce_kernel<true>, grid, dim3(warps * 32), staged_bytes, stream,
             act_base, act_stride, out, dim, inter, slots, row_weight, rw_stride, w2_base,
-            w2_stride, w2s_base, w2s_stride, ids, g_down_fp4_mode);
+            w2_stride, w2s_base, w2s_stride, w2s_pitch, ids, g_down_fp4_mode);
     } else {
         le = dsv41_experts_pdl_or_plain(
             expert_gemv_fp4_down_reduce_kernel<false>, grid, dim3(warps * 32), lut_bytes, stream,
             act_base, act_stride, out, dim, inter, slots, row_weight, rw_stride, w2_base,
-            w2_stride, w2s_base, w2s_stride, ids, g_down_fp4_mode);
+            w2_stride, w2s_base, w2s_stride, w2s_pitch, ids, g_down_fp4_mode);
     }
     if (le != cudaSuccess) { (void)cudaGetLastError(); return (int)le; }
     return (int)cudaGetLastError();
@@ -5697,7 +5785,7 @@ __global__ void __launch_bounds__(kThreads) e4m3_gemm_kernel(
     const uint8_t* __restrict__ b_hi,     // second half (b_split >= 0), else b
     const uint8_t* __restrict__ b_hi_scale,
     float* __restrict__ out,              // [rows, n_total]
-    int rows, int n_total, int k, int b_split, int epi_mode, float limit,
+    int rows, int n_total, int k, int b_sf_pitch, int b_split, int epi_mode, float limit,
     const float* __restrict__ row_weight,
     // Indirect (graph-friendly) B addressing, same convention as
     // mxf4_gemm_kernel: ids != nullptr derives the four B pointers per CTA from
@@ -5847,7 +5935,7 @@ __global__ void __launch_bounds__(kThreads) e4m3_gemm_kernel(
                     sc = bhs_use;
                     row = n_glob - b_split;
                 }
-                if (row >= 0) v = ue8m0_to_f(sc[(size_t)row * nk_blk + bb]);
+                if (row >= 0) v = ue8m0_to_f(sc[(size_t)row * (size_t)b_sf_pitch + bb]);
             }
             s.sb[sub][n] = v;
         }
@@ -5981,10 +6069,13 @@ inline cudaError_t e4x_launch_gemm(const uint8_t* a, const float* a_scale, const
     };
     if (!bulk_align_ok("tc5::e4x", chk, 7)) return cudaErrorInvalidValue;
     const dim3 grid((unsigned)(n_total / kNTile), (unsigned)(rows / kMTile));
+    // The B e8m0 planes' PHYSICAL row stride (the w2 SF-pitch fix): `k/32` for
+    // every plane but `w2.scale`, whose padded 16 B rows the loader lays out.
+    // See `dsv41_sf_pitch`.
     e4m3_gemm_kernel<<<grid, kThreads, 0, stream>>>(
-        a, a_scale, b, b_scale, b_hi, b_hi_scale, out, rows, n_total, k, b_split, epi_mode, limit,
-        row_weight, b_base, b_stride, bs_base, bs_stride, bh_base, bh_stride, bhs_base, bhs_stride,
-        ids, slot);
+        a, a_scale, b, b_scale, b_hi, b_hi_scale, out, rows, n_total, k, dsv41_sf_pitch(k),
+        b_split, epi_mode, limit, row_weight, b_base, b_stride, bs_base, bs_stride, bh_base,
+        bh_stride, bhs_base, bhs_stride, ids, slot);
     return cudaGetLastError();
 }
 
@@ -6095,7 +6186,7 @@ __global__ void __launch_bounds__(kThreads) e4m3_gemm_grouped_kernel(
     const int* __restrict__ n_active,     // [1] live length of `active`
     const int* __restrict__ counts,       // [n_experts] rows per expert
     const int* __restrict__ starts,       // [n_experts + 1] exclusive prefix sum
-    int n_experts, int n_total, int k, int b_split, int epi_mode, float limit,
+    int n_experts, int n_total, int k, int b_sf_pitch, int b_split, int epi_mode, float limit,
     // The four B planes, derived per CTA from `base + e * stride` exactly as the
     // dense arm derives them from `base + ids[slot] * stride`. There is no
     // direct-pointer path here: the expert ALWAYS comes from the group table.
@@ -6236,7 +6327,7 @@ __global__ void __launch_bounds__(kThreads) e4m3_gemm_grouped_kernel(
                     sc = bhs_use;
                     row = n_glob - b_split;
                 }
-                if (row >= 0) v = ue8m0_to_f(sc[(size_t)row * nk_blk + bb]);
+                if (row >= 0) v = ue8m0_to_f(sc[(size_t)row * (size_t)b_sf_pitch + bb]);
             }
             s.sb[sub][n] = v;
         }
@@ -6363,9 +6454,9 @@ inline cudaError_t e4x_launch_gemm_grouped(
     const int m_tiles = (m_cap + kMTile - 1) / kMTile;
     const dim3 grid((unsigned)(n_total / kNTile), (unsigned)m_tiles, (unsigned)n_assign);
     e4m3_gemm_grouped_kernel<<<grid, kThreads, 0, stream>>>(
-        a, a_scale, out, active, n_active, counts, starts, n_experts, n_total, k, b_split,
-        epi_mode, limit, b_base, b_stride, bs_base, bs_stride, bh_base, bh_stride, bhs_base,
-        bhs_stride);
+        a, a_scale, out, active, n_active, counts, starts, n_experts, n_total, k,
+        dsv41_sf_pitch(k), b_split, epi_mode, limit, b_base, b_stride, bs_base, bs_stride, bh_base,
+        bh_stride, bhs_base, bhs_stride);
     return cudaGetLastError();
 }
 

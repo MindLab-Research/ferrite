@@ -112,3 +112,32 @@ CUDA_VISIBLE_DEVICES=0..7, LD_LIBRARY_PATH=$HOME/ferrite/kernels/cuda, --tp 8 --
 **根修口径**（未实施，属 L4-3/L4-4 收尾）：使 SF 行 pitch 满足 16B ⇒ `padded_inter(inter/world) % 512 == 0`（即 inter/world 需被 512 整除；当前 288 → padded 320 → 10B）。需要 scale 平面物理行 stride 与逻辑 `k/32` 解耦（行间 padding + 内核 scale 索引 stride 参数化），数值不变（pad 区不读）。TMA bulk 的 16B 硬对齐使 byte-fallback 不可行（§1.2 已证）。
 
 **修复后复验口径**：`DSV41_ALIGN_AUDIT=1` 装载期 `pool geometry OK`（0 violation）→ `DSV41_ALIGN_STRICT=1` 装载通过 → tcgen05 臂 8/8 → 0/8 Err → 计数前 61 行 + 零拉丁红线。
+
+## 11. 根修实施记录（2026-09-13，ministry-works/tcgen05-sf-stride-fix）
+
+§10「需要 scale 平面物理行 stride 与逻辑 `k/32` 解耦」已实施。**数值不变，只改地址**。
+
+**不变量（新）**：专家 e8m0 scale 平面的**物理行 stride 与 16 对齐**：
+`physical = align16(padded_inter(inter/world)/32)`（production：10 → 16）。
+逻辑索引宽度仍是 `k/32 = 10`，内核只读每行前 10 字节，pad 区不读、不参与任何 dot。
+
+**两侧公式（必须一致，同一环境变量驱动）**：
+- Rust（布局 + 门）：`weights::sf_plane_pitch(logical)` / `weights::sf_pitch_plane(name, shard)`
+  （只对 `Shard::ExpertCols` 的 `.scale` 即 `w2.scale` 生效；`w1/w3.scale` 的 `dim/32` 由
+  `check_bulk_geometry` 的 `nsf` 硬门保证已是 16 倍数，不动）
+- `.cu`（寻址）：`dsv41_sf_pitch(k) = align16(k >> 5)`，launcher 计算后作为 **kernel 参数**
+  显式传入，所有 scale 读点用 `b_sf_pitch` / `w2s_pitch`，不再写 `k>>5`。
+  `k` 是内核自己的 reduction dim：down 方向 = K_ATOM 补齐后的 `inter/world`（320 → 16，即本修复），
+  gate/up = `dim`（5120 → 160，无变化）。
+
+**env-gate**：`DSV41_SF_STRIDE_PAD`（默认 **ON**，= 只要不是以 `0` 开头；`=0` 是逃生门，
+两侧同时回退到旧的 10 字节布局，用于 A/B 定位）。这是 bug fix 不是优化，所以默认开。
+
+**ABI 未变**：所有 `extern "C"` 入口签名不变（pitch 由 `.so` 内部从已有的 `k` 计算并传给
+*kernel*），因此 `chain_dev.rs`、`device.rs` 调用点、`kernels/cuda/tests_*.cu` 全部无需改动。
+
+**代价**：每专家 w2.scale 平面 51200 → 81920 B（+30720 B/专家），
+≈ +484 MB/rank（+1.2% of 38.6 GiB/rank）。
+
+**复验**：`cargo check --workspace --all-targets` EXIT=0；`cargo test -p ferrite-models --lib
+dsv41::weights` 10/10。GPU 复验见交付报告（`[align]` 应打印 `pitch=16 pitch%16=0 row1&15=0`）。

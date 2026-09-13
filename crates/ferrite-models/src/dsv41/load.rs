@@ -23,6 +23,9 @@ use crate::dsv41::device::{DevBuf, Device};
 use crate::dsv41::weights::{
     check_bulk_geometry, gateup_ilv, local_shape, tensor_specs, SafetensorsIndex, Shard, TensorSpec,
 };
+// the SF-pitch half of the pool layout: `sf_pitch_plane` / `sf_plane_pitch` /
+// `sf_stride_pad` (the w2 10-byte-row fix, see `plan_pitch` below)
+use crate::dsv41::weights;
 
 /// Tensors whose consumer is a bf16 tensor-core GEMM: they stay bf16 verbatim.
 /// Everything else that arrives as bf16 is widened to f32 on the way in —
@@ -75,6 +78,13 @@ fn dtype_size(dt: &str) -> usize {
 pub struct TensorPlan {
     pub local: Vec<usize>,
     pub bytes: usize,
+    /// PHYSICAL row stride in bytes. Equal to `local[1..]*esz` for every plane
+    /// except the expert e8m0 plane this fix re-pitches (`w2.scale`:
+    /// `sf_plane_pitch(10) = 16`), where the rows are laid out wider than the
+    /// kernel's logical `k/32` indexing width — see
+    /// [`crate::dsv41::weights::sf_plane_pitch`] and
+    /// docs/agent/tcgen05-rank7-verdict.md §10.
+    pub pitch: usize,
     pub dtype: String,
     pub shard: String,
     pub begin: u64,
@@ -138,6 +148,28 @@ pub fn align_audit() -> bool {
 /// report has to use to be actionable at the call site.
 const ALIGN_PLANES: [&str; 6] = ["w1", "w1.scale", "w3", "w3.scale", "w2", "w2.scale"];
 
+/// The PHYSICAL row stride of one planned plane, in bytes.
+///
+/// Identity for every tensor in the model except the ONE plane the SF-pitch fix
+/// re-pitches: the routed experts' `w2.scale` (`Shard::ExpertCols` + `.scale`),
+/// whose logical row is `padded_inter(inter/world)/32 = 10` bytes at the
+/// production shape and whose physical row becomes
+/// [`weights::sf_plane_pitch`]`(10) = 16`. The pad bytes are never read (the
+/// kernels index the first `k/32` bytes of each row) and take no part in any
+/// dot-product, so the numerics are untouched — only the addresses move.
+///
+/// The `.cu` mirrors this with one formula, `dsv41_sf_pitch(k) = align16(k >> 5)`
+/// (`kernels/cuda/dsv41_experts_mxf4.cu`), driven by the same
+/// `DSV41_SF_STRIDE_PAD` variable; `DSV41_ALIGN_AUDIT=1` prints the physical
+/// pitch at load time so the two sides are comparable in one run.
+fn plan_pitch(name: &str, shard: &Shard, logical_pitch: usize) -> usize {
+    if weights::sf_pitch_plane(name, *shard) {
+        weights::sf_plane_pitch(logical_pitch)
+    } else {
+        logical_pitch
+    }
+}
+
 /// `DSV41_ALIGN_AUDIT=1` (`load_expert_pool`): print the 16B-grid position of
 /// every operand a tcgen05 / `cp.async.bulk` arm will derive from this layer's
 /// pool, and report every violation it finds.
@@ -178,8 +210,12 @@ fn audit_expert_pool(
     let mut bad: Vec<String> = Vec::new();
     for (k, name) in ALIGN_PLANES.iter().enumerate() {
         let p = &plans[k]; // expert 0's plan for this plane
-        let esz = p.esz();
-        let pitch = p.local.get(1..).map(|d| d.iter().product::<usize>()).unwrap_or(1) * esz;
+        // PHYSICAL row stride (bytes) — what the pool actually laid out, which
+        // for `w2.scale` is `sf_plane_pitch(10) = 16` after the fix (it used to
+        // be the logical 10, and that WAS the reported violation). `p.pitch` is
+        // the one number the `.cu`'s `dsv41_sf_pitch(k)` has to agree with.
+        let pitch = p.pitch;
+        let logical = p.local.get(1..).map(|d| d.iter().product::<usize>()).unwrap_or(1) * p.esz();
         // interleaved: w3 shares w1's doubled region, so the kernel reads it at
         // offset 0 — report what the kernel will use, not the plan's own slot
         let off = if ilv && k == 2 { 0 } else { poff[k] };
@@ -192,7 +228,7 @@ fn audit_expert_pool(
         let row1 = (base_usize + off + pitch) & 0xF;
         eprintln!(
             "[align] L{layer} r{rank} e0 {name:<9} base&15={a} worst_base&15={worst} \
-             stride%16={} pitch={pitch} pitch%16={pitch_rem} row1&15={row1}",
+             stride%16={} pitch={pitch} pitch%16={pitch_rem} row1&15={row1} logical_pitch={logical}",
             block % 16
         );
         if a != 0 || worst != 0 {
@@ -207,7 +243,7 @@ fn audit_expert_pool(
             bad.push(format!(
                 "L{layer} {name}: row pitch {pitch} B is not a multiple of 16 (row 1 starts \
                  {row1} B off the grid) — every row past the first of this plane is \
-                 unaddressable by the bulk/uint4 paths"
+                 unaddressable by the bulk/uint4 paths (DSV41_SF_STRIDE_PAD=0 restores this)"
             ));
         }
     }
@@ -611,10 +647,18 @@ impl<'a> Loader<'a> {
         };
         let local = local_shape(&Dsv41Config::production(), &spec_full, world, 0);
         let widen = h.dtype == "BF16" && !KEEP_BF16.iter().any(|k| spec.name.ends_with(k));
-        let bytes = local.iter().product::<usize>() * if widen { 4 } else { dtype_size(&h.dtype) };
+        let esz = if widen { 4 } else { dtype_size(&h.dtype) };
+        // LOGICAL row width = the kernel's `k/32` indexing width (or `k/2` for a
+        // packed fp4 plane), PHYSICAL row stride = the same unless this is the
+        // one expert plane the SF-pitch fix re-pitches.
+        let logical_pitch = local.get(1..).map(|d| d.iter().product::<usize>()).unwrap_or(1) * esz;
+        let physical_pitch = plan_pitch(&spec.name, &spec.shard, logical_pitch);
+        let rows = local.first().copied().unwrap_or(1);
+        let bytes = rows * physical_pitch;
         Ok(TensorPlan {
             local,
             bytes,
+            pitch: physical_pitch,
             dtype: h.dtype.clone(),
             shard: self.index.get(&spec.name).unwrap().clone(),
             begin: h.begin,
@@ -663,9 +707,14 @@ impl<'a> Loader<'a> {
         match plan.shard_rule {
             Shard::Cols | Shard::ExpertCols => {
                 let per = inner / world;
+                // DESTINATION pitch is the PHYSICAL row stride (== local[1]*esz
+                // for every plane but `w2.scale`, which is laid out 16 B/row —
+                // see `plan_pitch`). The SOURCE pitch stays the checkpoint's
+                // `per*esz`: the real bytes land at the start of each wide row
+                // and the 6 B tail keeps the zero it was allocated with.
                 self.dev.upload_from_2d(
                     target,
-                    plan.local[1] * esz,
+                    plan.pitch,
                     data.wrapping_add(rank * per * esz) as *const std::ffi::c_void,
                     row_bytes,
                     per * esz,
@@ -673,6 +722,11 @@ impl<'a> Loader<'a> {
                 )?;
             }
             _ => {
+                debug_assert_eq!(
+                    plan.pitch, row_bytes,
+                    "{}: a row-sharded plane must keep its contiguous layout",
+                    plan.shard
+                );
                 self.dev.upload_from(
                     target,
                     data.wrapping_add(row0 * row_bytes) as *const std::ffi::c_void,
@@ -786,6 +840,22 @@ impl<'a> Loader<'a> {
         debug_assert_eq!(block % ALIGN, 0);
         debug_assert!(poff.iter().all(|o| o % ALIGN == 0));
         debug_assert!(block * n_routed >= total);
+        // The SF-pitch invariant (the 2026-09-13 fix): with DSV41_SF_STRIDE_PAD
+        // ON every plane's PHYSICAL row stride is a 16 B multiple, which is what
+        // lets `pool + e*block + poff[k] + row*pitch` stay on the grid for EVERY
+        // row (`w2.scale` used to be 10 B). The `.cu` addresses the same stride
+        // (`dsv41_sf_pitch(k) = align16(k >> 5)`), so a violation here would be a
+        // silent wrong answer there — hence the assert, not a comment.
+        for (k, name) in ALIGN_PLANES.iter().enumerate() {
+            if weights::sf_stride_pad() {
+                debug_assert_eq!(
+                    plans[k].pitch % 16,
+                    0,
+                    "{name}: physical row pitch {} is off the 16B grid",
+                    plans[k].pitch
+                );
+            }
+        }
         // one allocation; BOTH the K padding and the alignment padding are zero
         let pool_bytes = (block * n_routed).max(1);
         let pool = self.dev.alloc(pool_bytes)?;

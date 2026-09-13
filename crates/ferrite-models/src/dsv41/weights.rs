@@ -461,6 +461,70 @@ pub fn padded_inter(n: usize) -> usize {
 /// docs/agent/tcgen05-tma-bulk-align-design.md.
 pub const BULK_ALIGN: usize = 16;
 
+/// `DSV41_SF_STRIDE_PAD` — the **w2 SF row-pitch fix**, DEFAULT **ON**.
+///
+/// ON (unset, or any value but `0`): an expert **e8m0 scale plane** whose
+/// logical row is `k/32` bytes gets a PHYSICAL row stride rounded UP to the
+/// 16 B grid ([`sf_plane_pitch`]). At the production shape w2's plane is
+/// `padded_inter(inter/world)/32 = 10` bytes per row, so row 0 was aligned and
+/// every row after it started `10 * r mod 16 != 0` bytes off the grid — the ONE
+/// violation `DSV41_ALIGN_AUDIT=1` reported identically on 8/8 ranks, and the
+/// adjudicated root cause of the tcgen05 `cuda error 716` (misaligned address)
+/// at the first prefill (`docs/agent/tcgen05-rank7-verdict.md` §3/§10).
+///
+/// This is a BUG FIX, not an optimisation, so the default is ON. `=0` is the
+/// escape hatch: it restores the historical (broken) layout so the fix can be
+/// A/B'd against it in one process. Both layouts are numerically identical —
+/// the padding bytes are never read by a kernel and take no part in any
+/// dot-product; only the ADDRESSES move.
+///
+/// ⚠️ MUST agree with the `.cu` side, which reads the SAME variable once per
+/// process (`dsv41_sf_stride_pad_enabled()` / `dsv41_sf_pitch()` in
+/// `kernels/cuda/dsv41_experts_mxf4.cu`, mirror of [`sf_plane_pitch`]): one env
+/// var, one formula (`align16(k >> 5)`), so the loader's layout and the
+/// kernels' addressing can never drift. A disagreement would be a SILENT wrong
+/// answer (rows read 6 bytes early), which is exactly the class of failure this
+/// fix removes.
+pub fn sf_stride_pad() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_SF_STRIDE_PAD").map(|v| v != "0").unwrap_or(true))
+}
+
+/// The PHYSICAL row stride, in bytes, of an expert e8m0 scale plane whose
+/// LOGICAL row is `logical_pitch` bytes wide (one byte per `k/32` scale column,
+/// so bytes == scale columns here).
+///
+/// This is the whole fix: the row stride is DECOUPLED from the logical `k/32`
+/// the kernels index. The logical width stays what the kernel's arithmetic
+/// wants (`sc[row * k/32 + kblock]`), the physical width becomes 16 B-aligned so
+/// that `pool + e*block + poff[k] + row*pitch` lands on the 16 B grid for EVERY
+/// row, which is what `cp.async.bulk*`, `LDG.128` and every `uint4` operand path
+/// require. At the production shape: 10 -> 16.
+///
+/// `DSV41_SF_STRIDE_PAD=0` returns `logical_pitch` unchanged (the historical
+/// layout). See [`sf_stride_pad`].
+pub fn sf_plane_pitch(logical_pitch: usize) -> usize {
+    if sf_stride_pad() {
+        logical_pitch.div_ceil(BULK_ALIGN) * BULK_ALIGN
+    } else {
+        logical_pitch
+    }
+}
+
+/// True for the ONE family of expert planes this fix re-pitches: a `.scale`
+/// plane that is `Shard::ExpertCols`, i.e. `w2.scale` — the routed down
+/// projection's e8m0 plane, whose columns are the TP-split `inter` axis. It is
+/// the only plane in the expert pool whose logical row width is not already a
+/// multiple of 16 (`padded_inter(inter/world)/32 = 10`), so it is the only one
+/// that needs a padded physical stride.
+///
+/// The `Shard::ExpertRows` scale planes (`w1.scale`, `w3.scale`) keep their
+/// `dim/32` pitch, which [`check_bulk_geometry`] independently pins to a
+/// multiple of 16 (the `nsf = dim/32` check is a HARD load-time error).
+pub fn sf_pitch_plane(name: &str, shard: Shard) -> bool {
+    shard == Shard::ExpertCols && name.ends_with(".scale")
+}
+
 /// The pool geometry the bulk paths depend on, checked ONCE per model at LOAD
 /// time. A config that cannot be bulk-addressed must fail here (seconds) rather
 /// than at the first prefill (191 ms in, with a detached err 716 and no kernel
@@ -497,42 +561,60 @@ pub fn check_bulk_geometry(cfg: &Dsv41Config, world: usize) -> Result<()> {
     // w2's e8m0 plane is `[dim, padded_inter(inter/world)/32]` — 10 bytes per row
     // at the production shape (9 real + 1 pad), and `10 % 16 = 10 != 0`. The
     // FIRST row is still 16B-aligned (the plane base is), but every row r > 0
-    // starts at `base + r*10`, i.e. OFF the 16B grid — exactly the class of
-    // pointer the bulk/`uint4` operand paths cannot address. It is the only
+    // would start at `base + r*10`, i.e. OFF the 16B grid — exactly the class of
+    // pointer the bulk/`uint4` operand paths cannot address. It was the only
     // non-16B row pitch the earlier checks did not cover.
     //
+    // FIXED 2026-09-13 (`docs/agent/tcgen05-rank7-verdict.md` §10): the physical
+    // stride is now DECOUPLED from the logical `k/32` the kernels index —
+    // `sf_plane_pitch(padded_inter(inter/world)/32)` rounds the row up to the
+    // 16 B grid (10 -> 16) and `load.rs` lays the plane out that way, so this
+    // gate now asserts the NEW invariant instead of warning about the old defect.
+    //
     // It is also RANK-SYMMETRIC: `padded_inter(inter/world)` is the same on every
-    // rank, so this cannot produce a rank-specific fault (it is the first
-    // suspect for the "all 8 ranks fault together" shape, which the per-rank ack
+    // rank, so it never produced a rank-specific fault (it is the first suspect
+    // for the "all 8 ranks fault together" shape, which the per-rank ack
     // reporting in `serve.rs::broadcast` now distinguishes from a rank-local
     // one). Rank-specific faults are impossible from uniform sharding anyway
     // (`base_r = r*per`, and an aligned `per` gives aligned `base_r` for every
     // r) — see the alignment audit in `load.rs` (`DSV41_ALIGN_AUDIT=1`).
-    let sf_row = padded_inter(inter_local) / 32;
-    if sf_row % BULK_ALIGN != 0 {
-        let msg = format!(
-            "w2 SF row pitch padded_inter(inter/world)/32={sf_row} is not 16B \
-             (needs padded_inter(inter/world) % 512 == 0, i.e. the K_ATOM=64-padded \
-             inter/world must ALSO be a multiple of 512); rows past the first of w2's \
-             e8m0 plane start off the 16B grid"
-        );
-        if align_strict() {
-            bad.push(msg);
-        } else {
-            // env-gate: WARN by default so the shipped shape still loads;
-            // DSV41_ALIGN_STRICT=1 turns it into a load-time error. The project
-            // rule is that a new gate defaults OFF (the code stays, the behaviour
-            // does not change until it is asked for).
-            eprintln!(
-                "[align] bulk-geometry WARN: {msg} \
-                 (set DSV41_ALIGN_STRICT=1 to make this a load-time error)"
-            );
-        }
-    }
+    //
+    // With the pad ON (default) this can no longer fail: the check is kept so
+    // that `DSV41_SF_STRIDE_PAD=0` — the escape hatch — still gets the loud
+    // load-time warning the fix replaced.
+    let sf_cols = padded_inter(inter_local) / 32; // LOGICAL (what the kernel indexes)
+    let sf_pitch = sf_plane_pitch(sf_cols); // PHYSICAL (what the pool lays out)
+    assert_sf_pitch(sf_pitch, sf_cols, align_strict(), &mut bad);
     if bad.is_empty() {
         Ok(())
     } else {
         Err(FerriteError::Config(format!("bulk-geometry: {}", bad.join("; "))))
+    }
+}
+
+/// The w2-SF half of [`check_bulk_geometry`], split out so the escape-hatch
+/// (`DSV41_SF_STRIDE_PAD=0`) behaviour is testable and readable in one place:
+/// with the pad ON the physical stride is 16B by construction and this can never
+/// fire; with it OFF the historical 10-byte pitch comes back and the old
+/// WARN/STRICT handling has to stay in force.
+fn assert_sf_pitch(pitch: usize, cols: usize, strict: bool, bad: &mut Vec<String>) {
+    if pitch % BULK_ALIGN == 0 {
+        return;
+    }
+    let msg = format!(
+        "w2 SF row PHYSICAL pitch {pitch} is not 16B (logical padded_inter(inter/world)/32={cols}); \
+         rows past the first of w2's e8m0 plane start off the 16B grid. The fix is \
+         DSV41_SF_STRIDE_PAD (default ON, a BUG FIX) — it is only unset because this run \
+         set DSV41_SF_STRIDE_PAD=0 to restore the historical layout"
+    );
+    if strict {
+        bad.push(msg);
+    } else {
+        // escape-hatch leg: WARN by default so the historical shape still loads;
+        // DSV41_ALIGN_STRICT=1 turns it into a load-time error.
+        eprintln!(
+            "[align] bulk-geometry WARN: {msg} (set DSV41_ALIGN_STRICT=1 to make this a load-time error)"
+        );
     }
 }
 
@@ -1016,25 +1098,38 @@ mod tests {
         }
     }
 
-    /// `check_bulk_geometry` must pass on the shipped shape (the new w2-SF row
-    /// pitch is a WARN there, not an error) and must still reject a config whose
-    /// `nsf` row pitch is off the 16B grid. The SF check is the one that used to
-    /// be missing: w2's e8m0 plane is `padded_inter(inter/world)/32 = 10` bytes
-    /// per row at the production shape, so every row past the first is off the
-    /// 16B grid — a fact the gate now names at load time.
+    /// `check_bulk_geometry` must pass on the shipped shape and must still
+    /// reject a config whose `nsf` row pitch is off the 16B grid. The w2-SF
+    /// pitch is the one this gate used to miss: w2's e8m0 plane is
+    /// `padded_inter(inter/world)/32 = 10` bytes per row at the production
+    /// shape, so every row past the first was off the 16B grid. Since the
+    /// 2026-09-13 fix the PHYSICAL stride is `sf_plane_pitch(10) = 16`, i.e. the
+    /// invariant the gate now asserts holds by construction.
     #[test]
     fn bulk_geometry_covers_w2_sf_row_pitch() {
         let cfg = Dsv41Config::production();
         // production: dim/32 = 160 (%16 == 0) and padded_inter(288) = 320 (%16 == 0),
-        // so only the NEW w2-SF pitch (320/32 = 10) is off the grid — and that one
-        // is a WARN unless DSV41_ALIGN_STRICT=1 (a OnceLock env read, so the strict
-        // arm cannot be exercised in-process).
+        // so the w2-SF row is the only pitch that ever needed padding — and it no
+        // longer does, see below.
         assert!(check_bulk_geometry(&cfg, 8).is_ok(), "production shape must load");
-        if !align_strict() {
-            let inter_local = cfg.moe_inter_dim / 8;
-            let sf_row = padded_inter(inter_local) / 32;
-            assert_eq!(sf_row, 10, "w2 SF row pitch at the production shape");
-            assert_ne!(sf_row % BULK_ALIGN, 0, "…and it IS off the 16B grid");
+        let inter_local = cfg.moe_inter_dim / 8;
+        let sf_cols = padded_inter(inter_local) / 32;
+        assert_eq!(sf_cols, 10, "w2 SF LOGICAL row pitch at the production shape");
+        if sf_stride_pad() {
+            // the fix (default ON): the physical stride is on the 16B grid, so
+            // every row of the plane — not just row 0 — is addressable by the
+            // bulk/uint4 paths. This is the invariant the gate asserts.
+            assert_eq!(sf_plane_pitch(sf_cols), 16, "w2 SF PHYSICAL stride");
+            assert_eq!(sf_plane_pitch(sf_cols) % BULK_ALIGN, 0);
+            // the mirror of the `.cu`'s `dsv41_sf_pitch(k) == align16(k >> 5)`
+            // with k = the K_ATOM-padded inter/world the launchers receive.
+            let k = padded_inter(inter_local);
+            assert_eq!(sf_plane_pitch(k / 32), 16, "…and equals the .cu's formula");
+        } else {
+            // escape hatch: DSV41_SF_STRIDE_PAD=0 restores the historical layout,
+            // where the gate falls back to the WARN it used to print.
+            assert_eq!(sf_plane_pitch(sf_cols), 10);
+            assert_ne!(sf_plane_pitch(sf_cols) % BULK_ALIGN, 0);
         }
 
         // a config whose dim/32 is not a 16B multiple still fails hard, with or
@@ -1043,5 +1138,38 @@ mod tests {
         bad.dim = 6016; // nsf = 188, 188 % 16 = 12
         let e = check_bulk_geometry(&bad, 8).unwrap_err().to_string();
         assert!(e.contains("nsf=dim/32=188"), "{e}");
+    }
+
+    /// The pitch decoupling touches exactly ONE plane family (`w2.scale`) and
+    /// leaves every other expert plane's row width alone — the property the
+    /// `.cu`'s single `dsv41_sf_pitch(k)` formula relies on. `w1/w3.scale` are
+    /// `dim/32` (pinned to 16B by the `nsf` check above) and both fp4 weight
+    /// planes are `k/2`, which `padded_inter` already makes a multiple of 32.
+    #[test]
+    fn only_w2_scale_needs_a_padded_row_pitch() {
+        let cfg = Dsv41Config::production();
+        let specs = tensor_specs(&cfg, 8);
+        let find = |n: &str| specs.iter().find(|s| s.name == n).unwrap().clone();
+        // the plane the fix re-pitches
+        let w2s = find("layers.6.ffn.experts.0.w2.scale");
+        assert!(sf_pitch_plane(&w2s.name, w2s.shard));
+        assert_eq!(local_shape(&cfg, &w2s, 8, 0), vec![5120, 10], "logical, unchanged");
+        assert_eq!(sf_plane_pitch(10), if sf_stride_pad() { 16 } else { 10 });
+        // …and none of the others
+        for n in [
+            "layers.6.ffn.experts.0.w1.scale",
+            "layers.6.ffn.experts.0.w3.scale",
+            "layers.6.ffn.experts.0.w1.weight",
+            "layers.6.ffn.experts.0.w2.weight",
+            "layers.6.ffn.experts.0.w3.weight",
+        ] {
+            let s = find(n);
+            assert!(!sf_pitch_plane(&s.name, s.shard), "{n} must keep its pitch");
+            let cols = local_shape(&cfg, &s, 8, 0)[1];
+            assert_eq!(cols % BULK_ALIGN, 0, "{n}: local row width {cols} is already 16B");
+        }
+        // a non-expert scale plane (attention) is not in this family either
+        let attn = find("layers.6.attn.wq_a.scale");
+        assert!(!sf_pitch_plane(&attn.name, attn.shard));
     }
 }
