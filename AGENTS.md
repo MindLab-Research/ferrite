@@ -91,6 +91,20 @@ LD_LIBRARY_PATH=$HOME/ferrite/kernels/cuda ./target/release/ferrite-serve --back
 | `DSV41_SF_STRIDE_PAD=0` | w2 SF 根修逃生门（默认 ON） | — |
 | `DSV41_AR_PROBE=1` + site 分流 | AR device 探针（attn/moe 分桶符号 `ferrite_p2p_ar_v5_attn/_moe`） | 无 |
 
+## 性能基准与"击败 sglang"（2026-09-14 用户指令，必读）
+
+**参考**：`https://www.sglang.io/blog/deepseek-v4.1-flash-kernel-optimization`
+（同族模型 DSV4.1-Flash 的 kernel 优化，**35.2 → 873.6 tok/s**，4×GB300、BS=1、attention TP4 + MoE TP4、
+random 4k/1k、**模拟 accept 5.5**）。**详情与 16 步阶梯见 `docs/agent/moe-bs-crash-investigation.md` §97/§98。**
+
+**三条必须记住的**：
+1. **可比性折算**：他们 4 卡、我们单机 8 卡 ⇒ 只比**每 GPU**。plain decode 他们 **50.8**、我们 **14.0**（落后 3.6×）；
+   我们的 400 目标仅为其全优化态（218.4/GPU）的 **23%** ⇒ **400 是必经里程碑，不是终点**。
+2. **他们的第一条教训与我们同源**："确认一个 GEMM 实际 dispatch 到哪个 kernel，通常比调 tile 更值钱"
+   —— 他们只修 **FP8 量化块/scale 布局**就从 35→118（**3.3×**）。
+3. **测量口径必须固定 accept**（他们都用模拟 5.5；我们当前实测 ~2.24）⇒ 用 `~/bench_protocol.sh`
+   按同口径测（random 4k/1k、固定输出 1024、BS=1、greedy），并**同轮背靠背 A/B、一次一个变量**。
+
 ## 合并纪律（2026-09-14 事故复盘，必守）
 
 1. **合并后必须用项目自身的构建验收**（`bash build.sh 103a`），**不能只靠单文件编译**：
