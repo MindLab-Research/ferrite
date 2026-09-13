@@ -94,5 +94,10 @@ echo "$BUILD_ID" > "$(dirname "$0")/.build_id"
     -o "$OUT" "${SRCS[@]}"
 
 echo "built ${OUT} for sm_${ARCH} from ${SRCS[*]} (build_id ${BUILD_ID})"
-[ ${#SKELETON_FLAGS[@]} -gt 0 ] && \
+if [ ${#SKELETON_FLAGS[@]} -gt 0 ]; then
     echo "  skeleton flags: ${SKELETON_FLAGS[*]} (gated blocks are COMPILED IN; each still needs its runtime env gate)"
+fi
+# Never let a bare [ test ] be the last command: with no skeleton flags it
+# evaluates false and the script would exit 1 AFTER a successful build,
+# which downstream gates read as "build failed" (observed on port-dspark S1).
+exit 0
