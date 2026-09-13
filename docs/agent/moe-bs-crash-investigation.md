@@ -891,3 +891,32 @@ case 2/4 还出现粘性 `misaligned address`）。它是 swapAB 朝向（fp4 �
 
 **注意**：修好之后，**朝向（swapAB）与 SF 字节序（SFREV）都要用受控实验重新判定**（§27），
 因为之前所有基于"全错"文本的结论都是在 B 打包错的条件下得到的。
+
+## §30 packed 几何的独立推导（对 §29 修法的预测，待 subagent 实测校验）
+
+**已知锚点**（都是树内的硬事实）：
+1. 根因（§29）：硬件按 **packed（2 元素/字节）** 读 fp4 操作数，低 nibble = 偶 k。
+2. 官方 W1/W3 子 tile = **8192 B** = 128 行 × **64 B**（K=128 packed）⇒ **无 padding 的稠密 64 B/行**。
+3. 官方给 **W 操作数**的 descriptor（`moe_bs_up_tl.cu:115`，由前一个 subagent 摘出）：
+   **`lbo=1、sbo=64、layout_type=2`（SWIZZLE_128B）**。
+4. 探针实测的硬约束：一个 `scale_vec::1X` K-block（32 元素）= B 侧 **16 字节**。
+
+**推导**：
+- 16 B = 32 个 packed 元素 = **正好一个 K-block** ⇒ **`lbo=1`（16 B）就是 K-block 的步长**，即
+  **连续 K-block 在 smem 里是紧邻的**（row-major packed，行内 4 个 16 B chunk）。
+  ⇒ **K-block 的 descriptor 递进量 = 16 B = 1 unit**（不是 e4m3 那种 32 B，也不是我们之前用的 4096 B）。
+- `sbo=64`（1024 B）：在"2 行占一个 128 B swizzle span"的形态下，8 个 span = **16 行** ⇒
+  **SBO 的语义仍是"行组步长"，但 packed 形态下每个行组是 16 行**（e4m3 形态下是 8 行）。
+- 由此的**预测**：
+  | 参数 | 预测值 |
+  |---|---|
+  | smem 行字节数（K=128） | **64 B** |
+  | LBO | **1 unit（16 B）** |
+  | SBO | **64 units（1024 B）** |
+  | layout_type | **2（SWIZZLE_128B）** |
+  | K-block 递进 | **ki × 16 B（ki × 1 unit）** |
+  | 行内 chunk 置换 | 应在 4 个 16 B chunk 内按行号 XOR（而非 e4m3 的 8 chunk 全 span XOR），因为 64 B 行只占半个 128 B span |
+- **e4m3 侧（A 操作数）不变**：它仍是 1 B/元素、128 B/行，`lbo=1/sbo=64/layout=2`、递进 32 B ✓（§26 已核对）。
+
+**校验方式**：`bs-packed-geometry` subagent 的实测（要求 `const` 稠密 parity **relerr=0** 且 `sweep1d k`
+**128/128**）若与本预测一致 ⇒ 直接落地；若不一致 ⇒ 以实测为准，并回头修正本节的推导（把差异原因记下来）。
