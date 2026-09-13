@@ -4962,12 +4962,14 @@ fn hc_tail_split() -> bool {
                         inter_local as i32,
                         cfg.swiglu_limit,
                     )?;
-                    // op-level diagnostic: the first expert's swiglu'd
-                    // activation sample — kind 8 — splits the gate_up's output
-                    // from the down's contribution to the MoE output.
+                    // op-level diagnostic: the first expert's FULL swiglu'd
+                    // activation — kind 8 — and the RAW gate|up dots (pre-clamp,
+                    // pre-swiglu) as kind 10, splitting the gate_up's dot
+                    // products from the swiglu/down contributions.
                     if slot == 0 && layer == 0 {
                         if let Ok(xdp) = std::env::var("DSV41_GT_XDUMP") {
-                            self.gt_dump_vec(&xdp, 8, self.s.ex_act.ptr, 16)?;
+                            self.gt_dump_vec(&xdp, 8, self.s.ex_act.ptr, 320)?;
+                            self.gt_dump_vec(&xdp, 10, self.s.ex_act.ptr, 64)?;
                         }
                     }
                     self.dev.expert_down_fp4_indirect(
