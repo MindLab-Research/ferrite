@@ -2587,3 +2587,23 @@ compressor 投影 mrows、`ATTN_PROJ_ALIGN` 等**代码已在**，出货脚本�
 - `wo_b`（eager）：`DSV41_WOB_F32` **默认 ON** ⇒ 走 SIMT f32 GEMV，**跳过 fp8 往返**（非 tensor core）⇒ 中等；
 - `idx_wq_b`：TileLang wq_b 在该站 **decline**（`out_stride == n`，`chain_dev.rs:7305-7306`）⇒ 落 SIMT `gemm_fp8_mx_rope`；
 - `comp_wkv/comp_wgate`（eager）：`lin_f32_on` → SIMT f32 GEMV。
+
+## §101 有界等待补丁的形状审读 + **AR 侧代码的独立佐证**（与 §95 互为印证）
+
+主 agent 审读 `bs-wait` worktree 的实现（落地前"写前先读"）：
+- 新增 `whp_mbar_probe(bar, phase)`：把 `mbarrier.try_wait.parity` 的结果**返回给 C**（`selp` 取值），
+  **不再用汇编级 `@!P bra WAIT` 回跳** ⇒ 自旋由 C 侧计数与上限控制 ✓；
+- 超限调用 `whp_mma_timeout_report(...)` 打印诊断（block/k/phase/warpid 状态）✓，冗长转储由
+  `DSV41_MOE_BS_WAITDBG=1` 门控（默认 OFF）✓；
+- 辅助函数带 **`whp_` 唯一前缀** ✓（遵守 AGENTS.md 的合并纪律，避免同名重复定义）；
+- 注释明确"**正常路径不变**"：稳态下首次 `try_wait` 即返回真 ⇒ 每 K 轮只多一次比较+分支 ✓。
+
+### 🎯 独立佐证（价值等同一次实验）
+该 subagent 读 AR 侧代码时发现：**`[ar5-hang] … spins>5000000 TIMEOUT -> PARK` 这行本身是"有界"的**
+（自旋到 5e6 就 PARK ✓）⇒ 它的注释直接写下结论：**"那行是症状：某个 rank 的 kernel 从未返回、stream 从未推进"** ✓
+⇒ **与主 agent 从 kernel 侧读出的 §92/§95 结论完全一致**（两条独立路径、同一结论）：
+> 我们的 kernel 在无界自旋里卡死 ⇒ 其余 rank 在 all-reduce 里等到超时并 PARK ⇒ 刷 `ar5-hang`。
+
+⇒ 这使 §95 的"挂死与非法指令是同一枚硬币"从**推理**升级为**双侧印证** ✓：
+一侧是 kernel 的无界自旋（读 kernel 源码），另一侧是 AR 的有界 PARK（读 AR 源码）。
+**有界等待落地后**，前者会变成一份可读诊断，从而把间歇故障变成可复现的报错 ✓。
