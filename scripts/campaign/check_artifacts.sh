@@ -69,16 +69,27 @@ say "sanity: .so newer than its sources?" \
 # 0 steps with an empty output — one whole wasted round, and easy to misread as a kernel problem. So
 # compare them HERE, before any arm runs: a batch whose two artefacts come from different checks must
 # never reach a measurement.
-SO_ID=$(strings "$SO" 2>/dev/null | grep -oE 'build_id [0-9a-f]+-dirty\+cu[0-9a-f]+' | head -1)
-BIN_ID=$(strings "$BIN" 2>/dev/null | grep -oE 'build_id [0-9a-f]+-dirty\+cu[0-9a-f]+' | head -1)
-if [ -z "$SO_ID" ] || [ -z "$BIN_ID" ]; then
-  say "build-id readable in both artefacts?" "NO (so='$SO_ID' bin='$BIN_ID') — cannot verify; treating as stale"
+# The engine reads the .so's id through the `ferrite_kernel_build_id` symbol and compares it against
+# the binary's embedded `FERRITE_BUILD_ID` (build.rs -> rustc-env), refusing to start on a mismatch.
+# My first attempt grepped for a `build_id …` *prefix*, which never appears — the ids are bare
+# `<sha40>-dirty+cu<hex16>` strings — so the check reported "unreadable" and aborted the batch. Match
+# the SHAPE instead, and fail ONLY when both are readable and differ: the engine remains the enforcer,
+# this is the early warning that saves a wasted round.
+ID_RE='[0-9a-f]{40}-dirty\+cu[0-9a-f]{16}'
+SO_ID=$(strings "$SO" 2>/dev/null | grep -oE "$ID_RE" | head -1)
+BIN_ID=$(strings "$BIN" 2>/dev/null | grep -oE "$ID_RE" | head -1)
+STAMP_ID=$(cat kernels/cuda/.build_id 2>/dev/null | tr -d '\n' | grep -oE "$ID_RE" | head -1)
+say "build-ids (so / binary / stamp file)" "$SO_ID / $BIN_ID / $STAMP_ID"
+if [ -n "$SO_ID" ] && [ -n "$BIN_ID" ] && [ "$SO_ID" != "$BIN_ID" ]; then
+  say "so/binary build-id match" "MISMATCH — engine would refuse to start"
   fail=1
-elif [ "$SO_ID" != "$BIN_ID" ]; then
-  say "so/binary build-id match" "MISMATCH — $SO_ID vs $BIN_ID (engine would refuse to start)"
+elif [ -n "$STAMP_ID" ] && [ -n "$SO_ID" ] && [ "$STAMP_ID" != "$SO_ID" ]; then
+  say ".so vs its .build_id stamp" "MISMATCH — the .so was not built by this tree's build.sh"
   fail=1
+elif [ -z "$SO_ID" ] || [ -z "$BIN_ID" ]; then
+  say "so/binary build-id match" "ids not readable from strings() — relying on the engine's own check"
 else
-  say "so/binary build-id match" "ok ($SO_ID)"
+  say "so/binary build-id match" "ok"
 fi
 
 echo "=== verdict ==="
