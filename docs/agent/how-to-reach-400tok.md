@@ -90,3 +90,22 @@ bash ~/verify_correct.sh 8899 <NAME> # 标准三测（1..100 / 拉丁乱码探�
 3. `DSV41_SWALLOW_STEP=1`（吞主链步）
 4. `DSV41_VERIFY_HEAD_FOLD` / `_SLICED` 的两种组合
 → 目标是让 **1..100 前 61 行 = 1..61**（红线），同时保住 318 tok/s。
+
+### 6.1 权威解释（代码注释原文），决定下一批臂
+
+`sids_writeback()`（`chain_dev.rs:4089+`）的注释写明：write-back 喂的是**更正确的** token（`emitted.last()` =
+verify 的 argmax），它把 **`verify_out` 自身的取值错误放大**成更早的 collapse，因此默认 OFF——**"blocker 是 verify 的值"**
+（"Re-enable once the verify-value fault is fixed"）。**write-back 本身数学上正确**（两次独立复核 ✓）。
+
+⇒ 所以"数字跳跃"= **verify 取值有误**的直接后果 ✓。手写 BS 臂正是跑在 verify 里的 MoE（它坏 ⇒ verify 值错），
+但**若 BS 臂 OFF 后仍跳**，缺口另有来源；默认配置里**与官方不一致**的两处最可疑：
+
+| 候选 | 默认 | 与官方的关系 | 单变量臂 |
+|---|---|---|---|
+| `DSV41_SEQ_ALIGN` | **OFF** | 官方归约按**专家 id 升序**；默认是 legacy 升序 slot ⇒ 顺序不同 ✗ | `=1` |
+| `DSV41_VERIFY_HEAD_SLICED` | **ON** | 只写每行前 `seg` 的词表切片 ⇒ **argmax 落在切片外就取错** ✗ | `=0`（A/B） |
+| `DSV41_SEED_ALIGN` | OFF | 判词路线 A：seed↔tap 对齐 | `=1` |
+| `DSV41_SIDS_WRITEBACK` | OFF | **数学正确**，但会放大 verify 的错值 ⇒ **修好 verify 值之后**再开 | 最后再试 |
+
+**判据**：每个臂都跑 `~/num100.sh <NAME> DSV41_MOE_TILELANG_BS=0 DSV41_MOE_BS_HANDWRITTEN=0 [门]`，
+看 **1..100 前 61 行是否 = 1..61** 且 p50 不退化（当前最好 = 10.17ms / 318 tok/s @acc2.2，带 `VERIFY_GRAPH=1`）。
