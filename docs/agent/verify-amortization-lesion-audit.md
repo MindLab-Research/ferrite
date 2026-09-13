@@ -121,6 +121,20 @@ B1 系三臂的断崖都在 line 52（1..51 正确然后跳 62）+ mean-k 0.64-0
 1. **票面必须用 nsys 时间占比算**（COMP/ENGRAM 高估 10×；ATTN_MROWS 兑现因为 nsys 占 5.1%）。
 2. **mrows 零摊销实锤**（52.1µs/5 行 = 单行 gemv 的 5×）——**MPAR 前一切 mrows 化无时间收益**（gemv-lesion 的前置铁律）；共享专家 480 发/步的折叠（SH 族）也要等 MPAR 回炉后才有效。
 
+**§10.1 env 腿判定修正（2026-09-13 01:55，envchk 臂 + sh-gate-receipts 交付）**：
+- **/proc 回读判死：best 系列的 env 腿完全通**（7 个关键 gate 全在进程：ATTN/COMPRESSOR/HC_DEBUG/HC_FRONT_ROWS/INDEXER/SH_EXP/SH_PAIR 全 =1）。
+- **v6 nsys 轮的 SH 幻影是那个脚本特有的 env 丢失**（nsys 包装的 env 传递问题）——**v6 的 nsys 病灶表是"SH/INDEXER/COMPRESSOR 全关"的口径**：raw hc_mixes 30272 发、480 发共享专家逐行、sparse_attn 3.2× 都是在 gate 没进进程下测的。**病灶时间占比需要按 best 系列（gate 全开）重测**——verify 24.49 的真实构成与 v6 表不同。
+- **[hc-front] 无 note = hc split 在 best 系列成功运行**（off-note 和 declined-note 都没打）——**hc 的 −3ms 可能已在 best1 的 −1.14ms 里部分兑现**（v6/第四刀的 env 断裂才走 raw）。hc0 对照臂（HC_FRONT_ROWS=0 显式关）在跑，将给出 hc 的精确贡献。
+- **教训**：任何 nsys/A/B 脚本必须带 `/proc/<pid>/environ` 回读断言（已加入 ab_best.sh）；nsys 包装的 env 传递（`env -u X ... nsys profile ...`）与直接 env 的差异是幻影门温床。
+
+**§10.2 AR_SAFE 口径的 head 放大（proj-head-lesion 判决，读 nsys 表必带修正）**：
+- **三处词表切片（eager/verify/draft head slice）全部以 `uses_v5()` 为必要条件**（chain_dev.rs:6112/:7109/:1925、dspark_dev.rs:3252）——AR_SAFE（AR_V5=0）下 head **每次 launch 读全量 1.323GB** 而非 165MB 切片（**8× 放大**）。
+- v6 表的 head 族 6.3%（gemv_bf16 3.8% + v1_mrows 2.5%）**不是生产口径**——生产（v5 ON）下缩到 ~1/8。**wo_a_grouped / gemm_fp8 / v2 不受影响**。
+- wo_a_grouped<5> 4.5%（2.49ms/步）：verify 40 发 grid 仅 128×1（<148 SM）——latency/占用率病（72GB/s ≈ 1% 峰值）；修法 = nwarps 可调（:7234 写死 8）+ WO_PAIR 未接 mrows。
+- gemv_bf16_v1_mrows<5>（draft head 1.36ms）：AR_SAFE 下未切片 1.323GB/发；摊薄失效根因 = f32 激活 2× 权重字节 + 行重读。
+- VERIFY_HEAD_MROWS 在 v6 轮也 env 断（v1 逐行 6 发/步为证）。
+- draft 4 投影走 16-row tile（69% 浪费，m=5 用 16 行）→ ATTN_PROJ_ALIGN 转 mrows（需与 WOB_F32 同开 + 双门禁）。
+
 **双门禁**：每个优化臂必须同时报告 `step_ms`（[dspark] 分解）**AND** `mean-k`（A0 基线 1.34；掉了 = 数值回归，立即弃用该 gate）。
 
 1. **重编**：subagent 交付的 .cu/chain_dev 改动 → `build.sh 103a` + `cargo build --release`（双产物）+ 符号三证。
