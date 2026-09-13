@@ -2401,3 +2401,28 @@ AGENTS.md 已明写"nsys 轮只看 kernel 相对倍数（AR 形态已变），�
 或 commit 与实际 MMA 不匹配）。这一点很重要：**有界等待落地后，挂死会变成一份可读诊断**
 （`k`、期望相位、mbarrier 状态），从而**暴露 MMA 未到达的真实原因**——而不是像现在这样只表现为 serve 卡死 +
 其它 rank 刷 `ar5-hang`。**这是把"间歇挂死"变成"可定位故障"的关键一步。**
+
+## §95 挂死与"非法指令"是同一枚硬币（据 §92/§94 的结构性推理）
+
+读 MMA 发射段（`moe_bs_handwritten.cu:748-782`）：
+```c
+for (int ki = 0; ki < 4; ++ki) {
+    ...
+    if (lane == 0) {            // 单线程发射
+        /* tcgen05.mma ... */
+    }
+}
+if (lane == 0) { hw_tc_commit(mma_bar); }     // 紧随其后，同一 warp
+```
+⇒ **发射与 commit 结构上严格配对**（每轮 k 各 4 次 MMA + 1 次 commit），**不存在"跳过 MMA 却照常等待"** ✓
+（§94 已确认相位与配对也正确）⇒ §94 的"MMA 未到达"只剩一种来源：**MMA 执行本身出错**。
+
+而本项目**已独立知道**：本 kernel 的真实错误类型是 **illegal instruction**（"illegal memory access" 是
+context poisoning 的二级效应，见 §57 的更正 + 早前的 SYNC-DIAG 结论）：
+> **MMA 非法指令 ⇒ 不 arrive ⇒ `try_wait` 永假 ⇒ tid 0 无界自旋、其余线程堵在 `__syncthreads` ⇒
+> 内核永不返回 ⇒ serve 卡死 ⇒ 其它 rank 在 all-reduce 里超时刷 `ar5-hang`。**
+
+⇒ **两个此前的谜题（"间歇挂死"与"illegal instruction"）应视为同一故障的两个侧面**，
+而**有界等待 + 诊断**（§92 的修复）正是让这个故障**可定位**的关键：
+它会把"卡死"变成"打印 `k`/期望相位/mbarrier 状态后返回"，从此外层能拿到真实 CUDA 错误
+（`cudaGetLastError` 的 illegal instruction），把间歇性变成可复现。
