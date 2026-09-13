@@ -1280,3 +1280,60 @@ hw_tc_cp(hw_make_sf_desc(SFB_sh), SF_tmem + 4);   // B 操作数的 SF
 `n_tile*64` 与 W1/W3 半区的对应）；
 ② **K 组 `k` 与逐迭代重写 tile 的同步**（我们 k = 0..39，每轮原地重写；SF 的 `k` 必须与 tile 的 `k` 同源）；
 ③ **朝向**（U 回合在测；但注意官方 a8b4/a4b8 **两朝向都 PASS** ⇒ 朝向差异必然来自我们自己的 swapAB 实现）。
+
+# 🎯🎯 §47 【定谳】fp4 操作数的真实 smem 语义：**packed 数据 + 16 B 容器只用前 8 B**
+
+由 subagent `bs-packed-geometry` 在硬件上**精确定标**（`max|D-ref| = 0`、`relerr = 0`，不是"更小"）得出，
+并**同时调和了 §29（packed）与 §43（unpacked）两派看似矛盾的结论**——它们是同一个布局的两面。
+
+## 真实语义（三条实测事实）
+1. **数据是 packed**：硬件每个字节吃 **2 个 4-bit 元素**（**低 nibble = 偶 k、高 nibble = 奇 k**，
+   由 nibble 全随机的稠密 `random` 用例**精确 PASS** 独立证实）。
+2. **但放在 16 B 容器里、只用前 8 B**：TMA dtype `16U4_ALIGN16B` 的字面含义 =
+   **16 个 4-bit 元素 = 8 B 数据 / 16 B 容器**。实测：把单字节写到 fp4 操作数的**原始 smem 偏移**上扫 0..1023，
+   **SW128（`lbo=1,sbo=64,layout=2`）与 SWIZZLE_NONE（`lbo=8,sbo=16`）两族描述符都只读每个 16 B 槽的 `0-7` 字节**，
+   `8-15` **从不被读**。
+3. ⇒ 一行 64 个 packed 字节折成 **8 个容器 = 128 B footprint**；128 行 = **16384 B** ——
+   **与官方每 stage 的 fp4 smem 尺寸完全一致**，也解释了官方 `ki*32` 对 A/B **都用 32 B**：
+   一个 MMA 消费 **2 个槽**（A：2×16 B = 32 个 e4m3；B：2×8 B = 16 B = 32 个 packed fp4），K 对两边都是 32，自洽。
+
+## 正确配置（推荐：**保持官方描述符不变，只改写公式**）
+```c
+// p = 行内 packed 字节下标 [0,64)；c = 16 B 容器下标 [0,8)
+__device__ __forceinline__ int hw_pack_sw128(int row, int p) {
+    const int c = (p >> 3) & 7;
+    return (row >> 3) * 1024 + (row & 7) * 128 + (((c ^ (row & 7)) & 7) << 4) + (p & 7);
+}
+```
+- **描述符保持 `lbo=1(16 B) / sbo=64(1024 B) / layout_type=2(SW128)`**（= 官方原值，**不改**）
+- **K-block 递进保持 `ki*32 B`**（= 官方原值，**不改**）；idesc 不动；smem 占用也不变（仍 16384 B/操作数）
+- staging：把**源 packed 字节原样**写到 `hw_pack_sw128(row, p)` ✓
+
+**备选（V-canonical）**：写公式 `(p>>4)*4096 + (row>>3)*256 + (row&7)*16 + (((p>>3)&1)*128) + (p&7)`，
+描述符 `lbo=8(128 B)/sbo=16(256 B)/layout_type=0`，递进 `ki*4096 B` —— 同样**精确 PASS**。
+
+## 实测对照（同一仪器，稠密 random）
+| 写入方式 | relerr | 判据 |
+|---|---|---|
+| **hw_pack_sw128 + 官方描述符** | **0** | **PASS** ✓（推荐） |
+| **hw_pack_canon + canonical 描述符** | **0** | **PASS** ✓ |
+| unpacked（即我们此前的写法） | 1.491 | FAIL |
+| v1（`hw_pack_idx`） | 1.031 | FAIL |
+| 候选 D（`lbo=1/sbo=32/layout=4`） | 0.4569 | FAIL |
+| 稠密行 `row*64+col` | — | FAIL |
+其它判据：`const`（BSB=0x02 与 0x22）、`sfprobe`（期望 2720）、`random_sf` 全部 `relerr≈0`；
+`sweep1d k/m/n` 各 **128/128**；冲激 A/B 各 **36/36**。
+
+## ⚠️ 方法论教训（重要）
+- **`const` 对 K-block 递进是盲的**（均匀数据下 `BSADV` 从 8 到 256 单位都 PASS）⇒
+  定标**必须**用稠密 `random` + `sfprobe` 才能锁定递进与 SF 字节序。
+- **旧的"sweep1d k 应 128/128"在 unpacked 写入下永远是 64/128**：奇数 kk 的元素落到 16 B 槽的**后半**
+  （不被读）且与空的高 nibble 配对 ⇒ 该现象曾被误读为"A 侧 parity 问题"，**实为 B 槽布局问题**（已写入 §29 的错误链条）。
+- ⇒ **教训**：仅凭"某一族配置全都失败"就下"硬件语义是 X"的结论是危险的；
+  需要 **(a) 正向存在一个精确 PASS 的配置**（本轮做到了：relerr=0）+ **(b) 原始 smem 偏移级的直接观测**（本轮做了）
+  才能定谳。
+
+## 主 agent 已落地的修复
+`kernels/cuda/tilelang_gen/moe_bs_handwritten.cu`：新增 `hw_pack_sw128()`；
+`g_packed` 分支的 W1/W3 staging 改用它（源字节原样写入）；packed 分支的描述符固定为
+`hw_make_desc(..., 1, 64, 2)`、递进固定 `ki*2`（= 32 B）。门控 `DSV41_MOE_BS_PACKED=1` 开启即用此布局。
