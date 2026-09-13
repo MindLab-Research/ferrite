@@ -74,7 +74,11 @@ fi
 
 echo "=== staged-operand content check (BS) ==="
 if [ -f "$HOME/sfdump_check.py" ]; then
-  timeout 600 python3 "$HOME/sfdump_check.py" --in-dir /tmp/sfd_LV_REF 2>&1 | tail -18
+  for d in /tmp/sfd_LV_REF/eager /tmp/sfd_LV_REF/rows /tmp/sfd_LV_REF; do
+    [ -d "$d" ] || continue
+    echo "--- sfdump_check $d"
+    timeout 600 python3 "$HOME/sfdump_check.py" --in-dir "$d" 2>&1 | tail -14
+  done
 else
   echo "(sfdump_check.py missing)"
 fi
@@ -86,7 +90,7 @@ if [ -f "$HOME/sfdump_replay.py" ]; then
     for e in "$d/eager" "$d/rows"; do
       [ -d "$e" ] || continue
       echo "--- $e"
-      timeout 900 python3 "$HOME/sfdump_replay.py" --sfdump "$d" --gu "$e" 2>&1 | tail -6
+      timeout 900 python3 "$HOME/sfdump_replay.py" --sfdump "$(dirname $e)" --gu "$e" 2>&1 | tail -6
     done
   done
 else
