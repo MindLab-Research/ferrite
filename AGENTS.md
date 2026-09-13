@@ -148,12 +148,24 @@ random 4k/1k、**模拟 accept 5.5**）。**详情与 16 步阶梯见 `docs/agen
 - serve 卡住/日志 mtime 停滞 = 挂了（查 `stat -c %y` + pgrep，别等）。
 - 加载错防线（三道 runtime + 三道编译期 + git hooks）见 `docs/agent/` 的加载防线文档。
 
-## 当前状态与下一步（2026-09-14 晚——fp4 MoE BS 臂：语义已定谳 + 两个接线缺陷已修；精度按清单逐项转正）
+## 当前状态与下一步（2026-09-14 深夜——harness 九项拦截已全清；首次可信验证轮在跑；精度五门待逐项转正）
 
 **详细记录一律在 `docs/agent/moe-bs-crash-investigation.md`（§10–§22），本节只放结论与指针。**
 
 - **手写 kernel 的 6 个真 bug 已修**：idesc `b_sf_id` 漏 `<<4`、smem 布局与 descriptor 的 swizzle 声明不匹配、
   K-block 递进单位误判 8×、缺 `fence.proxy.async`、缺 `tcgen05.fence::before/after_thread_sync`（3 处）。
+- **🏁 判定标准（用户裁决，§99/§106）**：SGLang 的 **acc 5.5 是模拟值**（其 server 配置钉死它来测 kernel 速度），
+  **不作为我们要追的水平**；**我们在真实 acc ≈ 2.2 下达到 ~450 tok/s 即算击败 sglang**。
+  ⚠️ **口径差 1**：他们的 "accept length" **含 bonus token**，我方 `mean-k` **不含** ⇒
+  **同口径我方 `tok/step = mean-k + 1 = 3.24`**；由 `tok/s = tok/step ÷ step` ⇒ **450 tok/s 需要 step ≈ 7.2 ms**
+  ⇒ **这是一道纯 step 削减题**（当前 spec step ≈ 32.5ms = draft 3.87 + verify 28.17 + commit 0.47）。
+  真正的病灶见下（verify 的 **4.45× 未摊薄**）。
+- **🧰 harness 自身曾拦路九次（§111 全清单，务必先读再动 harness）**：其中三处是**我改脚本时自己造**的
+  （`sed "$d"` 双引号展开致死、`GRAPH_OFF` 多行拼接被拆断、**花括号污染 python 引号**导致 OUT 行从未生成）。
+  ⇒ **铁律：改完 harness 必须用"真实最小用例"跑一遍，`bash -n` 不够**（查不出 `set -u` 未定义变量与语义破坏）。
+  现 `arm_run.sh` 的 OUT 行**已用真实执行验证可解析** ✓。
+- **🔬 首次可信验证轮在跑**：`~/arm_run.sh`（图门全关 + 焊好探针路径）与 `~/arm_run_fast.sh`（图 ON，性能专用）
+  分工见 §42/§109；`~/verify_all.sh` 一条命令跑完"重编 → BS 臂文本判据 → 五道精度门 DBG → cp.async 门 → spec 两侧门 → 博客口径基准"。
 - **🎯 fp4 语义定谳（§47，硬件实测 relerr=0）**：fp4 操作数是 **packed（2 元素/字节）但放在 16 B 容器里、
   硬件只读每槽前 8 B**（TMA dtype `16U4_ALIGN16B` = 16 个 4-bit 元素 = 8 B 数据/16 B 容器）⇒ 每行 footprint 128 B、
   每 stage 16384 B。写公式 `hw_pack_sw128()`（§47）；**描述符/递进/idesc 保持官方原值不变**（`lbo=1,sbo=64,layout=2`、`ki*32 B`）。
