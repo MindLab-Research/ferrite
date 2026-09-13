@@ -3789,27 +3789,18 @@ static inline int dsv41_smem_ceiling(KernPtr /*kern*/) {
 }
 
 extern "C" int dsv41_quant_fp8(const float* x, uint8_t* y, float* scale, int rows, int cols,
-                               int block, int round_scale, cudaStream_t s,
-                               // F7 (DSV41_F7_QUANT_STRIDE): the SOURCE row pitch in
-                               // elements. Default `0` = "== cols", i.e. the ABI that
-                               // existed before this parameter — every existing caller
-                               // (including the C++ tests, which pass no argument at
-                               // all) stays on the old path, bit for bit. ONLY the
-                               // source reads move: the destination pitch is `cols`,
-                               // and the per-block arithmetic is unchanged.
-                               int src_stride = 0) {
+                               int block, int round_scale, cudaStream_t s) {
     if (rows <= 0 || cols % block != 0) return (int)cudaErrorInvalidValue;
     // A pitch SHORTER than the row would make the block groups overlap (row r's
     // tail read as row r+1's head). That is a caller error, not a shape to
     // tolerate: this whole parameter exists to feed a pitch the `cols` spelling
     // cannot express, and a smaller one is only reachable by a typo.
-    if (src_stride != 0 && src_stride < cols) return (int)cudaErrorInvalidValue;
     dim3 grid((rows * (cols / block) + 255) / 256), blk(1, 256);
     // one thread-block per (row, scale-block) group; the y dim carries the lanes
     const int nb = cols / block;
     blk = dim3(1, (block < 256 ? block : 256));
     grid = dim3(rows * nb);
-    quant_kernel<0><<<grid, blk, 0, s>>>(x, y, scale, rows, cols, block, round_scale, src_stride);
+    quant_kernel<0><<<grid, blk, 0, s>>>(x, y, scale, rows, cols, block, round_scale, 0);
     return (int)cudaGetLastError();
 }
 
@@ -14994,5 +14985,335 @@ extern "C" int dsv41_hc_front_persist_mb(const float* x, const float* hc_fn,
     hc_pre_persist_mb_kernel<<<grid, 1024u, smem, s>>>(
         x, hc_fn, hc_scale, hc_base, pre, post, comb, hc, dim, sinkhorn_iters, eps, w_norm,
         pre_collapse, out, eps_norm, xq, xsc, hc_dim, mix, split, truncate);
+    return (int)cudaGetLastError();
+}
+
+// ============================================================================
+// P3 MEGAKERNEL: the verify block's hc front end, PREFUSED with the T1 fp8 emit
+// (docs/agent/p3-megakernel-verify-design.md §1.3 / §2.1; gate DSV41_P3_MEGAKERNEL).
+//
+// WHY THIS IS A SEPARATE KERNEL. `hc_pre_persist_mb_kernel` above already has the
+// right SHAPE for the verify block - the dots spread over `mix * split` blocks,
+// the collapse on its own block running in PARALLEL with them, and the tail
+// (ss / sigmoid / sinkhorn / comb) ELECTED to whichever dot block finishes last,
+// with no ticket and no spin (the `hc_front_kernel` spin measured +3.2 ms/step).
+// Its one defect for a multi-row block is the fp8 emit's ADDRESSING: `xq[c]` and
+// `xsc[c >> 5]` carry no row base, so a `rows = m` block cannot be handed a
+// buffer and the caller must follow the whole front end with a separate
+// `quant_rows(xn)` launch. That single launch - plus the `x_r` / `xn_r` round
+// trips the fold removes - is the entire reason the verify's per-layer hc chain
+// is 13 launches instead of 3.
+//
+// The new mathematics is exactly that addressing: `xq[r * xq_pitch + c]` and
+// `xsc[r * (xq_pitch >> 5) + (c >> 5)]`, which is `quant_kernel`'s own indexing
+// (`y[(size_t)r * cols + ...]`, `scale[r * nb + b]` with `nb = cols / 32`).
+// Every other statement is `hc_pre_persist_mb_kernel`'s, term for term: the
+// dot's three-accumulator `float4` lane chain, the ss replay, the collapse's
+// ascending-`i` `fmaf` chain, the `__shfl_down` + `red[32]` + ascending
+// cross-warp fold, the 32-lane `__shfl_xor` amax, `fast_round_scale(a, 1/448)`,
+// the `+/-448` clamp and `__nv_fp8_e4m3`. So:
+//
+//   * at `split == 1` the four outputs (`pre/post/comb` from the tail, `out` +
+//     `xq`/`xsc` from the collapse) are BIT-EXACT against the sequence
+//     `hc_mixes + hc_collapse_norm + quant_rows(xn)` (design §5.1);
+//   * the emitted fp8 pair is `quant_kernel<0>`'s (design §5.3's F1 fp8 item).
+//
+// fp8 GROUPING (the `dim % 32` hazard, design §7). Each warp's 32 lanes cover 32
+// CONSECUTIVE `c` per pass (`c = tid; c += 1024`), i.e. exactly one 32-element
+// quant block, so the warp-level `__shfl_xor` amax IS that block's amax and
+// `xsc[r][c >> 5]` receives that block's scale - the same grouping `quant_kernel`
+// gets from `block = 32`. This identity needs `dim % 32 == 0` AND
+// `blockDim % 32 == 0`; both hold (5120 / 1024) and the LAUNCHER declines
+// (returns 2) when the first does not, so the caller keeps `quant_rows`.
+//
+// PITCH. `xq_pitch` is the CALLER's staging row pitch and is NOT implied by
+// `dim`: `quant_rows` pitches `s.xq_r` by its `cols` argument while the
+// allocation is sized for the widest activation (chain_dev.rs #5). Every
+// consumer reads it back by `k` (`gemm_fp8_mrows_kernel`: `a + r*k`,
+// `a_scale + r*(k/32)`), so the caller passes the same `cols` it would have
+// handed `quant_rows` and the bytes land where the projections look for them.
+// `xq_pitch <= 0` (or a null `xq`/`xsc`) disables the emit entirely - the
+// `nullptr` path is byte for byte the older kernel's.
+//
+// THE SHARED-MEMORY SHAPE IS THE DESIGN'S (§3.1): the 24 x 20480 f32 = 1.875 MiB
+// of hc weights NEVER enter smem. Each dot block stages one weight row's K CHUNK
+// plus the matching x chunk (`2 * hc_dim / split` floats), which at `split = 1`
+// is 160 KiB and at `split = 8` is 20 KiB; the weights themselves are resident
+// in L2, so DRAM pays for them once per row and L2 serves the rest.
+// ============================================================================
+__global__ void __launch_bounds__(1024, 1)
+verify_hc_front_prefused_kernel(const float* __restrict__ x, const float* __restrict__ hc_fn,
+                                const float* __restrict__ hc_scale,
+                                const float* __restrict__ hc_base, float* __restrict__ pre,
+                                float* __restrict__ post, float* __restrict__ comb, int hc,
+                                int dim, int sinkhorn_iters, float eps,
+                                const float* __restrict__ w_norm,
+                                const float* __restrict__ pre_collapse, float* __restrict__ out,
+                                float eps_norm, uint8_t* __restrict__ xq,
+                                float* __restrict__ xsc, int xq_pitch, int hc_dim, int mix,
+                                int split, int truncate) {
+    const int r = blockIdx.y;
+    const int bid = blockIdx.x;
+    const int ndot = mix * split;
+    const int ss_stride = mix * 32;
+    const int nwarp = ss_stride >> 5;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const float* xrow = x + (size_t)r * hc_dim;
+    extern __shared__ float mk_sm[];
+    __shared__ unsigned s_elected;
+    __shared__ float wpart[32];
+    __shared__ float sss;
+    __shared__ float p_mixes[64];
+    __shared__ float p_cm[64];
+    __shared__ float p_red[32];
+
+    if (bid < ndot) {
+        // ---------------- dot: one projection row over one K chunk ----------
+        const int m = bid % mix;        // m varies fastest so the `mix` blocks
+        const int ck = bid / mix;       // of a chunk share one x read (L2)
+        const int chunk = hc_dim / split;
+        const int lo = ck * chunk;
+        float* s_x = mk_sm;             // chunk floats, staged
+        float* s_w = mk_sm + chunk;     // chunk floats, this projection row
+        const int n4 = chunk >> 2;
+        const float4* xg = reinterpret_cast<const float4*>(xrow + lo);
+        const float4* wg = reinterpret_cast<const float4*>(hc_fn + (size_t)m * hc_dim + lo);
+        float4* sx = reinterpret_cast<float4*>(s_x);
+        float4* sw = reinterpret_cast<float4*>(s_w);
+        for (int i = threadIdx.x; i < n4; i += blockDim.x) dsv41_cp_async16(&sx[i], &xg[i]);
+        dsv41_cp_commit();
+        for (int i = threadIdx.x; i < n4; i += blockDim.x) dsv41_cp_async16(&sw[i], &wg[i]);
+        dsv41_cp_commit();
+        dsv41_cp_wait_all();
+        __syncthreads();
+        if (threadIdx.x < 32) {
+            // hc_mix_dots_kernel's float4 three-accumulator lane chain, restricted
+            // to [lo, lo + chunk). At split == 1 this is that kernel's dot exactly.
+            float a0 = 0.f, a1 = 0.f, a2 = 0.f;
+            int c = lane;
+            for (; c + 64 < n4; c += 96) {
+                const float4 w0 = sw[c], w1 = sw[c + 32], w2 = sw[c + 64];
+                const float4 v0 = sx[c], v1 = sx[c + 32], v2 = sx[c + 64];
+                a0 += w0.x * v0.x + w0.y * v0.y + w0.z * v0.z + w0.w * v0.w;
+                a1 += w1.x * v1.x + w1.y * v1.y + w1.z * v1.z + w1.w * v1.w;
+                a2 += w2.x * v2.x + w2.y * v2.y + w2.z * v2.z + w2.w * v2.w;
+            }
+            for (; c < n4; c += 32) {
+                const float4 w = sw[c], v = sx[c];
+                a0 += w.x * v.x + w.y * v.y + w.z * v.z + w.w * v.w;
+            }
+            for (int k = (n4 << 2) + lane; k < chunk; k += 32) a0 += s_w[k] * s_x[k];
+            float acc = (a0 + a1) + a2;
+            for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
+            if (lane == 0) g_hc_part[r][m][ck] = acc;
+        }
+        // Publish and elect, exactly as the persist_mb kernel does: the writer of
+        // g_hc_part is threadIdx.x == 0 (warp 0, lane 0), so the release fence
+        // orders that store; s_elected is block-uniform so the branch is uniform.
+        if (threadIdx.x == 0) {
+            __threadfence();
+            s_elected = (atomicAdd(&g_hc_mb_done[r], 1u) == (unsigned)(ndot - 1)) ? 1u : 0u;
+        }
+        __syncthreads();
+        if (s_elected == 0u) return;    // no barrier follows on this path - safe
+    } else {
+        // ---------------- collapse: collapse + rmsnorm + fp8, one block ------
+        // dsv41_hc_collapse_norm_kernel's body at blockDim 1024 (same tree, same
+        // #pragma unroll 4), run in parallel with the dots because it does not
+        // read their output. The fp8 half is the ONLY place this kernel differs
+        // from hc_pre_persist_mb_kernel: the row base is folded into both the
+        // byte store and the scale store.
+        float* o_r = out + (size_t)r * dim;
+        const bool emit = (xq != nullptr) && (xsc != nullptr) && (xq_pitch > 0);
+        uint8_t* xq_r = xq + (size_t)r * (size_t)xq_pitch;
+        float* xsc_r = xsc + (size_t)r * (size_t)(xq_pitch >> 5);
+        float s2 = 0.f;
+#pragma unroll 4
+        for (int c = threadIdx.x; c < dim; c += blockDim.x) {
+            float acc = 0.f;
+            for (int i = 0; i < hc; ++i)
+                acc = fmaf(pre_collapse[(size_t)r * hc + i], xrow[(size_t)i * dim + c], acc);
+            // same round trip as dsv41_hc_collapse_norm_kernel (DSV41_BF16_TRUNCATE)
+            if (truncate) acc = __bfloat162float(__float2bfloat16(acc));
+            o_r[c] = acc;
+            s2 += acc * acc;
+        }
+        for (int off = 16; off > 0; off >>= 1) s2 += __shfl_down_sync(0xffffffffu, s2, off);
+        if ((threadIdx.x & 31) == 0) p_red[threadIdx.x >> 5] = s2;
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float t = 0.f;
+            for (int i = 0; i < (int)(blockDim.x >> 5); i++) t += p_red[i];
+            p_red[0] = rsqrtf(t / dim + eps_norm);
+        }
+        __syncthreads();
+        const float inv2 = p_red[0];
+        const int lane31 = threadIdx.x & 31;
+        for (int c = threadIdx.x; c < dim; c += blockDim.x) {
+            const float v = o_r[c] * inv2 * w_norm[c];
+            o_r[c] = v;
+            if (emit) {
+                // quant_kernel's per-32 arithmetic, term for term. blockDim is a
+                // multiple of 32 and the walk strides by blockDim, so a warp's 32
+                // lanes hold 32 consecutive `c` and the shuffle amax is exactly
+                // the 32-element block's amax (see the header).
+                float a = fabsf(v);
+                for (int off = 16; off > 0; off >>= 1)
+                    a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
+                const float sc = fmaxf(fast_round_scale(a, 1.0f / 448.0f), 1e-30f);
+                if (lane31 == 0) xsc_r[c >> 5] = sc;
+                const float q = fminf(fmaxf(v * (1.0f / sc), -448.0f), 448.0f);
+                const __nv_fp8_e4m3 f8 = __nv_fp8_e4m3(q);
+                xq_r[c] = *(const uint8_t*)&f8;
+            }
+        }
+        return;                         // collapse path never reaches the tail
+    }
+
+    // ---------------- tail: run by the elected (last) dot block -------------
+    // Acquire: every other dot block stored g_hc_part BEFORE its release fence +
+    // atomicAdd, and this block observed the final count.
+    __threadfence();
+    {
+        // ss, hc_mixes_tail_kernel's ss_in == 0 branch (see the persist_mb copy).
+        float ss = 0.f;
+        for (int c = threadIdx.x; c < hc_dim; c += ss_stride) ss += xrow[c] * xrow[c];
+        for (int off = 16; off > 0; off >>= 1) ss += __shfl_xor_sync(0xFFFFFFFFu, ss, off);
+        if ((threadIdx.x & 31) == 0 && warp < nwarp) wpart[warp] = ss;
+        __syncthreads();
+        if (threadIdx.x < 32) {
+            float v = (threadIdx.x < (unsigned)nwarp) ? wpart[threadIdx.x] : 0.f;
+            for (int off = 16; off > 0; off >>= 1) v += __shfl_xor_sync(0xFFFFFFFFu, v, off);
+            if (threadIdx.x == 0) sss = v;
+        }
+    }
+    __syncthreads();
+    const float inv = rsqrtf(sss / (float)hc_dim + eps);
+    for (int m2 = threadIdx.x; m2 < mix; m2 += blockDim.x) {
+        // The K partials in a FIXED ascending ck order: deterministic, but not
+        // the single warp's tree sum, hence not bit-exact for split > 1.
+        float a = 0.f;
+        for (int ck = 0; ck < split; ++ck) a += g_hc_part[r][m2][ck];
+        p_mixes[m2] = a * inv;
+    }
+    __syncthreads();
+    if (threadIdx.x < (unsigned)hc) {
+        const int j = threadIdx.x;
+        pre[(size_t)r * hc + j] =
+            (1.f / (1.f + expf(-(p_mixes[j] * hc_scale[0] + hc_base[j])))) + eps;
+        post[(size_t)r * hc + j] =
+            2.f / (1.f + expf(-(p_mixes[hc + j] * hc_scale[1] + hc_base[hc + j])));
+    }
+    for (int jk = threadIdx.x; jk < hc * hc; jk += blockDim.x) {
+        const int j = jk / hc, k = jk % hc;
+        p_cm[jk] = p_mixes[2 * hc + j * hc + k] * hc_scale[2] + hc_base[2 * hc + j * hc + k];
+    }
+    __syncthreads();
+    if (warp == 0) {
+        const int hh = hc * hc;
+        float c = (lane < hh) ? p_cm[lane] : 0.f;
+        float mx = c;
+        for (int off = 1; off < hc; off <<= 1)
+            mx = fmaxf(mx, __shfl_xor_sync(0xFFFFFFFFu, mx, off));
+        c = expf(c - mx);
+        float rs = c;
+        for (int off = 1; off < hc; off <<= 1) rs += __shfl_xor_sync(0xFFFFFFFFu, rs, off);
+        c = c / rs + eps;
+        for (int it = 0; it < sinkhorn_iters; ++it) {
+            if (it > 0) {
+                float st = c;
+                for (int off = 1; off < hc; off <<= 1)
+                    st += __shfl_xor_sync(0xFFFFFFFFu, st, off);
+                c = c / (st + eps);
+            }
+            float t = c;
+            for (int off = hc; off < hh; off <<= 1) t += __shfl_xor_sync(0xFFFFFFFFu, t, off);
+            c = c / (t + eps);
+        }
+        if (lane < hh) p_cm[lane] = c;
+    }
+    __syncthreads();
+    for (int jk = threadIdx.x; jk < hc * hc; jk += blockDim.x)
+        comb[(size_t)r * hc * hc + jk] = p_cm[jk];
+    // Reset LAST: the loop above was the final g_hc_part read of this row.
+    if (threadIdx.x == 0) atomicExch(&g_hc_mb_done[r], 0u);
+}
+
+// P3 MegaKernel entry (DSV41_P3_MEGAKERNEL=1, Rust-gated). Same contract as
+// dsv41_hc_front_persist_mb plus the row-based fp8 emit: `xq`/`xsc` are the
+// caller's `[rows, xq_pitch]` / `[rows, xq_pitch/32]` staging (the layout
+// `quant_rows` writes and `gemm_fp8_mrows` reads), and a non-null pair means
+// "emit the T1 fp8 here" so the caller can drop its `quant_rows(xn)` launch.
+// A SEPARATE symbol so every older path stays byte-for-byte untouched and a
+// stale `.so` simply resolves it to None (the Rust side then keeps the chain).
+//
+// ABI: (x, hc_fn, hc_scale, hc_base, w_norm, pre_collapse, pre, post, comb, out,
+//       xq, xsc, xq_pitch, rows, hc, dim, sinkhorn_iters, eps, eps_norm,
+//       truncate, stream) -> 0 launched, 2 DECLINED (never 1).
+//
+// "2" and not cudaErrorInvalidValue: 1 collides with a real launch failure (the
+// r42-45 argument the sibling entries record), and every decline below is a
+// shape property the caller has a bit-identical fallback for (the split /
+// two-launch front end + `quant_rows`), which is exactly the reference this
+// kernel was written against.
+extern "C" int dsv41_verify_hc_front_prefused(const float* x, const float* hc_fn,
+                                              const float* hc_scale, const float* hc_base,
+                                              const float* w_norm, const float* pre_collapse,
+                                              float* pre, float* post, float* comb, float* out,
+                                              uint8_t* xq, float* xsc, int xq_pitch, int rows,
+                                              int hc, int dim, int sinkhorn_iters, float eps,
+                                              float eps_norm, int truncate, cudaStream_t s) {
+    if (x == nullptr || hc_fn == nullptr || hc_scale == nullptr || hc_base == nullptr ||
+        pre == nullptr || post == nullptr || comb == nullptr)
+        return (int)cudaErrorInvalidValue;
+    if (rows <= 0 || hc <= 0 || dim <= 0) return (int)cudaErrorInvalidValue;
+    // Shape declines, all of them "the caller's older chain is the reference".
+    if (rows > DSV41_HC_SPREAD_MAXR) return 2;
+    // The collapse half is what emits `out`/`xq`/`xsc`; a caller that wants the
+    // fp8 staged must also want the collapse, and vice versa (the same pairing
+    // dsv41_hc_front_persist enforces).
+    if ((w_norm == nullptr) != (pre_collapse == nullptr)) return 2;
+    if (w_norm != nullptr && out == nullptr) return 2;
+    // An emit request must be complete: a byte buffer without its scale row (or
+    // without a usable pitch) cannot produce `quant_kernel`'s output.
+    if ((xq == nullptr) != (xsc == nullptr)) return 2;
+    if (xq != nullptr && (xq_pitch <= 0 || (xq_pitch & 31) != 0)) return 2;
+    // fp8 grouping (design §7): the warp-level amax IS a 32-element quant
+    // block's amax only when `dim` is a whole number of blocks.
+    if (xq != nullptr && (dim & 31) != 0) return 2;
+    const int mix = hc * (2 + hc);
+    if (mix > 64) return 2;
+    const int hc_dim = hc * dim;
+    // K chunks: one dot block per (projection row, chunk). DEFAULT 1 - the
+    // design's recommended shape and the only BIT-EXACT one (at split == 1 the
+    // chunk is the whole row, so the dot is hc_mix_dots_kernel's lane chain
+    // statement for statement). split > 1 recombines the K partials in ck order,
+    // which is deterministic but <= 1 ulp off, and is only for the throughput
+    // A/B (design §5.2). Read once: this launcher runs twice a layer.
+    static const int split = [] {
+        const char* e = getenv("DSV41_P3_MK_SPLIT");
+        if (e == nullptr) return 1;
+        const int v = atoi(e);
+        return (v >= 1 && v <= DSV41_HC_MB_MAXS) ? v : 1;
+    }();
+    if (hc_dim % (4 * split) != 0) return 2;
+    const int chunk = hc_dim / split;
+    const size_t smem = (size_t)2 * (size_t)chunk * sizeof(float);
+    // 160 KiB at split == 1 needs the per-context opt-in; a shape whose single
+    // chunk does not fit declines so the caller takes the fallback chain (design
+    // §7: "160 KiB opt-in 被拒 -> 落回 split = 8").
+    if (smem > (size_t)dsv41_smem_ceiling(verify_hc_front_prefused_kernel)) return 2;
+    cudaError_t e = cudaFuncSetAttribute(verify_hc_front_prefused_kernel,
+                                         cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                         dsv41_smem_ceiling(verify_hc_front_prefused_kernel));
+    if (e != cudaSuccess) {
+        (void)cudaGetLastError();
+        return (int)e;
+    }
+    dim3 grid((unsigned)(mix * split + 1), (unsigned)rows);
+    verify_hc_front_prefused_kernel<<<grid, 1024u, smem, s>>>(
+        x, hc_fn, hc_scale, hc_base, pre, post, comb, hc, dim, sinkhorn_iters, eps, w_norm,
+        pre_collapse, out, eps_norm, xq, xsc, xq_pitch, hc_dim, mix, split, truncate);
     return (int)cudaGetLastError();
 }
