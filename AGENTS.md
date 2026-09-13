@@ -117,7 +117,24 @@ random 4k/1k、**模拟 accept 5.5**）。**详情与 16 步阶梯见 `docs/agen
   ⇒ `tok/step 3.24 / 10.6 ms` ≈ **306 tok/s**；再往下压 step（或按 §106 的 tok/step 口径）才到 450 ✓。
 - ⚠️ **禁止**用 `[dspark] steps=` 的 `verify=` 累积均值做性能判断（含 prefill 污染，会得到"verify > step"这种不可能的结论）。
 
-## 当前回归状态（2026-09-14 深夜，读这条就够）
+## 当前状态（2026-09-14 深夜二，读这条就够 —— 战略已切换）
+
+- **正确性**：**手写 BS 臂（`DSV41_MOE_TILELANG_BS`/`DSV41_MOE_BS_HANDWRITTEN`）当前会毁模型**（1..100 数数输出全乱码 ✗）
+  ⇒ **一切测量必须在它 OFF 时做** ✓；**OFF 的那条路径已被证明与官方 oracle 逐位相同**（本会话未再重跑它作基准，但历史上已证 ✓）。
+  ⇒ 本会话为它修的**真 bug 已入库**（段表读错缓冲 / TMEM lane（gate+down）/ launch 点 smem / alloc 校验可达性 /
+  **`tcgen05.commit` 的 `.shared::cluster` 使多 slot barrier 塌陷**（PTX §9.7.18.12.1）/ SFDUMP 死仪器 / DCLEAR 缺 fence /
+  DRAIN 无界自旋 / 构建失败不中止 / 脚本截断）—— 这些是**遗留资产**，将来重启 BS 臂时直接用 ✓。
+- **性能主线（当务之急）**：400 tok/s @acc2.2 ⇒ **step ≈ 8.1 ms**（现在 ~32.5 ms）。**唯一大杠杆 = verify 的 4.45× 未摊薄**
+  （verify 28.17ms vs eager 6.33ms）。**已定位到确切代码**：verify 路径（`chain_dev.rs::moe_rows`）"**one activation row per launch**"
+  + gate GEMV 是 `for r in 0..m` 的**逐行**循环 ✗；而**摊薄所需的批量路径已实现且默认关闭**：
+  `DSV41_MOE_BATCH`、`DSV41_ATTN_MROWS`、`DSV41_COMPRESSOR_PROJ_MROWS`、`DSV41_ENGRAM_{PROJ,GATHER}_MROWS`、
+  `DSV41_MROWS_MPAR`、`DSV41_DRAFT_P3LITE_{SEED,KV,ATTN}`、`gemv_bf16_v2_mrows[_route]`、`DSV41_MOE_DOWN_BS`。
+  ⇒ **下一步 = 同一份正确路径上把这批门全开、量 `[dsv41] step pos` 的 p50（禁吞吐反推）**，然后按 `docs/agent/` 的
+  `amortization-plan` 逐项（一次一个变量、每步先保 1..100 前 61 行 = 1..61）。
+- **纪律（用户明令）**：禁 pass 2（不重跑已判定臂）✓；**禁空跑 baseline**（基准已有）✓；**不堆新仪器** ✓；
+  **一切测量前先确认产物同源**（`num100.sh` 已焊入构建门 ✓ —— 我曾因 kill 掉构建中途的批次而留下不同源双产物，白跑一轮 ✗）；
+  `.cu` 改动攒批（每次改动都触发 ~3.5 分钟全量重编）✓。
+- 详细过程：`docs/agent/moe-bs-crash-investigation.md` §141–§155。
 
 - **症状**：serve 能启动/加载/武装 BS 臂，但**首个请求时卡死** —— 日志刷 `[ar5-hang] … TIMEOUT -> PARK`
   且**整轮 0 个 `[dsv41] step pos`**；`curl` 拿不到响应（`http=000`）。**用户锚点："之前从来没卡过"** ⇒ 是回归。
