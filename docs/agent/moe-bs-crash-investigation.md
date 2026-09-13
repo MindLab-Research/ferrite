@@ -1633,3 +1633,23 @@ eid[SEG_CAP]    : i32 -- 该段的 expert id（**pad 段任意，取 0**）
 ⇒ pad 段的 `eid = 0` 是**合法** id（expert 0 在池内）⇒ 不存在越界权重指针 ⇒ **该假设作废** ✓
 （pad 段算出的行不会被使用：scatter 侧按 `counts[seg]==0` 早退 ✓）。
 ⇒ **`[NC]` 不进入的原因仍待 NC-TRACE 逐行探针回答**（T2 窗口运行中；9 处提前 return 都已带行号打印）。
+
+## §61 【精度】全算子审计结论（subagent `precision-audit-full`）：**8 个独立缺陷**
+
+> 用户硬性要求："精度必须和官方 pytorch 实现完全对齐，fp4 fp8，**不能高也不能低**"。
+> 本次审计把范围扩到**全算子**（此前 ~85%），逐项带双侧 file:line。
+> 结论：**ALIGNED 22 项 / MISALIGNED 10 项（去重 8 个独立缺陷）/ NEEDS-GPU 5 项 / UNKNOWN 3 项**。
+
+### 三项"缺失量化"（我方**精度偏高**，与官方不一致）—— 新发现
+| 项 | 官方 | 我方 | 后果 |
+|---|---|---|---|
+| **A2 窗口 KV** | `model.py:707`（主干）/`:1042`/`:1062`（DSpark）：`kv_norm → rope → act_quant(kv, block=32, "ue8m0", inplace=True)` ⇒ 入 ring **前**把 bf16 行吸附到 e4m3/block32/幂次网格 | `chain_dev.rs:62-64` 注释自述 "ring is f32"；`:20197-20247` 只做 `rmsnorm→rope→bf16_snap`；`:20328-20379` 的 `ring_win_fused_kernel` 是**纯 f32 拷贝**；全仓无就地 `act_quant` | **精度偏高** ✗（仓库内已自认：`accept-first-strategy.md:67`、`s4 §3.4`） |
+| **A3 压缩 KV latent** | `model.py:758-760`：`fp4_act_quant(latent, **block=16**, True, scale_dtype=**e4m3**)`；`kernel.py:159-166` 的 **e4m3-标度分支**：`amax=max(amax, 6*2^-9)`、`s = Cast(f32, Cast(e4m3, amax/6))`（**不是幂次！**）、byte=`fp4(clamp(x/s,±6))`、inplace 写回反量化值 | `chain_dev.rs:21102-21203` `compress_on`：只 `bf16_snap_on(latent)` → commit；`glue.cu:1185-1220` 只 rope + f32 存储。**全仓没有 block=16 的 fp4 量化，也没有 e4m3-标度分支**（`quant_kernel` 只有幂次标度） | **缺整个量化器分支** ✗ |
+| **A4 indexer q/k** | `model.py:546`(k)/`:552`(q)：`fp4_act_quant(·, block=32, True)`，默认 e8m0 幂次标度（`kernel.py:165-166`），inplace 写回反量化值 | `chain_dev.rs:20892-20929`(k)、`:20945-21014`(q)：**全程 f32，无 fp4 往返** | **精度偏高** ✗ |
+
+### 其余 MISALIGNED（原报告另有 5 项，含 RoPE 系数、累加序、PV 操作数、一处位置相位（非精度）、
+以及"已知两处"的**默认 OFF 态**——即在出货默认臂下那两处**仍未对齐**）。
+### NEEDS-GPU 5 项（其中最关键：**出货臂的 env 组合无法从源码判定**，决定上述若干项是否真实成立）。
+
+**⇒ 行动**：新开三条实现线（各自隔离 worktree、默认 OFF、带 DBG 探针、CPU 可 `cargo check` 验证），
+分别补齐 A2 / A3 / A4 三个缺失量化；GPU 验收与 env 裁决由主 agent 独占执行。
