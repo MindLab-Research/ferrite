@@ -195,6 +195,46 @@ THREADS = 128         # 3 个工作 warp + 1 个空转（原型 §2 的分工）
 STAGES_DEFAULT = 6    # 原型实测最优（stg=8 超 228KB smem）
 
 
+# ---------------------------------------------------------------------------
+# ⚠️ TileLang 0.1.14 API 契约：`tilelang.jit` 必须装饰**返回 PrimFunc 的工厂函数**，
+# **不能**装饰已经 `@T.prim_func` 构造好的对象。
+#
+# 0.1.14 的 eager 前端里 `T.prim_func(fn)` 是**立即构造** IR 的（builder.py:1660-1667），
+# 返回一个 `tvm.tirx.PrimFunc`；而 `tilelang.jit` 的 decorator 第一件事是
+#     pf = prim_func(func, eager_jit=True)        # jit/__init__.py:626
+#     sig = inspect.signature(func)               # eager/builder.py:1634
+# 即它把收到的东西**再当 Python 函数包一层 prim_func**。于是：
+#   * `@T.prim_func` 对象没有 `get_kernel_source()`（它是 PrimFunc，不是 JITKernel）；
+#   * 而且 `PrimFunc` 对象不是 callable ⇒ `inspect.signature()` 抛
+#         TypeError: <该对象的 TVMScript 形态> is not a callable object
+#     —— 报错里那句 `T.copy(T.region(C_tmem[0, 0], 1, 128, 128), ...)` 不是本文件的
+#     kernel 源码（kernel 里根本没有 `T.region` 调用），而是那个 PrimFunc 对象的 repr，
+#     被 `inspect.signature` 拼进了消息里。**这是伪线索**：epilogue 的
+#     `T.copy(C_tmem, C_l)` 写法本身没有问题（原型同形且已认证）。
+#
+# 正确形态 = 原型 `k_up_bs` 的 lazy 模式（也是本文件修复前的目标形态）：
+#     @tilelang.jit(...)
+#     def factory(...):
+#         @T.prim_func
+#         def main(...): ...
+#         return main
+# 调用 factory(...) 返回 **JITKernel**（有 `get_kernel_source()` / `get_host_source()`
+# / `export_sources()`），M 轴/形状参数走 factory 形参，方便 AOT 扫档。
+# ---------------------------------------------------------------------------
+# 配置：**不传 `pass_configs`**（与原型 `k_up_bs` 的 `@tilelang.jit(out_idx=[-1])` 完全同形）。
+#
+# ⚠️ 本文件此前写的是 `pass_configs={"tl::disable_tma_lower": False}` —— 两个问题：
+#   1. **键名拼错**：0.1.14 的合法键是 `tl.disable_tma_lower`（点号），`tl::...` 会在
+#      `PassConfigManager::Legalize` 立刻抛
+#          AttributeError: Invalid config option 'tl::disable_tma_lower'
+#      （JITKernel 构造阶段，晚于 lowering 一开始的 front-end 报错，所以这条错误在
+#       修好装饰器之后才会浮出来）；
+#   2. **该键已废弃**：`tl.disable_tma_lower` 在 0.1.14 的 `pass_config.py:345-349`
+#      里是 deprecated（推荐改用 `T.copy(..., disable_tma=True)` 逐调用控制）。
+# TMA lowering 在本版本**默认就是开的**（值 `False` 等于什么都不写），而 §3 的 ABI
+# （6 个 `__grid_constant__ const CUtensorMap`）正是默认 lowering 的产物 ⇒ 干脆不传，
+# 既少一个可弃依赖，也和认证过的原型一模一样。
+@tilelang.jit(out_idx=[-1])
 def moe_bs_up(NSEG, BM, NP_, K, E_, BN, BK, NH, threads=THREADS, stages=STAGES_DEFAULT,
               gran=GRAN):
     """grouped block-scaled fp4 (e2m1+ue8m0) up-GEMM，tcgen05 1-CTA，显式 async。
@@ -216,7 +256,18 @@ def moe_bs_up(NSEG, BM, NP_, K, E_, BN, BK, NH, threads=THREADS, stages=STAGES_D
     assert K % BK == 0 and (K // BK) % (gran * 4 // BK) == 0
     assert BK % gran == 0 and BK % 32 == 0 and BK <= 4 * gran
     assert BN % 128 == 0
-    assert BM % 64 == 0, "blockscaled tcgen05 has no M=16/32 atom (disable_ws path)"
+    # ⚠️ 本地（无 GPU）复现实测：BM=64 在 **trace 阶段**就会被库拒掉 ——
+    #     T.tcgen05_cp_warpx4(SFA_sh[st, :], SFA_tmem)
+    #   → builtin.py:_tcgen05_num_smem_chunks
+    #     ValueError: Packed scale-factor helpers require total extent to be a multiple of 128, got 64.
+    # 原因：`tcgen05.cp.32x128b.warpx4` 的 SF 区天然按 128 行铺；BM=64 时 SFA 的 smem 只有 64 个字。
+    # ⇒ **0.1.14 上 BM 必须是 128 的倍数**（这正是 wiring §5 step 1 那个"唯一没被原型覆盖的点"
+    #   的答案：不成立）。默认值 BM_DEFAULT=64 是「目标几何」的遗留值，AOT 生成请显式 `--bm 128`。
+    assert BM % 128 == 0, (
+        "tcgen05_cp_warpx4 requires the packed scale-factor smem extent to be a multiple of 128, "
+        "so BM must be a multiple of 128 on TileLang 0.1.14 (BM=64 fails at trace time in "
+        "builtin.py:_tcgen05_num_smem_chunks). Use --bm 128 for the certified geometry."
+    )
     assert 2 * NP_ % BN == 0, "the N axis must tile by BN with no pad"
     assert NH == NP_ // (2 * NP_ // BN), "half-tile rows must partition the weight plane"
     sf_words = K // (gran * 4)
@@ -225,7 +276,10 @@ def moe_bs_up(NSEG, BM, NP_, K, E_, BN, BK, NH, threads=THREADS, stages=STAGES_D
     M = NSEG * BM
     GRID_X = 2 * NP_ // BN
 
-    @tilelang.jit(pass_configs={"tl::disable_tma_lower": False})
+    # ⚠️ 这里**只**留 `@T.prim_func`：外层 factory 已由 `@tilelang.jit` 装饰（见本文件
+    # 上方 §"0.1.14 API 契约"）。在 `@T.prim_func` 之上再加 `@tilelang.jit` 会让 jit
+    # 收到一个 **PrimFunc 对象**而不是 Python 函数 ⇒
+    # `TypeError: ... is not a callable object`。原型的 `k_up_bs` 就是这个形态。
     @T.prim_func
     def main(A: T.Tensor((M, K), T.float4_e2m1fn),
              W1: T.Tensor((E_, NP_, K), T.float4_e2m1fn),
