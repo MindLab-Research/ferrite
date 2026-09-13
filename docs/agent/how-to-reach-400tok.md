@@ -119,3 +119,37 @@ verify 的 argmax），它把 **`verify_out` 自身的取值错误放大**成更
 
 **判据**：每个臂都跑 `~/num100.sh <NAME> DSV41_MOE_TILELANG_BS=0 DSV41_MOE_BS_HANDWRITTEN=0 [门]`，
 看 **1..100 前 61 行是否 = 1..61** 且 p50 不退化（当前最好 = 10.17ms / 318 tok/s @acc2.2，带 `VERIFY_GRAPH=1`）。
+
+## 7. 诚实的战略结论（2026-09-14 深夜，写给下一个会话）
+
+**账要算清：图化 ≠ 450 tok/s。** 按 `amortization-plan` 的族账本（verify m=6 口径，需按今天 24.5–26.7ms 重标）：
+
+| verify 内的族 | 账本 ms | 占 37.3ms | 瓶颈性质 |
+|---|---:|---:|---|
+| **shared expert** | 10.40 | 27.9% | **核效率 + 5× 重复读**（85GB/s） |
+| **routed experts**（gate+up+down） | 8.30 | 22.2% | **核效率**（378GB/s，20.7µs/发） |
+| 投影族（wq_a/wkv/wq_b/wo） | 3.7–8.7 | 9.9% | launch/合并 |
+| MoE router | 3.44 | 9.2% | 核效率 + 逐行×5 |
+| hc 链 / attn KV / indexer / AR | 2.96+2.80+2.50+1.40 | ~24% | 占用 / launch / 核效率 |
+
+- **提交那一半**（~7000 发 × 2.9µs ≈ 20.3ms）由**图化**解决 ⇒ ~2.8ms ✓（P1/P2 已在**非 spec** 模式下验证图化确实生效 ✓）。
+- **执行那一半**（~7.9ms 起步，按今天口径更大）**只能靠 MoE 的核效率** ✗ —— 而 450 tok/s 要求 step≈7.2ms
+  （draft ~3.4 + commit ~0.5 ⇒ **verify 必须 ≈3.3ms** ✗，比 SGLang 公布的 7.3ms 还低 ✗）。
+  ⇒ **纯靠"少发几次"到不了 450**；必须把 **shared expert / routed expert 的核效率**做上去 ✓。
+
+**⇒ 所以 BS 臂（`DSV41_MOE_TILELANG_BS`）依然是正解载体，理由不是偏好而是格式**：
+`precision-completeness` 已确认它是**唯一**与官方**同格式**的快速 MoE 路径——A = **e4m3** 1B/value、
+W = **原生 fp4 nibble + ue8m0 标度面**（与官方 `fp4_gemm` 完全同格式 ✓），而 `DSV41_MOE_TILELANG`（bf16）
+是**激活不量化**的格式级偏差 ✗（精度高 32×，用户红线）。
+
+**但 BS 臂当前会毁模型** ✗ ⇒ 它仍有**两条可信异常**：①与官方 oracle 不符（median rel≈1.2、corr≈0.04）
+②**同输入两次运行输出不同**（max|d|=8.54，输入已逐字节核对相同）⇒ ②意味着**内核里有竞态/非确定性** ✗。
+本会话为它修的 9 个真 bug（含 **`tcgen05.commit` 的 `.shared::cluster` 使多 slot barrier 塌陷**，PTX §9.7.18.12.1）
+和整套判别工具（`gu_numpy_ref.py` oracle、`gc_all` 原始 tile、`DCLEAR=2` qNaN 哨兵、`PRECLECEAR`、`KEEP_STAGE`、
+`SPIN_CAP` 确定性演练、阶段 dump）**都是遗留资产**，可直接用来继续。
+
+**最短的两条路（供选择）**：
+1. **要数字**：跑 `~/run_to_400.sh`（S1/S2/S3，全带 `DSV41_SPEC=1`）⇒ 得到**诚实的 spec 步与 tok/s**
+   （预期：图化后 verify 从 24.5–26.7 → ~10–12ms ⇒ step ~14–16ms ⇒ **200–230 tok/s** ✗，离 450 还差执行时间那一半）。
+2. **要 450**：回到 BS 臂（或任何**同格式**的快速 MoE），先把②的非确定性根因做掉
+   （首选判据：`DSV41_MOE_BS_PRECLEAR=1` 预清零 / `ZERO_ASF`(mode 5) 干净零乘积 / `gc_all` 原始 tile 对比）。
