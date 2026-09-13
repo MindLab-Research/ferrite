@@ -898,6 +898,7 @@ extern "C" int dsv41_moe_tilelang_gate_up_bs_dev(
     if (xq4 == nullptr || xsc4 == nullptr || out == nullptr || w1 == nullptr || w3 == nullptr ||
         sfw1 == nullptr || sfw3 == nullptr || eid_dev == nullptr || order_dev == nullptr ||
         counts_dev == nullptr || nseg_dev == nullptr)
+        { static bool _r=false; if(!_r){_r=true; fprintf(stderr, "[NC-TRACE] dev EARLY-RETURN at shim line 901 -> 2;\n");} }
         return 2;
     if (dim != kDim || inter != kNp) return 2;
     // FALLBACK (2026-09-14): decline during CUDA-graph capture — the tcgen05
@@ -918,6 +919,7 @@ extern "C" int dsv41_moe_tilelang_gate_up_bs_dev(
                         "[moe-bs] DECLINE during graph capture (tcgen05 MMA illegal-instruction "
                         "workaround) — verify steps fall back to per-slot GEMV\n");
             }
+            { static bool _r=false; if(!_r){_r=true; fprintf(stderr, "[NC-TRACE] dev EARLY-RETURN at shim line 921 -> 2;\n");} }
             return 2;
         }
     }
@@ -930,6 +932,7 @@ extern "C" int dsv41_moe_tilelang_gate_up_bs_dev(
     // 16B 对齐：A/W 走 TMA（必需），out 是 float2 store。
     if ((((uintptr_t)xq4 & 0xF) != 0) || (((uintptr_t)w1 & 0xF) != 0) ||
         (((uintptr_t)w3 & 0xF) != 0) || (((uintptr_t)out & 0x1F) != 0))
+        { static bool _r=false; if(!_r){_r=true; fprintf(stderr, "[NC-TRACE] dev EARLY-RETURN at shim line 933 -> 2;\n");} }
         return 2;
 
     // P0-2 (graph-capture audit, v2 state-gated — matching the bf16 shim's pattern):
@@ -946,6 +949,7 @@ extern "C" int dsv41_moe_tilelang_gate_up_bs_dev(
 
     if (!tl_bs_init()) {
         bs_init_failed_note(rows, dim, inter);
+        { static bool _r=false; if(!_r){_r=true; fprintf(stderr, "[NC-TRACE] dev EARLY-RETURN at shim line 949 -> 2;\n");} }
         return 2;
     }
     // driver/tensormap：首次调用做一次 dlopen；A/SFA/C 的 map 在 INIT 后建一次；
@@ -959,6 +963,7 @@ extern "C" int dsv41_moe_tilelang_gate_up_bs_dev(
             fprintf(stderr,
                     "[moe-bs] ARMED (device tables) but tensormap init FAILED (dlopen libcuda / "
                     "cuTensorMapEncodeTiled) -> this run measures the OLD path\n");
+        { static bool _r=false; if(!_r){_r=true; fprintf(stderr, "[NC-TRACE] dev EARLY-RETURN at shim line 962 -> 2;\n");} }
         return 2;
     }
 
@@ -979,6 +984,7 @@ extern "C" int dsv41_moe_tilelang_gate_up_bs_dev(
     // (tests if the caller's device table POINTERS are the issue vs shim's own scratch)
     static const bool g_dev_table_copy = []() {
         const char* v = getenv("DSV41_MOE_BS_DEV_TABLE_COPY");
+        { static bool _r=false; if(!_r){_r=true; fprintf(stderr, "[NC-TRACE] dev EARLY-RETURN at shim line 982 -> v != nullptr && v[0] != '0';\n");} }
         return v != nullptr && v[0] != '0';
     }();
     if (g_dev_table_copy) {
@@ -1080,6 +1086,7 @@ extern "C" int dsv41_moe_tilelang_gate_up_bs_dev(
     // kernel faults. Default OFF (sync kills perf). Enable for debugging only.
     static const bool g_sync_diag = []() {
         const char* v = getenv("DSV41_MOE_BS_SYNC_DIAG");
+        { static bool _r=false; if(!_r){_r=true; fprintf(stderr, "[NC-TRACE] dev EARLY-RETURN at shim line 1083 -> v != nullptr && v[0] != '0';\n");} }
         return v != nullptr && v[0] != '0';
     }();
     if (g_sync_diag) {
@@ -1134,6 +1141,7 @@ extern "C" int dsv41_moe_tilelang_gate_up_bs_dev(
     // pipeline structure is the trigger.
     static const bool g_use_handwritten = []() {
         const char* v = getenv("DSV41_MOE_BS_HANDWRITTEN");
+        { static bool _r=false; if(!_r){_r=true; fprintf(stderr, "[NC-TRACE] dev EARLY-RETURN at shim line 1137 -> v != nullptr && v[0] != '0';\n");} }
         return v != nullptr && v[0] != '0';
     }();
     if (g_use_handwritten) {
@@ -1241,6 +1249,7 @@ scatter_launch:
                     es == cudaSuccess ? "OK" : cudaGetErrorString(es));
         }
     }
+    { static bool _r=false; if(!_r){_r=true; fprintf(stderr, "[NC-TRACE] dev EARLY-RETURN at shim line 1244 -> (int)e;\n");} }
     return (int)e;
 }
 
