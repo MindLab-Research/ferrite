@@ -12,6 +12,7 @@ BAD=${2:-HEAD}
 cd "$HOME/ferrite" || exit 1
 echo "=== auto bisect: good=$GOOD bad=$BAD ==="
 step=0
+SKIP=0
 while :; do
   step=$((step+1))
   N=$(git rev-list --count "$GOOD..$BAD")
@@ -24,8 +25,20 @@ while :; do
   K=$(( (N + 1) / 2 ))
   MID=$(git rev-list --reverse "$GOOD..$BAD" | awk -v k="$K" 'NR==k')
   echo "    testing midpoint #$K = $MID  ($(git log -1 --format='%h %ad %s' --date=format:%H:%M $MID | cut -c1-90))"
-  out=$(bash "$HOME/gold_bisect.sh" "$MID" 2>&1 | tail -4)
+  out=$(bash "$HOME/gold_bisect.sh" "$MID" 2>&1 | tail -6)
   echo "$out" | sed 's/^/      /'
+  # ⚠️ A commit that does not BUILD is not evidence about the regression. The first version of this
+  # script treated a build failure as a divergence and moved BAD down -- i.e. it walked away from the
+  # answer while looking like it was making progress (af59890f cannot compile: its actq_scale sits
+  # ahead of fast_round_scale). Such a commit is SKIPPED, and an all-skipped range is reported as
+  # INCONCLUSIVE rather than as a verdict.
+  if echo "$out" | grep -qE "BUILD_SH FAILED|CARGO FAILED"; then
+    echo "    => INVALID (this commit does not build) -> skipping, splitting the range instead"
+    SKIP=$((SKIP+1))
+    if [ "$SKIP" -ge 6 ]; then echo "########## INCONCLUSIVE: six commits in a row failed to build ##########"; break; fi
+    GOOD=$MID   # treat as unusable by advancing GOOD past it (its subtree cannot hold the answer)
+    continue
+  fi
   if echo "$out" | grep -q "MATCHES the golden"; then
     GOOD=$MID
     echo "    => GOOD (this commit still reproduces the official gate|up) -> move GOOD up"
