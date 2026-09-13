@@ -874,6 +874,8 @@ extern "C" int dsv41_moe_tilelang_gate_up_bs_dev(
     // (2) block-scaled grouped GEMM（生成物）。ABI 与 host-table 入口一字不差 ——
     //     权威配方见那里的长注释（C 是描述符、SFA 是裸指针、W 排在最后）。
     //     唯一的变化：Eid 直接用调用方的 device 表（`eid_dev`），不再是常驻 scratch。
+    // ⚠️ DIAG: skip MMA launch to isolate crash source (gather/scatter vs MMA)
+    if (kSmem == 200704) return 0; // DIAG: skip MMA
     moe_bs_up_tl_kernel<<<dim3((unsigned)kGridX, (unsigned)kSegCap), kThreads, kSmem, s>>>(
         g_tmap_a, g_tmap_c, eid_dev, g_sfa, g_tmap_sfw1, g_tmap_sfw3, g_tmap_w1, g_tmap_w3);
     e = cudaGetLastError();
