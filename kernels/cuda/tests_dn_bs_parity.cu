@@ -274,8 +274,11 @@ int main(int argc, char** argv) {
     DN_CHECK(cudaGetLastError() == cudaSuccess, "H2D upload failed");
 
     // ---- arm A: SIMT(f32 act) 参考 ----
+    // NOTE: the real signature gained `seq_align` from the DSV41_SEQ_ALIGN merge (#5), which
+    // landed AFTER this harness was written — hence the original 'too few arguments' and the
+    // cudaStream_t-as-int error. 0 keeps that arm OFF, matching the reference's historical form.
     int rc = dsv41_expert_down_reduce_fp4_batched(d_act, 2 * kInter, d_ref, 1, kDim, kInter, d_rw, 1,
-                                                 kSlots, d_w2, w2_stride, d_w2s, w2s_stride, d_ids,
+                                                 kSlots, d_w2, w2_stride, d_w2s, w2s_stride, d_ids, 0,
                                                  st);
     DN_CHECK(rc == 0, "SIMT reference rc=%d", rc);
     cudaStreamSynchronize(st);
@@ -303,7 +306,7 @@ int main(int argc, char** argv) {
     cudaMemcpyAsync(d_act_q, h_act_q.data(), h_act_q.size() * sizeof(float),
                     cudaMemcpyHostToDevice, st);
     rc = dsv41_expert_down_reduce_fp4_batched(d_act_q, 2 * kInter, d_ref, 1, kDim, kInter, d_rw, 1,
-                                              kSlots, d_w2, w2_stride, d_w2s, w2s_stride, d_ids, st);
+                                              kSlots, d_w2, w2_stride, d_w2s, w2s_stride, d_ids, 0, st);
     DN_CHECK(rc == 0, "SIMT(quantised operand) rc=%d", rc);
     cudaStreamSynchronize(st);
     std::vector<float> h_refq(kDim);
