@@ -58,6 +58,9 @@ __device__ int g_sfrev = 0;
 // lbo=1 (16 B) / sbo=64 (1024 B) / layout_type=2 (SWIZZLE_128B). See
 // docs/agent/moe-bs-crash-investigation.md §29-§31.
 __device__ int g_sfst = 0;     // 1 = deliver the SF with tcgen05.st (isolated-instrument path)
+// 1 = run ONLY K-stage 0 (DSV41_MOE_BS_STAGE1=1), collapsing production to the isolation
+// instrument's single-stage regime so the K<128 partial can be judged against the oracle.
+__device__ int g_stage1 = 0;
 __device__ int g_ldw = 1;      // 1 (DEFAULT) = read D with the per-warp TMEM lane address, which
                                // PTX ISA 9.7.18.1.1 + CUTLASS + Triton all require (the address's
                                // lane field is an ABSOLUTE lane coordinate and a warp may only
@@ -820,6 +823,12 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
     }
 
     for (int k = 0; k < HW_KITER; ++k) {
+        // DSV41_MOE_BS_STAGE1=1: collapse production to the isolation instrument's regime — ONE
+        // 128-K stage. The instrument covers exactly one stage and PASSES; production runs 40, so
+        // this splits "even a single stage is wrong in production" (host-side ingest / staging)
+        // from "the stage-to-stage progression is wrong". `k` is block-uniform, so the branch and
+        // the break are legal.
+        if (g_stage1 && k > 0) break;
         const int s = g_cpasync ? (k & 1) : 0;
         uint8_t* A_s = A_sh + (size_t)s * HW_BM * HW_BK;   // this iteration's A stage
         uint8_t* B_s = B_sh + (size_t)s * HW_BM * HW_BK;

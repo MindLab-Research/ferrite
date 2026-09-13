@@ -758,6 +758,15 @@ bool tl_bs_init() {
         (void)cudaGetLastError();
         fprintf(stderr, "[moe-bs] per-warp TMEM lane address = %d\n", lw);
     }
+    // g_stage1: run only K-stage 0 (the isolation instrument's regime) — DSV41_MOE_BS_STAGE1=1.
+    if (ok) {
+        int st = 0;
+        const char* e = getenv("DSV41_MOE_BS_STAGE1");
+        if (e != nullptr && e[0] == '1') st = 1;
+        (void)cudaMemcpyToSymbol(g_stage1, &st, sizeof(int));
+        (void)cudaGetLastError();
+        fprintf(stderr, "[moe-bs] single K-stage = %d\n", st);
+    }
     // g_sfst: SF→TMEM delivery path (0 = production transpose+tcgen05.cp, 1 = the isolated
     // instrument's tcgen05.st register path). The production chain has never been validated
     // on its own; this gate decides whether it is the defect.
