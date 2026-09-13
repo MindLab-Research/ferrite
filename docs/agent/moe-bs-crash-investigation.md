@@ -2320,3 +2320,47 @@ AGENTS.md 已明写"nsys 轮只看 kernel 相对倍数（AR 形态已变），�
    今天它们默认 OFF，但**默认值可能变**；诊断臂不应把"是否 nograph"留给运气。
 2. `DSV41_AR_V5=0` 的缓解**保留但定位明确**：它是**改变 AR 形态**的钝器 ⇒ **只用于诊断轮**，
    性能数字必须来自不带它的轮次（AGENTS.md 已明写同一纪律）。
+
+## §92 🎯【已确认的挂死路径】kernel 的 MMA 等待是**无界自旋** ⇒ MMA 不到达就永久挂死
+
+主 agent 读 `kernels/cuda/tilelang_gen/moe_bs_handwritten.cu` **第 781 行附近**（k 循环末尾）实测原文：
+
+```c
+        if (lane == 0) {
+            hw_tc_commit(mma_bar);            // 发 commit：全部 MMA 完成时 mbarrier 到达
+        }
+    }
+
+    // (6) 所有线程等待 MMA 完成（mbarrier wait + syncthreads）
+    if (tid == 0) {
+        const uint32_t phase = k & 1;         // "phase 0 for first use, then alternating"
+        asm volatile(
+            "{
+	.reg .pred P;
+	"
+            "WAIT:
+	"
+            "mbarrier.try_wait.parity.shared::cta.b64 P, [%0], %1;
+	"
+            "@!P bra WAIT;
+	}"              // ← **无条件回跳**：P 永假 ⇒ 永久自旋
+            :: "r"((uint32_t)__cvta_generic_to_shared(mma_bar)), "r"(phase));
+    }
+    __syncthreads();                          // ← 其余 127 线程在此等 tid 0
+```
+
+**机制（与线上事故逐条吻合）**：
+- 若 MMA 因任何原因**没有 arrive**（被跳过、commit 次数与 wait 不匹配、`phase` 与实际相位错位、
+  或某条 early `return` 让 MMA 未发射），**tid 0 就永久自旋**；
+- 其余 127 个线程**堵在 `__syncthreads()`** ⇒ 整个 block 挂死 ⇒ 内核永不返回 ⇒ **serve 永不返回**；
+- 其它 rank 在 all-reduce 里等这个 rank ⇒ 日志刷
+  `[ar5-hang] rank=… peer=… need=… cur=… spins>5000000 TIMEOUT -> PARK`，且整轮 **0 个 step**（§90 的现象）。
+⇒ 这与"间歇性"（只在 MMA 未到达/相位错位时触发）和"对照组正常"（F1/P1 没踩到）**都吻合** ✓。
+
+**处置**：已开 `bs-wait-hang-proof` 线，要求把它改成**有界等待**（超限则打印诊断并返回 ⇒ 把"永久挂死"
+变成"明确报错"），并顺带审计文件内其它等待点（`cp.async.wait_group`、`__syncthreads` 等由硬件/构造保证返回）。
+**纪律**："无界变有界"是**安全属性**，可无条件生效（正常路径第一次 `try_wait` 即成功 ⇒ 行为不变）；
+诊断打印用门控（`DSV41_MOE_BS_WAITDBG=1`，默认 OFF）。
+
+**方法论**：这条路径是**读代码读出来的**（不是靠日志猜的）——与 §90 的教训互为镜像：
+**先用代码确定"是否存在会永不返回的路径"，再用日志佐证现象**。
