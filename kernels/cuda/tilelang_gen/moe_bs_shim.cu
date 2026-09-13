@@ -813,6 +813,27 @@ extern "C" int dsv41_moe_tilelang_gate_up_bs_dev(
         counts_dev == nullptr || nseg_dev == nullptr)
         return 2;
     if (dim != kDim || inter != kNp) return 2;
+    // FALLBACK (2026-09-14): decline during CUDA-graph capture — the tcgen05
+    // MMA encounters "illegal instruction" during graph EXECUTION (replay)
+    // even though the identical kernel runs fine on a direct launch. Root
+    // cause not yet identified (see docs/agent/moe-bs-crash-investigation.md).
+    // Declining here makes the Rust side fall back to the proven per-slot GEMV
+    // path for the spec/verify steps (the graph-captured ones), while the
+    // eager/prefill steps keep the full BS arm. Kill this once the real
+    // graph-execution root cause is fixed.
+    {
+        cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+        if (cudaStreamIsCapturing(s, &cs) == cudaSuccess && cs != cudaStreamCaptureStatusNone) {
+            static bool g_capture_decline_noted = false;
+            if (!g_capture_decline_noted) {
+                g_capture_decline_noted = true;
+                fprintf(stderr,
+                        "[moe-bs] DECLINE during graph capture (tcgen05 MMA illegal-instruction "
+                        "workaround) — verify steps fall back to per-slot GEMV\n");
+            }
+            return 2;
+        }
+    }
     if (topk < 1 || topk > kTopkMax) return 2;
     if (rows < 1 || rows > kRowsMax) return 2;
     // nseg 的形状检查在这里**不存在**（device 上的值 host 读不到）——见上方文件头。
