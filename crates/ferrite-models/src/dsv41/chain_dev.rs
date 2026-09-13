@@ -19014,8 +19014,18 @@ impl<'a> DevChain<'a> {
                         self.s.route_w_r.ptr as *mut f32,
                         dim,
                     );
+                    // Staged-operand snapshot for THIS path (the verify's own staging: up to `m`
+                    // live rows per segment) under `<dir>/rows`, so it cannot overwrite the eager
+                    // one. The multi-row path is the only place the D row mapping is observable.
+                    if let Some(base) = sfdump_dir() {
+                        let dir = format!("{base}/rows");
+                        if let Err(e) = self.moe_bs_sfdump_once(&dir, topk, dim) {
+                            eprintln!("[bs-sfdump] {e}");
+                        }
+                    }
                 }
-            }            // The separate swiglu pass is element-wise and row-local, and its
+            }
+            // The separate swiglu pass is element-wise and row-local, and its
             // kernel walks the SAME [rows][slot][slot_stride] layout
             // (`base + (blockIdx.z*gridDim.y + blockIdx.y)*slot_stride`), so the
             // m-row loop collapses into one rows=m launch with no order
@@ -24010,10 +24020,13 @@ fn oracle_tap() -> bool {
                             dim,
                         );
                         // Second, independently gated dump on the same one-shot latch: the
-                        // hand-written kernel's STAGED-operand snapshot (filled at k == 0) plus the
-                        // tables that index it. Copied back here, after the launch, with one
-                        // blocking download — `DSV41_MOE_BS_SFDUMP=<dir>`.
-                        if let Some(dir) = sfdump_dir() {
+                        // hand-written kernel's STAGED-operand snapshot (filled at K-stage
+                        // `DSV41_MOE_BS_SFDUMP_K`, default 0) plus the tables that index it. Copied
+                        // back here, after the launch, with one blocking download —
+                        // `DSV41_MOE_BS_SFDUMP=<dir>`, written under `<dir>/eager` so the
+                        // multi-row (`rows`) dump cannot overwrite it.
+                        if let Some(base) = sfdump_dir() {
+                            let dir = format!("{base}/eager");
                             if let Err(e) = self.moe_bs_sfdump_once(&dir, topk, dim) {
                                 eprintln!("[bs-sfdump] {e}");
                             }
