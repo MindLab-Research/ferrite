@@ -964,3 +964,31 @@ if (g_packed) {
 3. `[NC]` 达标后再用 `~/verify_correct.sh` 验文本（1..100 前 61 行）——**文本只是辅助判据**；
 4. **然后**才用 `~/orient_controlled.sh` 重新受控判定朝向（SWAPAB）与 SF 字节序（SFREV）——
    因为之前所有"全错"的文本结论都是在 B 打包错的条件下得到的（§27）。
+
+## §32 两条新知识（编译检查环境 + packed 几何的候选 B/C）
+
+### (a) 编译检查必须在**仓库目录**里做
+把 shim/kernel 拷到 `/tmp/xxx` 再 `nvcc -c` 会报一堆**假**错误
+（`identifier "tl_bs_init" is undefined` / `kBm` / `kSegCap` / `kMovThreads` undefined），
+因为仓库目录里还有 shim 需要的其它头/宏。**正确做法**（本次实测 `PK_RC=0`，产物 164 KB）：
+```bash
+ssh ubuntu@43.202.208.136 'cd ~/ferrite && git fetch -q origin && \
+  git checkout -q origin/main -- kernels/cuda/tilelang_gen/ && \
+  cd kernels/cuda/tilelang_gen && \
+  nvcc -c moe_bs_shim.cu -o /tmp/pk_shim.o -gencode arch=compute_103a,code=sm_103a \
+       -O2 -std=c++17 -I. -I../tilelang_inc 2>&1 | grep -E "error" | head -6; echo RC=${PIPESTATUS[0]}'
+```
+（§22 记过"要编 shim 而不是编 kernel"；本节补上"要在仓库目录里编"。）
+
+### (b) packed 几何：候选 B / C（有原理，待实测定标）
+从三条实测硬事实反推：① 硬件 2 元素/字节；② 一个 `scale_vec::1X` K-block（32 元素）= **16 B**；
+③ 官方 W 子 tile = **8192 B = 128 行 × 64 B**。
+再由 UMMA 的"core matrix 原子 = 8 行 × 16 B"（packed 下 16 B 恰好 = 一个 K-block）得：
+
+| 候选 | 写公式（`kb = k/32` = K-block 下标） | lbo | sbo | layout | K-block 递进 |
+|---|---|---|---|---|---|
+| **B**（主推） | `byte(row,kb) = (row%8)*16 + kb*128 + (row/8)*512` | **8**（128 B） | **32**（512 B） | 0（SWIZZLE_NONE） | `ki*128 B` = `ki*8` |
+| **C**（备选） | 同 B | 8 | 32 | **1**（SWIZZLE_128B_BASE32B） | 同 B |
+| ~~§30 的猜测~~ | 行内 16 B chunk 按行号 XOR | 1 | 64 | 2 | `ki*16 B` | ← 已被本节的推导取代（但仍保留为对照） |
+
+判据同前：`const` 稠密 parity `max|D-ref| = 0` 且 `sweep1d k` 128/128。
