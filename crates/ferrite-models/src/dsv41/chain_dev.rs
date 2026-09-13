@@ -3456,6 +3456,16 @@ fn hc_tail_split() -> bool {
             self.dev.win_kv_quant_rt(self.s.kv.ptr as *mut f32, hd as i32, 32)?;
         }
 
+        // op-level diagnostic: the current position's FULLY-processed KV row
+        // (post-rope, post-quant-RT — exactly what enters the ring) at layer 0,
+        // kind 5, n = head_dim, for the KV-chain bisection against the ref's
+        // window_kv_cache slot.
+        if let Ok(xdp) = std::env::var("DSV41_GT_XDUMP") {
+            if layer == 0 {
+                self.gt_dump_vec(&xdp, 5, self.s.kv.ptr, hd)?;
+            }
+        }
+
         if layer == 0 && hc_dbg() {
             let kv = self.dl(self.s.kv.as_f32(), hd)?;
             let r = (kv.iter().map(|v| v * v).sum::<f32>() / kv.len() as f32).sqrt();
