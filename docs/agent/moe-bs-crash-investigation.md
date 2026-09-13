@@ -1344,3 +1344,24 @@ __device__ __forceinline__ int hw_pack_sw128(int row, int p) {
 即恰好装满**一个操作数 stage**（16384 B），与描述符 `sbo=64`（1024 B/8 行组 × 16 组）完全吻合，
 且不越界进入 SF 区（A=0/SFA=32768/SFB=33280）✓。
 ⇒ 修复**不改变 smem 占用**（仍 16384 B/操作数），只是把数据摆到硬件真正会读的那 8 B/槽上。
+
+## §49 修复的三方一致性交叉验证（nibble 序 + 子 tile 尺寸）
+
+修复正确性依赖两个约定，二者**必须同时成立**，现逐项核对：
+
+### (a) nibble 序：源字节"低 nibble = 偶 k"
+- **官方 PASS 证据**：`bs-packed-geometry` 用 **nibble 全随机**的稠密 `random` 用例精确 PASS（relerr=0）
+  ⇒ 硬件确实"低 nibble = 偶 k、高 nibble = 奇 k" ✓
+- **我们的装载约定**：加载期的 fp4 打包（`fp4_pack_kernel`）为 `packed = (lo & 0xF) | (hi << 4)`，`lo` = 元素 `2i`
+  ⇒ **低 nibble = 偶元素** ✓（与上面一致 ✓）
+⇒ 我们的**源字节可以原样**写到 `hw_pack_sw128(row,p)`（$p$ = 行内 packed 字节下标）✓ **无需再拆装 nibble**。
+
+### (b) 子 tile 尺寸：64 行 → 8192 B footprint
+- 官方 `moe_bs_up_tl.cu:88-93` 的 **W1/W3 子 tile 各 8192 B** ✓
+- §47 的容器语义给：**一行 footprint = 8 个 16 B 容器 = 128 B**
+  ⇒ W1 子 tile = **64 行 × 128 B = 8192 B** ✓✓ **吻合**
+- 我们 kernel 的 B tile = 128 行（W1 64 + W3 64）⇒ footprint = **16384 B** ✓（= §48 的核验值 ✓）
+
+⇒ (a)(b) 同时成立 ⇒ **修复的写公式与官方描述符配套，且不需要任何额外的 nibble 变换** ✓。
+**⚠️ 反过来说**：任何"把 packed 字节拆成两个 1-byte 元素"的写法（我们此前的 unpacked staging）
+都会让硬件只看到一半的 K —— 这正是 §29 那个"0x02 只剩 1/2"现象的真正来源 ✓（也因此它**不是**探针假象）。
