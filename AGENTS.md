@@ -107,11 +107,20 @@ LD_LIBRARY_PATH=$HOME/ferrite/kernels/cuda ./target/release/ferrite-serve --back
 - serve 卡住/日志 mtime 停滞 = 挂了（查 `stat -c %y` + pgrep，别等）。
 - 加载错防线（三道 runtime + 三道编译期 + git hooks）见 `docs/agent/` 的加载防线文档。
 
-## 当前状态与下一步（2026-09-14 中午——fp4 MoE crash 三路 runtime audit 完毕 + DIAG 在测）
+## 当前状态与下一步（2026-09-14 下午——变量拆分完成：crash 是结构性的，判别实验在跑）
 
-**crash 排查完整记录**（illegal memory access in MMA kernel）：
+**核心发现（变量拆分测试）**：**crash 不是数据依赖的——是结构性的！**
+- ZERO_SF / ZERO_A / ZERO_EID 全部仍 crash（数据不是触发器）
+- MMA kernel 在 m=1（eager）正常、m>1（verify）crash，与输入数据无关
+- 触发器是**执行上下文的结构性差异**
 
-**已否定假设**（三路 audit subagent + 手工验证）：
+**判别实验（在跑）**：
+1. no-swallow（DSV41_SWALLOW_STEP=0）：verify 用 m=5（legacy arm）而非 m=6（swallowed arm）
+2. k-limit=1（kernel 只跑 1 个 k-iteration）：测试流水线深度
+
+**C8 块加宽分析完成**：需改 3 处（DSPARK_DRAFTS + VERIFY_ROWS + **config.json 的 dspark_block_size——运行期无 env 覆盖**）+ 影子常量（ACC_BINS、spec_step M）+ 硬编码（glue.cu m>6）+ TileLang shim cap。核心 0.5 人日。
+
+**已否定假设**（exhaustive）：
 1. ✅relinquish_alloc_permit（修复 d25d5fe 但非根因——JIT 无它也不 crash）
 2. ✅idesc ki-bits（illegal-instr-3 权威位表：[4,6)=b_sf_id 非 k_size，sf_id 选择是故意的）
 3. ✅fast math（NO_FAST_MATH 也 crash——只改变错误类型 illegal instruction↔illegal memory access）
