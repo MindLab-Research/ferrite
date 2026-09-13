@@ -3181,3 +3181,21 @@ SH_PAIR_MROWS=false INDEXER_MROWS=false COMPRESSOR_MROWS=false SH_EXP_TILELANG=f
 3. 与 §120 的规则一致：**诊断探针一律 opt-in**，且其风险必须显式记录 ✓。
 
 **这一节的价值**：把"下一个会卡的地方"提前点名 ⇒ 卡住时**30 秒内**即可按症状归因，而不是几小时 ✓。
+
+## §125 排除：`DSV41_SEQ_ALIGN` 的 ABI 穿线在**生产路径上正确**（挂死嫌疑清除）
+
+§117 的层级里最后一个未核对的嫌疑是"ABI 变更导致实参错位 ⇒ 垃圾 stream ⇒ 挂死" ✗。逐项核对结果：
+
+| 检查项 | 实测 | 结论 |
+|---|---|---|
+| C 侧签名 | `… const int* ids, int seq_align, cudaStream_t stream`（`dsv41_experts_mxf4.cu:3963-3967`） | `seq_align` 在 stream **之前** ✓ |
+| Rust 调用点 ①`chain_dev.rs:18871` | 尾部 `ids_base, if seq_align() { 1 } else { 0 },` | **落位正确** ✓ |
+| Rust 调用点 ②`:23846` | 尾部 `ids, if seq_align() { 1 } else { 0 },` | **落位正确** ✓ |
+| Rust 调用点 ③`:20874`（一个 DBG/对照 helper） | 尾部 `ids, flag`（`flag` 是 `0/1` 的循环变量） | 仅**测试性质**的 helper；不影响生产路径 ✓ |
+| FFI 绑定 `device.rs:1493-1498` | 声明 **15 个形参 + `CuStream`** | stream 由包装器内部补 ✓（Rust 传 15 个 ✓ 与 C 的 16 个对齐 ✓） |
+| 唯一真正被这次 ABI 变更**打破**的调用方 | `kernels/cuda/tests_dn_bs_parity.cu`（测试文件 ✗） | 与 §113 一致 ✓（不影响生产 ✓） |
+
+⇒ **生产路径的 ABI 穿线正确** ⇒ 挂死嫌疑**清除** ✓。
+⇒ 至此 §117 的"总是生效"层级 + §122 的加载期清单 + 本节的生产调用链，**三处排查全部封闭** ✓：
+剩余的唯一嫌疑就是**已被处置的两个**（有界等待→门控 OFF ✓；NUMCHECK 探针→opt-in ✓）。
+⇒ 正在跑的 `11e16d24`（构建 + 分阶段探针 + 一臂）即为**判定性验证** ✓。
