@@ -279,15 +279,16 @@ struct TmapSpec {
 };
 
 // A 的「元素」是 **e4m3，1 元素 = 1 字节** ⇒ **没有 sub-byte 二义性**（旧的 VERIFY #1
-// 「box 首维按字节还是按元素」在 A 上从此消解：两者相等）。
-// W 的「逻辑元素」仍是 4 bit：TMA **没有** sub-byte 的 data type，所以权重按**打包后的
-// 字节**描述：dim0 = K/2 个 UINT8（smem 侧仍是 unpacked，1 B/元素）。
-// ⇒ A 与 W 的 box 首维从此**分家**。
-// ⚠️ VERIFY #1（仅剩 W 一侧）：box 首维是按**字节（K/2）**还是按**元素（K）**给。按字节
-//    时 box[0] = kBk/2 = 64；若新 dump 的 W 侧给的是 128，说明 lowering 用了别的形态
-//    （见 wiring §4）。
+// 「box 首维按字节还是按元素」在 A 上消解：两者相等）。
+// W 的「逻辑元素」是 **4 bit**：TMA 用 `CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B`（值 14，
+// 见权威 dump `moe_bs_up_tl_host.cu` 的 dtype=14）按**元素**描述权重，所以 dim0 / box[0]
+// 都是 **元素单位（K, K-tile）**，只有 **行距 gstride[0] 仍是字节（K/2）**。
+// ⚠️ VERIFY #1（W 侧，2026-09-13 dump 已定案）：dump 给的是 dtype=14、gdim[0]=5120、
+//    gstride[0]=2560、box[0]=128 ⇒ 按**元素**给（不是旧注释说的 packed 字节 64）。
+//    旧实现按 UINT8 + dim0=K/2 + box[0]=64 描述，与 dump 不符 ⇒ 静默错读。
 constexpr cuuint32_t kABoxA = (cuuint32_t)kBk;        // A: BK 字节（= BK 个 e4m3）
-constexpr cuuint32_t kABoxW = (cuuint32_t)(kBk / 2);  // W: BK/2 字节（packed e2m1）
+// W: `kBk` 个 4-bit 元素 = 64 B（box[0] 与 gdim[0] 同为元素单位；见 spec_w）
+constexpr cuuint32_t kABoxW = (cuuint32_t)kBk;
 
 // ⚠️ VERIFY #2：swizzle。A_sh / B_sh 的 smem 行 = BK 字节 = 128 B（unpacked fp4）
 //    ⇒ CU_TENSOR_MAP_SWIZZLE_128B 是预期值。C_sh 的行 = BN*4 = 512 B（f32）⇒ 也可能
@@ -325,15 +326,19 @@ TmapSpec spec_a(const void* a) {
 // 这是 2026-09-13 修复的根因。所以 stride 只能由知道池布局的调用方给。
 TmapSpec spec_w(const void* w, int64_t w_stride, const char* what) {
     TmapSpec s{};
-    s.dtype = CU_TENSOR_MAP_DATA_TYPE_UINT8;
+    // 权威 dump（`moe_bs_up_tl_host.cu` W1_desc）: dtype=14 (16U4_ALIGN16B)、
+    // gdim[0]=5120、gstride[0]=2560、box[0]=128。⇒ dim0 / box[0] 按 **4-bit 元素**
+    // 计，gstride[0] 按**字节**计（行距 K/2 = 2560 B）。旧的 UINT8 + dim0=K/2 +
+    // box[0]=64 与 dump 不符，是 2026-09-13 修复的第二个根因。
+    s.dtype = CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B;   // == 14（权威 dump）
     s.rank = 3;
     s.addr = w;
-    s.gdim[0] = (cuuint64_t)(kDim / 2);
+    s.gdim[0] = (cuuint64_t)kDim;                      // 5120（4-bit 元素单位）
     s.gdim[1] = (cuuint64_t)kNp;
     s.gdim[2] = (cuuint64_t)kE;
-    s.gstride[0] = (cuuint64_t)(kDim / 2);              // 行距（K 连续）
+    s.gstride[0] = (cuuint64_t)(kDim / 2);              // 行距仍是字节（K/2 = 2560）
     s.gstride[1] = (cuuint64_t)w_stride;                // expert 面 stride = block stride
-    s.box[0] = kABoxW;
+    s.box[0] = kABoxW;                                  // 128（4-bit 元素 = 64 B）
     s.box[1] = (cuuint32_t)kNh;                         // 半块：64 行
     s.box[2] = 1;
     s.ilv = CU_TENSOR_MAP_INTERLEAVE_NONE;

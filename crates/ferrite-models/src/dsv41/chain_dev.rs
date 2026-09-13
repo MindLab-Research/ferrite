@@ -597,6 +597,11 @@ struct Scratch {
     /// segments. A DEVICE pointer is what the shim's movers take (`seg >= *nseg`),
     /// which is what removes the host round trip.
     tl_nseg: DevBuf,
+    // BS (blockscaled) 独立段表：BM=128（不是 bf16 的 16）
+    bs_order: DevBuf,
+    bs_counts: DevBuf,
+    bs_eid: DevBuf,
+    bs_nseg: DevBuf,
     xq4_r: DevBuf,       // [m, dim] fp4 nibbles (dim/2 bytes/row) or e4m3 (dim)
     xsc4_r: DevBuf,      // [m, dim/32 + 8] f32 scales (either format)
     /// [m, topk, 2*inter] routed gate|up output. The batched expert launchers
@@ -814,6 +819,11 @@ pub(crate) fn moe_bf16_dequant() -> bool {
 pub(crate) const TILELANG_SEG_CAP: usize = 36;
 /// The generated kernels' MMA M-tile: every segment's rows are padded to this.
 pub(crate) const TILELANG_BM: usize = 16;
+
+/// BS shim 的 MMA M-tile（moe_bs_shim.cu 的 kBm=128）。**不是** bf16 的
+/// TILELANG_BM(16)：BS mover 索引 order[seg*128 + r]，用 16-stride 的表
+/// 既越界（576 项 vs 下标 767）又静默错读（align 预填的 -1 被当 pad）。
+pub(crate) const TILELANG_BS_BM: usize = 128;
 
 /// Host-side `moe_align` — the ferrite port of the prototype's
 /// `moe_grouped_proto.py::moe_align` (SGLang `moe_align_block_size` semantics):
@@ -4842,6 +4852,11 @@ impl<'a> DevChain<'a> {
             tl_counts: dev.alloc(4 * TILELANG_SEG_CAP)?,
             tl_eid: dev.alloc(4 * TILELANG_SEG_CAP)?,
             tl_nseg: dev.alloc(4)?,
+            // BS (blockscaled) 段表：独立 BM=128（不是 bf16 的 16）
+            bs_order: dev.alloc(4 * TILELANG_SEG_CAP * TILELANG_BS_BM)?,
+            bs_counts: dev.alloc(4 * TILELANG_SEG_CAP)?,
+            bs_eid: dev.alloc(4 * TILELANG_SEG_CAP)?,
+            bs_nseg: dev.alloc(4)?,
             // `dim` bytes per row covers both activation formats: the packed fp4
             // arm uses `dim/2`, the DSV41_EXPERT_ACT_E4M3 arm exactly `dim`.
             xq4_r: dev.alloc((VERIFY_ROWS * dim).max(8))?,
@@ -7182,6 +7197,11 @@ impl<'a> DevChain<'a> {
             dim as i32,
             cfg.norm_eps,
         )?;
+        // D1 boundary 2/10 — the engram writes into the residual stream. The
+        // reference's Engram returns `(h + gate * value).to(x.dtype)`
+        // (`model.py:365`), i.e. bf16, and every later reader of `h` in that layer
+        // sees the rounded row.
+        self.bf16_snap(self.s.h.ptr as *mut f32, hc * dim)?;
         Ok(())
     }
 
@@ -7589,6 +7609,11 @@ impl<'a> DevChain<'a> {
             hc as i32,
             cfg.vocab_size as i32,
         )?;
+        // D1 boundary 1/10 — the residual stream is BORN here. The reference's
+        // `h = self.embed(input_ids)` and the `unsqueeze(2).repeat(..)` that gives
+        // it its `hc_mult` copies both produce bf16 (`model.py:1253-1258`), so this
+        // is the first grid the whole 44-layer stream rides on.
+        self.bf16_snap(self.s.h.ptr as *mut f32, hc * dim)?;
 
         // probe: h right after embedding + hc expansion
         if hc_dbg() {
@@ -16268,6 +16293,70 @@ impl<'a> DevChain<'a> {
         Ok(true)
     }
 
+    /// The **block-scaled** twin of [`Self::moe_tilelang_tables_dev`]: the SAME
+    /// `dsv41_route_group` + `dsv41_moe_align_from_group` device chain (so the same
+    /// capture safety — no D2H read, no H2D upload), but the segment tables land in
+    /// the **BS** scratch (`bs_order` / `bs_counts` / `bs_eid` / `bs_nseg`) built with
+    /// the BS shim's own MMA M-tile, [`TILELANG_BS_BM`] = 128.
+    ///
+    /// WHY A SEPARATE TABLE. `moe_bs_shim.cu` fixes `kBm = 128` and both its movers
+    /// index the order table as `order[seg * BM + r]` (`tl_moe_bs_gather_kernel` /
+    /// `tl_moe_bs_scatter_kernel`). The bf16 shim's table is `TILELANG_BM = 16`-strided,
+    /// so handing it to the BS arm read past the 576-entry table (`seg * 128 + r` spans
+    /// up to 4607) **and** silently mis-took the align prefill `-1` for a pad row — the
+    /// 2026-09-13 crash/numeric root cause. The two arms therefore keep distinct
+    /// tables; `dsv41_route_group` is idempotent, so each arm calls its own builder.
+    ///
+    /// Returns `Ok(false)` under the same conditions as the bf16 builder: the routing
+    /// cannot be expressed as segments or the `.so` lacks either half (the caller keeps
+    /// the proven launches).
+    fn moe_bs_tables_dev(&mut self, m: usize, topk: usize, n_routed: usize) -> Result<bool> {
+        let n_assign = m * topk;
+        if n_assign == 0
+            || n_assign > TILELANG_SEG_CAP
+            || n_assign * 4 > self.s.grp_src.bytes
+            || TILELANG_SEG_CAP * 4 > self.s.grp_counts.bytes
+        {
+            return Ok(false); // the tables could not be expressed anyway
+        }
+        let built = self.dev.route_group(
+            self.s.route_idx_r.ptr as *const i32,
+            self.s.grp_counts.ptr as *mut i32,
+            self.s.grp_starts.ptr as *mut i32,
+            self.s.grp_rows.ptr as *mut i32,
+            self.s.grp_slots.ptr as *mut i32,
+            self.s.grp_perm.ptr as *mut i32,
+            self.s.grp_src.ptr as *mut i32,
+            self.s.grp_active.ptr as *mut i32,
+            self.s.grp_nactive.ptr as *mut i32,
+            m as i32,
+            topk as i32,
+            n_routed as i32,
+            grp_m_cap(self.cfg) as i32,
+        )?;
+        if !built {
+            return Ok(false);
+        }
+        // `TILELANG_BS_BM` (= 128), NOT `TILELANG_BM`: the shim's `kBm` fixes the
+        // order table's row stride, so the align must emit the very stride the BS
+        // movers read. `bs_order` is allocated `TILELANG_SEG_CAP * TILELANG_BS_BM`
+        // i32 for exactly this.
+        let aligned = self.dev.moe_align_from_group(
+            self.s.grp_active.ptr as *const i32,
+            self.s.grp_nactive.ptr as *const i32,
+            self.s.grp_counts.ptr as *const i32,
+            self.s.grp_starts.ptr as *const i32,
+            self.s.grp_src.ptr as *const i32,
+            self.s.bs_order.ptr as *mut i32,
+            self.s.bs_counts.ptr as *mut i32,
+            self.s.bs_eid.ptr as *mut i32,
+            self.s.bs_nseg.ptr as *mut i32,
+            TILELANG_SEG_CAP as i32,
+            TILELANG_BS_BM as i32,
+        )?;
+        Ok(aligned)
+    }
+
     /// `DSV41_MOE_TL_HOST_ALIGN=1` diagnostic: rebuild the tables on the host and
     /// memcmp them against the device ones. A difference is an ERROR — the whole
     /// device arm rests on the two being bit-identical, so reporting one and
@@ -17003,8 +17092,9 @@ impl<'a> DevChain<'a> {
             } else if bs_ready && !grp_gu {
                 // The tables come from the DEVICE (`dsv41_route_group` +
                 // `dsv41_moe_align_from_group`), so this works inside a capture:
-                // no D2H read, no H2D upload. See `moe_tilelang_tables_dev`.
-                let bs_tbl = self.moe_tilelang_tables_dev(m, topk, n_routed)?;
+                // no D2H read, no H2D upload. See `moe_bs_tables_dev` — the BS arm
+                // needs its OWN BM=128 tables, not the bf16 arm's BM=16 ones.
+                let bs_tbl = self.moe_bs_tables_dev(m, topk, n_routed)?;
                 let bs_w = Self::moe_bs_weights(ld, dim, inter_local);
                 if bs_tbl {
                     if let Some(w) = bs_w {
@@ -17016,10 +17106,10 @@ impl<'a> DevChain<'a> {
                             w.1,
                             w.2,
                             w.3,
-                            self.s.tl_eid.ptr as *const i32,
-                            self.s.tl_order.ptr as *const i32,
-                            self.s.tl_counts.ptr as *const i32,
-                            self.s.tl_nseg.ptr as *const i32,
+                            self.s.bs_eid.ptr as *const i32,
+                            self.s.bs_order.ptr as *const i32,
+                            self.s.bs_counts.ptr as *const i32,
+                            self.s.bs_nseg.ptr as *const i32,
                             w.4,
                             m as i32,
                             dim as i32,
@@ -18716,11 +18806,27 @@ fn oracle_tap() -> bool {
             cfg.norm_eps,
         )?;
         }
+        // D1 boundary 3/10 — the attention sublayer's INPUT. The reference's
+        // `attn_norm` is an RMSNorm, which returns its result `.to(x.dtype)`
+        // (`model.py:288-293`) — bf16 — and the wq_a/wkv GEMMs below read exactly
+        // that bf16 row, which is `s.xn` here.
+        //
+        // The hc front end may have emitted the T1 fp8 of `xn` (`s.xq`/`s.xsc`)
+        // from the UNROUNDED row. Clearing `xq_of_xn_valid` makes the next
+        // `quant1(xn)` re-quantise from the rounded buffer, which is the
+        // reference's own order (norm -> bf16 -> act_quant).
+        self.bf16_snap(self.s.xn.ptr as *mut f32, dim)?;
+        self.s.xq_of_xn_valid.set(false);
         let attn_hc_folded = self.attention(layer, pos)?;
         // Tail split join: the attention (projections + AR) has now consumed the
         // EARLY half, so the LATE half's `comb` must be visible to hc_post. A
         // no-op unless hc_mixes_auto issued a split above.
         self.dev.hc_tail_join()?;
+        // D1 boundary 4/10 — the attention sublayer's OUTPUT (wo_b plus its
+        // all-reduce; `model.py:788`, `RowParallelLinear.forward:278` rounds the
+        // f32 AR sum back to the input dtype). `s.o` is the `x` the `hc_post`
+        // below expands, and the reference's `hc_post` evaluates on bf16 operands.
+        self.bf16_snap(self.s.o.ptr as *mut f32, dim)?;
         if Self::fuse_c() {
             // Segment-C P1: the fold already wrote this layer's hc_post onto
             // `s.h` from the AR pubred epilogue, so only the un-folded path
@@ -18748,6 +18854,11 @@ fn oracle_tap() -> bool {
             )?;
             self.copy_h_back()?;
         }
+        // D1 boundary 5/10 — `hc_post`'s residual update, the writer of the
+        // residual stream itself (`model.py:962-966`; `y.type_as(x)` = bf16). Both
+        // arms above converge here: the segment-C fold writes `s.h` from the AR
+        // epilogue, the fallback writes `s.h2` and copies it back.
+        self.bf16_snap(self.s.h.ptr as *mut f32, hc * dim)?;
 
         if phase_dbg() {
             eprintln!("[phs] L{layer} attn={:?}", _t_all.elapsed());
@@ -18829,6 +18940,13 @@ fn oracle_tap() -> bool {
             cfg.norm_eps,
         )?;
         }
+        // D1 boundary 6/10 — the FFN sublayer's INPUT: `ffn_norm`'s bf16 output
+        // (`model.py:288-293`, `model.py:991-992`), the row every MoE/GEMV below
+        // reads. Same T1 invalidation as the attention side above: the fused front
+        // end's fp8 of `xn` was taken from the unrounded row, so the flag is
+        // cleared and the next `quant1(xn)` re-emits from the rounded buffer.
+        self.bf16_snap(self.s.xn.ptr as *mut f32, dim)?;
+        self.s.xq_of_xn_valid.set(false);
         let _t_moeonly = std::time::Instant::now();
         // DSV41_GRAPH_MOE=1 captures the host-free part of the MoE (everything up
         // to the all-reduce) into one per-layer graph. The first step warms every
@@ -18872,6 +18990,12 @@ fn oracle_tap() -> bool {
         // Tail split join for the FFN front end (same contract as the attention
         // side): the MoE consumed the EARLY half, so wait the LATE half's comb.
         self.dev.hc_tail_join()?;
+        // D1 boundary 7/10 — the MoE sublayer's OUTPUT. The reference's MoE returns
+        // `y.type_as(x)` (`model.py:904`) after summing the routed experts and the
+        // shared expert in f32 (`y = torch.zeros_like(x, dtype=torch.float32)`), so
+        // the row `hc_post` expands below is bf16 there. `s.o` holds exactly that
+        // sum here (`moe_reduce` finished it above).
+        self.bf16_snap(self.s.o.ptr as *mut f32, dim)?;
         if Self::fuse_c() {
             // Segment-C P1: same fold as the attention side, on the MoE AR.
             if !moe_hc_folded {
@@ -18897,6 +19021,10 @@ fn oracle_tap() -> bool {
             )?;
             self.copy_h_back()?;
         }
+        // D1 boundary 8/10 — the FFN-side `hc_post`, the layer's last residual
+        // update (`model.py:993`). After this the residual stream carries the
+        // rounded block output into the next layer.
+        self.bf16_snap(self.s.h.ptr as *mut f32, hc * dim)?;
         if phase_dbg() {
             eprintln!("[phs] L{layer} ffn_total={:?}", _t_moe.elapsed());
         }
@@ -19015,6 +19143,56 @@ fn oracle_tap() -> bool {
             .memcpy_d2d(self.s.h.ptr, self.s.h2.ptr as *const c_void, self.s.h.bytes)
     }
 
+    /// `DSV41_BF16_TRUNCATE` — snap ONE computed boundary back onto the bf16 grid,
+    /// in place.
+    ///
+    /// WHY. The official reference runs every layer under
+    /// `torch.set_default_dtype(torch.bfloat16)` (`ref_inference/generate.py`), so
+    /// each activation it materialises — a GEMM output, an RMSNorm output, the
+    /// `hc_pre` collapse, `hc_post`'s residual update, the MoE sum — is bf16; the
+    /// next statement reads those rounded values. ferrite keeps the whole pipeline
+    /// in f32 (`*mut f32` everywhere), which is ~1e-3 MORE precise per layer than
+    /// the reference, and over the 44-layer chain that one-sided precision is what
+    /// the near-tie argmax flips ride on (docs/agent/dspark-correctness-chain.md,
+    /// "hc_pre 的 dtype 截断对照"; docs/agent/s4-paired-alignment-design.md §1.4).
+    /// This is the generalisation of the round trip
+    /// [`dsv41_hc_collapse_norm_kernel`] has always applied to the collapse
+    /// (`dsv41_kernels.cu`, the `truncate` argument) to every OTHER boundary the
+    /// reference rounds at.
+    ///
+    /// WHAT IT IS. `x[i] = __bfloat162float(__float2bfloat16(x[i]))` — RN
+    /// narrowing plus a lossless widening, exactly the intrinsics the existing
+    /// in-kernel collapse truncation uses. It reuses `dsv41_bf16_roundtrip`
+    /// (`dsv41_glue.cu`), so no kernel ABI moves, no buffer changes dtype and no
+    /// kernel gains a parameter: this is a VALUES-only change, and each call is a
+    /// separate launch the caller may place at the exact statement the reference
+    /// rounds at. That placement freedom is why it is a call and not a flag baked
+    /// into the producer kernel.
+    ///
+    /// GATE. Default OFF, read ONCE and cached (`bf16_truncate()`): OFF issues
+    /// NOTHING, so the live f32 path stays bit-for-bit today's. A missing
+    /// `dsv41_bf16_roundtrip` symbol degrades to OFF with ONE note rather than
+    /// silently — a silent no-op would turn the whole arm into the OFF arm and an
+    /// A/B would read "no change" (the trap [`act_e4m3_skipped_note`] documents).
+    ///
+    /// The MoE-TileLang-bs arm is untouched: it has its own precision path.
+    fn bf16_snap(&self, ptr: *mut f32, n: usize) -> Result<()> {
+        if !bf16_truncate() || n == 0 {
+            return Ok(());
+        }
+        if !self.dev.bf16_roundtrip(ptr, n as i64)? {
+            static NOTE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            NOTE.get_or_init(|| {
+                eprintln!(
+                    "[bf16-truncate] the loaded kernel .so has no `dsv41_bf16_roundtrip` \
+                     symbol, so DSV41_BF16_TRUNCATE degraded to OFF for every boundary \
+                     (rebuild the kernels to run the arm)"
+                );
+            });
+        }
+        Ok(())
+    }
+
     /// MLA window path + grouped output projection.
     /// Decode attention for one layer. Returns whether the segment-C hc-post was
     /// folded into this layer's attention all-reduce (see
@@ -19057,6 +19235,15 @@ fn oracle_tap() -> bool {
                 self.s.qr.ptr as *mut f32,
             )?;
         }
+        // D1 boundary 9/10 — the two attention-input GEMM outputs the reference
+        // rounds: `wq_a`'s and `wkv`'s (`model.py:770`/`705`; `linear()` returns
+        // the weight dtype, bf16 for the unquantised pair). They are snapped HERE,
+        // before the q norm and the kv norm consume them, which is the reference's
+        // own order (`q_norm(wq_a(x))`, `kv_norm(wkv(x))` — both norms read an
+        // already-bf16 row). It is also ahead of the `dual_chain_fork` below, so
+        // the kv half's side-stream chain sees the rounded row.
+        self.bf16_snap(self.s.qr.ptr as *mut f32, ql)?;
+        self.bf16_snap(self.s.kv.ptr as *mut f32, hd)?;
         // DUAL_CHAIN (DSV41_DUAL_CHAIN, default ON): fork the kv half onto the
         // runtime's second side stream HERE, so its kv norm + rope runs while the
         // q chain below (NORM_FUSE/lin_rope + wq_b gemv + rope, ~13.5us/layer)
@@ -19281,6 +19468,13 @@ fn oracle_tap() -> bool {
                 false,
             )?;
         }
+        // D1 boundary 10/10 — `wq_b`'s output after RoPE. The reference materialises
+        // `wq_b(qr)` as bf16 and rotates it IN PLACE (`model.py:771-772`), so the
+        // row `sparse_attn` scores is bf16. Placed after the rope block so it lands
+        // on the rope OUTPUT on every arm (the fused `lin_rope`/`lin_rope_norm`
+        // launches rotate inside the GEMV, so their pre-rope rounding is the one
+        // boundary this arm does not reproduce — see the report's residuals).
+        self.bf16_snap(self.s.q.ptr as *mut f32, nlh * hd)?;
 
         if layer == 0 && hc_dbg() {
             let q = self.dl(self.s.q.as_f32(), nlh * hd)?;
@@ -19581,7 +19775,16 @@ fn oracle_tap() -> bool {
         // call shape of `apply_rope_kernel` own the same block, so the emitted
         // bytes are bit-identical. A decline (or a missing symbol) falls back to
         // the three-launch sequence, which is why the second call is kept.
+        //
+        // ⚠️ NOT under `DSV41_BF16_TRUNCATE`: this epilogue emits the fp8 of `s.o`
+        // BEFORE the boundary snap below could round it, so the fused arm would
+        // feed wo_a an activation taken from the unrounded row. With the gate ON
+        // the pair is declined on purpose and the plain `sparse_attn` + o-rope +
+        // `bf16_snap` + `quant1` order runs instead (numerically the same rows,
+        // one launch each — the fusion is bit-identical, so declining it costs
+        // latency only).
         let s_orope = sparse_orope()
+            && !bf16_truncate()
             && self.dev.sparse_attn_orope(
                 self.s.q.as_f32(),
                 ring_ptr as *const f32,
@@ -19640,7 +19843,13 @@ fn oracle_tap() -> bool {
         // The rope pass touches only the trailing `rope_head_dim` lanes of each
         // head, so the emission is a second, warp-per-32-block pass over the
         // WHOLE flat region, bit-identical to dsv41_quant_fp8 (rows=1, block=32).
+        //
+        // ⚠️ Declined under `DSV41_BF16_TRUNCATE` for the same reason as
+        // `s_orope` above: its emission would predate the `s.o` snap, so the fp8
+        // wo_a consumes would come from the unrounded row. The plain `apply_rope`
+        // below then runs and the `quant1(s.o)` after the snap re-emits it.
         let o_q_epi = !s_orope
+            && !bf16_truncate()
             && orope_q()
             && self.dev.apply_rope_q(
                 self.s.o.ptr as *mut f32,
@@ -19690,6 +19899,14 @@ fn oracle_tap() -> bool {
         // B2/P1: the o-rope epilogue above already emitted `s.xq`/`s.xsc` from the
         // rotated `s.o` (or, with SPARSE_OROPE, the fused sparse kernel did);
         // only the fallback path still quantises here.
+        //
+        // ⚠️ Both fused emitters are REFUSED under `DSV41_BF16_TRUNCATE` (see
+        // `s_orope`/`o_q_epi` above), so on that arm this snap is the reference's
+        // `sparse_attn -> bf16` boundary (`model.py:780`, before the inverse o-rope
+        // writes into the same bf16 tensor) followed by the `apply_rope` rounding,
+        // and the `quant1` below then takes the fp8 of the ROUNDED row — the
+        // reference's `act_quant` input. OFF: not one instruction runs here.
+        self.bf16_snap(self.s.o.ptr as *mut f32, nlh * hd)?;
         if !s_orope && !o_q_epi {
             self.quant1(self.s.o.ptr as *const f32, (nlh * hd) as i32)?;
         }
@@ -19704,7 +19921,12 @@ fn oracle_tap() -> bool {
         // fused path (n % 32 != 0, or `mode` < 3 with no dynamic shared memory),
         // and we then run the plain call for every group; the emitted bytes are
         // bit-identical either way, which is what makes the fallback safe.
-        let wo_fuse = Self::wo_quant_fuse() && (olg % 32) == 0;
+        // ⚠️ Declined under `DSV41_BF16_TRUNCATE`: the epilogue's fp8 would be
+        // taken from the wo_a row BEFORE the boundary snap below rounds it, so
+        // wo_b would consume a stale activation. With the gate ON the fallback
+        // order runs (wo_a -> bf16_snap(s.wo) -> quant1/wo_b), which is the
+        // reference's `wo_a -> bf16 -> wo_b`.
+        let wo_fuse = Self::wo_quant_fuse() && (olg % 32) == 0 && !bf16_truncate();
         // wo_b is RowParallel: the input (groups*o_lora) is split, so this rank
         // reduces over its own slice and the ranks' partial sums are added.
         let ol_total = groups * cfg.o_lora_rank;
@@ -19839,6 +20061,13 @@ fn oracle_tap() -> bool {
             self.gemm_fp8_mx_or_swap(a, asc, wp, wsp, std::ptr::null(), out, olg as i32, k as i32)?;
         }
         }
+        // D1 — `wo_a`'s output is a GEMM boundary in the reference too: the grouped
+        // `einsum("bsgd,grd->bsgr")` (`model.py:787`) runs on bf16 operands. Snapped
+        // here, after every wo_a arm (wo_pair / tilelang / the per-group loop) and
+        // BEFORE wo_b reads it — both of wo_b's activations read `s.wo` itself as
+        // f32 (`DSV41_WOB_F32`) or quantise it here, so the rounded row is what the
+        // second projection sees either way.
+        self.bf16_snap(self.s.wo.ptr as *mut f32, ol_local)?;
         // wo_b's activation, in priority order:
         //  1. B1 (wo_fused): the wo_a epilogue already emitted `wo_q`/`wo_qsc`, so
         //     the quant1 that used to run here is skipped.
@@ -20787,8 +21016,9 @@ fn oracle_tap() -> bool {
                 } else if bs_ready {
                     // The tables come from the DEVICE (`dsv41_route_group` +
                     // `dsv41_moe_align_from_group`), so this works inside a capture
-                    // too: no D2H read, no H2D upload. See `moe_tilelang_tables_dev`.
-                    let bs_tbl = self.moe_tilelang_tables_dev(1, topk, ne)?;
+                    // too: no D2H read, no H2D upload. See `moe_bs_tables_dev` — the
+                    // BS arm needs its OWN BM=128 tables, not the bf16 arm's BM=16 ones.
+                    let bs_tbl = self.moe_bs_tables_dev(1, topk, ne)?;
                     let bs_w = Self::moe_bs_weights(ld, dim, inter_local);
                     if bs_tbl {
                         if let Some(w) = bs_w {
@@ -20800,10 +21030,10 @@ fn oracle_tap() -> bool {
                                 w.1,
                                 w.2,
                                 w.3,
-                                self.s.tl_eid.ptr as *const i32,
-                                self.s.tl_order.ptr as *const i32,
-                                self.s.tl_counts.ptr as *const i32,
-                                self.s.tl_nseg.ptr as *const i32,
+                                self.s.bs_eid.ptr as *const i32,
+                                self.s.bs_order.ptr as *const i32,
+                                self.s.bs_counts.ptr as *const i32,
+                                self.s.bs_nseg.ptr as *const i32,
                                 w.4,
                                 1,
                                 dim as i32,
