@@ -1150,6 +1150,57 @@ fn compressor_mrows() -> bool {
     *F.get_or_init(|| std::env::var("DSV41_COMPRESSOR_MROWS").map(|v| v != "0").unwrap_or(false))
 }
 
+/// One-time receipt for [`compressor_mrows`] at [`DevChain::mrows_compress_ok`]'s
+/// dispatch point — the bring-up failure mode this project keeps re-hitting is
+/// "the gate is ON and nothing changed", so the ARMED/DECLINED verdict (and, on a
+/// decline, the `pos_base`/`ratio` and shape/`.so` reason) is stated once per
+/// process instead of being left to inference. It exists to make the gate
+/// OBSERVABLE: without it a gate whose env leg never reached the process is
+/// indistinguishable from a gate whose kernel declined (the sh-gate-phantom
+/// ticket's defect 3). `OnceLock` keeps it off the hot path — like
+/// [`attn_mrows_decline`], a second call costs one atomic read.
+///
+/// `armed` is the `mrows_compress_ok` verdict for this layer; the reason fields
+/// are the same predicates that function tests, re-passed rather than re-derived
+/// so the two can never drift.
+fn compressor_mrows_note(
+    armed: bool,
+    layer: usize,
+    m: usize,
+    pos_base: i32,
+    ratio: i32,
+    dev_ok: bool,
+    w_ok: bool,
+) {
+    static F: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    F.get_or_init(|| {
+        if armed {
+            eprintln!(
+                "[sh-gate] COMPRESSOR_MROWS=1: ARMED (layer {layer}: ONE fused launch for the \
+                 block; pos_base={pos_base} ratio={ratio})"
+            );
+        } else {
+            let reason = if !dev_ok {
+                "stale .so (no dsv41_compressor_fused_mrows)"
+            } else if m < 2 || m > VERIFY_ROWS {
+                "m outside 2..=VERIFY_ROWS"
+            } else if pos_base <= 0 {
+                "pos_base <= 0 (first step / prefill state mapping)"
+            } else if ratio <= 1 {
+                "ratio <= 1 (no compression state)"
+            } else if !w_ok {
+                "layer carries no compressor (comp_wkv/comp_norm absent)"
+            } else {
+                "uncharacterised"
+            };
+            eprintln!(
+                "[sh-gate] COMPRESSOR_MROWS=1: DECLINED: {reason} (layer {layer} m={m} \
+                 pos_base={pos_base} ratio={ratio})"
+            );
+        }
+    });
+}
+
 /// MOE_DUAL (DSV41_MOE_DUAL, default ON): the MoE's SHARED expert half is issued
 /// on the runtime's second side stream so it overlaps the ROUTED experts' fp4
 /// chain on the main stream. The two halves of `moe()` read `xn` through
@@ -1328,6 +1379,31 @@ fn indexer_mrows() -> bool {
             .map(|v| v != "0")
             .unwrap_or(false)
     })
+}
+
+/// One-time receipt for [`indexer_mrows`] at [`DevChain::indexer_rows_m`]'s
+/// dispatch — the ARMED/DECLINED verdict the sh-gate-phantom ticket's defect 3
+/// asks for, once per process so a gate whose env leg never reached the process
+/// is distinguishable from a gate whose kernel declined. `n_layers` is the
+/// model's index-source count (the layers this gate can fire on), and the two
+/// `*_done` flags are [`DevChain::indexer_front_rows`]'s halves, so the receipt
+/// also names WHICH half of the front fused. Same discipline as
+/// [`attn_mrows_decline`]; `OnceLock` keeps it off the hot path (this site runs
+/// inside graph capture).
+fn indexer_mrows_note(armed: bool, n_layers: usize, q_done: bool, w_done: bool, reason: &'static str) {
+    static F: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    F.get_or_init(|| {
+        if armed {
+            eprintln!(
+                "[sh-gate] INDEXER_MROWS=1: ARMED on {n_layers} index-source layers \
+                 (q_done={q_done} w_done={w_done}: block-wide front hoisted out of the row loop)"
+            );
+        } else {
+            eprintln!(
+                "[sh-gate] INDEXER_MROWS=1: DECLINED: {reason} ({n_layers} index-source layers)"
+            );
+        }
+    });
 }
 
 /// ENGRAM-PROJ-MROWS (`DSV41_ENGRAM_PROJ_MROWS=1`, DEFAULT OFF): the multi-row
@@ -1613,6 +1689,26 @@ fn sh_exp_mrows() -> bool {
     *F.get_or_init(|| std::env::var("DSV41_SH_EXP_MROWS").map(|v| v != "0").unwrap_or(false))
 }
 
+/// One-time receipt for [`sh_exp_mrows`] at [`DevChain::shared_expert_mrows`]'s
+/// third arm — ARMED (the block-wide pass ran) or DECLINED with the first
+/// unmet precondition. The sh-gate-phantom ticket's defect 3: this gate had NO
+/// observation at all, so a gate whose env leg never reached the process looked
+/// exactly like a gate whose arm declined. `OnceLock`, same discipline as
+/// [`attn_mrows_decline`]; a second call is one atomic read.
+fn sh_exp_mrows_note(armed: bool, reason: &'static str) {
+    static F: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    F.get_or_init(|| {
+        if armed {
+            eprintln!(
+                "[sh-gate] SH_EXP_MROWS=1: ARMED, dispatched mrows (ONE block-wide \
+                 (w1/w3 -> swiglu -> w2) pass + one element-wise add)"
+            );
+        } else {
+            eprintln!("[sh-gate] SH_EXP_MROWS=1: DECLINED: {reason}");
+        }
+    });
+}
+
 /// A5: DSV41_MOE_EPI_ADD=0 reverts the shared expert's w2 to the
 /// (gemm_fp8_mx, ferrite_add) pair. DEFAULT OFF (parked with the other
 /// round-18-era fusion gates; the A5 epilogue itself is bit-identical, see the
@@ -1744,6 +1840,85 @@ fn sh_exp_fused() -> bool {
 fn sh_pair_m() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *F.get_or_init(|| std::env::var("DSV41_SH_PAIR_M").map(|v| v == "1").unwrap_or(false))
+}
+
+/// The three device-side `DSV41_GEMV_FP8_*` knobs the `dsv41_gemm_fp8_sh_exp_fused`
+/// launcher's hard precondition tests (`.cu:8932`: `mode == 4 && a32 &&
+/// !a32_staged`), mirrored here with the same env vars and the same defaults the
+/// .cu reads once at load. Read once and cached — it exists only to NAME the
+/// three values on a [`sh_pair_m_note`] decline, so a decline can be attributed
+/// to this guard instead of being another silence (the sh-gate-phantom ticket).
+fn gemv_fp8_knob_summary() -> (i32, bool, bool) {
+    static F: std::sync::OnceLock<(i32, bool, bool)> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        // atoi() semantics for the mode knob: a present-but-unparseable value is 0.
+        let mode = match std::env::var("DSV41_GEMV_FP8_MODE") {
+            Ok(v) => v.trim().parse::<i32>().unwrap_or(0),
+            Err(_) => match std::env::var("DSV41_GEMV_FP8_VEC") {
+                Ok(v) if v.starts_with('0') => 0,
+                _ => 4,
+            },
+        };
+        let a32 = match std::env::var("DSV41_GEMV_A32") {
+            Ok(v) => v.trim().parse::<i32>().unwrap_or(0) != 0,
+            Err(_) => true,
+        };
+        let a32_staged = match std::env::var("DSV41_GEMV_A32_STAGED") {
+            Ok(v) => v.trim().parse::<i32>().unwrap_or(0) != 0,
+            Err(_) => false,
+        };
+        (mode, a32, a32_staged)
+    })
+}
+
+/// One-time receipt for [`sh_pair_m`] at [`DevChain::shared_expert_mrows`]'s
+/// first (M-row) arm — ARMED, or DECLINED with the first unmet precondition.
+/// The sh-gate-phantom ticket's defect 3: this gate had NO observation, so "the
+/// env never reached the process" and "the kernel declined" were the same
+/// silence. A decline also prints the [`gemv_fp8_knob_summary`] triple, because
+/// the `dsv41_gemm_fp8_sh_exp_fused` launcher's `.cu:8932` guard rejects any run
+/// that is not `mode == 4 && a32 && !a32_staged` — the one `.so`-side decline
+/// this Rust-side precondition list cannot see. `OnceLock`, same discipline as
+/// [`attn_mrows_decline`].
+fn sh_pair_m_note(armed: bool, reason: &'static str) {
+    static F: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    F.get_or_init(|| {
+        if armed {
+            eprintln!(
+                "[sh-gate] SH_PAIR_M=1: ARMED fused (ONE dsv41_gemm_fp8_sh_exp_fused<m> for the \
+                 whole block, epi_add folding the w2 add)"
+            );
+        } else {
+            let (mode, a32, a32_staged) = gemv_fp8_knob_summary();
+            eprintln!(
+                "[sh-gate] SH_PAIR_M=1: DECLINED: {reason} [DSV41_GEMV_FP8_MODE={mode} \
+                 DSV41_GEMV_A32={a32} DSV41_GEMV_A32_STAGED={a32_staged}; the launcher needs \
+                 mode==4 && a32 && !a32_staged, .cu:8932]"
+            );
+        }
+    });
+}
+
+/// The one-line startup receipt for the four SH-family / compressor verify gates
+/// (sh-gate-phantom defect 3). It reads each gate's `OnceLock` — the exact value
+/// the dispatch points below will see — so the serve log answers "did the env leg
+/// reach the process?" on its first line, without waiting for a kernel to (not)
+/// run. `false` on any of them means the env var never arrived (the leg that
+/// broke in the v6 nsys round); `true` with a `DECLINED` at the dispatch point
+/// means the gate reached the process but the arm did not run. Called once from
+/// [`DevChain::new`]; `OnceLock` keeps it to one line per process.
+fn sh_gate_startup_note() {
+    static F: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    F.get_or_init(|| {
+        eprintln!(
+            "[sh-gate] startup: SH_EXP_MROWS={} SH_PAIR_MROWS={} INDEXER_MROWS={} \
+             COMPRESSOR_MROWS={}",
+            sh_exp_mrows(),
+            sh_pair_m(),
+            indexer_mrows(),
+            compressor_mrows(),
+        );
+    });
 }
 
 /// The phase-1 fold knob for `DSV41_SH_PAIR_M` (`DSV41_SH_PAIR_M_FOLD`, default
@@ -3839,6 +4014,10 @@ impl<'a> DevChain<'a> {
         opts: RunOpts,
         map: Option<crate::dsv41::engram::TokenMap>,
     ) -> Result<Self> {
+        // sh-gate-phantom defect 3: one startup line that reports the four SH /
+        // compressor gate values the dispatch points will read, so a broken env
+        // leg is visible in the serve log's first screen.
+        sh_gate_startup_note();
         let dim = cfg.dim;
         let hc = cfg.hc_mult;
         let hd = cfg.head_dim;
@@ -12249,7 +12428,30 @@ impl<'a> DevChain<'a> {
     /// So this entry fuses what is genuinely uncoupled — the front — and leaves
     /// the select where its `*clen` is row `r`'s own.
     fn indexer_rows_m(&mut self, layer: usize, m: usize) -> Result<(bool, bool)> {
-        self.indexer_front_rows(layer, m)
+        let out = self.indexer_front_rows(layer, m)?;
+        // Receipt at the dispatch point (sh-gate-phantom defect 3): the front's
+        // two halves decide ARMED vs DECLINED, and `n_layers` is the model's
+        // index-source count — the layers this gate can fire on.
+        let n_layers = (0..self.cfg.n_layers)
+            .filter(|&l| self.cfg.is_index_source(l))
+            .count();
+        if out.0 || out.1 {
+            indexer_mrows_note(true, n_layers, out.0, out.1, "");
+        } else {
+            let ld = &self.w.layers[layer];
+            let has = ld.idx_wq_b.is_some()
+                && ld.idx_wq_b_scale.is_some()
+                && ld.idx_weights.is_some();
+            let reason = if !has {
+                "layer carries no indexer weights (idx_wq_b/idx_weights absent)"
+            } else if m == 0 || m > VERIFY_ROWS {
+                "m outside 1..=VERIFY_ROWS"
+            } else {
+                "both front halves declined (proj_mrows / gemv_bf16_v2_mrows / a stale .so)"
+            };
+            indexer_mrows_note(false, n_layers, out.0, out.1, reason);
+        }
+        Ok(out)
     }
 
     /// The indexer FRONT for a whole block: the m-row twin of the first three
@@ -12799,17 +13001,21 @@ impl<'a> DevChain<'a> {
     /// VERIFY_ROWS`, the first step (`pos_base == 0` is the prefill state mapping),
     /// `ratio == 1` (no gate, no state), and a layer that carries no compressor.
     fn mrows_compress_ok(&self, layer: usize, m: usize, pos_base: i32) -> bool {
-        if !compressor_mrows() || !self.dev.supports_compressor_fused_mrows() {
+        if !compressor_mrows() {
             return false;
         }
-        if m < 2 || m > VERIFY_ROWS || pos_base <= 0 {
-            return false;
-        }
-        if self.cfg.compress_ratio(layer) <= 1 {
-            return false;
-        }
+        // The verdict and the reason fields are computed once and handed to the
+        // one-shot receipt below, so the receipt and the dispatch can never
+        // disagree (sh-gate-phantom defect 3: this gate had no observation at
+        // all). Same predicate as before, only re-spelled.
+        let dev_ok = self.dev.supports_compressor_fused_mrows();
+        let shape_ok = m >= 2 && m <= VERIFY_ROWS && pos_base > 0;
+        let ratio = self.cfg.compress_ratio(layer) as i32;
         let ld = &self.w.layers[layer];
-        ld.comp_wkv.is_some() && ld.comp_norm.is_some()
+        let w_ok = ld.comp_wkv.is_some() && ld.comp_norm.is_some();
+        let ok = dev_ok && shape_ok && ratio > 1 && w_ok;
+        compressor_mrows_note(ok, layer, m, pos_base, ratio, dev_ok, w_ok);
+        ok
     }
 
     /// COMPRESSOR-MROWS (`DSV41_COMPRESSOR_MROWS=1`, DEFAULT OFF): ONE
@@ -14279,8 +14485,28 @@ impl<'a> DevChain<'a> {
                 self.dev.stream(),
             )?;
             if ok {
+                sh_pair_m_note(true, "");
                 return Ok(true);
             }
+            // The launcher declined (`Ok(false)`) — fall through to the arms
+            // below, but say so once (sh-gate-phantom defect 3): a `.so`-side
+            // decline is otherwise the same silence as a gate that never ran.
+            sh_pair_m_note(false, "the launcher declined the block (Ok(false))");
+        } else if sh_pair_m() {
+            // Gate ON but one of the mirror preconditions below refused the arm:
+            // name the first unmet one instead of leaving another silence.
+            let reason = if !self.dev.supports_sh_exp_fused() {
+                "stale .so (no dsv41_gemm_fp8_sh_exp_fused symbol)"
+            } else if m == 0 || m > VERIFY_ROWS || m > 8 {
+                "m outside 1..=8 / VERIFY_ROWS"
+            } else if (sh_il % 32) != 0 {
+                "sh_il % 32 != 0"
+            } else if (dim % 32) != 0 {
+                "dim % 32 != 0"
+            } else {
+                "uncharacterised"
+            };
+            sh_pair_m_note(false, reason);
         }
         // ---- the fused arm (`DSV41_SH_EXP_FUSED`) ---------------------------
         // The shape gates are the kernel's own specialisation, mirrored here so a
@@ -14350,13 +14576,25 @@ impl<'a> DevChain<'a> {
                 return Ok(true);
             }
         }
-        if !sh_exp_mrows()
-            || m == 0
-            || m > VERIFY_ROWS
-            || (sh_il % 32) != 0
-            || (dim % 32) != 0
-            || !self.dev.supports_gemm_fp8_mrows()
-        {
+        if !sh_exp_mrows() {
+            return Ok(false);
+        }
+        // Gate ON: name the first unmet precondition so a decline is observable
+        // (sh-gate-phantom defect 3) instead of the old silence.
+        if m == 0 || m > VERIFY_ROWS {
+            sh_exp_mrows_note(false, "m outside 1..=VERIFY_ROWS");
+            return Ok(false);
+        }
+        if (sh_il % 32) != 0 {
+            sh_exp_mrows_note(false, "sh_il % 32 != 0");
+            return Ok(false);
+        }
+        if (dim % 32) != 0 {
+            sh_exp_mrows_note(false, "dim % 32 != 0");
+            return Ok(false);
+        }
+        if !self.dev.supports_gemm_fp8_mrows() {
+            sh_exp_mrows_note(false, "stale .so (no dsv41_gemm_fp8_mrows symbol)");
             return Ok(false);
         }
         // 1) ONE fp8 quantisation for the whole block.
@@ -14388,6 +14626,7 @@ impl<'a> DevChain<'a> {
             stride,
         )?;
         if !(ok1 && ok3) {
+            sh_exp_mrows_note(false, "kernel declined: gemm_fp8_mrows (w1/w3)");
             return Ok(false);
         }
         // 3) swiglu + the fp8 pair the w2 GEMV reads, all m rows in one launch.
@@ -14402,6 +14641,7 @@ impl<'a> DevChain<'a> {
                 self.s.xsc_r.ptr as *mut f32,
             )?;
         if !swiglu_ok {
+            sh_exp_mrows_note(false, "declined: swiglu_limit_q / supports_swiglu_q");
             return Ok(false);
         }
         // 4) w2 for all rows, then ONE element-wise add into the accumulator.
@@ -14418,6 +14658,7 @@ impl<'a> DevChain<'a> {
             dim as i32,
         )?;
         if !ok2 {
+            sh_exp_mrows_note(false, "kernel declined: gemm_fp8_mrows (w2)");
             return Ok(false);
         }
         self.dev.add_inplace_raw(
@@ -14425,6 +14666,7 @@ impl<'a> DevChain<'a> {
             self.s.sh_out_r.ptr as *const c_void,
             (m * dim) as i64,
         )?;
+        sh_exp_mrows_note(true, "");
         Ok(true)
     }
 
