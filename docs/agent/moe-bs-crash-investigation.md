@@ -3762,9 +3762,83 @@ SGLang 侧的实现路径（供性能/精度对照）：DeepGEMM `fp8_fp4_gemm_n
 （`transform_sf_into_required_layout`）；公开踩坑含"ue8m0 打包必须屏蔽 mantissa，否则静默错值"、
 "SF 双重交错"、CUTLASS `smem_atom_layoutSFB` 用错 major 等 ✓。
 
-### 4. 仍在手的关键矛盾（下一批要判）
+### 3.5 🏁 **官方语义 oracle 已建立并自校验通过**（可复算，用户硬性精度要求的直接证据）
 
-1. **m=1 的 gate|up 全错**（corr 0.012/0.018，88% 元素差）**无法**由 lane 字段解释 ⇒ 必须另有原因；
+`scripts/campaign/gu_numpy_ref.py`（CPU-only）按 `ref_inference/kernel.py` 的结构实现官方 fp4_gemm：
+每 32-K 块算 f32 部分积 → 乘该块的 `sa*sb` → 按 K 序累加 → bf16 输出；权重直读 **HF 官方 ckpt 的真 fp4**
+（`layers.<L>.ffn.experts.<E>.w1/w3.weight` = **I8 打包 e2m1**、`.scale` = **F8_E8M0 [2304,160]**），
+按 `Shard::ExpertRows`（每 rank 288 行 + pad 到 320）取片。
+
+**自校验结果（同一份真实 dump：`/tmp/gu_in_GD4_OLD`，prompt 首 token、layer 0）**：
+
+| 量 | 结果 | 意义 |
+|---|---|---|
+| 官方规则复算的 e4m3 **code** vs 我们的 `xq4` | **0 / 5120 字节不同** ✓ | 我们的 routed 激活量化**与官方逐字节一致** ✓ |
+| 官方规则复算的**标度** vs 我们的 `xsc4` | **max rel diff = 0** ✓ | 同上（幂次标度无损）✓ |
+| 我的官方语义 gate\|up vs **旧路径**的 dump | **max\|d\| = 0、corr = 1.000000、3840/3840 逐位相同** ✓✓ | **旧路径的 routed gate/up 就是官方 `fp4_gemm` 语义**（含累加序）⇒ 用户在 MoE gate/up 这一环的"与官方完全对齐"**已成立** ✓ |
+
+⚠️ 方法论教训：第一版用我手写的 RNE e4m3 编码器做对照，得到"51% 字节不同"的**假结论** ✗（手写编码器把
+8..15 全塞进尾数位，应为 `mant-8`）⇒ **对照官方一律用官方实现（此处 `torch.float8_e4m3fn`）**，
+不要手搓参考实现 ✗。
+
+推论：**BS 臂的 gate|up 只要与我的 oracle 逐位不符，就是 BS 臂的问题**（不再需要 GPU 上的官方脚本 ✓），
+而且 oracle 与旧路径逐位相同 ⇒ 我在 CPU 上就能给出"离官方多远"的判决 ✓✓。
+
+### 3.6 用 oracle 扫过的假设（全部**排除**，勿重查）
+
+| # | 假设 | 判据（CPU，同一份真实首层输入） | 结论 |
+|---|---|---|---|
+| 1 | BS 臂 output 与官方/l路不符 | oracle vs BS dump：`max|d|=8.44`、`median rel=1.24`、`frac>5%=0.885`、`corr=0.023` | ✅ **确认偏离**（而 oracle vs 旧路径 = 0 ✓） |
+| 2 | 是**通道置换**（同一多重集、顺序不同） | `Σbs − Σold` = O(1–13)（置换应 ≈0）；`sorted` 差 0.006 vs 均间距 0.0007 | ✗ 排除 |
+| 3 | 是**段/slot 置换** | 36 对 `(bs_slot, old_slot)` 最大 `|corr|` = 0.097 | ✗ 排除 |
+| 4 | 是**量纲/整体标度**错 | 各 slot 模长比 0.94–1.08（量级对） | ✗ 排除 |
+| 5 | 是**读错 expert**（含"把段号当 expert id"） | `gu_expert_probe.py`：26 个候选（自己的 id / ±1 / 0..7 / 段号 0..5）**最大 |corr| = 0.116** | ✗ **排除** |
+| 6 | 是 **clamp（swiglu_limit）差异** | clamp-aware 对拍：解释掉的元素数 = 0 | ✗ 排除 |
+| 7 | 是 **SF 转置 XOR** | 读写各一次 ⇒ 与 DeepGEMM 无 XOR 逐点等价 | ✗ 排除 |
+| 8 | 是 **生产 SF 投递链**（与 DeepGEMM 逐项对照） | 打包/smem 布局/UTCCP shape/desc 全一致 | ✗ 强证据排除（SFST 门仍实测） |
+| 9 | 是**权重区域寻址**跑偏 | 补零通道（gate 288..319、up 288..319）在两臂都**精确为 0** | ✗ 排除 |
+| 10 | 是 **shim 实参顺序/取值**（唯一未审计的静默错值类） | `argorder-audit`：host/dev 两条入口 × 6 项（指针配对、标量语义、派生量、w_stride 语义、SFW 池、宽度截断）**全部一致** | ✗ **排除** |
+| 11 | 是 **MMA 完成等待**（mbarrier parity）失效 ⇒ smem 被覆写 | `init count=1` ✓ / 每 stage 一次 commit ✓ / `try_wait.parity(k&1)` ✓ | ✗ 排除 |
+
+### 3.8 ⚠️ 关键方法论缺口（`loop-coverage-audit` 的结构性论证）
+
+**单 stage 仪器对"k=0 退化为 0"的确定性索引算术在数学上恒过**，而我的 `SFDUMP` 原本也只 dump `k == 0`
+⇒ **整类"per-stage 底址推进"错误此前完全不可见** ✗。而这类恰是唯一能同时给出"量级对 + 逐元素不相关 +
+非置换 + 非换 expert"的确定性机制（竞态/parity/fence 类只会污染部分 K 贡献 ⇒ corr 必然 ≫0，且历史上先
+表现为 `ar5-hang`）。
+
+四条只在多 stage 下起作用的推进（k=0 时全为 0）：
+
+| # | 量 | 表达式 | 期望 |
+|---|---|---|---|
+| 1 | A（e4m3） | `A[(seg*BM+m)*5120 + k*128 + kk]` | 每 stage 前进 128 个 K |
+| 2 | W1/W3（packed fp4） | `W1[e*w_stride + row*2560 + k*64 + col]` | byte 前进 64 ⇒ K 前进 128（2 元素/字节）|
+| 3 | SFA | `SFA[k*(36*128) + seg*128 + tid]` | 每组 128 字 = 128 个 K |
+| 4 | SFW1/SFW3 | `SFW[e*12800 + k*320 + n_tile*64 + tid]` | 每组 320 字 = 320 个 row × 1 K 组 |
+
+**新增的两个门（本次）**：
+- `DSV41_MOE_BS_KEEP_STAGE=s`：gather 把 K ∉ `[128s,128s+128)` 的 A 字节置 0 ⇒ **该臂的输出 = 第 s 个
+  stage 的偏积**；配 `gu_numpy_ref.py --kmin 128s --kmax 128(s+1)` ⇒ 与 oracle 的**同段**偏积对拍，
+  并可扫全部 40 段找出"**实际用了哪一段的标度**"⇒ 直接定位四条推进里哪一条跑偏 ✓（`batch9_keepstage.sh`）。
+- `DSV41_MOE_BS_SFDUMP_K=k`：内容快照可指定 stage（默认 0）⇒ `sfdump_check.py` 终于看得见任意 stage 的
+  W/SF 内容 ✓。
+
+⇒ 误差**只在算术内部**：K 元素配对 / 标度归属 / 逐元素映射中有一处不对，且它必须同时解释
+"量级对 + 逐元素不相关 + 非置换 + 非换 expert"。**下一判据 = `DSV41_MOE_BS_SFDUMP` 内容校验（`sfdump_check.py`）
++ 去假设 replay（`sfdump_replay.py`：输出是否等于"它自己 staged 的数据"的积）** ⇒ 分流"内容错" vs "使用错" ✓。
+
+### 3.7 另外两条已核对的"内部机制"（勿再当嫌疑）
+
+1. **MMA 完成等待（mbarrier parity）**：`mbarrier.init(mma_bar, 1)`（count=1 ✓）→ 每 stage 由 warp1 lane0
+   发一次 `tcgen05.commit.cta_group::1.mbarrier::arrive::one` ✓ → 每 stage `tid0` 用
+   `try_wait.parity(mma_bar, phase = k & 1)`（默认**无界** spin，bounded 变体由 `DSV41_MOE_BS_BOUNDED_WAIT`
+   门控且默认 OFF ✓）⇒ 到达计数 / parity 递进 / 首次等待语义**全部正确** ✓
+   ⇒ "下一 stage 的 loader 覆写了 MMA 仍在读的 smem"这条竞态**机制上不成立** ✓（且实测 48 step 无 hang ✓）。
+2. **TMEM 读的 lane 字段**（§144.1）：已修为默认 per-warp ✓；`tcgen05.cp` 经 `sf-cp-cutlass` 审计确认
+   **不受 ld/st 的 warp 分区限制**（`32x128b.warpx4` 广播到四个分区 ✓）⇒ 我们 `SF_tmem+0/+4`（lane 字段 0）
+   由 warp1 lane0 发射**正确** ✓。
+
+### 4. 仍在手的关键矛盾（下一批要判）1. **m=1 的 gate|up 全错**（corr 0.012/0.018，88% 元素差）**无法**由 lane 字段解释 ⇒ 必须另有原因；
 2. 候选：SF 投递（现由 DeepGEMM 证据支持"没错"✗）、**staged 内容**（`DSV41_MOE_BS_SFDUMP` + `sfdump_check.py` 判）、
    或 **m>1 路径的活行/行映射**（lane 修复后 m=6 是否变对 ⇒ 反过来检验 m=1 是否另有其因）；
 3. ⇒ 下一批四臂（OLD / BS默认 / LDW=0 正对照 / SFST）**必须同时给**：eager(m=1) 与 verify(m=6) 的 dump、
