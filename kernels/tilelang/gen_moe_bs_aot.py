@@ -21,6 +21,11 @@
 #   moe_bs_up_tl_host.cu  # host：TileLang 自己的 launcher —— CUtensorMap 的**权威配方**
 #   moe_bs_tl_config.txt  # 冻结几何 + grid/block/smem + 参数签名 + tensormap 表
 #
+# down 臂（`--down`，见 §5）产出：
+#   moe_bs_dn_tl.cu / moe_bs_dn_tl_host.cu / moe_bs_dn_tl_config.txt
+#   #   dn : A [NSEG*BM, K_pad=384] e4m3（尾 64 列 0）× W2 [E, dim, 384/2] packed fp4
+#   #        -> C [NSEG*BM, dim] f32（**列序不交错**，与 up 不同）
+#
 # ⚠️ GENERATED — do not edit（生成物由本脚本产出，shim 是手写件）。
 #
 # =============================================================================
@@ -202,6 +207,15 @@ BN_DEFAULT = 128      # BN%128==0 是硬约束；128 也是 N 轴的切法（5 �
 BK_DEFAULT = 128      # ≤ 4*gran = 128，且 ≥128（内层 128B ≥ 64B swizzle）
 THREADS = 128         # 3 个工作 warp + 1 个空转（原型 §2 的分工）
 STAGES_DEFAULT = 6    # 原型实测最优（stg=8 超 228KB smem）
+
+# ---- down 臂（`--down`，见 §5）------------------------------------------------
+# down 的 reduction 是 inter（不是 dim），N 轴才是 dim：K_pad = 384 = 3×128。
+K_DN_PAD_DEFAULT = 384  # 320 → 384：唯一能让 `BK ≡ 128 ∧ BK | K` 成立的最近倍数
+N_DN_DEFAULT = DIM      # down 的 N 轴 = 模型维度
+# 默认几何与 up 同档（BM=128 是 TileLang 0.1.14 上唯一可行的 M-tile）。
+# stages：K_pad/BK = 3 个 k-iter ⇒ 3 个 stage 刚好铺满，多出来的 buffer 只会白占 smem。
+# ⚠️ `moe_bs_up` 的 `--stages` 默认 6 在这里**不适用**（k_iters=3）。
+STAGES_DOWN_DEFAULT = 3
 
 
 # ---------------------------------------------------------------------------
@@ -386,6 +400,178 @@ def moe_bs_up(NSEG, BM, NP_, K, E_, BN, BK, NH, threads=THREADS, stages=STAGES_D
     return main
 
 
+# =============================================================================
+# 5. down 臂：K-pad 320 → 384 让 blockscaled 的形状约束重新成立
+# =============================================================================
+# **为什么 down 需要一个 pad**（roadmap 判决的缺口）：routed down 的 reduction 是
+# `K = inter_local = 320`，而 blockscaled 路径要求 `BK ≥ 128`、`BK ≤ 4·gran = 128`
+# （即 `BK ≡ 128`）且 `BK | K`。`320 / 128 = 2.5` 不整除 ⇒ **K=320 上无解**，
+# 所以 fp4 BS 臂此前只覆盖 gate/up（`N_UP=640, K=5120`）。
+#
+# 修法：**只把 K 轴补到 384**（`384 / 128 = 3` 整除 ✓），补出来的 64 列**全零**：
+#   * A 侧：`[NSEG*BM, K_pad=384]` e4m3，`k ∈ [320, 384)` 的 64 个字节写 0
+#     （0x00 = +0.0）；字节代价 +64 B/行 × 4608 行 = **+0.29 MB/层**（噪声）；
+#   * W2 侧：每个权重面的行距从 320/2 = **160 B 变成 384/2 = 192 B**，尾部 32 B 为 0。
+#     这是**真代价**：`192/160 = +20%` ⇒ w2 面 +163840 B/expert
+#     ⇒ `+163840 × 384 expert × 40 层 ≈ +2.5 GB/rank`（见 PROVENANCE §7.5 的对照：
+#     bf16 臂是 +105~113 GiB/rank，本臂这笔仍在同一量级之下）。
+#     实现上**不需要新池、不需要新 pack kernel**：这就是 `load.rs::plan_pitch` 里
+#     `w2.scale` 那一次 10 → 16 的**同一种 re-pitch**（`load.rs:165`），
+#     把 `w2.weight` 也重排一次 160 → 192 即可 —— `upload_from_2d` 按物理 pitch
+#     落行，池在分配时已 `zero_at` 过，所以尾部 32 B **天然是零**。
+#   * SF 侧：`sf_words = 384/128 = 3`（K=320 时只有 2.5 个字，本来就不可达）。
+#     装载期 pack 的词 2 只有前 2 个字节是真的（k ∈ [256,320)），高 2 字节写 0；
+#     实现上给 `dsv41_moe_bs_pack_wsf` 加一个「源行逻辑宽度」上界（`nsc_src = 320/32 = 10`）
+#     即可，越界字节写 0 —— 纯字节搬运语义不变。
+#
+# ⚠️ **K-pad 的数值影响 = 恒等**（验收 ⑤ 的答案）：补出来的每一项都含一个**恰好
+#    +0.0 的乘数**（e4m3 `0x00` = +0.0、e2m1 nibble 0 = +0.0），所以
+#    `sum_k (a_k·sa_k)·(b_k·sb_k)` 里这些项逐项为 0，MMA 的 fp32 累加加上 0 **不改变
+#    任何真实项的位**（+0.0 加到 x 上等于 x；只有 x = -0.0 时才变 +0.0，而 -0.0 与
+#    +0.0 在任何后续乘加里等价）。⇒ K-pad 不引入误差、不改变累加和。
+#    推论：块的**零填充必须是真的零**（内核不做 mask，见 wiring §1.2 第 4 条）——
+#    SFA/SFW2 的 pad 字也一并写 0，省得将来有人改 nibble 语义。
+#
+# 与 up 臂的**唯一结构差异**：down 的 N 轴（= `dim`）来自**一个**权重面
+# （`w2.weight`，[E, dim, K_pad]），不像 up 要把 `B_sh` 拆成 w1/w3 两个 64 宽半块
+# （ferrite 池把 `w1.scale` 插在两个面之间 ⇒ 不存在连续的 640 宽 gate‖up 面）。
+# ⇒ 每个 k-iter 只有**一次** W2 TMA（box `(BK, BN, 1)`）与**一次** SFW2 TMA
+# （box `(BN,)` 个字），且 **C 的列序不交错**（scatter 是普通行拷贝）。
+@tilelang.jit(out_idx=[-1])
+def moe_bs_down(NSEG, BM, N, KDIM, E_, BN, BK, threads=THREADS,
+                stages=STAGES_DOWN_DEFAULT, gran=GRAN):
+    """grouped block-scaled (A e4m3 / B e2m1, ue8m0) down-GEMM，tcgen05 1-CTA，显式 async。
+
+    grid (N/BN, NSEG)；每个 CTA 认领一个 (expert 段, N-tile)。
+
+    A   : [NSEG*BM, KDIM]      float8_e4m3fn  段内行已 gather + BM-padding + K-pad
+                                               （行距 KDIM 字节；尾 KDIM-K_real 列 = 0）
+    W2  : [E_, N, KDIM]        float4_e2m1fn  down 面（K 连续，**行距 KDIM/2 字节**）
+    SFA : [sf_words * NSEG*BM] uint32         每调用 pack（group-major）
+    SFW2: [E_, sf_words*N]     uint32         装载期 pack（group-major；尾字高字节 0）
+    Eid : [NSEG] int32                        每段的 expert id
+    C   : [NSEG*BM, N]         float32        **列序 = N**（与 up 的交错列序不同）
+
+    唯一与 `moe_bs_up` 不同的结构：B 的 BN 行由**一次** TMA 填满（up 是两次半块）。
+    """
+    assert KDIM % (gran * 4) == 0, "K must be a multiple of one packed SF word (4*gran)"
+    assert KDIM % BK == 0 and (KDIM // BK) % (gran * 4 // BK) == 0
+    assert BK % gran == 0 and BK % 32 == 0 and BK <= 4 * gran
+    # ⚠️ 下界同样是硬的（原型 §3.2 实测）：`BK < 128` 的内层只有 64 B < 128 B swizzle
+    # 原子 ⇒ TMA 描述符非法，**运行期**才报 `Invalid TMA descriptor arguments`。
+    # up 臂的同一约束只写在注释里（其认证几何是 BK=128，生成物已冻结）；down 的
+    # 全部存在理由就是 BK ≡ 128，所以这里把它 assert 死 —— 一个不合法的 BK 不该
+    # 产出一份只会在 GPU 上炸的 AOT 件。
+    assert BK >= 128, (
+        "BK < 128 leaves the inner row at 64 B < the 128 B swizzle atom: the TMA descriptor is "
+        "invalid (measured in tcgen05-blockscaled-proto.md §3.2). BK must be exactly 128 here "
+        "(BK <= 4*gran caps it too)."
+    )
+    assert BN % 128 == 0
+    # `tcgen05_cp.32x128b.warpx4` 要求 SF 区行数是 128 的倍数 ⇒ BM 必须是 128 的倍数。
+    assert BM % 128 == 0, (
+        "tcgen05_cp_warpx4 requires the packed scale-factor smem extent to be a multiple of 128, "
+        "so BM must be a multiple of 128 on TileLang 0.1.14 (BM=64 fails at trace time in "
+        "builtin.py:_tcgen05_num_smem_chunks)."
+    )
+    assert N % BN == 0, "the N axis (dim) must tile by BN with no pad"
+    sf_words = KDIM // (gran * 4)
+    sf_period = gran * 4 // BK
+    k_iters = KDIM // BK
+    M = NSEG * BM
+    GRID_X = N // BN
+
+    @T.prim_func
+    def main(A: T.Tensor((M, KDIM), T.float8_e4m3fn),
+             W2: T.Tensor((E_, N, KDIM), T.float4_e2m1fn),
+             SFA: T.Tensor((sf_words * M,), T.uint32),
+             SFW2: T.Tensor((E_, sf_words * N), T.uint32),
+             Eid: T.Tensor((NSEG,), "int32"),
+             C: T.Tensor((M, N), "float32")):
+        with T.Kernel(GRID_X, NSEG, threads=threads) as (bx, by):
+            # smem dtype：B 必须是 unpacked（packed 会静默错值，原型 §4.1）；
+            # A 是 e4m3 ⇒ 天然 1 B/元素，不需要（也没有）`_unpacked` 形态。
+            A_sh = T.alloc_shared((stages, BM, BK), T.float8_e4m3fn)
+            B_sh = T.alloc_shared((stages, BN, BK), T.float4_e2m1_unpacked)
+            SFA_sh = T.alloc_shared((stages, BM), "uint32")
+            SFW_sh = T.alloc_shared((stages, BN), "uint32")
+
+            C_tmem = T.alloc_tmem([BM, BN], "float32")
+            SFA_tmem = T.alloc_tmem([BM, 4], "uint32")
+            SFW_tmem = T.alloc_tmem([BM, BN // 128 * 4], "uint32")
+
+            C_l = T.alloc_fragment((BM, BN), "float32")
+            C_sh = T.alloc_shared((BM, BN), "float32")
+
+            loaded = T.alloc_barrier([32] * stages)    # TMA 完成
+            sf_full = T.alloc_barrier([32] * stages)   # SF 转置 + fence 完成
+            consumed = T.alloc_barrier([1] * stages)   # UMMA 已消费该 stage
+            tmem_full = T.alloc_barrier([1])           # 累加器就绪
+
+            tx = T.get_thread_binding()
+            e = Eid[by]                                # 专家 id（W2 的第三坐标）
+
+            if tx < 32:
+                # warp0：TMA producer（A + W2 + SFA + SFW2 —— 比 up 少两次半块 TMA）
+                for k in T.serial(k_iters):
+                    st = k % stages
+                    ph = (k // stages) & 1
+                    T.mbarrier_wait_parity(consumed[st], ph ^ 1)
+                    T.tma_copy(A[by * BM:(by + 1) * BM, k * BK:(k + 1) * BK],
+                               A_sh[st, :, :], barrier=loaded[st])
+                    T.tma_copy(W2[e, bx * BN:(bx + 1) * BN, k * BK:(k + 1) * BK],
+                               B_sh[st, :, :], barrier=loaded[st])
+                    if k % sf_period == 0:
+                        g = k // sf_period
+                        T.tma_copy(SFA[g * M + by * BM:g * M + (by + 1) * BM],
+                                   SFA_sh[st, :], barrier=loaded[st])
+                        T.tma_copy(SFW2[e, g * N + bx * BN:g * N + (bx + 1) * BN],
+                                   SFW_sh[st, :], barrier=loaded[st])
+                    T.mbarrier_arrive(loaded[st])
+
+            elif tx < 64:
+                # warp1：SF smem→TMEM，随后发 block-scaled UMMA（与 up 逐行同构）
+                for k in T.serial(k_iters):
+                    st = k % stages
+                    ph = (k // stages) & 1
+                    T.mbarrier_wait_parity(loaded[st], ph)
+                    T.mbarrier_wait_parity(sf_full[st], ph)
+                    if k % sf_period == 0:
+                        T.tcgen05_cp_warpx4(SFA_sh[st, :], SFA_tmem)
+                        T.tcgen05_cp_warpx4(SFW_sh[st, :], SFW_tmem)
+                    T.tcgen05_gemm_blockscaled(
+                        A_sh[st, :, :], B_sh[st, :, :], C_tmem, SFA_tmem, SFW_tmem,
+                        transpose_B=True,
+                        mbar=consumed[st],
+                        clear_accum=(k == 0),
+                        k_start=k * BK,
+                        sf_a_granularity_k=gran,
+                        sf_b_granularity_k=gran,
+                    )
+                T.tcgen05_mma_arrive(tmem_full)
+
+            elif tx < 96:
+                # warp2：`tcgen05.cp.32x128b.warpx4` 要求 SF 字先转置（原型 §1.3）
+                for k in T.serial(k_iters):
+                    st = k % stages
+                    ph = (k // stages) & 1
+                    T.mbarrier_wait_parity(loaded[st], ph)
+                    if k % sf_period == 0:
+                        T.tcgen05_sf_warp_transpose(SFA_sh[st, :])
+                        T.tcgen05_sf_warp_transpose(SFW_sh[st, :])
+                        T.fence_proxy_async()
+                    T.mbarrier_arrive(sf_full[st])
+
+            # epilogue：全部 warp（列序就是 N，scatter 不需要解交错）
+            T.mbarrier_wait_parity(tmem_full, 0)
+            T.sync_threads()
+            T.copy(C_tmem, C_l)
+            T.copy(C_l, C_sh)
+            T.copy(C_sh, C[by * BM, bx * BN])
+
+    return main
+
+
 def _dump(kern, path):
     src = kern.get_kernel_source()
     with open(path, "w") as f:
@@ -434,6 +620,111 @@ def _banner(name, raw_sha, raw_bytes):
     )
 
 
+def _gen_down(args, reason):
+    """`--down`：emit moe_bs_dn_tl.{cu,host.cu,banner} + moe_bs_dn_tl_config.txt。
+
+    与 `main()` 的 up 块逐项同构（同一套几何推导 + 同一份 CUtensorMap 表），
+    差别只在：K 是 `--kpad`（不是 dim）、N 是 dim、B 来自**一个**面（没有半块拆分）、
+    C 的列序不交错。所有数字仍由**本函数**算，shim 只许读 config（勿手改）。
+    """
+    BM, BN, BK, ST = args.dn_bm, args.dn_bn, args.dn_bk, args.dn_stages
+    gran, KDIM, N = args.gran, args.kpad, args.n
+    assert KDIM % (gran * 4) == 0, f"kpad={KDIM} 必须是一个 SF 字（4*gran={gran * 4}）的倍数"
+    assert KDIM % BK == 0, f"kpad={KDIM} 必须被 BK={BK} 整除（BK | K 是硬约束）"
+    assert BN % 128 == 0 and BM % 128 == 0
+    assert N % BN == 0, f"N={N} must be divisible by BN={BN}"
+    grid_x = N // BN
+    sf_words = KDIM // (gran * 4)
+    k_iters = KDIM // BK
+
+    kern = moe_bs_down(SEG_CAP, BM, N, KDIM, E, BN, BK,
+                       threads=THREADS, stages=ST, gran=gran)
+    src = _dump(kern, f"{args.outdir}/moe_bs_dn_tl.cu")
+    host = _dump_host(kern, f"{args.outdir}/moe_bs_dn_tl_host.cu")
+    sha = _sha(src)
+    with open(f"{args.outdir}/moe_bs_dn_tl.banner", "w") as f:
+        f.write(_banner("moe_bs_dn_tl.cu", sha, len(src)))
+
+    # smem 预算（与 up 同一个公式：A = e4m3、B = unpacked e2m1 ⇒ 都是 1 B/元素；
+    # C_sh 与 A_sh 生命周期不重叠，TileLang 会把它们叠在 offset 0 ⇒ 本式是**保守上界**，
+    # 真实峰值见 dump 的 buf_dyn_shmem 偏移；保守值才是 SetAttribute 该传的）
+    smem_ab = ST * (BM * BK + BN * BK)
+    smem_sf = ST * (BM + BN) * 4
+    smem_c = BM * BN * 4
+    smem_total = smem_ab + smem_sf + smem_c
+    smem_aliased = max(smem_c, ST * BM * BK) + ST * BN * BK + smem_sf
+    host_src_note = (
+        "moe_bs_dn_tl_host.cu"
+        if host
+        else "MISSING - transcribe the CUtensorMap recipe by hand (see wiring §4)"
+    )
+    sig = [l for l in src.splitlines() if "main_kernel" in l and "__global__" in l]
+    w2_pitch = KDIM // 2  # packed fp4 行距（字节）
+    w2_real = INTER // 2  # K-pad 之前每行的真实字节数（160）
+    lines = [
+        "# MoE tcgen05 block-scaled (A e4m3 / B e2m1, ue8m0) DOWN-GEMM AOT config",
+        "# GENERATED by gen_moe_bs_aot.py --down — the shim's constants are read off THIS file.",
+        f"is_tcgen05_fix=verified-in-source ({reason})",
+        f"E={E} DIM={DIM} INTER={INTER} K_REAL={INTER} K_PAD={KDIM} N={N} SEG_CAP={SEG_CAP} "
+        f"VERIFY_ROWS={VERIFY_ROWS} TOPK_MAX={TOPK_MAX}",
+        f"BM={BM} BN={BN} BK={BK} threads={THREADS} stages={ST} gran={gran}",
+        f"sf_words={sf_words} sf_period={gran * 4 // BK} k_iters={KDIM // BK}",
+        f"grid=({grid_x}, {SEG_CAP}) ctas={grid_x * SEG_CAP}",
+        f"smem_bytes={smem_total} (ab {smem_ab} + sf {smem_sf} + c {smem_c})",
+        f"smem_bytes_aliased={smem_aliased} (C/A 叠放后的预期峰值："
+        f"max(c {smem_c}, A {ST * BM * BK}) + B {ST * BN * BK} + sf {smem_sf})",
+        f"raw_sha256(dn)={sha}",
+        f"dn_cu_bytes={len(src)}",
+        f"host_source={host_src_note}",
+        "",
+        "# ---- device signature (the shim's parameter order / types) ----",
+        *sig,
+        "",
+        "# ---- K-pad 的形状契约（补出来的列/字节必须**真的是 0**）----",
+        f"#   A : [SEG_CAP*BM, {KDIM}] e4m3  行距 {KDIM} B；k ∈ [{INTER}, {KDIM}) 的 "
+        f"{KDIM - INTER} 列写 0x00（= +0.0）",
+        f"#   W2: [E, {N}, {KDIM}] 4-bit 元素  行距 {w2_pitch} B（= {KDIM}/2；K-pad 前是 {w2_real} B，"
+        f"+{(w2_pitch - w2_real) * 100 // w2_real}%）；尾部 {w2_pitch - w2_real} B = 0",
+        f"#     ⚠️ 池侧实现 = load.rs::plan_pitch 对 w2.weight 做同 w2.scale 的一次 re-pitch"
+        f"（{w2_real} -> {w2_pitch}），尾部零由池的 zero_at 保证，无需新池/新 pack",
+        f"#   SFW2: [E, {sf_words}*{N}] u32  词 g={KDIM // 128 - 1}（最后一个）覆盖 "
+        f"k ∈ [{KDIM - 128}, {KDIM})，其中 k >= {INTER} 的字节写 0",
+        f"#   SFA : [sf_words*M] 同规则（pad 行的 e4m3 字节与 SF 都写 0）",
+        "",
+        "# ---- tensormap operands (authoritative recipe = moe_bs_dn_tl_host.cu) ----",
+        "# kind=tma tensors, in the order TileLang will pass them:",
+        f"#   A     [M, {KDIM}]        e4m3 (row stride {KDIM} B, 1 B/value)",
+        f"#   W2    [E, {N}, {KDIM}]    fp4 packed (dtype=16U4_ALIGN16B；row stride {w2_pitch} B, "
+        f"expert stride = measured block)",
+        f"#   SFA   [sf_words*M]        uint32 (1-D，裸指针，**不走描述符**：dump 里是 cp.async.bulk)",
+        f"#   SFW2  [E, {sf_words}*{N}] uint32 (2-D: expert x word)",
+        f"#   Eid   [NSEG]              int32  (plain, no TMA)",
+        f"#   C     [M, {N}]            f32    (TMA store; row stride {N * 4} B)",
+        "",
+        "# ---- 对新 dump 的审计值（机械比对，勿凭记忆）----",
+        "#   idesc_blockscaled=144708608 (0x08A01400): a_format=0 E4M3, b_format=5 E2M1, K32, E8M0"
+        "  <- 与 up 同一个 idesc（格式没变）",
+        f"#   a_tma_bytes_per_k_iter={BM * BK} (BM*BK*1 B)",
+        f"#   b_tma_bytes_per_k_iter={(BN * BK) // 2} (BN*BK 个 4-bit = 半数字节；up 是两个半块各 "
+        f"{(BN * BK) // 4} B)",
+        f"#   mma_template=tcgen05mma_blockscaled_ss<tl::DataType::kFloat8_e4m3,false>",
+        f"#   a_row_stride_bytes={KDIM}",
+        f"#   w2_row_stride_bytes={w2_pitch}",
+        "",
+        "# ---- host-side layout contract (frozen in the POOL, not in this dump) ----",
+        f"#   w2 plane（K-pad 后）: [{N}, {w2_pitch}] u8   row pitch {w2_pitch} B",
+        f"#   w2.scale plane       : [{N}, {INTER // 32}] u8 逻辑宽度 {INTER // 32} B "
+        f"（物理 16 B，SF-pitch fix）",
+        f"#     -> down pack 输出 word[g*{N} + row] = u32(src + row*{INTER // 32} + g*4)，"
+        f"g*4+b >= {INTER // 32} 的字节写 0",
+        f"#   packed SF pool: [E, {sf_words}*{N}] uint32 = {sf_words * N * 4} B/expert",
+        f"#   C column order: tile bx covers dn[{BN}*bx .. +{BN}) —— **无交错**",
+    ]
+    with open(f"{args.outdir}/moe_bs_dn_tl_config.txt", "w") as f:
+        f.write("\n".join(lines) + "\n")
+    print("\n".join(lines))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("outdir", nargs="?", default=".")
@@ -443,10 +734,27 @@ def main():
     ap.add_argument("--bk", type=int, default=BK_DEFAULT)
     ap.add_argument("--stages", type=int, default=STAGES_DEFAULT)
     ap.add_argument("--gran", type=int, default=GRAN)
+    # ---- down 臂（可选；见 §5）------------------------------------------------
+    # 默认**只出 up**（保持既有 REGEN 手册逐字不变）。`--down` 追加 dn 的三件产出；
+    # `--skip-up` 单独出 dn（重生成 dn 时不必重写 up 的 dump / sha）。
+    ap.add_argument("--down", action="store_true",
+                    help="also emit the routed-down artifacts (moe_bs_dn_tl.*)")
+    ap.add_argument("--skip-up", action="store_true", help="with --down: skip the up artifacts")
+    ap.add_argument("--kpad", type=int, default=K_DN_PAD_DEFAULT,
+                    help="down 的 K 轴 pad 宽度（默认 384 = 3*BK；320 不整除 128 ⇒ 不可用）")
+    ap.add_argument("--dn-bm", type=int, default=BM_DEFAULT)
+    ap.add_argument("--dn-bn", type=int, default=BN_DEFAULT)
+    ap.add_argument("--dn-bk", type=int, default=BK_DEFAULT)
+    ap.add_argument("--dn-stages", type=int, default=STAGES_DOWN_DEFAULT)
     args = ap.parse_args()
 
     reason = verify_blockscaled_fix()
     print(f"[vendor] tilelang fix verified: {reason}")
+
+    if args.down:
+        _gen_down(args, reason)
+    if args.down and args.skip_up:
+        return
 
     BM, BN, BK, ST = args.bm, args.bn, args.bk, args.stages
     gran = args.gran
