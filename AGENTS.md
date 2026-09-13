@@ -67,7 +67,10 @@ LD_LIBRARY_PATH=$HOME/ferrite/kernels/cuda ./target/release/ferrite-serve --back
 | `DSV41_DSPARK=1` | armed（tap hook 等） | OFF |
 | `DSV41_DSPARK_DEBUG=1` | 逐轮 `[dspark-dbg]` trace | OFF |
 | `DSV41_DIFF_EAGER=1` | spec vs eager 逐位对照 probe | OFF |
-| `DSV41_VERIFY_HEAD_FOLD=0` | verify 的 head 走 per-row v1（folded 有 K 序差） | **OFF（=per-row）** |
+| `DSV41_VERIFY_HEAD_FOLD=0` | **已被重新指向 v1 核**（`dsv41_gemv_bf16_v1_mrows`）且**只管 UNSLICED 臂**（`geom.is_none()`，`chain_dev.rs:10385-10398`）——今天默认（SLICED ON）下它是**死门**。真正的 K 序差属于**旧 v2 折叠**（`head_gemv_bf16_mrows` = `gemv_bf16_nt_kernel<NT,1>`，实测 33% echo） | **OFF（=per-row）** |
+| `DSV41_VERIFY_HEAD_MROWS=1` | **SLICED 臂的 head 折叠**（v1 序 `dsv41_gemv_bf16_v1_mrows`，`chain_dev.rs:3710/10439`）：逐位相同 ⇒ **纯发射/内存削减**；m=6 时权重 993→165MB、gemv 6→1 发 | OFF |
+| `DSV41_HEAD_MTILE=1` | 上面那条的同核 **N-tile** 程序（bn=2/4，`dsv41_glue.cu:1666/1691`）：只改"哪个 warp 算哪个元素"，**逐位相同**；减的是每个 warp 重走 `M×k` 激活的 issue/L2 量 | OFF |
+| `DSV41_HEAD_TILELANG=1` | head 走 TileLang bf16 mma（M6/M1=1.00，m=6 125→42µs）——**⚠️ 把 f32 激活 cast 成 bf16，max_rel 2.3e-2 ⇒ 有数值债**（`chain_dev.rs:3729-3737`） | OFF（但 `~/push400_hw_test.sh` 已带上） |
 | `DSV41_VERIFY_HEAD_SLICED=0` | verify 的 head 关词表切分（回到每行读全量 1262MB） | **ON（切分 + 1 个 v5 round）** |
 | `DSV41_SIDS_WRITEBACK=1` | spec commit 后回写 emitted.last() 到 s.ids | OFF（verify 值修好后开） |
 | `DSV41_SWALLOW_STEP=1` | 吞主链步（6 行块） | OFF |
@@ -135,6 +138,22 @@ random 4k/1k、**模拟 accept 5.5**）。**详情与 16 步阶梯见 `docs/agen
   **一切测量前先确认产物同源**（`num100.sh` 已焊入构建门 ✓ —— 我曾因 kill 掉构建中途的批次而留下不同源双产物，白跑一轮 ✗）；
   `.cu` 改动攒批（每次改动都触发 ~3.5 分钟全量重编）✓。
 - 详细过程：`docs/agent/moe-bs-crash-investigation.md` §141–§155。
+
+## §157 【本会话的两条硬事实 + 一条新铁律】（2026-09-14 深夜三）
+
+1. **正确性可达，且已达**：在**正确路径**（`DSV41_MOE_TILELANG_BS=0 DSV41_MOE_BS_HANDWRITTEN=0`）
+   + **生产式图配置**（`DSV41_VERIFY_GRAPH=1 DSV41_GRAPH_STEP=1 DSV41_AR_V5=0`）下，1..100 数数输出
+   **1..98、100**（仅末位一处小瑕疵）✓ —— 而此前"数字跳跃"的**根因就是 `arm_run.sh` 的 `GRAPH_OFF`
+   把默认 ON 的 `GRAPH_STEP` 关掉**（该 flag 还顺带关掉 `ar_v5` ✗，一次动了两个变量）✓。
+2. **verify 是 MTP 的唯一主项，且是"发射次数"性质**：~7000 次流式发射/次（40 层 ×~170 节点）×~2.9µs
+   ⇒ ~20.3ms（28.17ms 里的绝大部分）⇒ 图化（节点 floor ~0.4µs）是第一杠杆 ✓；执行那一半落在
+   **shared expert 10.4ms（5-6 行重复读权重）+ routed experts 8.3ms** 的核效率上 ✗ ⇒ 450 tok/s（step≈7.2ms）
+   **必须两边都做** ✓。
+3. 🔴 **新铁律：凡开整步图（`GRAPH_STEP=1`）的臂，必须显式带 `DSV41_AR_V5=0`** ✗——
+   否则服务在 **all-reduce v5 路径挂死**（表现为装载后立刻死/无响应；本会话因此白跑一轮）。
+   `GRAPH_STEP=0` 只是*顺带*关掉 ar_v5，所以此前的臂从未撞上这个坑 ✓。
+4. **口径提醒**：`[dsv41] step pos=` **只在 `DSV41_SPEC=1` 时才是完整 step**；`arm_run.sh` 的 COMMON **不设它** ✗
+   ⇒ 非 spec 的数**不可用于 MTP 判断**（eager 与 verify 是两套实现：`moe` vs `moe_rows`）✓。
 
 ## §156 【400 tok/s 的账本】verify 是"提交开销"瓶颈，不是算力
 
