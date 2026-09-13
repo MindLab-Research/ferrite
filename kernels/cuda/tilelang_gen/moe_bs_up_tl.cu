@@ -67,6 +67,14 @@ extern "C" __global__ void __launch_bounds__(128, 1) main_kernel(__grid_constant
   if ((((int)threadIdx.x) >> 5) == 0) {
     tl::tmem_allocate((&(C_tmem[0])), 128);
     tl::tmem_allocate((&(sfa_data[0])), 32);
+    // ROOT-CAUSE FIX (2026-09-14, illegal-instr-5): PTX ISA requires the CTA to
+    // relinquish its TMEM allocation permit BEFORE tcgen05.dealloc. TileLang
+    // 0.1.14's codegen omits this call entirely (tl_templates has no such
+    // function), so the generated kernel's dealloc at the tail violates the ISA
+    // precondition and the tcgen05 unit traps with "illegal instruction".
+    // Verified convention in this repo: tests_tcgen05_mxf8f6f4_1x.cu:874-875
+    // and dsv41_experts_mxf4.cu:327-332 both call relinquish right after alloc.
+    asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;" ::: "memory");
   }
   tl::tcgen05_before_thread_sync();
   __syncthreads();
