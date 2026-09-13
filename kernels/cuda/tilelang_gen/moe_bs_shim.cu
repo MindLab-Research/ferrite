@@ -778,6 +778,16 @@ bool tl_bs_init() {
         (void)cudaGetLastError();
         fprintf(stderr, "[moe-bs] per-warp TMEM lane address = %d\n", lw);
     }
+    // g_mbar_ring: 2-entry mbarrier ring for the MMA-completion waits (the official structure)
+    // instead of one barrier absorbing all 40 arrivals. DSV41_MOE_BS_MBAR_RING=1.
+    if (ok) {
+        int mr = 0;
+        const char* e = getenv("DSV41_MOE_BS_MBAR_RING");
+        if (e != nullptr && e[0] == '1') mr = 1;
+        (void)cudaMemcpyToSymbol(g_mbar_ring, &mr, sizeof(int));
+        (void)cudaGetLastError();
+        fprintf(stderr, "[moe-bs] mbarrier ring = %d\n", mr);
+    }
     // g_keep_stage: keep only one 128-K stage's A bytes (DSV41_MOE_BS_KEEP_STAGE=<s>), so the
     // arm's output is that stage's partial and the per-stage base advances can be checked against
     // each other with the oracle's matching K range.

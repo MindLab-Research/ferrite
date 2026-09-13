@@ -72,6 +72,18 @@ done
 # already has the probe; this arm just turns it on and reports what it saw.
 rm -rf /tmp/ks_wdbg
 run KS_WDBG DSV41_GATEUP_DUMP=/tmp/ks_wdbg DSV41_MOE_BS_BOUNDED_WAIT=1 DSV41_MOE_BS_WAITDBG=1
+rm -rf /tmp/ks_ring
+run KS_RING DSV41_GATEUP_DUMP=/tmp/ks_ring DSV41_MOE_BS_MBAR_RING=1
+echo "=== THE FIX TEST: ring arm vs the official-semantics oracle (full K) ==="
+for d in /tmp/ks_ring; do
+  e=$d; [ -d "$d/eager" ] && e=$d/eager
+  if [ -f "$e/gateup.f32" ] && [ -f /tmp/gu_bs_new.f32 ]; then
+    python3 "$HOME/gdu_cmp.py" "$e/gateup.f32" /tmp/gu_bs_new.f32 6 640 10.0 2>&1 | head -6
+  else
+    echo "(missing $e/gateup.f32 or the oracle dump)"
+  fi
+done
+
 echo "=== mbarrier probe verdict ==="
 grep -a "moe-bs-wait" "$HOME/armrun_KS_WDBG.log" | head -12
 echo "-- counts --"

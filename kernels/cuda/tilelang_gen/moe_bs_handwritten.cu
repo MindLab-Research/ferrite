@@ -71,6 +71,10 @@ __device__ int g_ldw = 1;      // 1 (DEFAULT) = read D with the per-warp TMEM la
 // delivery/descriptor mapping is wrong" — the last two items no instrument has ever covered.
 __device__ int g_sfdump_on = 0;
 __device__ int g_sfdump_k = 0;   // which K-stage the snapshot captures (k == 0 is blind to advances)
+// 1 = use a 2-entry mbarrier ring for the MMA-completion waits (the official DeepGEMM structure)
+// instead of one barrier absorbing all 40 arrivals, where a single skipped/extra arrival
+// desynchronises the parity sequence (early return => no smem protection; or a permanent spin).
+__device__ int g_mbar_ring = 0;
 __device__ uint8_t* g_sfdump = nullptr;
 constexpr size_t kSfDumpA = 0;                                  // [36][128][128] u8
 constexpr size_t kSfDumpB = kSfDumpA + 36 * 128 * 128;          // [36][5][128][64] u8
@@ -790,6 +794,12 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
         hw_wait_fail = 0;   // no wait has expired yet; published by the barrier below
         asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;"
                      :: "r"((uint32_t)__cvta_generic_to_shared(mma_bar)));
+        if (g_mbar_ring) {
+            // The ring's second slot sits right after the first (16 B in total, well inside the
+            // smem this kernel already reserves).
+            asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;"
+                         :: "r"((uint32_t)__cvta_generic_to_shared(mma_bar + 1)));
+        }
         // mbarrier-init visibility uses the DEDICATED fence and must come BEFORE the
         // first barrier (TileLang: moe_bs_up_tl.cu:63 tl::fence_barrier_init() is
         // emitted ahead of tl:65's __syncthreads).
@@ -1016,9 +1026,12 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
                 }
             }
 
-            // Commit: signal mbarrier when all MMAs complete
+            // Commit: signal the barrier when all MMAs COMPLETE. With the ring gate on the commit
+            // targets this stage's own ring slot, so each barrier receives exactly one arrival per
+            // round (the official DeepGEMM structure, `consumed[k%3]`) instead of one barrier
+            // absorbing all 40 arrivals.
             if (lane == 0) {
-                hw_tc_commit(mma_bar);
+                hw_tc_commit(g_mbar_ring ? &mma_bar[k & 1] : mma_bar);
             }
         }
 
@@ -1032,22 +1045,29 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
         // steps in the round). Now the spin is capped and a timeout is REPORTED and
         // the whole block takes the abort path together.
         if (tid == 0) {
-            // mbarrier wait (phase 0 for first use, then alternating)
+            // DSV41_MOE_BS_MBAR_RING=1 (default OFF): use a 2-entry mbarrier RING instead of one
+            // barrier shared by all 40 stages — the official DeepGEMM structure (`consumed[k%3]`).
+            // Each ring slot then sees exactly one arrival per round and its parity flips once per
+            // round. With a SINGLE barrier, one skipped or extra arrival desynchronises the whole
+            // parity sequence: one wait returns early (no protection, so the operand smem is
+            // overwritten while the async MMA still reads it => cross-stage mixtures) and another
+            // spins forever (the `[ar5-hang]` / watchdog signature actually observed on the arms).
+            uint64_t* bar = g_mbar_ring ? &mma_bar[k & 1] : mma_bar;
+            const uint32_t phase = g_mbar_ring ? ((k >> 1) & 1) : (k & 1);
             if (g_bounded_wait) {
-                if (whp_mma_wait_bounded(mma_bar, k & 1, k, seg, n_tile)) {
+                if (whp_mma_wait_bounded(bar, phase, k, seg, n_tile)) {
                     hw_wait_fail = 1;   // published to all 128 threads by the barrier below
                 }
             } else {
                 // DEFAULT (restored): the ORIGINAL unbounded wait used for this kernel's whole
                 // history. Kept as the default because the always-on bounded wait is the prime
                 // suspect for the regression that made the serve hang on its first request.
-                const uint32_t phase = k & 1;
                 asm volatile(
                     "{\n\t.reg .pred P;\n\t"
                     "WAIT:\n\t"
                     "mbarrier.try_wait.parity.shared::cta.b64 P, [%0], %1;\n\t"
                     "@!P bra WAIT;\n\t}"
-                    :: "r"((uint32_t)__cvta_generic_to_shared(mma_bar)), "r"(phase));
+                    :: "r"((uint32_t)__cvta_generic_to_shared(bar)), "r"(phase));
             }
         }
         // tcgen05 thread-sync fences (TileLang's pattern): the MMA is an async tcgen05
