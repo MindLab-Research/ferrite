@@ -2946,3 +2946,28 @@ rmsnorm / norm+rope / rope-mrows / q-chain 融合 / hc 链 / head 在 draft 与 
 engram 在 draft 侧**不存在**。⇒ **draft 侧真正的可动项只有 (a) 的四投影（现成门）、(a′) `wo_b`→`mrows_f32`（现成门
 `DSV41_VERIFY_WOB_MROWS_F32`）、以及 (b)/(c) 的 MoE 换核（需新代码，且杠杆小）** ✓。
 ⇒ **结论：把精力继续压在 verify（28.17 ms）与 precision 转正上** ✓（与 §102 路线一致）。
+
+## §115 【硬锚点】SGLang 的 verify 是**实测 7.3 ms**（我们 28.17 ms ⇒ 3.9×）；附目标算术
+
+来源：本项目文档 `docs/agent/dspark-correctness-chain.md:1898`
+> **"sglang 硬锚点：verify=7.3ms（实测）、γ=5（与我们同）"**
+
+⇒ 这条比博客的"873.6 tok/s"更有用，因为它是**实测的 verify 单步耗时**且**γ 与我们一致**（都 5）：
+| 项 | SGLang | ferrite | 倍数 |
+|---|---|---|---|
+| verify（m=6 行） | **7.3 ms**（实测） | **28.17 ms** | **3.9×** ✗ |
+| γ（draft block size） | 5 | 5（`DSPARK_DRAFTS=5`）✓ | 1.0 |
+⇒ **同 γ 下 verify 差 3.9×** ⇒ 与 §. 的裁决（"C(6) 应 ≈ C(1)，实测 4.45× 是**实现未摊薄的病**"）
+**互相印证**：差距是**实现**的，不是规格/模型的 ✓ ⇒ **目标被证明可达** ✓。
+
+### 目标算术（把 450 拆到每一项）
+`tok/s = tok/step ÷ step`，`tok/step = mean-k + 1 = 3.24`（§106）：
+- **450 tok/s 要求 step ≈ 7.2 ms**（已算 ✓）；
+- 而 step = verify + draft + commit = **28.17 + 3.87 + 0.47 ≈ 32.5 ms** ⇒ 需削减 **25.3 ms**；
+- 若把 verify 压到 **SGLang 的 7.3 ms**：step ≈ 11.6 ms ⇒ **~279 tok/s** ✗ 仍未到 450；
+- ⇒ **要到 450 必须"比 SGLang 的 verify 更强"，或同时削 draft/commit，或抬高 tok/step** ✓：
+  - verify **→ 3 ms** 且 draft+commit 保持 ⇒ step ≈ 7.3 ms ⇒ **~444 tok/s** ✓（≈ 目标）；
+  - 或 verify → 7.3 ms **且** tok/step 抬到 5 ⇒ step 11.6 ms ⇒ 431 tok/s（同理可达）。
+⇒ **两条路都通**，但**都要求 verify 进入 3–7 ms 量级** ⇒ **verify 削减是唯一的主线** ✓（与 §102/§114 一致）。
+⇒ **落地载体**（按 §100/§112）：verify 侧 **MoE gate/up 的 BS 臂**（已就绪待验证）+ **down 的 blockscaled**（已入库待接线）
++ **cp.async 双缓冲**（已入库待验证）+ MROWS 族（已落地）+ 融合/重叠门。
