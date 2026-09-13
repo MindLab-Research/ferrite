@@ -58,6 +58,7 @@ __device__ int g_sfrev = 0;
 // lbo=1 (16 B) / sbo=64 (1024 B) / layout_type=2 (SWIZZLE_128B). See
 // docs/agent/moe-bs-crash-investigation.md §29-§31.
 __device__ int g_sfst = 0;     // 1 = deliver the SF with tcgen05.st (isolated-instrument path)
+__device__ int g_ldw = 0;      // 1 = read D with the instrument's per-warp lane address
 __device__ int g_packed = 1;   // DEFAULT ON: the MEASURED-correct layout (hw_pack_sw128)
 // Escape hatch for reference only: DSV41_MOE_BS_UNPACKED=1 restores the measured-WRONG
 // unpacked staging (relerr 1.491) that this whole investigation started from.
@@ -252,6 +253,21 @@ __device__ __forceinline__ void hw_tc_st_x4(uint32_t taddr, uint32_t w0, uint32_
 }
 __device__ __forceinline__ void hw_tc_wait_st() {
     asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
+}
+
+// TMEM 读的**仪器写法**（`tests_bs_impulse.cu` 用的同一条，`.32x32b.x8` + 显式 warp 偏移地址）。
+// 默认不使用：生产用 TileLang 的 `tcgen05_ld_32dp32bNx<128>`（地址 lane 字段恒 0）。
+// `DSV41_MOE_BS_LDW=1` 切到本路径，用来判定"lane 字段是否必须显式加 warp*32"。
+__device__ __forceinline__ void hw_tc_ld_x8(uint32_t taddr, uint32_t *v) {
+    asm volatile(
+        "tcgen05.ld.sync.aligned.32x32b.x8.b32 {%0,%1,%2,%3,%4,%5,%6,%7}, [%8];"
+        : "=r"(v[0]), "=r"(v[1]), "=r"(v[2]), "=r"(v[3]), "=r"(v[4]), "=r"(v[5]), "=r"(v[6]),
+          "=r"(v[7])
+        : "r"(taddr)
+        : "memory");
+}
+__device__ __forceinline__ void hw_tc_wait_ld() {
+    asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
 }
 
 // SF copy to TMEM（从 TileLang tcgen05_cp 复制——32x128b.warpx4 shape）
@@ -1010,7 +1026,21 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
         __syncthreads();
         asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
         // TileLang's verified TMEM read (replaces custom hw_tc_ld<128> that caused ICE)
-        tl::tcgen05_ld_32dp32bNx<128, false>(C_tmem, 0, C_reg);
+        // g_ldw=1: the ISOLATED INSTRUMENT's spelling instead — per-warp address
+        // `((warp*32)<<16) | (C_tmem + 8q)` with `.32x32b.x8` in 16 steps, so every warp
+        // addresses its OWN TMEM lane partition explicitly. TMEM lanes are warp-private, so the
+        // two spellings can only agree if the hardware ignores the address's lane field — which
+        // is exactly what DSV41_MOE_BS_LDW=1 decides.
+        if (g_ldw) {
+            for (int q = 0; q < 16; ++q) {
+                uint32_t v[8];
+                hw_tc_ld_x8(((uint32_t)(warp * 32) << 16) | (C_tmem + 8 * q), v);
+                hw_tc_wait_ld();
+                for (int i = 0; i < 8; ++i) C_reg[8 * q + i] = __uint_as_float(v[i]);
+            }
+        } else {
+            tl::tcgen05_ld_32dp32bNx<128, false>(C_tmem, 0, C_reg);
+        }
 
         // ensure all threads have read TMEM before writing C_sh (fenced pattern)
         asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
