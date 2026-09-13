@@ -107,11 +107,12 @@ LD_LIBRARY_PATH=$HOME/ferrite/kernels/cuda ./target/release/ferrite-serve --back
 - serve 卡住/日志 mtime 停滞 = 挂了（查 `stat -c %y` + pgrep，别等）。
 - 加载错防线（三道 runtime + 三道编译期 + git hooks）见 `docs/agent/` 的加载防线文档。
 
-## 当前状态与下一步（2026-09-14 凌晨——TileLang 战役：全部接线完成 + T 臂乱码根因定谳 + 双挂重跑在途）
+## 当前状态与下一步（2026-09-14 凌晨——R0 重大发现 + MoE fp4 AOT 在途）
 
 **里程碑**：
-- **TileLang 全部接线完成 ✓✓**（六件：五形状投影 wq_a/wq_b/wo_b/wo_a + MoE bf16 + MoE blockscaled fp4 + head bf16 + capture guard 全 shim）——13 TU + 7 tilelang 符号。
-- **T 臂 e2e 首验失败（line 2 乱码）→ 根因定谳**（两份审计交叉确认，`docs/agent/tl-garbage-verdict.md`）：**xsc/xsc_r 的 `.max()` 放在 `/32` 之前 = 算术 no-op**（~6KB 确定性越界读——修了 98f50e8）+ phase-2 四形状零 GPU 实测 + out_stride row-0 免疫 + g_part 单例竞写 + 半挂配置非法。
+- **🎉 R0 acc 诊断重大发现**：`p1=1.00`（首 token 100% 接受）、`mean-k=3.92`（远高于 dspark 报的 2.24——那是累积平均口径）、`hist[0]=0`（零步全拒）。**acc 不是 400 的瓶颈——step 时间是唯一瓶颈**。400 tok/s 只需 step ≤12.3ms（不是之前算的 8ms）。
+- **TileLang 全部接线完成 ✓✓** + **device-side moe_align 编译 ✓✓**（0818d78）+ **capture guard v2 全 shim ✓✓** + **TileLang 0.1.14 正式补丁 ✓✓**（4be4dda）。
+- **fp4 路线（用户裁决）**：必须 fp4、无 hack、无反量化。AOT 生成挂在 T.region API（gen-script-api-fix 修复中）。
 - **GPU 纪律铁律**（用户裁决 2026-09-13）：**subagent 禁止远端一切 GPU 操作**（micro bench / tilelang 运行 / AOT / 任何 GPU 占用）——GPU 测量是主 agent 专属职责。
 - **SGLang 对比判决**（保留有效）：verify = 一次 forward、m 是 batch 维——实测 1.2-1.3× eager；MoE 摊薄完全依赖 tensor core。
 - **tcgen05 blockscaled fp4 判决**（保留有效）：0.62× bf16 + 显存收益独立成立（零 dequant——解决 +105GiB）+ 0.1.14 上游 bug 2 行 shim 绕过。
