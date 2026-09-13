@@ -827,7 +827,8 @@ extern "C" int dsv41_moe_tilelang_gate_up_bs(
 // ===========================================================================
 // forward declaration (definition is appended at the end of this file)
 static void tl_bs_numcheck(const uint8_t* xq4, const float* xsc4, const uint8_t* w1,
-                           const uint32_t* sfw1, int e, int token, int64_t w_stride,
+                           const uint8_t* w3, const uint32_t* sfw1, const uint32_t* sfw3,
+                           int e, const int* order_h, int topk, int64_t w_stride,
                            const float* g_c, cudaStream_t s);
 
 extern "C" int dsv41_moe_tilelang_gate_up_bs_dev(
@@ -1155,8 +1156,15 @@ extern "C" int dsv41_moe_tilelang_gate_up_bs_dev(
                 if (cudaMemcpyAsync(&e0, eid_dev, sizeof(int), cudaMemcpyDeviceToHost, s) == cudaSuccess &&
                     cudaMemcpyAsync(&o0, order_dev, sizeof(int), cudaMemcpyDeviceToHost, s) == cudaSuccess &&
                     cudaStreamSynchronize(s) == cudaSuccess) {
-                    tl_bs_numcheck(xq4, xsc4, (const uint8_t*)w1, (const uint32_t*)sfw1,
-                                   e0, o0 / (topk > 0 ? topk : 1), w_stride, g_c, s);
+                    static int ord_h[128];
+                    if (cudaMemcpyAsync(ord_h, order_dev, 128 * sizeof(int),
+                                        cudaMemcpyDeviceToHost, s) == cudaSuccess &&
+                        cudaStreamSynchronize(s) == cudaSuccess) {
+                        (void)o0;
+                        tl_bs_numcheck(xq4, xsc4, (const uint8_t*)w1, (const uint8_t*)w3,
+                                       (const uint32_t*)sfw1, (const uint32_t*)sfw3,
+                                       e0, ord_h, topk, w_stride, g_c, s);
+                    }
                 }
             }
         }
@@ -1233,10 +1241,9 @@ extern "C" int dsv41_moe_bs_debug_gather(
 
 
 // ===========================================================================
-// §9 NUMCHECK — host-side reference for gate[0..15] of the first assignment.
-// Bypasses the model: decodes the SAME bytes the kernel sees (e4m3 activation,
-// e2m1 packed weights, f32 activation scales, ue8m0 weight scales) and compares
-// with the MMA's g_c. Declared before use at the scatter site.
+// §9 NUMCHECK — host-side reference for a matrix of probe points, covering the
+// M direction (rows 0/64/127), the N/tile direction (cols 0/64/128) and both
+// weight halves (W1 = gate for c<64, W3 = up for c>=64). Bypasses the model.
 // ===========================================================================
 static float tl_h_e2m1(unsigned n) {
     static const float mag[8] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
@@ -1250,50 +1257,77 @@ static float tl_h_e4m3(unsigned b) {
 }
 static double tl_h_ue8m0(unsigned b) { return (b == 0) ? 0.0 : ldexp(1.0, (int)b - 127); }
 
-static void tl_bs_numcheck(const uint8_t* xq4, const float* xsc4, const uint8_t* w1,
-                           const uint32_t* sfw1, int e, int token, int64_t w_stride,
-                           const float* g_c, cudaStream_t s) {
-    static uint8_t h_act[5120];
-    static float h_asc[160];
-    static uint8_t h_w1[16 * 2560];
-    static uint32_t h_sf[40 * 16];
-    static float h_gc[16];
-    if (e < 0 || token < 0) { fprintf(stderr, "[moe-bs][NUMCHECK] bad e/token\n"); return; }
-    if (cudaMemcpy(h_act, xq4 + (size_t)token * 5120, 5120, cudaMemcpyDeviceToHost) != cudaSuccess) return;
-    if (cudaMemcpy(h_asc, xsc4 + (size_t)token * 160, 160 * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) return;
-    if (cudaMemcpy(h_w1, w1 + (size_t)e * (size_t)w_stride, 16 * 2560, cudaMemcpyDeviceToHost) != cudaSuccess) return;
-    for (int k = 0; k < 40; ++k) {
-        if (cudaMemcpy(h_sf + k * 16, sfw1 + (size_t)e * 40 * 320 + (size_t)k * 320,
-                       16 * sizeof(uint32_t), cudaMemcpyDeviceToHost) != cudaSuccess) return;
-    }
-    if (cudaMemcpy(h_gc, g_c, 16 * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) return;
+// One probe: (row within the segment, column within the 640-wide g_c row).
+struct tl_probe { int r, col; };
 
-    double ref[16];
-    for (int n = 0; n < 16; ++n) {
+static void tl_bs_numcheck(const uint8_t* xq4, const float* xsc4, const uint8_t* w1,
+                           const uint8_t* w3, const uint32_t* sfw1, const uint32_t* sfw3,
+                           int e, const int* order_h, int topk, int64_t w_stride,
+                           const float* g_c, cudaStream_t s) {
+    if (topk <= 0) return;
+    static const tl_probe pr[] = {
+        {0, 0}, {0, 1}, {0, 2}, {0, 3},
+        {0, 64}, {0, 65}, {0, 66}, {0, 67},
+        {0, 128}, {0, 129},
+        {64, 0}, {64, 1},
+        {127, 0}, {127, 1},
+    };
+    const int npr = (int)(sizeof(pr) / sizeof(pr[0]));
+    static uint8_t act[8][5120];
+    static float asc[8][160];
+    int tok_of_row[128];
+    for (int r = 0; r < 128; ++r) tok_of_row[r] = order_h[r] < 0 ? -1 : order_h[r] / topk;
+    // copy each distinct token's activation row + scales (cache by token)
+    int cached[8]; int ncached = 0;
+    for (int i = 0; i < npr; ++i) {
+        int t = tok_of_row[pr[i].r];
+        if (t < 0 || t > 7) continue;
+        bool have = false;
+        for (int c = 0; c < ncached; ++c) if (cached[c] == t) have = true;
+        if (have) continue;
+        if (cudaMemcpy(act[t], xq4 + (size_t)t * 5120, 5120, cudaMemcpyDeviceToHost) != cudaSuccess) return;
+        if (cudaMemcpy(asc[t], xsc4 + (size_t)t * 160, 160 * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) return;
+        cached[ncached++] = t;
+    }
+    // whole scale planes for both weight halves
+    static uint32_t sf1[40 * 320], sf3[40 * 320];
+    if (cudaMemcpy(sf1, sfw1 + (size_t)e * 40 * 320, 40 * 320 * sizeof(uint32_t), cudaMemcpyDeviceToHost) != cudaSuccess) return;
+    if (cudaMemcpy(sf3, sfw3 + (size_t)e * 40 * 320, 40 * 320 * sizeof(uint32_t), cudaMemcpyDeviceToHost) != cudaSuccess) return;
+    static uint8_t wr[2560];
+    static float gc[128 * 640];
+    if (cudaMemcpy(gc, g_c, 128 * 640 * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) return;
+
+    fprintf(stderr, "[moe-bs][NUMCHECK] e=%d probes=%d\n", e, npr);
+    double worst = 0.0; int wi = -1;
+    for (int i = 0; i < npr; ++i) {
+        const int r = pr[i].r, col = pr[i].col;
+        const int t = tok_of_row[r];
+        if (t < 0) { fprintf(stderr, "[moe-bs][NUMCHECK] r=%d pad\n", r); continue; }
+        const int ntile = col >> 7, cc = col & 127;
+        const int wrow = (cc < 64) ? (ntile * 64 + cc) : (ntile * 64 + (cc - 64));
+        const bool is_up = (cc >= 64);
+        const uint8_t* wbase = is_up ? w3 : w1;
+        const uint32_t* sfb = is_up ? sf3 : sf1;
+        if (cudaMemcpy(wr, wbase + (size_t)e * (size_t)w_stride + (size_t)wrow * 2560,
+                       2560, cudaMemcpyDeviceToHost) != cudaSuccess) return;
         double acc = 0.0;
         for (int k = 0; k < 5120; ++k) {
-            const unsigned byte = h_w1[(size_t)n * 2560 + (k >> 1)];
+            const unsigned byte = wr[k >> 1];
             const unsigned nib = (k & 1) ? ((byte >> 4) & 0xFu) : (byte & 0xFu);
-            const double a = (double)tl_h_e4m3(h_act[k]);
-            const double sa = (double)h_asc[k / 32];
+            const double a = (double)tl_h_e4m3(act[t][k]);
+            const double sa = (double)asc[t][k / 32];
             const double w = (double)tl_h_e2m1(nib);
-            const unsigned sfbyte = (h_sf[(k / 128) * 16 + n] >> (((k / 32) & 3) * 8)) & 0xFFu;
+            const unsigned sfbyte = (sfb[(k / 128) * 320 + wrow] >> (((k / 32) & 3) * 8)) & 0xFFu;
             acc += a * sa * w * tl_h_ue8m0(sfbyte);
         }
-        ref[n] = acc;
+        const double mma = (double)gc[(size_t)r * 640 + col];
+        const double den = fabs(acc) > 1e-6 ? fabs(acc) : 1e-6;
+        const double rel = fabs(acc - mma) / den;
+        if (rel > worst) { worst = rel; wi = i; }
+        fprintf(stderr, "[moe-bs][NUMCHECK] r=%3d col=%3d tok=%d wrow=%3d %s ref=%9.4f mma=%9.4f rel=%.3g\n",
+                r, col, t, wrow, is_up ? "UP  " : "GATE", acc, mma, rel);
     }
-    fprintf(stderr, "[moe-bs][NUMCHECK] e=%d token=%d\n", e, token);
-    fprintf(stderr, "[moe-bs][NUMCHECK] ref :");
-    for (int n = 0; n < 8; ++n) fprintf(stderr, " %.4f", ref[n]);
-    fprintf(stderr, "\n[moe-bs][NUMCHECK] mma :");
-    for (int n = 0; n < 8; ++n) fprintf(stderr, " %.4f", (double)h_gc[n]);
-    double worst = 0.0; int wi = -1;
-    for (int n = 0; n < 16; ++n) {
-        double d = fabs(ref[n] - (double)h_gc[n]);
-        double den = fabs(ref[n]) > 1e-6 ? fabs(ref[n]) : 1e-6;
-        double rel = d / den;
-        if (rel > worst) { worst = rel; wi = n; }
-    }
-    fprintf(stderr, "[moe-bs][NUMCHECK] worst rel=%.4g at n=%d  %s\n", worst, wi,
-            worst < 1e-3 ? "MATCH (mma == host reference)" : "MISMATCH (mma != reference)");
+    fprintf(stderr, "[moe-bs][NUMCHECK] WORST rel=%.4g at probe %d (r=%d col=%d)  %s\n",
+            worst, wi, wi >= 0 ? pr[wi].r : -1, wi >= 0 ? pr[wi].col : -1,
+            worst < 1e-3 ? "ALL MATCH" : "MISMATCH");
 }
