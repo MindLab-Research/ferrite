@@ -2064,23 +2064,43 @@ fn head_slice() -> bool {
     *F.get_or_init(|| std::env::var("DSV41_HEAD_SLICE").map(|v| v != "0").unwrap_or(true))
 }
 
-/// `DSV41_VERIFY_HEAD_FOLD=1` re-enables the folded multi-row
-/// `head_gemv_bf16_mrows` for the verify's head. **Default OFF (the per-row
-/// `gemv_bf16`) because the folded path is measurably WRONG for this model.**
+/// `DSV41_VERIFY_HEAD_FOLD=1` (DEFAULT OFF) folds the UNSLICED verify head into
+/// ONE multi-row launch **on the v1-order kernel**
+/// (`dsv41_gemv_bf16_v1_mrows`), so the replicated 1262 MB head is streamed once
+/// instead of `m` times. It is the `n = vocab_size` twin of
+/// [`verify_head_mrows`] (which is the same kernel on the sliced geometry), and
+/// this arm's OFF state is the per-row `gemv_bf16`.
 ///
-/// The folded kernel's header argued bit-identity with "the single-row launch
-/// it replaces" (C1-C5); the production single-row head is
-/// `dsv41_gemv_bf16` → `gemv_bf16_kernel` (`gemv_bf16_v2_wanted(n)` needs
-/// `n < 2048`, and the head's `n = vocab_size = 129280`, so the v2/nt path is
-/// NOT taken — `folded-head-korder` established this from the code). The folded
-/// kernel's own scalar `for (c = lane; c < k; c += 32)` chain differs from it in
-/// the fp8/fma pairing details, and the measured effect on serve is large:
+/// ⚠️ THIS GATE USED TO ARM THE **v2** FOLD, AND THAT WAS THE `verify_out[0] ==
+/// next` ECHO. The retired program was `head_gemv_bf16_mrows`
+/// (`gemv_bf16_nt_kernel<NT, 1>`, the v2/`nt` body). Its own header claimed
+/// bit-identity with "the single-row launch it replaces", but the head's
+/// production single-row launch is NOT the v2/`nt` one: `Device::gemv_bf16`
+/// diverts to v2 only when `gemv_bf16_v2_wanted(n)` (`n < GEMV_V2_MAX_N` =
+/// 2048 — device.rs:7929/7951), and the head's `n = vocab_size = 129280` (or its
+/// per-rank slice, 16160 at world = 8). Both are far above the bound, so the
+/// per-row program is v1's `dsv41_gemv_bf16` → `gemv_bf16_kernel`, and the v2
+/// fold was a numerical change against it (`folded-head-korder` established this
+/// from the code). The measured effect on serve is large:
 ///   FOLD=1: `verify_out[0] == next` (the echo) on 33% of verify rows
 ///   FOLD=0: 9%   (22 steps, 出师表) — and the text's adjacent repeats drop 6 → 4.
 /// The echo is what makes `emitted = [next] + verify_out[..]` write `next` twice.
-/// Cost of FOLD=0: the head's 1262 MB weight is streamed ~m times instead of once
-/// (~+0.7 ms/step) — correctness over that, until the folded kernel is proven
-/// bit-identical to v1. Read once and cached (the house rule for hot-path gates).
+///
+/// WHY NO RE-PAIRING COULD HAVE FIXED THE v2 FOLD (the reason this gate is
+/// re-pointed instead of the kernel being "corrected"): the two programs differ
+/// in the intra-row ACCUMULATION CHAIN, not in any comparison or merge order.
+/// Per lane, v1 is 160 strictly serial `acc += (float)w[c] * x[c]` steps over
+/// `c = lane, lane + 32, ...` (dsv41_glue.cu:389), while the v2/`nt` body takes
+/// 20 steps of EIGHT elements (`uint4` W, two float4 x) each folded as two
+/// 4-term FMA groups (dsv41_glue.cu:873-887 / ferrite_kernels.cu:3462-3492).
+/// A serial chain cannot be reproduced by any vectorised re-association, so no
+/// argmax-side change (and no per-row-vs-folded change — the fold already carries
+/// one INDEPENDENT `acc[r]` per row and never sums across rows) can make the v2
+/// fold bit-equal to v1. The only bit-identical fold is v1's own program, which
+/// is what this gate now runs. See `docs/agent/draft-head-fold-v2-argmax-verdict.md`.
+///
+/// Cost of folding OFF: the head's 1262 MB weight is streamed ~m times instead of
+/// once (~+0.7 ms/step). Read once and cached (the house rule for hot-path gates).
 fn verify_head_fold() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *F.get_or_init(|| {
@@ -2098,20 +2118,25 @@ fn verify_head_fold() -> bool {
 /// program the sliced verify head runs IS v1: `gemv_bf16_v2_wanted(n)` diverts
 /// only `n < 2048`, and the head's per-rank `n` is `seg = vocab / world` (16160
 /// at world = 8), so the per-row call lands on `dsv41_gemv_bf16` /
-/// `gemv_bf16_kernel`. The existing folded entry (`head_gemv_bf16_mrows`, the
-/// thing `verify_head_fold` re-enables) is the **v2** (`gemv_bf16_nt`, WPR == 1)
-/// program — a NUMERICAL change against the v1 head, and it measured as one
-/// (33% echo). This gate takes the **v1 fold** instead, whose row r is
-/// bit-identical to the per-row launch it replaces: the same `c = lane; c += 32`
-/// scan, one independent accumulator per row, v1's `__shfl_xor_sync` tree, no
-/// K-split (the kernel header in dsv41_glue.cu carries the transcription
-/// argument). So it changes the head's TRAFFIC (`m` passes over the slice →
-/// one) and its LAUNCH COUNT (`m` → 1) and **not its values** — the design's
-/// 1.12ms → 0.25-0.4ms arm (`docs/agent/verify-family-fusion.md`).
+/// `gemv_bf16_kernel`. The other folded entry (`head_gemv_bf16_mrows`) is the
+/// **v2** (`gemv_bf16_nt`, WPR == 1) program — a NUMERICAL change against the v1
+/// head, and it measured as one (33% echo). This gate takes the **v1 fold**
+/// instead, whose row r is bit-identical to the per-row launch it replaces: the
+/// same `c = lane; c += 32` scan, one independent accumulator per row, v1's
+/// `__shfl_xor_sync` tree, no K-split (the kernel header in dsv41_glue.cu carries
+/// the transcription argument). So it changes the head's TRAFFIC (`m` passes over
+/// the slice → one) and its LAUNCH COUNT (`m` → 1) and **not its values** — the
+/// design's 1.12ms → 0.25-0.4ms arm (`docs/agent/verify-family-fusion.md`).
 ///
-/// Both folds are mutually exclusive and neither is reachable from the other:
-/// `verify_head_fold` only fires on the UNSLICED arm (`geom.is_none()`), this
-/// one only on the SLICED arm.
+/// Both folds are the SAME kernel and they are never combined — each geometry
+/// takes exactly one of them: `verify_head_fold` arms it on the UNSLICED arm
+/// (`geom.is_none()`), this one on the SLICED arm, and the unsliced branch below
+/// also honours this gate (the "structural dead gate" fix: the original call site
+/// sat inside the sliced branch, so an armed gate ran the per-row head on every
+/// slice-less A/B). Since `verify_head_fold` was re-pointed at this same kernel,
+/// the two gates select ONE program and differ only in which geometry they cover.
+/// The v2 fold (`head_gemv_bf16_mrows`) has no head caller any more — see
+/// `docs/agent/draft-head-fold-v2-argmax-verdict.md`.
 ///
 /// Default OFF: the arm is new and needs an `.so` carrying
 /// `dsv41_gemv_bf16_v1_mrows`; a stale one falls back to the per-row loop (the
@@ -2230,8 +2255,8 @@ impl VerifyHeadGeom {
 ///
 /// * UNSLICED arm, performed — the gate is ALIVE, just off the sliced geometry:
 ///   the same v1 kernel is bit-identical on the full-vocabulary head (`n = vocab`
-///   is still `>= GEMV_V2_MAX_N`, so the per-row program it replaces is v1, NOT
-///   the v2/nt fold `verify_head_fold` claims).
+///   is still `>= GEMV_V2_MAX_N`, so the per-row program it replaces is v1 — the
+///   same program `verify_head_fold` now runs there).
 /// * UNSLICED arm, not performed, no BF16 head — STRUCTURALLY DEAD for this
 ///   model: the v1 kernel is bf16-only and there is no slice geometry to fall
 ///   back to.
@@ -2286,15 +2311,18 @@ fn verify_head_mrows_note(
 /// launches, and the head is replicated, so the whole vocabulary is still
 /// compared — the exchange's packed key carries the GLOBAL index.
 ///
-/// **Why per-row `gemv_bf16(n = seg)` and not the folded
-/// `head_gemv_bf16_mrows`.** The fold's kernel IS the v2 (`gemv_bf16_nt`)
-/// program, while the production single-row head is v1 `gemv_bf16_kernel`
+/// **Why per-row `gemv_bf16(n = seg)` is the reference and the fold is an A/B
+/// arm.** The head's production single-row program is v1 `gemv_bf16_kernel`
 /// (`gemv_bf16_v2_wanted(n)` needs `n < 2048` and the head's `n` is the
-/// vocabulary) — so folding the head is a NUMERICAL change, and it measured as
-/// one (see [`verify_head_fold`]). The per-row call here is the SAME kernel the
-/// eager sliced head runs, so each verify row keeps the eager head's exact
-/// values. The fold is a separate, still-open correctness question and stays an
-/// opt-in A/B arm that this gate takes precedence over.
+/// vocabulary / its per-rank slice), so the only fold that can replace it without
+/// moving a value is the **v1-order** one: [`verify_head_mrows`] (and
+/// [`verify_head_fold`] on the unsliced geometry), whose row r is a transcription
+/// of `gemv_bf16_kernel`'s body. The `head_gemv_bf16_mrows` fold is the v2
+/// (`gemv_bf16_nt`) program — a NUMERICAL change against the v1 head that
+/// measured as one (33% echo), and it no longer has a head caller at all
+/// (`docs/agent/draft-head-fold-v2-argmax-verdict.md`). The per-row call here is
+/// the SAME kernel the eager sliced head runs, so each verify row keeps the eager
+/// head's exact values with no gate armed.
 ///
 /// **Why the argmax is ONE batched exchange, not m calls of `argmax_sliced`.**
 /// Every `dsv41_argmax_sliced` call IS a full v5 epoch round — publish, stamp,
@@ -7992,12 +8020,26 @@ impl<'a> DevChain<'a> {
         // re-deriving it.
         self.verify_geom.set(geom);
         let lg_stride = geom.map(|(stride, _)| stride).unwrap_or(cfg.vocab_size);
-        // The fold is the UNSLICED arm's alternative only: it changes the K order
-        // (a numerical change), so it is never combined with the slice.
+        // The fold is the UNSLICED arm's alternative only: the sliced arm has its
+        // own fold below (`verify_head_mrows`, on the same kernel), so the two are
+        // never combined.
+        //
+        // ⚠️ THE KERNEL IS THE **v1-ORDER** ONE (`dsv41_gemv_bf16_v1_mrows`), and
+        // that is the whole point of this gate now: its v2/`nt` program
+        // (`head_gemv_bf16_mrows`, `gemv_bf16_nt_kernel<NT, 1>`) was measured as a
+        // numerical change against the head's per-row program and flipped
+        // near-tie argmaxes (33% echo — see [`verify_head_fold`]). The v2 fold is
+        // bit-identical to the v2 single-row program, and the v2 single-row
+        // program is NOT what this head runs: `Device::gemv_bf16` diverts to
+        // v2/`nt` only when `gemv_bf16_v2_wanted(n)` (n < 2048), and this head's
+        // n is `vocab_size` = 129280. So the fold must run v1's program, whose
+        // row r is a transcription of `gemv_bf16_kernel`'s body (one independent
+        // accumulator per row, `c = lane; c += 32`, v1's `__shfl_xor_sync` tree,
+        // no K-split) and is therefore bit-identical — an argmax cannot move.
         let folded = geom.is_none()
             && verify_head_fold()
             && if head.dtype == "BF16" {
-                self.dev.head_gemv_bf16_mrows(
+                self.dev.head_gemv_bf16_v1_mrows(
                     head.ptr(),
                     self.s.xn_r.ptr as *const f32,
                     self.s.logits_r.ptr as *mut f32,

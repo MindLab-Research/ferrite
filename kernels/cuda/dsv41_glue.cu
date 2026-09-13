@@ -785,8 +785,8 @@ __global__ void gemv_f32_kernel(const float* __restrict__ w, const float* __rest
 // dspark-verify-perf-plan.md §1.2/§2.4). Here one block decodes its row tile
 // ONCE and folds every row against it.
 //
-// NUMERICS — for ANY m, row r of the m-row launch is BIT-IDENTICAL to the
-// PRODUCTION single-row head GEMV of row r's activation. That reference is
+// NUMERICS — for ANY m, row r of the m-row launch is BIT-IDENTICAL to the v2
+// single-row GEMV of row r's activation. That reference is
 // `gemv_bf16_nt_kernel`'s (ferrite_kernels.cu:3357) per-token body at WPR == 1
 // — the same body `gemv_bf16_v2_kernel` runs, i.e. the program the head
 // (out_f = 129280) actually gets from `gv2_wpr`/the nt launcher, which return
@@ -817,6 +817,25 @@ __global__ void gemv_f32_kernel(const float* __restrict__ w, const float* __rest
 // the head is streamed once instead of m times. The row->warp mapping and the
 // grid are not part of the contract either: rows are independent (C4), so which
 // warp computes a row cannot change its value.
+//
+// ⚠️⚠️ "THE SINGLE-ROW LAUNCH IT REPLACES" MEANS THE **v2** PROGRAM, AND NO HEAD
+// RUNS IT. `Device::gemv_bf16` diverts to v2/`nt` only when
+// `gemv_bf16_v2_wanted(n)` (`n < GEMV_V2_MAX_N` = 2048 — device.rs:7929/7951);
+// the head's `n` is the vocabulary (129280) or its per-rank slice (16160 at
+// world = 8), so the head's per-row program has ALWAYS been v1's
+// `dsv41_gemv_bf16` → `gemv_bf16_kernel` (this file, above). Folding a v1 head
+// with THIS kernel is therefore a NUMERICAL change and it measured as one:
+// `verify_out[0] == next` (the echo) on 33% of verify rows vs 9% for the per-row
+// v1 launch — near-tie argmaxes at a 129280-way vocabulary do move when a
+// 5120-term dot is re-associated (v1: 160 serial `acc += w*x` steps per lane,
+// `c = lane; c += 32`; here: 20 steps of 8 elements, two 4-term FMA groups).
+// USE `dsv41_gemv_bf16_v1_mrows` (dsv41_glue.cu:442) FOR A HEAD: its row r is a
+// TRANSCRIPTION of v1's body and is bit-identical to the per-row launch, so no
+// argmax can move. This kernel keeps its value only for `n < GEMV_V2_MAX_N`
+// shapes, where the v2/`nt` body really is the per-row program (the MoE gate's
+// `ferrite_gemv_bf16_v2_mrows`, ferrite_kernels.cu:3372, is that body's other
+// user). The head caller was re-pointed at the v1 fold; history and the bit-level
+// argument: `docs/agent/draft-head-fold-v2-argmax-verdict.md`.
 //
 // ⚠️ DOMAIN OF THE PARITY (read before reusing this kernel):
 //   * `out_f >= 16384` (hence WPR == 1). That is `gv2_wpr`'s first branch and
