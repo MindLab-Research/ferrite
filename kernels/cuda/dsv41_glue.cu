@@ -268,13 +268,6 @@ __global__ void win_kv_quant_rt_kernel(float* __restrict__ kv, int cols, int blo
     }
 }
 
-extern "C" int dsv41_win_kv_quant_rt(float* kv, int cols, int block, cudaStream_t s) {
-    if (cols <= 0 || block <= 0) return (int)cudaSuccess;
-    const int nblk = (cols + block - 1) / block;
-    win_kv_quant_rt_kernel<<<(unsigned)nblk, 32, 0, s>>>(kv, cols, block);
-    return (int)cudaGetLastError();
-}
-
 __global__ void swiglu_limit_q_kernel(float* __restrict__ gate_up, int rows, int inter,
                                       float limit, uint8_t* __restrict__ xq,
                                       float* __restrict__ xsc) {
@@ -584,6 +577,18 @@ __global__ void ar_reduce_kernel(float* __restrict__ dst, const float* __restric
 }
 
 }  // namespace
+
+// The launcher lives OUTSIDE the anonymous namespace: inside it, extern "C"
+// still gets internal linkage and dlsym cannot find the symbol (the failed
+// routehunt round proved this — "not in the loaded .so"). The kernel and the
+// helpers stay inside; anonymous-namespace names remain visible to the rest of
+// this translation unit.
+extern "C" int dsv41_win_kv_quant_rt(float* kv, int cols, int block, cudaStream_t s) {
+    if (cols <= 0 || block <= 0) return (int)cudaSuccess;
+    const int nblk = (cols + block - 1) / block;
+    win_kv_quant_rt_kernel<<<(unsigned)nblk, 32, 0, s>>>(kv, cols, block);
+    return (int)cudaGetLastError();
+}
 
 // The decode-step n-gram hash on the device: removes the LAST per-step H2D on
 // the decode path (the host used to run NgramHashState::forward_row and upload
