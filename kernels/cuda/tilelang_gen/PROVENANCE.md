@@ -77,7 +77,12 @@ scp ubuntu@43.202.208.136:'~/tl_proj/aot_gen/*' kernels/cuda/tilelang_gen/
 | 子树 | 来源 | 文件数 |
 |---|---|---|
 | `tl_templates/` | `tilelang-0.1.14/src/tl_templates/` **全量** | 46（1.1 MB）|
-| `cute/` + `cutlass/` | `tilelang-0.1.14/3rdparty/cutlass/include/` 的**传递闭包** | 35（0.6 MB）|
+| `cute/` + `cutlass/` | `tilelang-0.1.14/3rdparty/cutlass/include/` 的**传递闭包** | 37（1.6 MB）|
+
+- ⚠️ **2026-09-13 闭包扩展（+2）**：第五阶段的 `moe_bs_up_tl.cu` 头部 `tl_templates/cuda/intrin.h`
+  在 `#if __CUDA_ARCH_LIST__ >= 900` 下拉进 `cute/arch/mma_sm90_gmma.hpp`（它又拉
+  `cutlass/arch/synclog.hpp`），两者不在第一阶段闭包内 ⇒ 只补这两个（各带 sha256 核对，
+  取自同一 venv `3rdparty/cutlass/include/`）。补法仍是 `nvcc -M` 实测闭包。
 
 - 生成码 `#include <tl_templates/cuda/...>`（8 个头）与 `common.h` 里的 `<cute/...>` /
   `<cutlass/...>`；一个 `-I kernels/cuda/tilelang_inc` 同时覆盖三个前缀。
@@ -412,7 +417,8 @@ scp ubuntu@43.202.208.136:'~/tl_bs/aot_gen/*' kernels/cuda/tilelang_gen/
 | 项 | 值 |
 |---|---|
 | 形状 | up `n=640 (gate‖up), k=5120`；`E=384`、`NP=320`、`SEG_CAP=36` |
-| 几何 | `BM=64`（目标；`--bm 128` 是原型认证回退）、`BN=128`、`BK=128`、`nh=64`、`grid=(5,36)`、`threads=128`、`stages=6`、`gran=32` |
+| 几何 | **`BM=128`**（认证几何）、`BN=128`、`BK=128`、`nh=64`、`grid=(5,36)`、`threads=128`、`stages=6`、`gran=32` |
+| ⚠️ BM | `--bm 64`（"目标几何"）在 TileLang 0.1.14 上**不可用**：`tcgen05.cp.32x128b.warpx4` 要求 SF smem 行数是 128 的倍数 ⇒ trace 期即被库拒（`gen_moe_bs_aot.py:266 assert BM % 128 == 0`）。`BM_DEFAULT=64` 是历史遗留值，AOT **必须** `--bm 128`。shim 的 `kBm` 必须同步为 128（否则 A 的 box/行块、SFA 段步长 4608=36×128 全错）|
 | 数值路线 | **原生 mxfp4**：e2m1 数据 + ue8m0 标度直进 tensor core（`kind::mxf8f6f4.block_scale`） |
 | ABI | **TMA 描述符**（默认 lowering；见 §9.1-3） |
 | 0.1.14 补丁 | `gen_moe_bs_aot.py::install_blockscaled_fix()`（缺 `ann["is_tcgen05"]`，上游 v0.1.14 与 main 都缺） |
@@ -428,15 +434,53 @@ scp ubuntu@43.202.208.136:'~/tl_bs/aot_gen/*' kernels/cuda/tilelang_gen/
 （例如有人加了 `TL_DISABLE_TMA_LOWER`），它会在编译期直接失败并指向 §4.3 ——
 **不要绕过它**（绕过 = 一个「能编译但走错路」的 shim）。
 
+### 9.3.1 kernel launch 的 ABI（形参序 **不许猜**）
+
+权威配方 = `moe_bs_up_tl_host.cu` 里 TileLang 自己的调用
+`TVMFFIFunctionCall(main_kernel, args, 14)`：`args[0..7]` 是 kernel 形参，`args[8..13]`
+是 `grid(5,36) / block(128) / …/ smem=202752`。device 侧签名（同一份 dump）：
+
+| # | 形参 | 类型 | 形态 |
+|---|---|---|---|
+| 0 | `A_desc` | `CUtensorMap` | TMA load |
+| 1 | `C_desc` | `CUtensorMap` | TMA store —— ⚠️ **不是** `float*` |
+| 2 | `Eid` | `const int*` | 裸指针（唯一随形参走的元数据） |
+| 3 | `SFA` | `const uint*` | **裸指针**：SFA 走 `cp.async.bulk`（`tma_load(dst,src,barrier,size)`），**不需要描述符** ⇒ shim 的 `g_tmap_sfa` 是 dead 的 |
+| 4 | `SFW1_desc` | `CUtensorMap` | |
+| 5 | `SFW3_desc` | `CUtensorMap` | |
+| 6 | `W1_desc` | `CUtensorMap` | ⚠️ **W 排在 SFW 之后** |
+| 7 | `W3_desc` | `CUtensorMap` | |
+
+⇒ 三处反直觉（C 是描述符 / SFA 是裸指针 / W 在最后）正是"错位即编译错误"的来源；
+`<<<>>>` 的正确实参序见 `moe_bs_shim.cu` §6 的 `(2)` 段。
+⚠️ **launch 的 smem 参数 = 202752**（= device dump 的 `buf_dyn_shmem` 最高偏移 + 尾区；
+`C_sh` 与 `A_sh` **共享 offset 0**），**不是** config 里那笔未去别名的 268288（262 KiB
+> sm_100 的 227 KiB/block 上限 ⇒ `cudaFuncSetAttribute` 必失败）。不符 ⇒ launch err 1。
+
+
 ### 9.4 验收证据
 
 | 检查 | 结果 |
 |---|---|
 | `cargo check -p ferrite-models` / `cargo check --workspace` | **EXIT=0**（device.rs + weights.rs + load.rs） |
-| `nvcc … -cubin`（`moe_bs_up_tl.cu`）/ `-shared -fPIC`（`moe_bs_shim.cu`） | ⏳ 需先跑 §9.2 生成（主 agent，见 wiring §6.2） |
-| `nm -D` 两个 T 符号 | ⏳ 同上 |
+| `nvcc -O3 -std=c++17 --use_fast_math -c`（8 份 `*_shim.cu`，仅 `-I tilelang_inc`） | ✅ **8/8 EXIT=0、0 error**（2026-09-13，sm_100a；`moe_bs_shim.cu` regs 144/32/27） |
+| `bash kernels/cuda/build.sh 100a`（compile **+ link**） | ✅ **EXIT=0**（16 个 TU 全绿，含 `moe_bs_shim.cu`） |
+| `nm -D` 两个 T 符号 | ⏳ 待主 agent 在交付 .so 上核 |
 | GPU e2e + parity + bench | ⏳ 见 wiring §6.5/§6.6（主 agent 职责；**空卡**才用绝对 µs） |
-| raw sha256（`moe_bs_up_tl.cu`，banner 之前） | ⏳ 生成后回填（照 §7.2 的格式） |
+| raw sha256（`moe_bs_up_tl.cu`，banner 之前） | ✅ `ae21487c…1fa`（与 config 一致） |
+
+**2026-09-13 ABI 修复（第 13 次重编的编译错误）**：`moe_bs_shim.cu` 的 kernel 调用按 §9.3.1
+重排为 `(g_tmap_a, g_tmap_c, g_eid, g_sfa, g_tmap_sfw1, g_tmap_sfw3, g_tmap_w1, g_tmap_w3)`；
+并同步 `kBm 64→128`、`kSmem 184832→202752`。AOT 产物恢复原名（`moe_bs_up_tl.cu` /
+`moe_bs_up_tl_host.cu`，不再是 `.pending_abi_fix`）。
+
+⚠️ **仍未做（属 §9.3 的独立转写比对任务，改前先读 wiring §4.3/§6.2–6.3）**：
+`spec_a`/`spec_w` 的 dtype 与 box 语义（host 用 sub-byte dtype=14 + **按元素**的 box
+`(128,128)`；shim 现用 `UINT8` + 按字节 `(64,·)`），以及 `spec_c` 的 box 应为 `(32,128)`
+（现为 `(kBn=128,·)`；128×f32=512 B > 128 B swizzle ⇒ encode 必失败）。这两条不修，
+运行期 `dsv41_moe_tilelang_gate_up_bs` 会在 tensormap 编码处 decline（返回 2 ⇒ 安全回退
+老路径，**不是**错值）。
+
 
 
 

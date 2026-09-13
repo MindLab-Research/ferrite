@@ -158,7 +158,13 @@ namespace {
 // §1 冻结几何 —— 逐项来自 tilelang_gen/moe_bs_tl_config.txt（生成器写出，勿手改）
 // ===========================================================================
 constexpr int kSegCap = 36;      // SEG_CAP = VERIFY_ROWS(6) * TOPK_MAX(6)
-constexpr int kBm = 64;          // MMA M-tile（BM%64==0；64 目标 / 128 原型认证回退）
+constexpr int kBm = 128;         // MMA M-tile。⚠️ 必须 = moe_bs_tl_config.txt 的 BM=128：
+                                 // TileLang 0.1.14 的 `tcgen05.cp.32x128b.warpx4` 要求 SF
+                                 // smem 行数是 128 的倍数 ⇒ BM=64 在 **trace 期**就被库拒掉
+                                 // （gen_moe_bs_aot.py:266 `assert BM % 128 == 0`），所以 AOT
+                                 // 是以 `--bm 128` 生成的认证几何（64 只是"目标几何"的历史遗留）。
+                                 // 旁证：device dump 的 A 行块 = blockIdx.y*128、SFA 段步长
+                                 // = 4608 = 36*128、A 的 box = (64 B, 128 行)。
 constexpr int kDim = 5120;       // 模型维度 = up 的 K
 constexpr int kNp = 320;         // 一个权重面（w1 / w3）的行数 = inter_local
 constexpr int kNup = 2 * kNp;    // 640 = gate ‖ up
@@ -173,11 +179,17 @@ constexpr int kNh = 64;          // 每个 N-tile 取自一个权重面的行数
 constexpr int kGridX = kNup / kBn;            // 5
 constexpr int kThreads = 128;    // 3 个工作 warp + 1 空转（原型 §2 的分工）
 
-// 动态 smem（生成器算出；> 48 KiB ⇒ SetAttribute 是必要条件）。
-// 公式 = stages*(BM*BK + BN*BK)*1B（unpacked fp4）+ stages*(BM+BN)*4B（SF 字）
-//        + BM*BN*4B（C_sh 暂存）。BM=64/BN=BK=128/stages=6 ⇒ 184832 B。
-// ⚠️ 重生成后**必须**把 moe_bs_tl_config.txt 的 smem_bytes 抄到这里（不符 ⇒ launch err 1）。
-constexpr size_t kSmem = 184832;
+// 动态 smem（**生成物实际用量**；> 48 KiB ⇒ SetAttribute 是必要条件）。
+// ⚠️ 权威值 = 生成物自己的 launch（moe_bs_up_tl_host.cu 的 launch stack 末项 = 202752），
+//    也等于 device 内核 buf_dyn_shmem 的最高偏移 + 尾区：
+//      B_sh=98304 | SFA_sh=196608(+3072) | SFW_sh=199680(+3072)  ⇒  202752
+//    注意 C_sh 与 A_sh **共享 offset 0**（两者生命周期不重叠：C 只在所有 MMA 之后写），
+//    所以 C 的 65536 B **不叠加**。
+// ⚠️ 不要抄 moe_bs_tl_config.txt 的 smem_bytes=268288：那是「未去别名」的保守账
+//    （196608 fp4 + 6144 sf + 65536 c），268288 B = 262 KiB > sm_100 的 227 KiB/block
+//    上限 ⇒ cudaFuncSetAttribute 直接失败。
+// ⚠️ 不符 ⇒ launch err 1（cudaErrorInvalidValue），这是静默回退老路径的入口。
+constexpr size_t kSmem = 202752;
 // 每 expert 的 packed SF 池字节（w1 与 w3 各一份）
 constexpr size_t kSfPlaneBytes = (size_t)kSfWords * kNp * 4;  // 51200 B/面/expert
 
@@ -650,10 +662,22 @@ extern "C" int dsv41_moe_tilelang_gate_up_bs(
     if (e != cudaSuccess) return (int)e;
 
     // (2) block-scaled grouped GEMM（生成物）。
-    //     ⚠️ ARG ORDER：形参序由 TileLang lowering 决定，**以 moe_bs_tl_config.txt 的
-    //     signature 行为准**；描述符 / float* / int* 类型不同 ⇒ 错位是编译错误，不会静默。
+    //     ABI：形参序/类型 **100% 由 TileLang lowering 决定**，权威配方 =
+    //       * moe_bs_up_tl_host.cu 的 `TVMFFIFunctionCall(main_kernel, args, 14)`（args[0..7]）
+    //       * moe_bs_tl_config.txt 的 `device signature` 行
+    //     本 dump 的顺序（⚠️ 与直觉相反的三点：C 是**描述符**、SFA 是**裸指针**、W 在**最后**）：
+    //       (0) A_desc    CUtensorMap   TMA load
+    //       (1) C_desc    CUtensorMap   TMA store（**不是** raw float*）
+    //       (2) Eid       const int*    裸指针（唯一随形参走的元数据）
+    //       (3) SFA       const uint*   裸指针 —— SFA 走 cp.async.bulk（tma_load(dst,src,...)），
+    //                                   **不需要描述符**（§3 的 g_tmap_sfa 因此是 dead 的）
+    //       (4) SFW1_desc CUtensorMap
+    //       (5) SFW3_desc CUtensorMap
+    //       (6) W1_desc   CUtensorMap   ← W 排在 SFW 之后！
+    //       (7) W3_desc   CUtensorMap
+    //     描述符 / float* / int* 类型互不兼容 ⇒ 任何错位都是编译错误，不会静默。
     moe_bs_up_tl_kernel<<<dim3((unsigned)kGridX, (unsigned)kSegCap), kThreads, kSmem, s>>>(
-        g_tmap_a, g_tmap_w1, g_tmap_w3, g_tmap_sfa, g_tmap_sfw1, g_tmap_sfw3, g_eid, g_c);
+        g_tmap_a, g_tmap_c, g_eid, g_sfa, g_tmap_sfw1, g_tmap_sfw3, g_tmap_w1, g_tmap_w3);
     e = cudaGetLastError();
     if (e != cudaSuccess) return (int)e;
 
