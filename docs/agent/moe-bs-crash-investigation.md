@@ -3080,3 +3080,21 @@ bash ~/bisect_probe.sh origin/main --restore   # 用完恢复
 2. **NUMCHECK 探针**（本节）⇒ 从 COMMON 移除、改 opt-in ✓。
 ⇒ **验证在进行中**（`df37d9ad`：构建 + 分阶段探针 + 无 NUMCHECK 的一臂）；若仍卡，则按 §118 走
 实验 A（关 BS 臂）与实验 B（二分到合并波之前）。
+
+## §120 【风险普查】战役脚本里"会回读/同步"的探针清单（防止修好一个又踩下一个）
+
+按 §119 的机制（**多 rank lockstep 下任何 D2H 回读/流同步都可能死锁**），对全部战役脚本做了一次普查：
+
+| 脚本 | 涉及的回读类探针 | 性质 | 处置 |
+|---|---|---|---|
+| `~/arm_run.sh` | 原 `DSV41_MOE_BS_NUMCHECK=1` | **默认开启** ✗ = 高风险 | **已移除**（§119，改 opt-in）✓ |
+| `~/promote_all.sh` | `DSV41_{ROUTED_DOWN_QUANT,WINDOW_KV_QUANT,COMPRESS_LATENT_QUANT,INDEXER_FP4_RT,ATTN_P_BF16}_DBG` | **显式 opt-in** ✓（每臂单独传） | 保留 ✓，但**每臂只跑单门**、且属诊断轮 ✓ |
+| `~/spec_gates_test.sh` | `DSV41_ACC_HISTOGRAM=1` | **默认开启** ✗ = 同类风险 | **已加显式警示**（见下）✓ |
+| 其余（`arm_run_fast`/`verify_all`/`bench_protocol`/`bs_vs_old`/`endgame`/`staged_verify`） | 无 | — | 安全 ✓ |
+
+**规则（新增，写进纪律）**：
+1. **诊断探针一律 opt-in**，且**不得**出现在性能臂/正常臂的默认 env 里 ✓；
+2. 使用 `DSV41_ACC_HISTOGRAM` 这类**逐步回读**探针时，必须意识到它**可能**在 lockstep 下影响/拖死集群 ⇒
+   只用它跑**单臂诊断**，并观察是否出现 `ar5-hang` 刷屏 + 0 step ✓；
+3. 判据：若某探针开启后出现"**0 个 step + ar5-hang 刷屏**"，**先怀疑探针本身**（§119 的教训），
+   而不是先怀疑模型/kernel ✓。
