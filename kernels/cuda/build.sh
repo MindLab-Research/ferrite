@@ -176,6 +176,7 @@ echo "$BUILD_ID" > "$(dirname "$0")/.build_id"
     -std=c++17 \
     -gencode "arch=compute_${ARCH},code=sm_${ARCH}" \
     -I "$DIR/tilelang_inc" \
+    $( [ -d "/opt/dlami/nvme/dsv41_venv/lib/python3.12/site-packages/tilelang/3rdparty/cutlass/include" ] && echo "-I /opt/dlami/nvme/dsv41_venv/lib/python3.12/site-packages/tilelang/3rdparty/cutlass/include" ) \
     -DFERRITE_KERNEL_BUILD_ID="\"${BUILD_ID}\"" \
     "${SKELETON_FLAGS[@]+"${SKELETON_FLAGS[@]}"}" \
     -o "$OUT" "${SRCS[@]}"
