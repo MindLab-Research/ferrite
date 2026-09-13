@@ -384,9 +384,15 @@ TmapSpec spec_c(void* c) {
 CUtensorMap g_tmap_a, g_tmap_w1, g_tmap_w3, g_tmap_sfa, g_tmap_sfw1, g_tmap_sfw3, g_tmap_c;
 
 bool encode_one(CUtensorMap* out, const TmapSpec& s) {
+    // FIX(estride): TmapSpec{} zero-initializes estride to all 0s, but
+    // cuTensorMapEncodeTiled requires elementStrides to be either nullptr
+    // (= all 1s, contiguous) or an array with every entry >= 1. Passing
+    // zeros gives CUDA_ERROR_INVALID_VALUE (CUresult=1). All our tensors
+    // are box-contiguous → nullptr is the correct spelling.
     const CUresult r = g_encode(out, s.dtype, s.rank, const_cast<void*>(s.addr), s.gdim,
-                                s.rank > 1 ? s.gstride : nullptr, s.box, s.estride, s.ilv, s.swz,
-                                s.l2, s.oob);
+                                s.rank > 1 ? s.gstride : nullptr, s.box,
+                                nullptr,  // elementStrides: NULL = all 1s
+                                s.ilv, s.swz, s.l2, s.oob);
     if (r != CUDA_SUCCESS) {
         fprintf(stderr, "[moe-bs] cuTensorMapEncodeTiled(%s) failed: CUresult=%d\n", s.what, (int)r);
         return false;
