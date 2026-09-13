@@ -3343,3 +3343,20 @@ bash ~/staged_verify.sh bench    # 博客口径（random 4k/1k、固定 1024 输
 ⇒ 因此路线 = **① verify 削减**（BS 臂 gate/up + down blockscaled + cp.async + 融合重叠）
 **② accept 提升**（`ATTN_PROJ_ALIGN` / `DRAFT_MOE_MROWS` / `[acc-hist]` 从未实测 ⇒ 先测）
 **③ draft/commit 压缩**（博客第 13-15 步：小批量投影、indexer 后处理、C2 verify 压缩融合）。
+
+## §132 【搁置】down 对拍 harness 仍差 1 个编译错误；按用户指示不再为它花时间
+
+- `dn-harness-include-fix` 交付了一份 harness 修复（worktree `/tmp/dn-harness`，另带一份说明
+  `docs/agent/dn-harness-seq-align-abi.md`），但经**本仓库真实编译门**复验仍报 **1 个错误** ✗
+  （`scripts/merge_worktree.sh` 已自动撤销该次合并、未产生坏提交 ✓）。
+- 该线还带回一条**更正**：§126 把真因判成"TU 内可见声明少一个形参"是**反的** ✗ ——
+  其结论是 `--bench` 块里**两个调用点少传一个实参**（更平凡的一类）。
+  ⇒ §126 的"报错形态指向声明可见性"这条推论**不作数**，以本节的"仍差 1 个错误"为准（真因未定 ✓）。
+- **处置（用户指示 2026-09-14："尽可能只跑 GPU，CPU 线太慢，已知正确的要保存复用"）**：
+  **搁置** ✗ —— 它是 down 接线的前置仪器（非当前关键路径 ✓，且 down kernel 本身编译 0 error 且**完全惰性** ✓）。
+  待真正需要做 down 接线时，再一次性解决（届时直接看完整编译输出、不要再用"形态推断" ✓）。
+
+**用户指示的落地（即时生效）**：
+1. **GPU 臂优先**：诊断/验证一律走 `arm_run.sh`（1–2 分钟一轮 ✓，本轮已实证能跑出 48 step + 0 `ar5-hang` ✓）；
+2. **结果保存复用**：已确认的结论（如 C1 的 48 step/0 hang、OUT 行可解析）**直接引用，不再重跑** ✓；
+3. **不为慢活花墙钟**：4 条 CPU 线已全部卸载 ✓；harness 等次要仪器**搁置** ✓。
