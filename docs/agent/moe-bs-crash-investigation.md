@@ -3874,6 +3874,49 @@ SGLang 侧的实现路径（供性能/精度对照）：DeepGEMM `fp8_fp4_gemm_n
 若 `KS_RING` 臂与官方 oracle `corr≈1 / medrel≈0` ⇒ **修好** ✓；若仍不对，按 `mbar-protocol-audit` 的
 兜底方案（3 项 ring / 每 stage 专用 barrier / 超时后不写 C）继续 ✓。
 
+## §147 【澄清】mbarrier 竞态被论证排除 ⇒ 异常指向"输出非本轮所算"
+
+`mbar-protocol-audit` 给出**关键更正**：`try_wait.parity` 是 **1-bit 观察窗口**（只能区分"自上次成功探针以来
+完成 1 个相位" vs 0 个；完成 2 个相位 = 0 个的奇偶 ⇒ **一旦错过一次观察就永假 ⇒ 无界自旋 = hang**），
+而**"提前假通过"在默认单 barrier 路径上结构性不可能**——`:1096` 的 `__syncthreads()` 让 loader 无法越过
+wait ⇒ **到达数不可能超过等待数** ⇒ **smem 被提前覆写的竞态不成立** ✗。
+（有界路径是 **ABORT**（`:1115-1123` dealloc + return），不是 continue ⇒ 若 abort 后 C 未被写，scatter 会搬走
+**上一轮残留** ⇒ 那是**另一条**静默错值路径，已派 `safe-abort-diff` 出 patch 草案 ✓。）
+
+**因此本轮又排除了一批**（都给了 file:line）：
+
+| # | 检查 | 结论 |
+|---|---|---|
+| 1 | **内核启动实参逐项**（`moe_bs_handwritten_kernel<<<...>>>(g_a, w1, w3, g_sfa, sfw1, sfw3, eid_dev, g_c, w_stride)` vs 其签名 `(A, W1, W3, SFA, SFW1, SFW3, Eid, C, w_stride)`） | ✅ **逐项对齐**（同类静默换位被排除） |
+| 2 | loader 对齐谓词失败的行为 | ✅ 注释 + 代码一致：**回退普通 LDG/STS**，不跳过 ⇒ 不产生陈旧 smem |
+| 3 | `ZERO_*` 的 memset 实参 | ✅ `g_a` 整块 23.6 MB（正是 MMA 读的缓冲）、`g_sfa` 全量、`eid_dev` 全 36 项 |
+| 4 | Rust 传的 `out` 与 dump 读的缓冲 | ✅ eager 传 `ex_act_b`（multi-row 传 `ex_act_r`）⇒ 与 dump 一致 |
+| 5 | ring 相位算术（k=0..7 逐项） | ✅ 正确（且证明"ring 不改正确性、只改故障落点"） |
+| 6 | ring 的 smem 位置 | 🔴 发现**既有隐患**：首个 barrier 正好压在 NS=2 的极限上、ring 第 2 槽越界 8 B ⇒ 已加 `kHwMbarExtra=512` 修掉 ✓ |
+
+⇒ **剩下唯一未被解释的，是"输出不是本轮计算的结果"这一可能** ⇒ 由 `DSV41_MOE_BS_ZERO_ALL=1`
+（A+SF+EID 全零 ⇒ 输出**必须**恒 0）与 `batch11` 的跨构建 ZERO_A 复现判定 ✓；
+`output-stale-audit` 正在逐条追 `TMEM D → kernel C → scatter → ex_act_b` 上的陈旧值入口 ✓。
+
+## §148 当前仪器集与判定树（一次跑完即可定因）
+
+| 仪器 | 门 / 命令 | 判据（读法） |
+|---|---|---|
+| 官方语义 oracle | `scripts/campaign/gu_numpy_ref.py`（CPU，直读 HF ckpt 真 fp4+e8m0） | 与**旧路径**逐位相同（已验证 `max\|d\|=0`）⇒ 它就是"官方"的判据；BS 臂 vs 它 = `corr≈0.04 / medrel≈1.2` ✗ |
+| 全零活性 | `DSV41_MOE_BS_ZERO_ALL=1`（A+SF+eid 全零） | 输出**必须**恒 0；否则"值不是本轮算的" |
+| 原始输出 | `DSV41_MOE_BS_SFDUMP=<dir>` → `<dir>/eager/gc_seg0.f32`（MMA 的 `g_c`，scatter 之前） | 与 ZERO_ALL 联用：`g_c=0` 而 `ex_act_b≠0` ⇒ **scatter/陈旧**；`g_c≠0` ⇒ **MMA/epilogue** |
+| 预清零 | `DSV41_MOE_BS_PRECLEAR=1`（发射前异步 memset 调用方输出） | 若此后**对齐 oracle** ⇒ 垃圾是**陈旧残留**（且预清零即修复） |
+| 全 K 偏积 | `DSV41_MOE_BS_KEEP_STAGE=s` + `gu_numpy_ref.py --kmin 128s --kmax 128(s+1)` | 输出应等于"第 s 段的偏积"；若等于**别的段**的标度组合 ⇒ per-stage 推进错位 |
+| 单 stage 隔离 | `DSV41_MOE_BS_STAGE1=1` + `--kmax 128` | 仪器覆盖的那一档；不一致 ⇒ 主机侧取数/接线 |
+| 内容快照 | `DSV41_MOE_BS_SFDUMP_K=k` + `sfdump_check.py --in-dir <dir>/eager` | staged 内容 vs ckpt 期望（k 可指定，否则对推进类错误**结构性失明** ✗） |
+| 重放 | `sfdump_replay.py --sfdump <dir> --gu <dir>/eager` | 输出 vs"它自己 staged 数据的积" ⇒ 分流内容错 / 使用错 |
+| 确定性 | 同臂跑两次比 `gateup.f32` | 不同 ⇒ **存在竞争/陈旧** |
+| 旁路对照 | `DSV41_MOE_BS_CPASYNC=1`（另一套 staging）、`LDW=0`、`MBAR_RING=1`、`MBAR_PERSTAGE=1` | 文件自称 `LDW`/`CPASYNC` 逐位不变；不同 ⇒ 对应机制有问题 |
+| 神谕对照 | `DSV41_MOE_BS_WAITDBG=1` + `BOUNDED_WAIT=1` 的 `[moe-bs-wait-dbg]` | mbarrier 健康度（⚠️`other_parity_ready` 语义上恒 1 ⇒ **无效判据**，见 §147） |
+
+**产物纪律**：每次测量前必跑 `check_artifacts.sh`（`ensure_built.sh` 已内置）——它已两次拦下陈旧 `.so` ✓；
+**构建**：`ensure_built.sh` 按 `.cu` 内容哈希门控 ⇒ 源码未变时**零构建**（一轮 ~2.5 分钟 = 臂本身）✓。
+
 ⇒ 误差**只在算术内部**：K 元素配对 / 标度归属 / 逐元素映射中有一处不对，且它必须同时解释
 "量级对 + 逐元素不相关 + 非置换 + 非换 expert"。**下一判据 = `DSV41_MOE_BS_SFDUMP` 内容校验（`sfdump_check.py`）
 + 去假设 replay（`sfdump_replay.py`：输出是否等于"它自己 staged 的数据"的积）** ⇒ 分流"内容错" vs "使用错" ✓。
