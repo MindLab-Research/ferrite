@@ -148,6 +148,15 @@ B1 系三臂的断崖都在 line 52（1..51 正确然后跳 62）+ mean-k 0.64-0
 - **任务普查（同栈 chat/trans/cont 三任务）**：chat mean-k=0.74、trans/cont ~0.3-0.5（混合累计 0.47）——**所有正常任务 acc < 1，无任务达 2-3 稳态**。计数任务的 1.34 已是最高（双峰 0/5）。
 - **用户校准 acc 2-3 的来源待查**：lazy 栈（逐行 verify）的 acc 可能与 SWALLOW（块判定）不同——lazy 对照臂在跑；若 lazy 显著更高 ⇒ SWALLOW 的 spec_accept 块判定链有 accept bug。
 
+**§10.5 accept 损失 0.78 的完整判决（swallow-accept-loss，2026-09-13 03:10）**：
+- **判定链无 bug**：(a) 对齐逐 index 正确（无 off-by-one）、(b) spec_accept 是最长前缀匹配（无全或无）——两条栈调同一函数（:9361/:9853）。
+- **DIFF_EAGER 的举证有洞**：它只比 token 不比隐藏量（tap/ring KV/compressor latent 字节从未比较）+ 自重放覆盖块写 + 从 commit 后状态出发（对状态差异免疫）⇒ "数值一致"结论被推翻——**嫌疑 (c) 以隐藏量级复活**。
+- **机制**：SWALLOW 的 m=6 块在 per-row 隐藏量（tap + compressor latent）上与 lazy m=1 不等价——目标模型 argmax 稳健（DIFF_EAGER 48/48 none）但 **draft 是弱模型、消费的正是 tap**（import_tap → main_h）与 latent——计数任务 k_acc=0 集中在数字 near-tie 位 ⇒ 系统性 −0.78 且无 mismatch 行。
+- **三条不等价点**：S1（头号）tap 产生路径——hc 三开门（HC_VERIFY_FUSE/HC_FRONT_ROWS/VERIFY_AR_FOLD）在 rows=m 的 hc_mixes_auto 前端 vs lazy staging；S2 compressor 状态来路（块快照+replay vs 每行 pool+commit——无护栏的 hidden 等价）；S3 comp_side 被 spec_capture 分叉。
+- **旁证**：WOB_MROWS_F32（非逐位 mrows）⇒ mean-k 1.34→0.75-0.92（"m 行核非逐位 ⇒ accept 崩"先例）。
+- **判定实验**：E0（V5_LEDGER 混合臂）；E1（两栈 DSPARK_DEBUG 的 tap 字节对比——决定性三分）；E2（SWALLOW × hc 三开门逐个关——最小单变量直打 S1）；E3（TAP_PARITY 护栏——hidden 等价红线，建议进验收门）。
+- **过渡策略**：acc 侧以 lazy 2.120 为基准，SWALLOW 性能结论带 ±0.78 星号，直到 E1/E2 落地。
+
 **双门禁**：每个优化臂必须同时报告 `step_ms`（[dspark] 分解）**AND** `mean-k`（A0 基线 1.34；掉了 = 数值回归，立即弃用该 gate）。
 
 1. **重编**：subagent 交付的 .cu/chain_dev 改动 → `build.sh 103a` + `cargo build --release`（双产物）+ 符号三证。
