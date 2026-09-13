@@ -334,3 +334,31 @@ curl -sS --noproxy '*' https://mint-alpha.macaron.xin/v1/chat/completions \
 
 **⇒ 判据（廉价）**：故意把 `.so` 换成旧的 ⇒ `ensure_built.sh` 必须**响亮失败并重编**，而不是报 "unchanged, skipping"。
 
+## 17. 🎯 两簇证据：金标准是"孤例"——支持用户的"幻觉"判断
+
+把 `/tmp` 里**全部** 3840-float 的 `gate|up` 类产物两两比对（矩阵，见 §17 脚本），得到**两个簇**：
+
+| 簇 | 成员（时间） | 含义 |
+|---|---|---|
+| **A（= 官方 oracle）** | `gu_in_GD4_OLD`(**17:09 金标准**)、`gu_bs_new`(17:14)、`gu_numpy_old`(17:10)、`gu_numpy_GD4OLD`(18:01)、`gu_bs_row0`(17:17)、`gu_km_range`(17:22)、`oracle_chk/oracle.f32`(**今天 18:31 的 oracle 重算**) | **oracle 对这批输入稳定 ✓**；17:09 时**旧路输出 == oracle** ✓ |
+| **B** | `gu_old.f32`(**16:45**)、`oracle_chk/eager/gateup.f32`(**今天 18:31 我们自己的 dump**) | **我们旧路自 16:45 起输出未变** ✓ |
+
+**⇒ A ≠ B（corr −0.009）**，而**金标准是 17:09 之前唯一落在 A 簇的产物** ✗ ⇒
+**单调回归解释不了"比它早的(16:45)与比它晚的(今天)都属于 B"** ✗ ⇒ 更像是 **17:09 那次用了一个"瞬时不同"的树/二进制**（当时战役正在频繁改文件 ⇒ 脏树 ✓）⇒
+**⇒ 用户"之前正常是不是幻觉"的判断很可能成立** ✓。
+
+**金标准自身的 ENV（其臂日志逐字）**：
+```
+[GD4_OLD] ENV: DSV41_GATEUP_DUMP=/tmp/gu_in_GD4_OLD DSV41_MOE_BS_SFDUMP=/tmp/sfd_GD4_OLD \
+            DSV41_MOE_TILELANG_BS=0 DSV41_MOE_BS_HANDWRITTEN=0
+[GD4_OLD] OUT: '1\n2\n3\n4\n5\n6\n7\n8\n9\n10'   ← 用的是 arm_run.sh 的"数到10"短 prompt
+```
+⇒ 配置 = `arm_run.sh` 的 COMMON 默认 + BS 臂 OFF ✓（`arm_run.sh` mtime 15:56 < 17:09 ⇒ **无漂移** ✓）。
+（`batch4_fix.sh` 开头会重建双产物 ✓ 并打印 `.so` 的 md5 ✓ —— 但那次批次的**标准输出没有落盘** ✗，
+所以无法直接比对二进制；只能靠**干净的端点复现**来裁决 ✓。）
+
+**⇒ 裁决脚本 `~/golden_endpoint.sh`**（已入库）：
+① HEAD 上清树 + **同源重编** + 用金标准原样配置跑臂 + 与金标准比对（应落 B 簇）；
+② 检出 `ac69b054`（金标准 mtime 17:09:22 之前的最新提交，17:07:29）⇒ **强制重编**（部分检出后戳不可信 ✗）⇒ 同样比对。
+**两者都不落 A 簇 ⇒ 金标准不可复现 ⇒ 无代码回归（幻觉成立）** ✓；**若 `ac69b054` 落 A 簇 ⇒ 回归真实** ⇒ 再按"只碰过 4 个非 BS 文件的 9 个提交"收窄二分 ✓。
+
