@@ -88,10 +88,11 @@ def main():
     gu = np.fromfile(os.path.join(a.gu, "gateup.f32"), dtype="<f4")
     act = 2 * (dim // 16) if dim else 640
     # the dump's layout is [m][topk][act_slot]; act_slot = 2*inter_local, taken from the file size
-    m_rows = gu.size // (topk * 640)
+    gu3 = gu.reshape(m_rows, topk, 640)
     print(f"meta: nseg={nseg} topk={topk} dim={dim}  gu has {m_rows} row(s); eid={eid[:nseg]}")
-    row = m_rows - 1 if a.row < 0 else a.row
-    gu = gu.reshape(m_rows, topk, 640)[row]
+    m_rows = gu.size // (topk * 640)
+    gu3 = gu.reshape(m_rows, topk, 640)
+    print(f"meta: nseg={nseg} topk={topk} dim={dim}  gu has {m_rows} row(s); eid={eid[:nseg]}")
 
     blocks = dim // 32
     worst = 0.0
@@ -121,7 +122,7 @@ def main():
                                      * e8m0(sb_all[rl, blk])
                     # the scatter's column mapping: gate half -> nt*64 + j, up half -> 320 + nt*64 + j
                     n = (nt * 64 + np.arange(64)) if half == 0 else (320 + nt * 64 + np.arange(64))
-                    got = gu[flat % topk][n]
+                    got = gu3[flat // topk][flat % topk][n]
                     den = np.maximum(np.abs(acc), 1e-6)
                     rel = np.abs(got - acc) / den
                     worst = max(worst, float(np.median(rel)))
