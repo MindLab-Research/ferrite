@@ -199,3 +199,50 @@
 1. 验证手写 kernel 输出质量（修复 SetAttribute 后）
 2. 如果输出正确：用 DSV41_MOE_BS_HANDWRITTEN=1 跑 push400
 3. 后续优化：给手写版加 TMA 和简单双缓冲（不学 TileLang 的复杂 3-stage）
+
+## Core Matrix 布局修复（2026-09-14 晚——输出乱码的根因）
+
+**问题**：手写 kernel 0 errors 但输出乱码（数字无序，mean-k=2.000）
+**根因**：UMMA smem descriptor 期望 **core matrix 布局**（8行×16B 原子），不是 row-major
+
+**Core Matrix 布局公式**：
+```
+addr(m, k) = (m/8)*1024 + (k/16)*128 + (m%8)*16 + (k%16)
+```
+- 8行×16B = 128B 一个 core matrix（原子）
+- K-blocks per row: 128/16 = 8
+- M-blocks: 128/8 = 16
+- lbo = 16B（原子内行距）= 1（16B 单位）
+- sbo = 1024B（原子间距）= 64（16B 单位）
+- layout = 0（无 swizzle，自然 core matrix 顺序）
+
+**为什么 TileLang 不需要手动做**：TMA 硬件自动写 core matrix 布局
+**手写 kernel 必须**：在 global→smem 加载时手动转换为 core matrix 布局
+
+**修复**（8471fc0 + 6408f11）：
+- A tile: `A_sh[(m>>3)*1024 + (kk>>4)*128 + (m&7)*16 + (kk&15)] = val`
+- B tile: 同样公式（W1 前 64 行 + W3 后 64 行）
+- Descriptor: layout 从 2 改为 0
+
+## cp.async 双缓冲优化设计（下一步性能优化）
+
+**当前性能**：verify=34.45ms（顺序执行，无重叠）
+**优化后预期**：verify≈22ms（load 完全隐藏在 compute 后）
+**400 tok/s 需要**：step≤9.8ms——需要更激进的优化
+
+**双缓冲流程**：
+```
+预加载 iteration 0 → buf0 (cp.async)
+for k in 0..40:
+    cp.async 加载 k+1 → buf1
+    __pipeline_wait_prior(1)  // 等 k 的数据
+    __syncthreads()
+    计算 k（从 buf0）
+    swap(buf0, buf1)
+```
+
+**smem 布局（双缓冲，~98KB）**：
+- buf0: A[0,16K) B[16K,32K) SF[32K,34K)
+- buf1: A[35K,51K) B[51K,67K) SF[67K,69K)
+- mbar: [34K, 34K+8)
+- C staging: 覆盖 buf1（所有 MMA 完成后写入，此时 buf1 不再需要）
