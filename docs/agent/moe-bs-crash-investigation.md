@@ -1392,3 +1392,22 @@ __device__ __forceinline__ int hw_pack_sw128(int row, int p) {
 ⇒ (a)(b) 同时成立 ⇒ **修复的写公式与官方描述符配套，且不需要任何额外的 nibble 变换** ✓。
 **⚠️ 反过来说**：任何"把 packed 字节拆成两个 1-byte 元素"的写法（我们此前的 unpacked staging）
 都会让硬件只看到一半的 K —— 这正是 §29 那个"0x02 只剩 1/2"现象的真正来源 ✓（也因此它**不是**探针假象）。
+
+## §50 精度对齐再补一项：**投影层 fp8 的量化 block 也是 32**（与我方一致）
+
+此前有一个未核对的疑点：官方 `act_quant` 的**函数默认形参**是 `block_size=128`
+（`ref_inference/kernel.py:41`），而我方 `dsv41_quant_fp8` 用 **block 32** ⇒ 疑似不对齐。
+
+**核对结果：一致，无缺口。** 官方 `model.py:27-30` 明确写死：
+```python
+fp8_block_size = 32   # one fp8 scale per 32x32 weight block / 32 activations
+fp4_block_size = 32   # one fp4 scale per 32 elements along K
+scale_fmt = "ue8m0"
+scale_dtype = torch.float8_e8m0fnu
+```
+且模型里所有 `act_quant(...)` 调用传的都是 `fp8_block_size`（= 32）⇒ **官方 fp8 与 fp4 都是 block 32**，
+与我方 `dsv41_quant_fp8(block=32, round_scale=1)`（`dsv41_kernels.cu`）**逐项一致** ✓
+（也与 §14 里 subagent 实测"激活量化输出与官方**逐字节一致**"互相印证 ✓）。
+
+**教训**：读官方实现时**不要用函数默认形参**当结论，要看**模型实际传入的值**
+（`kernel.py:41` 的 `block_size=128` 默认值曾一度让我怀疑存在缺口）。
