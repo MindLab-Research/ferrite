@@ -1491,3 +1491,30 @@ self.s.route_w.ptr as *const f32,               ×2   ← 路由权重实参
 
 ⇒ 修复的**代码实现与实测通过的规范严格一致**，且结构性质（8 B/槽、恰好铺满一个操作数 stage）
 已由独立算术证明，不依赖任何 GPU 测量 ✓（即使 subagent 的仪器有偏，这一步也能保证实现无笔误）。
+
+## §55 验收判据已机械化：`wq_check.py`（subagent `wq-accept-checker` 交付，主 agent 已实跑验证）
+
+**路径**：`/home/smith/wq_check.py`（主 agent 已 scp 到远端 `~/wq_check.py`）。
+**本地与远端 `--selftest` 均 PASS（12/12 用例）** ✓（主 agent 实跑，非仅看报告）。
+
+### 用法
+```bash
+# 单文本判定
+python3 wq_check.py --text-file <f> [--expect-count 61] [--eager-file <f2>]
+# 多份 arm 日志 → 结论表
+python3 wq_check.py --log ~/armrun_F1.log ~/armrun_F2.log [--eager-file <f>]
+# 自测（12 用例：3 种事故形态 + 正常计数 + EAGER 同现/不一致 + 反转义 + 截断降级）
+python3 wq_check.py --selftest
+```
+退出码：`0 = PASS/WARN`、`1 = 有 FAIL`。
+
+### 它机械化的四条判据（正是用户红线）
+| 判据 | 实现要点 | FAIL 阈值（可调，见脚本 `TH` 字典） |
+|---|---|---|
+| **重复** | 最长重复子串（≥3 次）+ 重复密度 + 单字符占比 + 单数字占比 + 最常见 token 占比 | 任一子信号命中 |
+| **乱码** | 制表符/控制符占比、不可打印字符、可读字符占比、字母数字 CJK 占比 | 比例越界 |
+| **计数** | 逐行抽整数（容忍 `1.`/`- 1`/`**1**`/反引号），要求严格 `1..N`；**不足 N 只降级 WARN** | 出现乱序/跳号 ⇒ FAIL 并报 `first_bad_line` |
+| **EAGER 对照** | 比较两者的整数序列公共前缀与逐字一致性 | **两者退化一致 ⇒ `exculpated`（模型行为，判 PASS）** ✓ |
+
+⇒ 这条把文档里"**退化与 EAGER 一致 = 干净**"的判读规则**做成了机械判据**，不再靠人眼判断 ✓。
+**验收流程**（§51 第 2 步）改为：`arm_run` → `wq_check.py --log ... [--eager-file ...]` → `VERDICT` 决定是否继续。
