@@ -2131,11 +2131,18 @@ impl<'a> DevChain<'a> {
                 let mut lg = vec![0f32; cfg.vocab_size];
                 let b = Device::view(self.s.logits.ptr, cfg.vocab_size * 4);
                 self.dev.download_f32(&b, &mut lg)?;
-                use std::io::Write as _;
-                let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
-                f.write_all(&(self.step_count as u64).to_le_bytes())?;
-                for v in &lg {
-                    f.write_all(&v.to_le_bytes())?;
+                let sc = self.step_count as u64;
+                let io = (|| -> std::io::Result<()> {
+                    use std::io::Write as _;
+                    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
+                    f.write_all(&sc.to_le_bytes())?;
+                    for v in &lg {
+                        f.write_all(&v.to_le_bytes())?;
+                    }
+                    Ok(())
+                })();
+                if io.is_err() {
+                    return Err(FerriteError::Config(format!("DSV41_GT_LOGITS_DUMP: {io:?}")));
                 }
             }
         }
