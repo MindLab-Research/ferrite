@@ -76,20 +76,29 @@ say "sanity: .so newer than its sources?" \
 # the SHAPE instead, and fail ONLY when both are readable and differ: the engine remains the enforcer,
 # this is the early warning that saves a wasted round.
 ID_RE='[0-9a-f]{40}-dirty\+cu[0-9a-f]{16}'
-SO_ID=$(strings "$SO" 2>/dev/null | grep -oE "$ID_RE" | head -1)
-BIN_ID=$(strings "$BIN" 2>/dev/null | grep -oE "$ID_RE" | head -1)
+# ⚠️ The AUTHORITY is kernels/cuda/.build_id: build.rs reads exactly that file and bakes it into the
+# binary as FERRITE_BUILD_ID (crates/ferrite-kernel/build.rs:215), while the engine dlsyms the .so's
+# ferrite_kernel_build_id() and compares (cuda.rs:2088). Grepping `strings` for an id-shaped token was
+# the earlier approach and it produced FALSE mismatches, each of which cost a needless full rebuild —
+# the tool meant to save a round was spending them. So: trust the stamp file, and verify only that the
+# binary carries it and was linked after it. The .so's own id is checked at runtime by the engine,
+# which refuses to start on a mismatch.
 STAMP_ID=$(cat kernels/cuda/.build_id 2>/dev/null | tr -d '\n' | grep -oE "$ID_RE" | head -1)
-say "build-ids (so / binary / stamp file)" "$SO_ID / $BIN_ID / $STAMP_ID"
-if [ -n "$SO_ID" ] && [ -n "$BIN_ID" ] && [ "$SO_ID" != "$BIN_ID" ]; then
-  say "so/binary build-id match" "MISMATCH — engine would refuse to start"
+BIN_HAS=$( [ -n "$STAMP_ID" ] && strings "$BIN" 2>/dev/null | grep -cF "$STAMP_ID" || echo 0 )
+SO_ID=$(strings "$SO" 2>/dev/null | grep -oE "$ID_RE" | head -1)
+BIN_ID="$STAMP_ID"
+say "stamp kernels/cuda/.build_id" "${STAMP_ID:-MISSING}"
+say "binary carries that id" "$([ "$BIN_HAS" -gt 0 ] && echo yes || echo NO)"
+say "so id (advisory; the engine is the enforcer)" "${SO_ID:-(not extractable)}"
+if [ -z "$STAMP_ID" ]; then
+  say ".build_id" "MISSING — build.sh has not run in this tree"; fail=1
+elif [ "$BIN_HAS" -le 0 ]; then
+  say "so/binary pair" "binary does NOT carry the stamp id — it predates the kernel build (rebuild cargo)"
   fail=1
-elif [ -n "$STAMP_ID" ] && [ -n "$SO_ID" ] && [ "$STAMP_ID" != "$SO_ID" ]; then
-  say ".so vs its .build_id stamp" "MISMATCH — the .so was not built by this tree's build.sh"
-  fail=1
-elif [ -z "$SO_ID" ] || [ -z "$BIN_ID" ]; then
-  say "so/binary build-id match" "ids not readable from strings() — relying on the engine's own check"
+elif [ ! "$BIN" -nt kernels/cuda/.build_id ]; then
+  say "link order" "binary is older than .build_id — cargo ran before the kernel finished"; fail=1
 else
-  say "so/binary build-id match" "ok"
+  say "so/binary pair" "ok (stamp id present in the binary and linked after it)"
 fi
 
 echo "=== verdict ==="
