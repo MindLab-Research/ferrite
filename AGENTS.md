@@ -105,7 +105,16 @@ LD_LIBRARY_PATH=$HOME/ferrite/kernels/cuda ./target/release/ferrite-serve --back
 - serve 卡住/日志 mtime 停滞 = 挂了（查 `stat -c %y` + pgrep，别等）。
 - 加载错防线（三道 runtime + 三道编译期 + git hooks）见 `docs/agent/` 的加载防线文档。
 
-## 当前状态与下一步（2026-09-12 session 深夜收官——SWALLOW 解锁 + A1a 教训）
+## 当前状态与下一步（2026-09-13 400 攻坚进行时——MTP 摊薄修复批 + accept 损失调查）
+
+**本轮实测与判决（详见 `docs/agent/verify-amortization-lesion-audit.md` §6-§10）**：
+- **最优栈 verify=24.49ms**（p50 全步 28.14）：真基线 ~32 → hc split fallthrough −3.4（hc0 对照）→ 1b/ROPE/ATTN_MROWS −4.1；SH_PAIR/COMPRESSOR/INDEXER 融合 ARMED（[sh-gate] 回执判死，收益已含）。
+- **正确性红线通过**：出师表 300 拉丁 = EAGER 对照同现（模型行为）；DIFF_EAGER 48 行全 none（块数值与逐行一致）。
+- **accept 损失 0.78（重大调查中）**：lazy 2.120 vs SWALLOW 1.34（同模型同任务）——spec_accept 是统一前缀匹配（判定相同）、DIFF_EAGER 数值一致 ⇒ **损失聚焦 drafts 构造差异**（两条栈的 draft 链 gate 不同 → 1ULP 翻转嫌疑）。
+- **acc 现状**：计数 1.34（k_acc 双峰 0/5——draft 善换行差数字）、chat 0.74、python 0.58——**无任务稳态 2-3**；用户校准的 2-3 来自 lazy。
+- **已交付待 sweep**：p3lite 段 B（l4/K2）+ wo_a nwarps 可调 + MPAR 回炉（prologue 重排+coverage-aware auto）+ attn-fence（166b038）+ MoE grouped-down；tcgen05 gate/up 716 修复中。
+- **方法论修正**：AR_SAFE nsys 表对生产模式无效（side-stream 前置 decline）；票面必须 nsys 时间占比（COMP/ENGRAM 高估 10×）；**mrows 零摊销**（52µs/5行=5× 单行）——MPAR 是 SH 族收益前提；env 回读断言必须（/proc/pid/environ）。
+
 
 **Session 成果（783+ commits，107 知识文件）**：
 - **范式转移**：所有"损坏"判定是模型行为（EAGER 对照确认）。验证协议 v2：计数只对前 61 行有效；退化与 EAGER 一致 = 干净。
