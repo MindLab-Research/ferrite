@@ -224,8 +224,16 @@ __device__ __forceinline__ void hw_tc_mma(uint32_t d_tmem, uint64_t a_desc, uint
 }
 
 __device__ __forceinline__ void hw_tc_commit(void *mbar) {
-    asm volatile("tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%0];"
-                 :: "r"((uint32_t)__cvta_generic_to_shared(mbar)) : "memory");
+    // PTX ISA 9.7.18.12.1: the `.shared::cluster` state space is OPTIONAL, and when present the
+    // `[mbar]` operand is resolved in the CLUSTER window at object granularity — so N commits that
+    // differ only by an 8-byte slot step all signal the SAME object. The default single-barrier path
+    // could never notice (there is only one object, so every addressing form agrees), but the per-stage
+    // and ring modes hung exactly as that predicts: every wait past slot 0 spun to its cap (step 153 ms
+    // vs 13 ms, log frozen, watchdog kill). PTX's own Example 1 omits the state space, which selects
+    // generic addressing, so the operand must then be the GENERIC address — hence the plain pointer
+    // with an "l" constraint rather than a cvta'd 32-bit offset.
+    asm volatile("tcgen05.commit.cta_group::1.mbarrier::arrive::one.b64 [%0];"
+                 :: "l"(mbar) : "memory");
 }
 
 // TMEM read: 使用 TileLang 已验证的 tcgen05_ld（避免 128-operand 自定义 asm 的 ICE）
