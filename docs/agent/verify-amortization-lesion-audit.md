@@ -188,6 +188,11 @@ B1 系三臂的断崖都在 line 52（1..51 正确然后跳 62）+ mean-k 0.64-0
 - **根因链完整闭环**：hc_collapse per-row pre 契约 vs m-row hook 单行 4-float 越界（r≥1 污染 tap 行 1..k_emit）→ Fix A（pre_mean_r [VERIFY_ROWS][hc] 全 1/hc 复制，零成本 bit 等价）→ acc 恢复并超越 lazy。
 - **400 的 acc 半边落地**：acc 2-3 达标（2.24）；余下 = step 31→8ms（3.9×：MoE grouped −2 + tensor core −4~6 + draft p3lite −2 + misc）。
 
+**§10.10.1 COMP_PARITY 判决（2026-09-13 04:20，S2 状态机探针）**：
+- **19 IDENTICAL / 0 MISMATCH** + 每个源层的 proj-live OK（spec_snap_kvp/scp == 活 kvp_r/scp_r——replay 消费的是块自己的投影）⇒ **S2（compressor 状态来路）完全排除**。
+- **0.78 accept 损失案双嫌疑闭环**：S1 修复（tap 越界→Fix A→acc 2.24 验证）+ S2 干净（19/0）——案件关闭。
+- p3b2 否决补遗：ALIGN+P3LITE 段 B 双负（draft 4.00 +0.2ms 且 acc 2.02 −0.22）——draft 投影家族的分叉伤 acc 大于段 B 收益，draft 减肥保持 3.7-3.9ms 现状。
+
 **静态逐项比对（`compress_replay`+`compress_replay_row` :10331/:10386 vs `compress_row` :13675）——S2 分叉候选清单**：
 
 | # | 候选点 | 位置（file:line） | 判定 |
