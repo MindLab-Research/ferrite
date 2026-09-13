@@ -50,49 +50,36 @@ for pat in (r"\[dsv41\]\s*mean-k[^\n]*", r"accept[^\n]{0,80}", r"\[dspark\][^\n]
 PY
 }
 
-echo "############ S1: SPEC baseline on the CORRECT path (no graphs) ############"
-bash "$HOME/num100.sh" STEP_S1 \
-  DSV41_SPEC=1 DSV41_MOE_TILELANG_BS=0 DSV41_MOE_BS_HANDWRITTEN=0
-judge "S1 (spec, correct path, no graphs)" "$HOME/armrun_STEP_S1.log"
+echo "############ P0: the PRODUCTION-LIKE config — both graphs on (one variable pair) ############"
+# graph-safety-audit: DSV41_GRAPH_STEP defaults to ON (unwrap_or(true), since 2026-09-11) and
+# arm_run.sh's GRAPH_OFF explicitly forces it to 0 — so EVERY earlier arm ran with the whole-step graph
+# disabled, which also (side effect) disables ar_v5. That is very likely why the earlier non-spec arms
+# showed 10.19 ms where the user's reference is 6.3 ms/step. VERIFY_GRAPH is OFF by default, so P0
+# turns both on: the closest thing to the production configuration that exists as an env set.
+bash "$HOME/num100.sh" STEP_P0 \
+  DSV41_SPEC=1 DSV41_MOE_TILELANG_BS=0 DSV41_MOE_BS_HANDWRITTEN=0 \
+  DSV41_VERIFY_GRAPH=1 DSV41_GRAPH_STEP=1
+judge "P0 (spec + verify graph + step graph)" "$HOME/armrun_STEP_P0.log"
 
-echo "############ S2: S1 + VERIFY GRAPH (one variable) ############"
-bash "$HOME/num100.sh" STEP_S2 \
-  DSV41_SPEC=1 DSV41_MOE_TILELANG_BS=0 DSV41_MOE_BS_HANDWRITTEN=0 DSV41_VERIFY_GRAPH=1
-judge "S2 (spec + verify graph)" "$HOME/armrun_STEP_S2.log"
-
-echo "############ S3: S2 + step graph + the precision-neutral folds ############"
-bash "$HOME/num100.sh" STEP_S3 \
+echo "############ P1: P0 + the precision-neutral folds (one variable) ############"
+bash "$HOME/num100.sh" STEP_P1F \
   DSV41_SPEC=1 DSV41_MOE_TILELANG_BS=0 DSV41_MOE_BS_HANDWRITTEN=0 \
   DSV41_VERIFY_GRAPH=1 DSV41_GRAPH_STEP=1 \
   DSV41_GATE_MROWS=1 DSV41_GATE_MROWS_ROUTE=1 \
   DSV41_ATTN_MROWS=1 DSV41_COMPRESSOR_PROJ_MROWS=1 \
   DSV41_ENGRAM_PROJ_MROWS=1 DSV41_ENGRAM_GATHER_MROWS=1 \
   DSV41_DRAFT_P3LITE_SEED=1 DSV41_DRAFT_P3LITE_KV=1 DSV41_DRAFT_P3LITE_ATTN=1
-judge "S3 (spec + both graphs + folds)" "$HOME/armrun_STEP_S3.log"
+judge "P1F (P0 + precision-neutral folds)" "$HOME/armrun_STEP_P1F.log"
 
-echo "############ S4: S2 + the SAME-FORMAT grouped MoE (e4m3 act + native fp4 weights) ############"
-# expert_grouped()'s own doc says the grouped arm is a NUMERIC NO-OP ON ITS OWN: it builds the layout
-# but the consumer needs DSV41_EXPERT_TCGEN05_E4M3 too, so with only GROUPED armed the proven
-# per-(row, slot) launches answer the step and an "ON" arm silently measures the old path. Together
-# they are the precision-correct fast MoE: A = e4m3, W = native fp4 nibbles + ue8m0 scales, i.e. the
-# official fp4_gemm's format (unlike DSV41_MOE_TILELANG, whose activation is never quantised).
-# This is the lever the amortization ledger points at (shared expert 10.4ms + routed experts 8.3ms,
-# both kernel-efficiency bound, and the shared expert re-reads its weights 5x because m=6 rows share
-# them - which is exactly what a grouped/batched GEMM removes; it is invisible in the 1-row decode
-# steps the earlier arms measured).
-bash "$HOME/num100.sh" STEP_S4 \
-  DSV41_SPEC=1 DSV41_MOE_TILELANG_BS=0 DSV41_MOE_BS_HANDWRITTEN=0 DSV41_VERIFY_GRAPH=1 \
+echo "############ P2: P0 + the SAME-FORMAT grouped MoE (one variable) ############"
+bash "$HOME/num100.sh" STEP_P2G \
+  DSV41_SPEC=1 DSV41_MOE_TILELANG_BS=0 DSV41_MOE_BS_HANDWRITTEN=0 \
+  DSV41_VERIFY_GRAPH=1 DSV41_GRAPH_STEP=1 \
   DSV41_EXPERT_GROUPED=1 DSV41_EXPERT_TCGEN05_E4M3=1
-judge "S4 (spec + verify graph + same-format grouped MoE)" "$HOME/armrun_STEP_S4.log"
+judge "P2G (P0 + same-format grouped MoE)" "$HOME/armrun_STEP_P2G.log"
 
-echo "############ S5: S2 with the OLD per-slot MoE (MOE_BATCH=0) — the m>1 A/B ############"
-# The user's reference is "eager 6.3 ms/step and a perfect 1..100", which this session's earlier
-# non-spec arms did NOT reproduce (10.19 ms and number skips). One candidate difference is that
-# DSV41_MOE_BATCH defaults to TRUE (moe_batch() returns true unless set to 0), so those arms took the
-# BATCHED expert path while the reference presumably took the per-(row,slot) one. At m=1 batching has
-# nothing to share and only adds setup; at m=6 it should win. S5 is the m=6 side of that A/B against
-# S2, so the pair says which default is right per mode rather than by assumption.
-bash "$HOME/num100.sh" STEP_S5 \
-  DSV41_SPEC=1 DSV41_MOE_TILELANG_BS=0 DSV41_MOE_BS_HANDWRITTEN=0 DSV41_VERIFY_GRAPH=1 \
-  DSV41_MOE_BATCH=0
-judge "S5 (spec + verify graph + OLD per-slot MoE)" "$HOME/armrun_STEP_S5.log"
+echo "############ P3: P0 + the OLD per-slot MoE (the m=6 side of the MOE_BATCH A/B) ############"
+bash "$HOME/num100.sh" STEP_P3O \
+  DSV41_SPEC=1 DSV41_MOE_TILELANG_BS=0 DSV41_MOE_BS_HANDWRITTEN=0 \
+  DSV41_VERIFY_GRAPH=1 DSV41_GRAPH_STEP=1 DSV41_MOE_BATCH=0
+judge "P3O (P0 + old per-slot MoE)" "$HOME/armrun_STEP_P3O.log"
