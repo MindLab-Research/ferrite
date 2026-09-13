@@ -2136,3 +2136,30 @@ dsv41_glue.cu(3281): error: function "<unnamed>::glue_e2m1_encode" has already b
 | **launcher 越界守卫**（新内核的 grid/block 与传入尺寸不匹配 ⇒ 静默越界） | 逐门读 `extern "C"` 入口的前置校验 | A2 `dsv41_win_kv_quant_rt`：校验 `kv/cols>0/block∈(0,256]且%32==0/cols%block==0` ✓；A3 `dsv41_compress_latent_fp4`：校验 `x/rows/hd>0且%16==0/ld` ✓；A4 `dsv41_indexer_fp4_rt`：校验 `x/rows,cols>0/cols%32==0` ✓；I3 的门判定与 `ops.rs` 镜像一致（`[0]=='1'` ≡ `starts_with('1')`）✓ |
 
 ⇒ 三类风险**均已排除**。**纪律**：每次多线合并后都应跑这三项普查（成本几分钟，能避免整轮 GPU 窗口作废）。
+
+## §85 【状态快照】本 session 末（供下个 session 30 秒接上）
+
+### 已完成且已验证
+| 面 | 状态 |
+|---|---|
+| **fp4 smem 语义** | 定谳（§47）：packed 数据 + 16 B 容器只用前 8 B；写公式 `hw_pack_sw128`（**默认已转正**）；描述符/递进/idesc 保持官方原值；独立算术核验（§54）与硬件 relerr=0 实证 |
+| **BS 臂接线** | 修了两个真缺陷：swapAB epilogue 输出打包（§62，修复前 640 个输出里 512 个位置错）；`HANDWRITTEN` 分支 `goto` 跳过 `[NC]` 探针（§65 M2）；我的仪器化回归已回退（§65 M1） |
+| **差异法审计** | 新路径 vs 旧路径（输出正确）**十项取数全 SAME**（§69）；D3/D4/D5 已修 |
+| **精度五门** | `DSV41_ROUTED_DOWN_QUANT` / `DSV41_WINDOW_KV_QUANT`(A2) / `DSV41_COMPRESS_LATENT_QUANT`(A3) / `DSV41_INDEXER_FP4_RT`(A4) / `DSV41_ATTN_P_BF16`(I3) —— **全部已合入主树、默认 OFF**；单测 **116 passed**；OFF 路径逐门核实（§78）；无半挂（§76）；集成卫生三项普查通过（§84） |
+| **累加序审计** | 17 项分档（§77）：10 项 CPU 即判无害 / 4 项抽检 / 3 项需 GPU；**风险唯一落点 = head logits**（§81：真差异是**输入边界**，比序差大 162~560 倍） |
+| **合并纪律** | 已写进 `AGENTS.md`：用项目自身构建验收、`pipefail` 传播退出码、helper 唯一前缀、worktree diff 平铺应用 + 三项确认（§83 事故复盘） |
+
+### 待办（按优先级）
+1. **有效构建后的决定性回合**（§83 修好后重开）：看两朝向的**机械文本判据**（`~/wq_check.py`）
+   —— 正确则进 2；不正确则用 `~/bs_vs_old.sh`（差异测试）+ 延迟 `[NC]` 探针定位。
+2. **`~/endgame.sh`**：全 gate 回归（`push400_hw_test.sh`，已 tee 落盘）+ 真实 p50。
+3. **`~/promote_all.sh`**：五门逐项转正（每门：DBG 对拍 → 文本红线 → 快速臂无回归），
+   转正后把对应 env **加进出货脚本**（`push400_hw_test.sh`/`verify_correct.sh`）。
+4. **采纳"可廉价对齐"两项**（`cheap-align-two` 正在做：#5 MoE down 求和排列 / #13 swiglu silu 形式）。
+5. **启用 `cp.async` 门**（`bs-cpasync-pipeline` 正在做；smem 预算已核算：双缓冲 67584 B ≪ 166912 B ✓）。
+6. **C 档剩余两项**（indexer topk / draft-verify）按 `cgrade-verify-prep` 的手册上机抽检。
+
+### 环境与脚本（远端 `~/`）
+`arm_run.sh`（5 图门全关 + OUT/ERR/STEP 回写日志）、`arm_run_fast.sh`（图 ON，唯一可作性能 p50）、
+`wq_check.py`、`bs_vs_old.sh`、`decisive2.sh`、`endgame.sh`、`promote_all.sh`、`promote_precision.sh`、`packed_matrix.sh`。
+**编译检查**：必须在**仓库目录**编 shim（kernel 被 shim `#include`）；`.cu` 变则**双产物背靠背重编**。
