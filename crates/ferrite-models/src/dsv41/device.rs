@@ -358,6 +358,7 @@ struct Kernels {
     gemv_f32_v2: Option<unsafe extern "C" fn(*const f32, *const f32, *mut f32, c_int, c_int, CuStream) -> c_int>,
     argmax: Option<unsafe extern "C" fn(*const f32, *mut c_int, c_int, *mut c_int, CuStream) -> c_int>,
     window_idxs: Option<unsafe extern "C" fn(*mut i32, *const c_int, c_int, CuStream) -> c_int>,
+    win_kv_quant_rt: Option<unsafe extern "C" fn(*mut f32, c_int, c_int, CuStream) -> c_int>,
     comp_placeholder:
         Option<unsafe extern "C" fn(*mut i32, *const c_int, c_int, c_int, CuStream) -> c_int>,
     ring_append:
@@ -813,6 +814,7 @@ impl Device {
             argmax: ko!(rt, "dsv41_argmax"),
             engram_hash_step: ko!(rt, "dsv41_engram_hash_step"),
             window_idxs: ko!(rt, "dsv41_window_idxs"),
+            win_kv_quant_rt: ko!(rt, "dsv41_win_kv_quant_rt"),
             comp_placeholder: ko!(rt, "dsv41_comp_placeholder"),
             compress_commit: ko!(rt, "dsv41_compress_commit"),
             ring_append: ko!(rt, "dsv41_ring_append"),
@@ -3036,6 +3038,15 @@ impl Device {
         let f = self.need(self.kernels.window_idxs, "dsv41_window_idxs")?;
         let rc = unsafe { f(idxs, pos_ctr, window, self.stream) };
         self.kerr(rc, "dsv41_window_idxs")
+    }
+
+    /// The official window-KV fp8 round trip (act_quant inplace semantics) on
+    /// one [cols] row in blocks of `block` (= fp8_block_size = 32): the ring
+    /// must hold bf16(dequant), exactly the reference's cache domain.
+    pub fn win_kv_quant_rt(&self, kv: *mut f32, cols: i32, block: i32) -> Result<()> {
+        let f = self.need(self.kernels.win_kv_quant_rt, "dsv41_win_kv_quant_rt")?;
+        let rc = unsafe { f(kv, cols, block, self.stream) };
+        self.kerr(rc, "dsv41_win_kv_quant_rt")
     }
 
     /// Publish the roped index key into the owner's group slot, with the slot

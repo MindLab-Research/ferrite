@@ -759,6 +759,16 @@ fn ring_win_fuse() -> bool {
     *F.get_or_init(|| std::env::var("DSV41_RING_WIN_FUSE").map(|v| v != "0").unwrap_or(true))
 }
 
+/// The official window-KV cache domain: the reference runs
+/// `act_quant(kv, fp8_block_size=32, ..., inplace=True)` on the POST-ROPE kv
+/// before it enters the ring, so the cache holds bf16(dequant) — not raw f32.
+/// DEFAULT ON: the red line is matching the official's domains exactly
+/// ("精度不能高也不能低"). `DSV41_WIN_KV_QUANT=0` opts out for A/B.
+fn win_kv_quant() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_WIN_KV_QUANT").map(|v| v != "0").unwrap_or(true))
+}
+
 /// B3 (DSV41_COMP_PLACEHOLDER_FUSE, default ON): the recency-placeholder launch
 /// (30/step, ~1.0us each) writes `idxs[win, win+take)` into the SAME buffer the
 /// `ring_win_fuse` epilogue already writes `idxs[0, win)` into, and `sparse_attn`
@@ -3401,6 +3411,16 @@ fn hc_tail_split() -> bool {
         // finished `s.kv`. A no-op when the fork did not take.
         if dual {
             self.dev.dual_chain_join()?;
+        }
+
+        // The official's window-KV cache domain: quantize the POST-ROPE kv in
+        // place (blocks of fp8_block_size=32) so the ring holds bf16(dequant),
+        // exactly the reference's `act_quant(..., inplace=True)` that runs
+        // before its cache write. Runs after the join so the side stream's rope
+        // is visible, and before `ring_win_fuse`/`ring_append` — the ring's
+        // first and only writer of this row.
+        if win_kv_quant() {
+            self.dev.win_kv_quant_rt(self.s.kv.ptr as *mut f32, hd as i32, 32)?;
         }
 
         if layer == 0 && hc_dbg() {
