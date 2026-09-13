@@ -2625,3 +2625,20 @@ compressor 投影 mrows、`ATTN_PROJ_ALIGN` 等**代码已在**，出货脚本�
 
 **纪律**（贯穿）：同轮背靠背 A/B、**一次一个变量**、判据用 `wq_check`/`[NC]`/p50（**不用**图关掉的诊断臂数字）、
 每次改动后**走项目自身构建**（§83）、合并用 `~/merge_worktree.sh`（§84/§89）。
+
+## §103 "内核就绪、只差一个 env"的实情核实（§100 结论 4 的落地）
+
+主 agent 逐项核对（代码定义点 + `~/push400_hw_test.sh` 实际是否开启）：
+
+| env | 代码 | 出货脚本 | 结论 |
+|---|---|---|---|
+| `DSV41_COMPRESSOR_PROJ_MROWS` | `device.rs:7842` | 以 `DSV41_COMPRESSOR_MROWS=1` 开启 ✓ | 已生效 |
+| `DSV41_ATTN_MROWS_ROPE_NORM` | `device.rs:6496` | `=1` ✓ | 已生效 |
+| `DSV41_GEMM_TILELANG` / `DSV41_MOE_TILELANG_BS` | — | `=1` ✓ | 已生效 |
+| **`DSV41_ATTN_PROJ_ALIGN`** | **`dspark_dev.rs:134` 有完整文档** | **计数 = 0 ⇒ 未开** ✗ | **唯一"就绪未开"项** ✓ |
+
+⇒ **行动**：`DSV41_ATTN_PROJ_ALIGN` 属于"零新代码、只差一个 env"的低风险收益
+⇒ 走 §87 的**性能门**判据转正：**门开/门关数值必须逐字节一致**（它是程序对齐 ⇒ 不应改数值）+ 同轮背靠背 p50 比较。
+**注意**：它作用在 **draft（MTP）侧的 attention 投影**（`dspark_dev.rs`），因此
+**只在 spec 臂上才有意义**（plain decode 不经过）⇒ 验证必须在 `DSV41_SPEC=1` 的臂上做，
+且要与 `DSV41_DIFF_EAGER`/accept 长度一起看（对齐若改动了程序，accept 可能变）。
