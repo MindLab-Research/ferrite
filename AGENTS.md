@@ -107,15 +107,20 @@ LD_LIBRARY_PATH=$HOME/ferrite/kernels/cuda ./target/release/ferrite-serve --back
 - serve 卡住/日志 mtime 停滞 = 挂了（查 `stat -c %y` + pgrep，别等）。
 - 加载错防线（三道 runtime + 三道编译期 + git hooks）见 `docs/agent/` 的加载防线文档。
 
-## 当前状态与下一步（2026-09-14——手写 fp4 MoE BS 臂：朝向已定，残余一错）
+## 当前状态与下一步（2026-09-14——手写 fp4 MoE BS 臂：🎯 根因已定谳 = fp4 操作数必须按 PACKED staging）
 
 **详细记录一律在 `docs/agent/moe-bs-crash-investigation.md`（§10–§22），本节只放结论与指针。**
 
 - **手写 kernel 的 6 个真 bug 已修**：idesc `b_sf_id` 漏 `<<4`、smem 布局与 descriptor 的 swizzle 声明不匹配、
   K-block 递进单位误判 8×、缺 `fence.proxy.async`、缺 `tcgen05.fence::before/after_thread_sync`（3 处）。
-- **朝向是主因**：`DSV41_MOE_BS_SWAPAB=1`（A=权重 e2m1 / B=激活 e4m3，idesc a_fmt=5/b_fmt=0，epilogue 转置）
-  把 e2e 输出从**随机乱码**推进到**递减的连续数字**（`5 4 3 2 1 6 5 4`）。树内唯一"GPU 已验证"的 mxf8f6f4
-  配置（PH0 探针、`tc5::e4`）用的正是这个朝向。**残余一个系统性误差**待钉死。
+- **🎯 根因（§29，实证非推导）**：**硬件把 fp4(E2M1) 操作数按 PACKED（2 元素/字节，低 nibble=偶 k）读，
+  而我们按 unpacked（1 元素/字节）写** ⇒ 所有奇数 K 元素恒为 0、K 覆盖腰斩。铁证：B 字节全 `0x22`（两 nibble 都=1.0）
+  时稠密 parity **relerr=0 精确 PASS**；全 `0x02` 时 D 恰好是金标准的 **1/2**。官方 W 子 tile 8192 B
+  = 128 行 × 64 B 亦独立佐证 packed。**其它全部已验证正确**（36/36 冲激命中、A 侧字节级一致、descriptor lbo/sbo/K 递进、
+  idesc、M/N 方向、TMEM 读回、MMA 确实发射——含 TMEM 毒化自证）。
+  ⇒ 修法 = 把 fp4 操作数按 packed staging（64 B/行 for K=128）+ 相应改 descriptor/K-block 递进。
+- **⚠️ 因此之前一切基于"全错文本"的结论都是在 B 打包错的条件下得到的**：朝向（SWAPAB）与 SF 字节序（SFREV）
+  都必须**修好打包后用受控实验重新判定**（§27 给出了 `~/orient_controlled.sh`，且必须以 `[NC]` 数值为主判据）。
 - **头号假设 = SF 字节序**（硬件可能 MSB-first：byte j 携带 K-block `3-j`；我们两侧都按 LSB-first 打包）。
   门控 `DSV41_MOE_BS_SFREV=1` 用一行 idesc 改动（`sf_id = 3-ki`）同时修正权重侧与激活侧。
 - **门控一览**（全默认 OFF）：`DSV41_MOE_BS_{HANDWRITTEN,CANON,SCALEVEC1X,SWAPAB,SFREV,NUMCHECK}`。
