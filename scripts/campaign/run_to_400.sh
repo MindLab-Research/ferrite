@@ -69,3 +69,18 @@ bash "$HOME/num100.sh" STEP_S3 \
   DSV41_ENGRAM_PROJ_MROWS=1 DSV41_ENGRAM_GATHER_MROWS=1 \
   DSV41_DRAFT_P3LITE_SEED=1 DSV41_DRAFT_P3LITE_KV=1 DSV41_DRAFT_P3LITE_ATTN=1
 judge "S3 (spec + both graphs + folds)" "$HOME/armrun_STEP_S3.log"
+
+echo "############ S4: S2 + the SAME-FORMAT grouped MoE (e4m3 act + native fp4 weights) ############"
+# expert_grouped()'s own doc says the grouped arm is a NUMERIC NO-OP ON ITS OWN: it builds the layout
+# but the consumer needs DSV41_EXPERT_TCGEN05_E4M3 too, so with only GROUPED armed the proven
+# per-(row, slot) launches answer the step and an "ON" arm silently measures the old path. Together
+# they are the precision-correct fast MoE: A = e4m3, W = native fp4 nibbles + ue8m0 scales, i.e. the
+# official fp4_gemm's format (unlike DSV41_MOE_TILELANG, whose activation is never quantised).
+# This is the lever the amortization ledger points at (shared expert 10.4ms + routed experts 8.3ms,
+# both kernel-efficiency bound, and the shared expert re-reads its weights 5x because m=6 rows share
+# them - which is exactly what a grouped/batched GEMM removes; it is invisible in the 1-row decode
+# steps the earlier arms measured).
+bash "$HOME/num100.sh" STEP_S4 \
+  DSV41_SPEC=1 DSV41_MOE_TILELANG_BS=0 DSV41_MOE_BS_HANDWRITTEN=0 DSV41_VERIFY_GRAPH=1 \
+  DSV41_EXPERT_GROUPED=1 DSV41_EXPERT_TCGEN05_E4M3=1
+judge "S4 (spec + verify graph + same-format grouped MoE)" "$HOME/armrun_STEP_S4.log"
