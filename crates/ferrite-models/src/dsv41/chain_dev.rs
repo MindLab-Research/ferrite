@@ -2139,6 +2139,45 @@ fn sh_exp_fused() -> bool {
 /// the parity cases are what bring it up, and the four-text check is what flips
 /// it. Requires the two SH_EXP envs off the critical path — this arm is tried
 /// BEFORE the M=1 fused arm in `shared_expert_mrows`.
+/// TileLang shared-expert gate (`DSV41_SH_EXP_TILELANG=1`, DEFAULT OFF): the whole
+/// (w1w3 -> swiglu -> fp8 emit -> w2) chain as TWO TileLang fp8 MMA launches — the M
+/// activation rows share ONE weight read (the SIMT arms re-read w1/w3 m times) and the
+/// grid barrier disappears. Design: `docs/agent/c5-sh-exp-tilelang-design.md` §⑤.
+///
+/// ⚠️ Tried BEFORE `DSV41_SH_PAIR_M`, and the two are mutually exclusive in effect
+/// (whichever wins makes the other inert for the process). Reason: this arm is (b′)
+/// "double swap" — m=1 (eager) and m<=8 (verify) run the SAME program, which is the only
+/// way a tensor-core shared expert may be taken. Letting `DSV41_SH_PAIR_M` win would put
+/// the verify side on a THIRD program — exactly the `DSV41_PROJ_MMA` death (mean-k
+/// 2.240 -> 0.020, `tilelang-integration-design.md` §312).
+///
+/// Read ONCE and cached: this branch runs 40x/step inside the layer loop, so a per-call
+/// getenv would be the hot-path slip every other gate here avoids.
+fn sh_exp_tilelang() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("DSV41_SH_EXP_TILELANG").map(|v| v == "1").unwrap_or(false)
+    })
+}
+
+/// One-time receipt for [`sh_exp_tilelang`] — ARMED, or DECLINED with the first unmet
+/// precondition. Same sh-gate-phantom discipline as [`sh_pair_m_note`]: a gate with no
+/// observation makes "the env never reached the process" and "the arm declined"
+/// indistinguishable. `OnceLock`, so a second call is one atomic read.
+fn sh_exp_tilelang_note(armed: bool, reason: &'static str) {
+    static F: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    F.get_or_init(|| {
+        if armed {
+            eprintln!(
+                "[sh-gate] SH_EXP_TILELANG=1: ARMED TileLang fp8 MMA (gu+dn, M rows share one \
+                 weight read, no grid barrier) — SH_PAIR_M / SH_EXP_FUSED are inert this process"
+            );
+        } else {
+            eprintln!("[sh-gate] SH_EXP_TILELANG=1: DECLINED: {reason}");
+        }
+    });
+}
+
 fn sh_pair_m() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *F.get_or_init(|| std::env::var("DSV41_SH_PAIR_M").map(|v| v == "1").unwrap_or(false))
@@ -2214,11 +2253,12 @@ fn sh_gate_startup_note() {
     F.get_or_init(|| {
         eprintln!(
             "[sh-gate] startup: SH_EXP_MROWS={} SH_PAIR_MROWS={} INDEXER_MROWS={} \
-             COMPRESSOR_MROWS={}",
+             COMPRESSOR_MROWS={} SH_EXP_TILELANG={}",
             sh_exp_mrows(),
             sh_pair_m(),
             indexer_mrows(),
             compressor_mrows(),
+            sh_exp_tilelang(),
         );
         // The diagnostic A/B guards, on their own line so a gate that is OFF (the
         // steady state) does not read as an unarmed SH fold. Printed from the same
@@ -17858,6 +17898,91 @@ impl<'a> DevChain<'a> {
         dim: usize,
     ) -> Result<bool> {
         let cfg = self.cfg;
+        // ---- the TileLang arm (`DSV41_SH_EXP_TILELANG`) ---------------------
+        // Tried FIRST (highest priority): the whole (w1w3 -> swiglu -> fp8 emit -> w2)
+        // chain as TWO TileLang fp8 MMA launches — the M activation rows share ONE
+        // weight read (the SIMT arms re-read w1/w3 m times) and there is no grid
+        // barrier (the two phases are two launches; L2 reads L1's output from global).
+        // Design: docs/agent/c5-sh-exp-tilelang-design.md §④/§⑤.
+        //
+        // (b′) DOUBLE SWAP: this program is NOT bit-identical to the SIMT arm, but m=1
+        // (eager) and m<=8 (verify) run the SAME program. It therefore must be taken on
+        // BOTH sides, which is why it outranks `DSV41_SH_PAIR_M` (letting that win would
+        // swap only the verify side onto a third program — the DSV41_PROJ_MMA death).
+        //
+        // The shape mirrors below are the generator's frozen geometry (sh_il == 288,
+        // dim == 5120), so a shape the shim would decline never costs a launch. Fallback
+        // safety is the shim's "gate everything, then launch" rule: `moe_out_r` is
+        // written ONLY by L2's epilogue, and L1 writes only `sh_aq_r`/`sh_aqsc_r` — the
+        // scratch every arm below rewrites. A decline leaves `moe_out_r` untouched.
+        if sh_exp_tilelang()
+            && self.dev.supports_sh_exp_tilelang()
+            && m != 0
+            && m <= VERIFY_ROWS
+            && m <= 8
+            && sh_il == 288
+            && dim == 5120
+        {
+            // 1) ONE fp8 quantisation of the block — the same launch the arms below
+            //    start with, so the activation is staged once either way.
+            //    P3: skipped when the prefused FFN front end already emitted it.
+            if !self.take_xq_staged() {
+                self.quant_rows(self.s.xn_r.ptr as *const f32, m, dim as i32)?;
+            }
+            let ok = self.dev.sh_exp_tilelang(
+                self.s.xq_r.ptr as *const u8,
+                self.s.xsc_r.ptr as *const f32,
+                w1.as_u8(),
+                w1s.as_u8(),
+                w3.as_u8(),
+                w3s.as_u8(),
+                cfg.swiglu_limit,
+                sh_il as i32,
+                dim as i32,
+                m as i32,
+                // `fold_r`: an ABI placeholder — this program's M fold lives inside the
+                // mma tile and is independent of m (the (b′) precondition).
+                1,
+                // `act` is not a by-product of this program; the shim declines a
+                // non-null pointer rather than silently dropping the rows.
+                std::ptr::null_mut(),
+                0,
+                self.s.sh_aq_r.ptr as *mut u8,
+                self.s.sh_aqsc_r.ptr as *mut f32,
+                sh_il as i32,
+                (sh_il / 32) as i32,
+                w2.as_u8(),
+                w2s.as_u8(),
+                dim as i32,
+                // w2.scale's row pitch == sh_il/32 == 9 (UNPADDED, the frozen pool
+                // layout). The shim declines any other value instead of reading the
+                // wrong row — the silent-wrong-value class of tcgen05-rank7-verdict §10.
+                (sh_il / 32) as i32,
+                dim as i32,
+                // epi_add folds `add_inplace_raw(moe_out_r, sh_out_r)` into L2's store
+                // (the same operand pair, the same element-wise sum).
+                1,
+                self.s.moe_out_r.ptr as *mut f32,
+            )?;
+            if ok {
+                sh_exp_tilelang_note(true, "");
+                return Ok(true);
+            }
+            sh_exp_tilelang_note(false, "the shim declined the block (Ok(false))");
+        } else if sh_exp_tilelang() {
+            // Gate ON but a mirror precondition refused: name the first unmet one
+            // instead of leaving another silence (sh-gate-phantom defect 3).
+            let reason = if !self.dev.supports_sh_exp_tilelang() {
+                "stale .so (no dsv41_sh_exp_tilelang symbol)"
+            } else if m == 0 || m > VERIFY_ROWS || m > 8 {
+                "m outside 1..=8 / VERIFY_ROWS"
+            } else if sh_il != 288 || dim != 5120 {
+                "shape is not the frozen (sh_il == 288, dim == 5120)"
+            } else {
+                "uncharacterised"
+            };
+            sh_exp_tilelang_note(false, reason);
+        }
         // ---- the M-row arm (`DSV41_SH_PAIR_M`) ------------------------------
         // Tried FIRST: ONE `dsv41_gemm_fp8_sh_exp_fused<m>` for the whole block,
         // replacing all m rows' (w1w3 -> swiglu -> fp8 emit | barrier | w2) with a

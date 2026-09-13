@@ -172,6 +172,33 @@ CU_HASH="$( { sha256sum "${SRCS[@]}"; echo "flags ${SKELETON_FLAGS[*]-<none>}"; 
 BUILD_ID="${BUILD_ID}+cu${CU_HASH}"
 echo "$BUILD_ID" > "$(dirname "$0")/.build_id"
 
+# SAME-FAST-MATH SPLIT (2026-09-14, the fp4-MoE illegal-instruction root cause):
+# TileLang's tcgen05 inline-asm kernels MUST NOT be compiled with
+# --use_fast_math — the JIT (which works) does not use it, and with it the
+# MMA traps with CUDA_ERROR_ILLEGAL_INSTRUCTION (five-way review + JIT A/B
+# isolated; the flag lets ptxas reassociate/schedule around the asm in a way
+# the tcgen05 unit rejects). The REST of the .so keeps fast math ON (removing
+# it globally regressed the batched capture by ~2x and destabilized the pool
+# size classes — see the 2026-09-10 note below). So: tilelang_gen shims are
+# compiled as their own TUs WITHOUT the flag, everything else WITH it, and the
+# .o files are linked into one .so.
+TL_OBJS=()
+OTHER_SRCS=()
+for f in "${SRCS[@]}"; do
+    case "$f" in
+        */tilelang_gen/*_shim.cu)
+            obj="${f%.cu}.no_fm.o"
+            "$NVCC" -O3 -c -std=c++20 \
+                -gencode "arch=compute_${ARCH},code=sm_${ARCH}" \
+                -I "$DIR/tilelang_inc" \
+                $( [ -d "/opt/dlami/nvme/dsv41_venv/lib/python3.12/site-packages/tilelang/3rdparty/cutlass/include" ] && echo "-I /opt/dlami/nvme/dsv41_venv/lib/python3.12/site-packages/tilelang/3rdparty/cutlass/include" ) \
+                -o "$obj" "$f" || exit 1
+            TL_OBJS+=("$obj")
+            ;;
+        *) OTHER_SRCS+=("$f") ;;
+    esac
+done
+
 "$NVCC" -O3 -shared -Xcompiler -fPIC $FAST_MATH_FLAG \
     -std=c++20 \
     -gencode "arch=compute_${ARCH},code=sm_${ARCH}" \
@@ -179,7 +206,7 @@ echo "$BUILD_ID" > "$(dirname "$0")/.build_id"
     $( [ -d "/opt/dlami/nvme/dsv41_venv/lib/python3.12/site-packages/tilelang/3rdparty/cutlass/include" ] && echo "-I /opt/dlami/nvme/dsv41_venv/lib/python3.12/site-packages/tilelang/3rdparty/cutlass/include" ) \
     -DFERRITE_KERNEL_BUILD_ID="\"${BUILD_ID}\"" \
     "${SKELETON_FLAGS[@]+"${SKELETON_FLAGS[@]}"}" \
-    -o "$OUT" "${SRCS[@]}"
+    -o "$OUT" "${OTHER_SRCS[@]}" "${TL_OBJS[@]+"${TL_OBJS[@]}"}"
 
 echo "built ${OUT} for sm_${ARCH} from ${SRCS[*]} (build_id ${BUILD_ID})"
 # NOTE: the `|| true` is load-bearing under `set -e`. With the mxf4 flag now
