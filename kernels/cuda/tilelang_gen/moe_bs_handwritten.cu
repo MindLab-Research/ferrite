@@ -291,8 +291,8 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
             // smem descriptors for A and B tiles
             // layout=0 (no swizzle), LBO=1 (16B = core matrix row stride), SBO=64 (1024B = 8-row atom stride)
             // (数据已按 core matrix 布局写入，无需 swizzle)
-            const uint64_t a_desc_base = hw_make_desc(A_sh, 1, 64, 0);  // layout=0 (no swizzle)
-            const uint64_t b_desc_base = hw_make_desc(B_sh, 1, 64, 0);  // layout=0 (no swizzle)
+            const uint64_t a_desc_base = hw_make_desc(A_sh, 8, 64, 0);  // layout=0 (no swizzle)
+            const uint64_t b_desc_base = hw_make_desc(B_sh, 8, 64, 0);  // layout=0 (no swizzle)
 
             for (int ki = 0; ki < 4; ++ki) {
                 // idesc: M=128, N=128, a_fmt=0 (E4M3), b_fmt=5 (E2M1), sf_id=ki
