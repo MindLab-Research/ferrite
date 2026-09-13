@@ -921,7 +921,46 @@ extern "C" int dsv41_moe_tilelang_gate_up_bs_dev(
         xq4, xsc4, g_a, g_sfa, order_dev, counts_dev, kDim, kDim / 32, kSfWords, (int)topk, nseg_dev);
     cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) return (int)e;
-    // VARIABLE-ISOLATION DIAGNOSTICS (DSV41_MOE_BS_ZERO_{SF,A,EID}, default OFF):
+    // GATHER VERIFY DIAGNOSTIC (one-shot): compare g_a's first valid row with
+    // the original xq4 data to verify the gather is mapping correctly.
+    static bool g_gather_diag_done = false;
+    if (!g_gather_diag_done) {
+        g_gather_diag_done = true;
+        cudaStreamCaptureStatus cst = cudaStreamCaptureStatusNone;
+        cudaStreamIsCapturing(s, &cst);
+        if (cst == cudaStreamCaptureStatusNone) {
+            // Find the first valid segment+row from counts
+            int counts_h[kSegCap];
+            cudaMemcpyAsync(counts_h, counts_dev, kSegCap * sizeof(int), cudaMemcpyDeviceToHost, s);
+            cudaStreamSynchronize(s);
+            int first_seg = -1;
+            for (int i = 0; i < (int)kSegCap; ++i) {
+                if (counts_h[i] > 0) { first_seg = i; break; }
+            }
+            if (first_seg >= 0) {
+                // Get the flat assignment index for this segment's row 0
+                int order_h[1];
+                cudaMemcpyAsync(order_h, order_dev + first_seg * kBm, sizeof(int), cudaMemcpyDeviceToHost, s);
+                cudaStreamSynchronize(s);
+                const int flat_idx = order_h[0];
+                const int src_row = flat_idx / (int)topk;
+                // Read 16 bytes from both g_a (gathered) and xq4 (original)
+                uint8_t ga_h[16], xq_h[16];
+                cudaMemcpyAsync(ga_h, g_a + (size_t)(first_seg * kBm) * kDim, 16, cudaMemcpyDeviceToHost, s);
+                cudaMemcpyAsync(xq_h, xq4 + (size_t)src_row * kDim, 16, cudaMemcpyDeviceToHost, s);
+                cudaStreamSynchronize(s);
+                fprintf(stderr, "[moe-bs][GATHER-DIAG] seg=%d flat=%d src_row=%d: "
+                                "g_a[0..15]=%02x%02x%02x%02x%02x%02x%02x%02x "
+                                "xq4[0..15]=%02x%02x%02x%02x%02x%02x%02x%02x %s\n",
+                        first_seg, flat_idx, src_row,
+                        ga_h[0],ga_h[1],ga_h[2],ga_h[3],ga_h[4],ga_h[5],ga_h[6],ga_h[7],
+                        xq_h[0],xq_h[1],xq_h[2],xq_h[3],xq_h[4],xq_h[5],xq_h[6],xq_h[7],
+                        (ga_h[0]==xq_h[0] && ga_h[1]==xq_h[1] && ga_h[2]==xq_h[2] && ga_h[3]==xq_h[3] &&
+                         ga_h[4]==xq_h[4] && ga_h[5]==xq_h[5] && ga_h[6]==xq_h[6] && ga_h[7]==xq_h[7]) ?
+                        "✅ MATCH" : "❌ MISMATCH!");
+            }
+        }
+    }
     // after the gather fills the buffers, ZERO one of them before the MMA to
     // isolate WHICH data variable triggers the m=6 crash. m=1 works with all
     // real data; m=6 crashes. If zeroing X makes m=6 work, X is the trigger.
