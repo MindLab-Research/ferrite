@@ -16,6 +16,10 @@
 //! to the shared `ferrite-kernel::devrt` / `ferrite_p2p_ar_v5`, what remains
 //! here is the DSV4 kernel ABI table and the per-rank staging parameters.
 
+/// `k_acc` histogram + p1/p_j decomposition (`DSV41_ACC_HISTOGRAM=1`): the
+/// same-arm accept-shape calibration (R0) and the oracle-tap contrast's
+/// counters (R1).
+pub mod acc_hist;
 pub mod chain;
 pub mod chain_dev;
 pub mod config;

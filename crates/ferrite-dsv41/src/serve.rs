@@ -801,9 +801,22 @@ fn pool_rank_body(
                 if res_tx.send((rank, dev_id, r.map(|_| out))).is_err() {
                     return Ok(());
                 }
+                // R0/R1 (`DSV41_ACC_HISTOGRAM=1` / `DSV41_ORACLE_TAP=1`): the
+                // request's accept-shape summary. Printed at the request's END
+                // (the decode command is the last thing a request sends) so one
+                // A/B run's report is one line, and rank-limited because every TP
+                // rank is a separate process writing the same log.
+                if rank == 0 {
+                    ferrite_models::dsv41::acc_hist::print_summary("serve");
+                }
             }
             // the pool dropped its senders (process shutdown)
-            Err(_) => return Ok(()),
+            Err(_) => {
+                if rank == 0 {
+                    ferrite_models::dsv41::acc_hist::print_summary("serve-shutdown");
+                }
+                return Ok(());
+            }
         }
     }
 }

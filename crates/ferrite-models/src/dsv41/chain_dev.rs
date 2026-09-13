@@ -10238,6 +10238,11 @@ impl<'a> DevChain<'a> {
         judges[0] = next;
         judges[1..].copy_from_slice(&verify_out[..DSPARK_DRAFTS - 1]);
         let k_acc = Self::accept(&drafts, &judges);
+        // R0 (`DSV41_ACC_HISTOGRAM=1`): the arm's per-step accept shape. The
+        // legacy block does NOT contain the anchor row, so the FIRST link is
+        // `drafts[0]` against the step's own argmax `next` (see `judges[0]`
+        // above) — the same event `k_acc >= 1` encodes.
+        crate::dsv41::acc_hist::note("legacy", pos, k_acc, drafts[0] == next);
 
         // ---- 6. the commit: roll back everything past the accepted prefix,
         // replay the kept rows through the compressors, advance the counter.
@@ -10461,6 +10466,9 @@ impl<'a> DevChain<'a> {
         // step emits (the anchor plus the accepted drafts), 1..=m.
         let k_emit = spec_accept::<u32, u32>(&drafts, &rows, true);
         let k_acc = k_emit - 1;
+        // R0 (`DSV41_ACC_HISTOGRAM=1`): the anchor-carrying block's first link is
+        // `drafts[0]` against ROW 0's argmax (the block's row 0 IS the anchor).
+        crate::dsv41::acc_hist::note("aligned", pos, k_acc, drafts[0] == rows[0]);
         // The legacy report shape: the five argmaxes AFTER the anchor row. They
         // are the judges of `drafts[0..5]` (`verify_out[j]` = the token at
         // `pos + 2 + j`), and the block's LAST row's argmax — the bonus token at
@@ -10701,12 +10709,27 @@ impl<'a> DevChain<'a> {
             self.tap_parity_probe(pos, m, &rows_in, &host_mirrors, Self::tap_strict_rows())?;
         }
 
+        // ---- 3c. R1: the ORACLE TAP contrast (`DSV41_ORACLE_TAP=1`, default
+        // OFF). ONE extra draft forward fed the main chain's OWN hidden at
+        // `pos` (row 0 of the block just forwarded) instead of the carried tap
+        // (which sits at `pos - 1`), reporting `drafts[0] == rows[0]` — the
+        // first accept link under the CORRECT input. See [`oracle_tap`] for the
+        // experiment and [`DevChain::oracle_tap_probe`] for the safety argument.
+        // Placed here so `dspark_tap_r` is intact, the counter is still at `pos`
+        // and the round's commit has not happened yet.
+        if Self::oracle_tap() {
+            self.oracle_tap_probe(dspark, token, pos, rows[0]);
+        }
+
         // ---- 4. the accept: index-aligned on the anchor-carrying block (see the
         // doc comment), through the SHARED chain. `k_emit` counts the tokens the
         // step emits (the anchor plus the accepted drafts), 1..=m.
         let k_emit = spec_accept::<u32, u32>(&drafts, &rows, true);
         let k_acc = k_emit - 1;
         let next = rows[0];
+        // R0 (`DSV41_ACC_HISTOGRAM=1`): the swallowed block's first link is
+        // `drafts[0]` against `rows[0]` (the anchor row's argmax = `next`).
+        crate::dsv41::acc_hist::note("swallowed", pos, k_acc, drafts[0] == rows[0]);
         // The legacy report shape: the five rows AFTER the anchor are the
         // `[d1..d5]`-style verify block, row `j` at `pos+1+j`, argmax `pos+2+j`.
         let mut verify_out = [0u32; DSPARK_DRAFTS];
@@ -10788,6 +10811,45 @@ impl<'a> DevChain<'a> {
             verify_ms,
             commit_ms,
         })
+    }
+
+    /// R1's probe body: ONE extra draft forward on the ORACLE tap
+    /// (`DSV41_ORACLE_TAP=1`). See [`oracle_tap`] for the experiment and the
+    /// safety argument; this function is only the mechanics plus the recording.
+    ///
+    /// `main_top` is the round's anchor-row argmax (`rows[0]`, the token at
+    /// `pos + 1`), i.e. the main chain's own greedy answer at the position the
+    /// draft's `drafts[0]` proposes — so `drafts[0] == main_top` on the correct
+    /// input is the FIRST ACCEPT LINK under the oracle.
+    ///
+    /// Errors are LOGGED, never propagated: the caller's block is legal and its
+    /// commit still has to happen, so a probe may not answer an error for a step
+    /// whose tokens are already decided (`vrow0_step`'s discipline).
+    fn oracle_tap_probe(
+        &mut self,
+        dspark: &mut DsparkDev,
+        token: u32,
+        pos: usize,
+        main_top: u32,
+    ) {
+        let r = (|| -> Result<()> {
+            // Row 0 of the round's own block = the anchor's forward = the main
+            // chain's hidden of `token` at `pos`.
+            dspark.import_tap_row(
+                self.s.dspark_tap_r.ptr as *const f32,
+                VERIFY_ROWS,
+                0,
+            )?;
+            // The SAME (token, pos) the round's normal draft used, so the ring
+            // seed is idempotent (see [`oracle_tap`]).
+            dspark.draft_forward(token, pos)?;
+            let od = dspark.drafts()?;
+            crate::dsv41::acc_hist::note_oracle(pos, od[0], main_top);
+            Ok(())
+        })();
+        if let Err(e) = r {
+            eprintln!("[dsv41] oracle tap probe (pos {pos}) failed: {e}");
+        }
     }
 
     // =========================================================================
@@ -11204,6 +11266,10 @@ impl<'a> DevChain<'a> {
         );
         let k_acc = k_emit - 1;
         let next = rows[0];
+        // R0 (`DSV41_ACC_HISTOGRAM=1`): the lazy arm shares the swallowed block's
+        // row-0 anchor semantics, so its first link is `drafts[0]` against row 0's
+        // argmax as well.
+        crate::dsv41::acc_hist::note("lazy", pos, k_acc, drafts[0] == rows[0]);
         // The legacy report shape: the rows AFTER the anchor, row `j` at
         // `pos + 1 + j` — the same shift the batched arm applies. Only `0..k_acc`
         // has a defined value here (see the doc comment).
@@ -17657,6 +17723,58 @@ fn tap_mean_rows() -> bool {
 fn tap_input() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *F.get_or_init(|| std::env::var("DSV41_TAP_INPUT").map(|v| v != "0").unwrap_or(false))
+}
+
+/// R1 ORACLE TAP (`DSV41_ORACLE_TAP=1`, default OFF) — the "correct input"
+/// contrast of the accept-separation experiment (`accept-ceiling-analysis.md`
+/// §5.2, `accept-1214-to-2-3-path.md` §4).
+///
+/// # The question
+///
+/// The accept chain's first link (`drafts[0]` vs the anchor's argmax) is the
+/// single point the whole `mean-k` is bimodal around, and the SWALLOW arm feeds
+/// that draft a tap the draft's own position does NOT describe: the block's
+/// anchor forward happens AFTER the draft, so `carry_kept_tap` hands over the
+/// previous round's last KEPT row — the hidden of `pos - 1`, while the draft is
+/// asked about `pos`. Two explanations fit the same `p1 ≈ 0.43`:
+///
+/// * **geometric** — the head would follow the backbone if the input were at the
+///   right position/slot (⇒ `SEED_ALIGN`-class fixes pay);
+/// * **input/head** — even fed the right hidden the 3-layer head cannot
+///   reproduce the backbone's near-ties (⇒ no geometry fix pays).
+///
+/// # The probe
+///
+/// Re-run ONE draft forward, in the SAME round, with `main_h` gathered from row
+/// 0 of the round's OWN verify block ([`DsparkDev::import_tap_row`]) — that row
+/// IS the forward of `token` at `pos`, i.e. the draft's correct input, produced
+/// by the main chain itself — and compare the re-run's top-1 with `rows[0]`, the
+/// anchor row's argmax (the token at `pos + 1`). The rate is recorded by
+/// [`crate::dsv41::acc_hist::note_oracle`] and summarised at serve exit.
+///
+/// # Why this costs nothing but time (the safety argument)
+///
+/// The probe runs POST-verify, PRE-accept, i.e. BEFORE the commit and with the
+/// counter still at `pos`:
+///
+/// * the commit's inputs (`dspark_tap_r`, `host_mirrors`) are not written by a
+///   draft forward, and the accept uses the `drafts` the round already
+///   downloaded, so the round's own outcome is untouched;
+/// * the draft's ring seed goes to the SAME slot the round's normal forward
+///   already seeded (`seed_window(s, pos)` is a function of `(s, pos)` alone),
+///   so the re-run is idempotent on the draft's state;
+/// * `main_h` is rewritten by the re-run, but the next round's `import_tap`
+///   overwrites it from the carried tap before anything reads it;
+/// * the counter has NOT moved yet, so the `DSV41_DRAFT_GRAPH` replay addresses
+///   the same ring slot as the round's normal forward.
+///
+/// A probe failure is logged and swallowed (the round's block is legal and its
+/// commit still has to happen — `vrow0_step`'s discipline). Read ONCE and cached
+/// (the house rule for every hot-path gate). Costs one extra draft forward
+/// (~4-9 ms) per round — a LOCALISATION tool, never a perf mode.
+fn oracle_tap() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_ORACLE_TAP").map(|v| v == "1").unwrap_or(false))
 }
 
     fn layer(&mut self, layer: usize, pos: usize, pa: usize) -> Result<usize> {

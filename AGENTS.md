@@ -74,6 +74,8 @@ LD_LIBRARY_PATH=$HOME/ferrite/kernels/cuda ./target/release/ferrite-serve --back
 | `DSV41_SEED_ALIGN=1` | 判词路线 A（seed↔tap 对齐） | OFF |
 | `DSV41_VERIFY_GRAPH=1` | verify 的 CUDA 图化 | OFF |
 | `DSV41_TIMING=1` | `[dspark] steps=` 计时行 | OFF |
+| `DSV41_ACC_HISTOGRAM=1` | R0：逐 step `[acc-hist]` 行 + 收尾 `[acc-hist-summary]`（k_acc 直方图 + p1/p_j 分解；`docs/agent/r0-r1-accept-diagnosis-manual.md`） | OFF |
+| `DSV41_ORACLE_TAP=1` | R1：oracle tap 对照（draft 改喂主链同位 hidden，比 `drafts[0]` vs `rows[0]`，收尾报 rate） | OFF |
 
 **2026-09-13 摊薄修复批新增 gate**（详见 `docs/agent/verify-amortization-lesion-audit.md` §9 + 各设计文档；全部默认 OFF、逐位论证、双门禁验证中）：
 

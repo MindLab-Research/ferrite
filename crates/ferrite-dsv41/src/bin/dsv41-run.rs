@@ -230,6 +230,10 @@ let dev = Device::open(&so)?;
             el.as_secs_f64() * 1e3 / n as f64
         );
     }
+    // R0/R1 (`DSV41_ACC_HISTOGRAM=1` / `DSV41_ORACLE_TAP=1`): the same-arm accept
+    // shape of THIS run — the histogram plus the p1/p_j decomposition, and the
+    // oracle-tap agreement rate when that probe is armed.
+    ferrite_models::dsv41::acc_hist::print_summary("oneshot");
     println!("--- ids: {:?}", &produced[..produced.len().min(24)]);
     Ok(())
 }

@@ -1060,6 +1060,54 @@ impl<'a> DsparkDev<'a> {
         Ok(())
     }
 
+    /// R1 ORACLE TAP (`DSV41_ORACLE_TAP=1`, default OFF): fill `main_h` with ONE
+    /// row of the chain's PER-ROW tap block (`dspark_tap_r`, laid out
+    /// `[slot][rows][dim]`) instead of the contiguous `[n_target, dim]` block
+    /// [`Self::import_tap`] expects.
+    ///
+    /// This is the same gather [`Self::note_ctx_rows`] performs for a committed
+    /// row — one `dim`-wide slice per slot — WITHOUT that function's projection
+    /// and window-ring side effects: the caller drives a normal
+    /// [`Self::draft_forward`] afterwards, so `project_main_x` must not run
+    /// twice and the ring seed belongs to the forward, not to the gather.
+    ///
+    /// # Why row 0 is the draft's "correct input"
+    ///
+    /// A verify block's row 0 is the forward of the token at the block's own
+    /// base position (`pos` for the SWALLOW/LAZY layout), so gathering row 0
+    /// hands the draft the main chain's OWN hidden at exactly the `(token, pos)`
+    /// it is being asked about. The online path cannot do that — the anchor's
+    /// forward is the row the draft would need BEFORE it runs — and carries the
+    /// previous round's last KEPT row instead, which sits one position earlier
+    /// (`carry_kept_tap`'s `keep - 1`). The oracle contrast is therefore
+    /// "the same draft, fed the same-position hidden instead of the stale one".
+    ///
+    /// `row` is a ROW INDEX inside the block (0-based); the block's row stride is
+    /// `rows`, which callers pass as `VERIFY_ROWS` — the same stride the tap hook
+    /// writes with, so a block with fewer rows than the slot holds (a partial
+    /// block) still addresses correctly.
+    pub fn import_tap_row(&mut self, tap_r: *const f32, rows: usize, row: usize) -> Result<()> {
+        let dim = self.dim;
+        let n_target = self.n_target;
+        debug_assert!(
+            row < rows,
+            "dspark: import_tap_row asked for row {row} of a {rows}-row tap block"
+        );
+        let row_bytes = dim * std::mem::size_of::<f32>();
+        for slot in 0..n_target {
+            let src = (tap_r as *const u8)
+                .wrapping_add((slot * rows + row) * row_bytes);
+            let dst = (self.main_h.ptr as *mut u8).wrapping_add(slot * row_bytes);
+            self.dev
+                .memcpy_d2d(dst as *mut c_void, src as *const c_void, row_bytes)?;
+        }
+        if tap_bf16() {
+            let n = (n_target * dim) as i64;
+            self.dev.bf16_roundtrip(self.main_h.ptr as *mut f32, n)?;
+        }
+        Ok(())
+    }
+
     /// Append a COMMITTED verify block's target hiddens to the window rings:
     /// rows `0..keep` of the block, written at the positions `pos_base + j`.
     ///
