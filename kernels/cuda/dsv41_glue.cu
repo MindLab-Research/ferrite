@@ -2648,3 +2648,159 @@ extern "C" int dsv41_bf16_roundtrip(float* x, long n, cudaStream_t s) {
     dsv41_bf16_roundtrip_kernel<<<(unsigned)blocks, 256, 0, s>>>(x, n);
     return (int)cudaGetLastError();
 }
+
+// ===========================================================================
+// ROUTED EXPERT DOWN PREP (DSV41_ROUTED_DOWN_QUANT, default OFF)
+// ===========================================================================
+// WHY. The official routed expert (`ref_inference/model.py:841-851`) is
+//
+//     gate = self.w1(x).float(); up = self.w3(x).float()
+//     up   = clamp(up, -lim, lim); gate = clamp(gate, max=lim)
+//     x = F.silu(gate) * up
+//     if weights is not None: x = weights * x     # route weight BEFORE w2
+//     return self.w2(x.to(dtype))                 # bf16 -> act_quant(e4m3,32)
+//
+// Two things differ on ferrite's routed down path:
+//   (a) ORDER: the routing weight is applied in the DOWN kernel's epilogue
+//       (`expert_gemv_fp4_down_reduce_kernel`: `x *= row_weight[0]`), i.e.
+//       *after* the official's `x.to(bf16)` boundary instead of before it;
+//   (b) OPERAND: the down kernel consumes the f32 activation as-is, so the
+//       `act_quant(e4m3, block=32, ue8m0)` round trip that the official w2
+//       materialises (`ref_inference/kernel.py:41-95`, called WITHOUT `inplace`
+//       from `model.py:184`) never happens, while per (b) the official GEMM
+//       multiplies `e4m3_decode(q) * scale` in f32 (`kernel.py:543-545`:
+//       `C_local_accum += C_local * scale_a * scale_b`, C_local being the
+//       FP8xFP8 MMA of the *activation bytes*).
+//
+// This kernel restores BOTH, in place, in ONE launch per routed MoE pass:
+//
+//     v = act[i]                       // silu*up, f32, the swiglu output
+//     v *= route_w[row*slots + slot]   // (1) official `weights * x`
+//     v = bf16(v)                      // (2) official `x.to(dtype)`
+//     amax = max(|v|) over the 32-block, then max(amax, 1e-4)
+//     sc = 2^ceil(log2(amax / 448))    // (3) `fast_round_scale` (kernel.py:75-79)
+//     q = e4m3(v / sc)                 // (4) `T.Cast(FP8, clamp(v/sc,+-448))`
+//     act[i] = e4m3_decode(q) * sc     // (5) the value fp4_gemm multiplies by
+//
+// (2)-(5) are `act_quant(x, block=32, scale_fmt="ue8m0", inplace=False)`'s
+// semantics, term for term:
+//   * `amax_local[i] = T.max(amax_local[i], 1e-4)`              -- kernel.py:76
+//   * `s_local[i] = fast_round_scale(amax_local[i], 1/448)`     -- kernel.py:78
+//   * `T.clamp(x/s, -448, 448)` then `T.Cast(FP8, ...)`         -- kernel.py:88
+//     (round-to-nearest-even + saturate == `__nv_fp8_e4m3`)
+// ⚠️ The 1e-4 floor is the REFERENCE's, deliberately taken here INSTEAD of
+// ferrite's usual `fmaxf(scale, 1e-30)` floor (dsv41_kernels.cu:156): the two
+// differ only on a block whose amax < 1e-4, and this kernel's whole purpose is
+// to reproduce the reference operand, not our own quantiser's.
+// ⚠️ The finisher is `decode(q) * sc` in f32, NOT a second bf16 rounding: the
+// reference only writes bf16 back on the `inplace=True` arm (`kernel.py:120-122`)
+// and `linear()` does not use it -- `fp4_gemm` reads the FP8 bytes + the scale
+// and dequantises in f32 inside the accumulator.
+//
+// WHO APPLIES THE WEIGHT NOW: the caller must NOT also pass `row_weight` to the
+// down launch (the kernels' `row_weight == nullptr` path means "no per-slot
+// weight" -- `dsv41_experts_mxf4.cu:2349`, `:2886`, `:852`), otherwise the route
+// weight is applied twice. The host wiring owns that half (chain_dev.rs).
+//
+// GRID/ABI. One WARP per 32-element scale block; grid = (ceil(inter/32), slots,
+// rows) with blockIdx.z = the activation row, so the (row, slot) slice base is
+// EXACTLY the down kernel's
+//     act_base + (row * slots + slot) * pitch        (`act_stride == pitch`)
+// and the routing weight is EXACTLY the one the down kernel would have read
+// (`row_weight[(row*slots + slot) * rw_stride]`, rw_stride == 1 at both routed
+// call sites -> the flat [rows*slots] index used below).
+// `pitch` is the slot pitch the gate/up arm wrote: `inter` under the fused
+// gate_up+swiglu epilogue, `2*inter` for the raw arms (chain_dev.rs `act_slot`).
+// Only the first `inter` floats of each slice are touched -- the same half the
+// down kernel reads -- so the stale `up` half of a raw slice is left alone.
+// `inter` is a multiple of 32 at every real shape (inter_local = inter/TP);
+// a trailing partial block is handled anyway (masked amax), so a shape that is
+// not a multiple of 32 can never read or write out of bounds.
+//
+// DETERMINISM. Every output element is produced by exactly one lane, the amax is
+// a fixed-shape warp shuffle tree, and the scale arithmetic is the same in every
+// lane -- bitwise stable run to run, and free of cross-block reduction order.
+
+namespace {
+
+// Verbatim copy of dsv41_kernels.cu's `e4m3_to_f` (:52-62): this file is a
+// separate translation unit (build.sh compiles each .cu on its own), so the
+// __device__ helper there is not visible here.
+__device__ __forceinline__ float glue_e4m3_byte_to_f(uint8_t b) {
+    const uint32_t s = ((uint32_t)b & 0x80u) << 24;
+    const uint32_t e = ((uint32_t)b >> 3) & 0x0Fu;
+    const uint32_t m = (uint32_t)b & 0x07u;
+    if (e == 0u) {
+        const float v = (float)m * (1.0f / 512.0f);
+        return (b & 0x80u) ? -v : v;
+    }
+    return __uint_as_float(s | ((e + 120u) << 23) | (m << 20));
+}
+
+// The bf16 boundary of `x.to(dtype)`: RN narrowing then the exact widening back.
+__device__ __forceinline__ float glue_bf16_round(float v) {
+    return __bfloat162float(__float2bfloat16(v));
+}
+
+// The five per-element values the DSV41_ROUTED_DOWN_QUANT_DBG readback prints,
+// for the ONE block (row 0, slot 0, block 0). `dbg` is nullptr in production.
+#define GLUE_DBG_FLOATS 160   // 5 x 32
+#define GLUE_DBG_PRE_WEIGHT 0
+#define GLUE_DBG_POST_WEIGHT 32
+#define GLUE_DBG_POST_BF16 64
+#define GLUE_DBG_SCALE_EXP 96
+#define GLUE_DBG_POST_QUANT 128
+
+__global__ void routed_down_prep_kernel(float* __restrict__ act, const float* __restrict__ route_w,
+                                        int slots, int pitch, int inter, float* __restrict__ dbg) {
+    const int lane = (int)threadIdx.x;          // blockDim.x == 32: one block per warp
+    const int b = (int)blockIdx.x;              // which 32-wide scale block of the contraction
+    const int slot = (int)blockIdx.y;
+    const int row = (int)blockIdx.z;
+    const int i0 = b << 5;
+    const int n = min(32, inter - i0);          // == 32 except in a trailing partial block
+    const bool live = lane < n;
+    float* slice = act + ((size_t)row * (size_t)slots + (size_t)slot) * (size_t)pitch;
+    // (1) official `x = weights * x`, with the down kernel's own flat index
+    // (`row_weight[(row*slots + slot) * rw_stride]`, rw_stride == 1).
+    const float rw = route_w[(size_t)row * (size_t)slots + (size_t)slot];
+    const float pre = live ? slice[i0 + lane] : 0.f;
+    const float wtd = pre * rw;
+    // (2) official `x.to(dtype)` -- ONCE, and after the weight, never before it.
+    const float rounded = glue_bf16_round(wtd);
+    // (3) block-32 amax with the REFERENCE's floor, then its power-of-two scale.
+    float a = fabsf(rounded);
+    for (int off = 16; off > 0; off >>= 1) a = fmaxf(a, __shfl_xor_sync(0xFFFFFFFFu, a, off));
+    const float amax = fmaxf(a, 1e-4f);
+    const float sc = glue_fast_round_scale(amax, 1.0f / 448.0f);
+    // (4) `T.Cast(FP8, clamp(v / s, -448, 448))`.
+    const float q = fminf(fmaxf(rounded * (1.0f / sc), -448.0f), 448.0f);
+    const __nv_fp8_e4m3 f8 = __nv_fp8_e4m3(q);
+    // (5) the operand fp4_gemm's accumulator multiplies: decode * scale, in f32.
+    const float dq = glue_e4m3_byte_to_f(*(const uint8_t*)&f8) * sc;
+    if (live) slice[i0 + lane] = dq;
+    if (dbg != nullptr && row == 0 && slot == 0 && b == 0) {
+        const int t = lane & 31;
+        dbg[GLUE_DBG_PRE_WEIGHT + t] = pre;
+        dbg[GLUE_DBG_POST_WEIGHT + t] = wtd;
+        dbg[GLUE_DBG_POST_BF16 + t] = rounded;
+        dbg[GLUE_DBG_SCALE_EXP + t] = (float)((__float_as_uint(sc) >> 23) & 0xFFu);
+        dbg[GLUE_DBG_POST_QUANT + t] = dq;
+    }
+}
+
+}  // namespace
+
+// `dbg` is OPTIONAL: pass nullptr in production (the probe is a default-OFF
+// diagnostic, and the kernel is bit-identical either way -- the dbg stores touch
+// no input or output element).
+extern "C" int dsv41_routed_down_prep(float* act, const float* route_w, int rows, int slots,
+                                      int pitch, int inter, float* dbg, cudaStream_t s) {
+    if (act == nullptr || route_w == nullptr) return (int)cudaErrorInvalidValue;
+    if (rows <= 0 || slots <= 0 || pitch <= 0 || inter <= 0) return (int)cudaSuccess;
+    if (pitch < inter) return (int)cudaErrorInvalidValue;
+    const int nb = (inter + 31) >> 5;
+    const dim3 grid((unsigned)nb, (unsigned)slots, (unsigned)rows);
+    routed_down_prep_kernel<<<grid, 32, 0, s>>>(act, route_w, slots, pitch, inter, dbg);
+    return (int)cudaGetLastError();
+}

@@ -1668,6 +1668,15 @@ struct Kernels {
     >,
     swiglu_limit_batched:
         Option<unsafe extern "C" fn(*mut f32, c_int, c_int, f32, i64, c_int, CuStream) -> c_int>,
+    /// ROUTED DOWN PREP (DSV41_ROUTED_DOWN_QUANT, default OFF): the official
+    /// routed expert's activation pipeline in ONE in-place launch (route weight
+    /// -> bf16 -> block-32 e4m3 quant+dequant), so the down GEMV consumes the
+    /// operand the reference's `fp4_gemm` consumes. Optional: an older .so
+    /// without it leaves the gate inert (with one notice).
+    routed_down_prep: Option<
+        unsafe extern "C" fn(*mut f32, *const f32, c_int, c_int, c_int, c_int, *mut f32, CuStream)
+            -> c_int,
+    >,
     ar_reduce: Option<
         unsafe extern "C" fn(*mut f32, *const f32, i64, i64, c_int, *const c_uint, c_uint, CuStream) -> c_int,
     >,
@@ -2320,6 +2329,7 @@ impl Device {
             moe_bs_act_e4m3_cap: ko!(rt, "dsv41_moe_bs_act_e4m3_cap"),
             w2_l2_prewarm: ko!(rt, "dsv41_w2_l2_prewarm"),
             swiglu_limit_batched: ko!(rt, "dsv41_swiglu_limit_batched"),
+            routed_down_prep: ko!(rt, "dsv41_routed_down_prep"),
             ar_reduce: ko!(rt, "dsv41_ar_reduce"),
             route_topk: ko!(rt, "dsv41_route_topk"),
             route_group: ko!(rt, "dsv41_route_group"),
@@ -8761,6 +8771,45 @@ impl Device {
         let f = self.need(self.kernels.swiglu_limit_batched, "dsv41_swiglu_limit_batched")?;
         let rc = unsafe { f(gate_up, rows, inter, limit, slot_stride, slots, self.stream) };
         self.kerr(rc, "dsv41_swiglu_limit_batched")
+    }
+
+    /// ROUTED DOWN PREP (DSV41_ROUTED_DOWN_QUANT, default OFF): the official
+    /// routed expert's activation pipeline, in place, in ONE launch — route
+    /// weight, then the `x.to(bf16)` boundary, then the block-32 e4m3
+    /// quantise/dequantise act_quant round trip whose f32 result is what the
+    /// official `fp4_gemm` multiplies. `pitch` is the slot pitch the gate/up arm
+    /// wrote (`act_slot`: `inter` fused, `2*inter` raw) and `route_w` is read at
+    /// the flat `(row*slots + slot)` index, exactly like the down launcher's
+    /// `rw_stride == 1` addressing.
+    ///
+    /// ⚠️ The caller must then pass `row_weight = nullptr` to the down launch:
+    /// this call has already applied the route weight.
+    ///
+    /// `dbg` is None in production. Some(ptr) enables the 5x32 probe dump
+    /// (DSV41_ROUTED_DOWN_QUANT_DBG) — the kernel's output is identical either way.
+    pub fn routed_down_prep(
+        &self,
+        act: *mut f32,
+        route_w: *const f32,
+        rows: i32,
+        slots: i32,
+        pitch: i32,
+        inter: i32,
+        dbg: Option<*mut f32>,
+    ) -> Result<()> {
+        let f = self.need(self.kernels.routed_down_prep, "dsv41_routed_down_prep")?;
+        let d = dbg.unwrap_or(std::ptr::null_mut());
+        let rc = unsafe {
+            f(act, route_w, rows, slots, pitch, inter, d, self.stream)
+        };
+        self.kerr(rc, "dsv41_routed_down_prep")
+    }
+
+    /// True when the loaded .so carries the routed-down prep entry point
+    /// (`dsv41_routed_down_prep`). A stale .so leaves DSV41_ROUTED_DOWN_QUANT
+    /// inert — with a one-shot notice from the chain, never silently.
+    pub fn supports_routed_down_prep(&self) -> bool {
+        self.kernels.routed_down_prep.is_some()
     }
     /// Publish `src` into every rank's staging slot for this rank, from the device.
     pub fn ar_store(

@@ -707,6 +707,42 @@ extern "C" {
         stream: CuStream,
     ) -> i32;
 
+    /// ROUTED DOWN PREP (DSV41_ROUTED_DOWN_QUANT, default OFF): the official
+    /// routed expert's activation pipeline, in place, ONE launch.
+    ///
+    /// For every (row, slot) slice of `act` -- shape [rows][slots][pitch], the
+    /// SAME addressing the down launcher uses (`act_base + (row*slots+slot)*pitch`,
+    /// `pitch == act_stride`, `route_w` read at the flat `(row*slots+slot)`
+    /// index, i.e. `rw_stride == 1`) -- and over the first `inter` floats only:
+    ///   v *= route_w[row*slots+slot]     -- official `x = weights * x` (BEFORE bf16)
+    ///   v  = bf16(v)                     -- official `x.to(dtype)`
+    ///   amax over the 32-block, `max(amax, 1e-4)`, `sc = 2^ceil(log2(amax/448))`
+    ///   act[i] = e4m3_decode(e4m3_encode(v/sc)) * sc
+    /// The last line is the operand the official `fp4_gemm` multiplies by (its
+    /// `act_quant(e4m3, block=32, ue8m0)` + f32 dequant), so after this call the
+    /// activation in `act` is what the official w2 saw.
+    ///
+    /// ⚠️ THE CALLER MUST NOT ALSO PASS `row_weight` TO THE DOWN LAUNCH: the
+    /// weight is applied here, and the down kernels' `row_weight == nullptr`
+    /// path means "no per-slot weight" (they would otherwise multiply twice).
+    ///
+    /// `dbg` is OPTIONAL (DSV41_ROUTED_DOWN_QUANT_DBG): a 160-float device buffer
+    /// that receives the 5 x 32 probe values for (row 0, slot 0, block 0);
+    /// nullptr in production, and the kernel's output is identical either way.
+    /// There is NO .so-version guard on the symbol: it is read as an OPTIONAL
+    /// symbol by the loader, so a stale .so simply leaves the gate inert.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dsv41_routed_down_prep(
+        act: *mut f32,
+        route_w: *const f32,
+        rows: i32,
+        slots: i32,
+        pitch: i32,
+        inter: i32,
+        dbg: *mut f32,
+        stream: CuStream,
+    ) -> i32;
+
     /// Gather `n` rows of `dim` floats by index (`src` rows may repeat).
     pub fn dsv41_gather_rows(
         src: *const f32,

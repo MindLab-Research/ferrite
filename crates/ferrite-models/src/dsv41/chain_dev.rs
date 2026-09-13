@@ -1205,6 +1205,224 @@ fn down_fuse() -> bool {
     *F.get_or_init(|| std::env::var("DSV41_DOWN_FUSE").map(|v| v != "0").unwrap_or(true))
 }
 
+/// DSV41_ROUTED_DOWN_QUANT=1 (default OFF) aligns the routed experts' DOWN INPUT
+/// with the official reference — the second half of the D1 precision work.
+///
+/// The reference's `Expert.forward` (`ref_inference/model.py:841-851`) applies
+/// the routing weight BEFORE the single bf16 boundary and hands `w2` a bf16
+/// tensor, which `linear()` (`model.py:184`) quantises with
+/// `act_quant(e4m3, block=32, ue8m0)`; `fp4_gemm` then multiplies the decoded
+/// operand (`kernel.py:543-545`). Ferrite instead (a) applies the route weight in
+/// the down kernel's EPILOGUE — i.e. on the far side of the bf16 boundary — and
+/// (b) feeds the down kernel plain f32, with no e4m3 block round trip.
+///
+/// With the gate ON both are restored by ONE in-place launch
+/// (`dsv41_routed_down_prep`, kernels/cuda/dsv41_glue.cu) placed between the
+/// routed swiglu and the down launch:
+///     v *= route_w[row*slots+slot] -> v = bf16(v) ->
+///     amax over 32, max(amax,1e-4), sc = 2^ceil(log2(amax/448)) ->
+///     v = e4m3_decode(e4m3_encode(v/sc)) * sc
+/// and the down launch is then made WITHOUT `row_weight` (nullptr = "no per-slot
+/// weight" in `dsv41_experts_mxf4.cu:2349/:2886`), since the weight is already in.
+///
+/// ⚠️ It REPLACES the post-swiglu `bf16_snap` on the routed activation at its
+/// call site rather than adding to it: the reference rounds ONCE, after the
+/// weight multiply. Rounding the unweighted activation first and again after the
+/// multiply is two roundings where the reference has one.
+///
+/// DEFAULT OFF, read ONCE and cached like every other gate here (a per-call
+/// getenv is a CUDA-graph capture hazard and a hot-path slip), and only `"1"`
+/// turns it ON.
+pub(crate) fn routed_down_quant() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("DSV41_ROUTED_DOWN_QUANT")
+            .map(|v| v.starts_with('1'))
+            .unwrap_or(false)
+    })
+}
+
+/// DSV41_ROUTED_DOWN_QUANT_DBG=1 (default OFF, only meaningful with the gate
+/// above) turns on the ONE-SHOT operand probe: the prep kernel additionally
+/// writes the five per-element values of its (row 0, slot 0, block 0) block into
+/// a 160-float device buffer, the host downloads it, recomputes the same five
+/// groups on the CPU from the pre-weight inputs (see
+/// [`RoutedDownDbg::cpu_reference`]) and prints both plus their difference. The
+/// point is to prove, on real data, that the operand ferrite hands its down GEMV
+/// is the operand the official `fp4_gemm` multiplies by — the check that "looks
+/// right, numbers wrong" cannot survive.
+pub(crate) fn routed_down_quant_dbg() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("DSV41_ROUTED_DOWN_QUANT_DBG")
+            .map(|v| v.starts_with('1'))
+            .unwrap_or(false)
+    })
+}
+
+/// One-shot notice for an armed-but-inert routed-down gate — the #1 measurement
+/// trap in this project is "a gate was exported and the OLD path answered the
+/// step", so every state in which the arm cannot do what its name says announces
+/// itself exactly once.
+pub(crate) fn routed_down_quant_skipped_note(reason: &str) {
+    static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    ONCE.get_or_init(|| {
+        eprintln!(
+            "warning: DSV41_ROUTED_DOWN_QUANT is set, but the routed down input was NOT aligned \
+             with the reference: {reason}. The step still computes correct values — it just runs \
+             the OLD operand path (an A/B arm of \"ROUTED_DOWN_QUANT\" under this state is \
+             measuring the OLD path)."
+        );
+    });
+}
+
+/// The `.so`-missing reason string, shared by the two routed call sites so the
+/// notice text cannot drift between them.
+pub(crate) const ROUTED_DOWN_NO_SYMBOL: &str = "the loaded .so has no \
+    `dsv41_routed_down_prep` entry point (rebuild kernels/cuda: bash build.sh 103a)";
+
+// ===========================================================================
+// DSV41_ROUTED_DOWN_QUANT_DBG: the one-shot operand probe
+// ===========================================================================
+// The prep kernel writes these five groups for its (row 0, slot 0, block 0)
+// 32-element block; the host recomputes the same five from the pre-weight inputs
+// and prints both. What the probe must show, element by element:
+//   ① pre-weight  : the swiglu output (what the down kernel used to receive)
+//   ② post-weight : `weights * x`                     (official model.py:847)
+//   ③ post-bf16   : `x.to(dtype)`                      (official model.py:849)
+//   ④ e8m0 exponent byte of the block scale           (official kernel.py:75-79)
+//   ⑤ post-quant  : the f32 `fp4_gemm` multiplies by  (official kernel.py:543)
+// Kernel vs CPU must agree EXACTLY on ①②④ and on ③⑤ up to nothing at all unless
+// the two e4m3 ROUNDERS (CUDA `__nv_fp8_e4m3` vs `quant::e4m3_encode`) disagree
+// on a tie — which the printed per-element difference makes visible rather than
+// arguable.
+const ROUTED_DOWN_DBG_BLOCK: usize = 32;
+const ROUTED_DOWN_DBG_FLOATS: usize = 5 * ROUTED_DOWN_DBG_BLOCK;
+
+/// One 32-element block's five groups, as either side computes them.
+struct RoutedDownDbg {
+    pre: Vec<f32>,
+    weighted: Vec<f32>,
+    bf16: Vec<f32>,
+    scale_exp: Vec<f32>,
+    dequant: Vec<f32>,
+}
+
+/// `x.to(dtype)` for bf16, round-to-nearest-EVEN — the same rounding
+/// `__float2bfloat16` performs (`cvt.rn.bf16.f32`). Saturates at the format's
+/// top like the hardware conversion; the activation is always finite, so the
+/// NaN case is not spelled out.
+fn bf16_rn(v: f32) -> f32 {
+    let bits = v.to_bits();
+    if (bits & 0x7F80_0000) == 0x7F80_0000 {
+        return v; // inf / NaN pass through (never reached on this path)
+    }
+    let lsb = (bits >> 16) & 1;
+    f32::from_bits(bits.wrapping_add(0x7FFF + lsb) & 0xFFFF_0000)
+}
+
+impl RoutedDownDbg {
+    /// The five groups as the KERNEL wrote them (a flat 160-float buffer).
+    fn from_device(vals: &[f32]) -> Self {
+        let g = |k: usize| vals[k * ROUTED_DOWN_DBG_BLOCK..(k + 1) * ROUTED_DOWN_DBG_BLOCK].to_vec();
+        Self {
+            pre: g(0),
+            weighted: g(1),
+            bf16: g(2),
+            scale_exp: g(3),
+            dequant: g(4),
+        }
+    }
+
+    /// The same five groups on the CPU, written from the REFERENCE
+    /// (`ref_inference/kernel.py:41-95`, `act_quant(block=32, scale_fmt="ue8m0",
+    /// inplace=False)`) instead of from the CUDA kernel — the probe must compare
+    /// two implementations, not one implementation with itself. The codec comes
+    /// from [`crate::dsv41::quant`] (the crate's own reference golden), and the
+    /// scale follows kernel.py:76-79 exactly: `max(amax, 1e-4)` and then
+    /// `fast_round_scale(amax, 1/448)`.
+    fn cpu_reference(pre: &[f32], route_w: f32) -> Self {
+        use crate::dsv41::quant::{e4m3_decode, e4m3_encode, fast_round_scale, FP8_MAX};
+        let weighted: Vec<f32> = pre.iter().map(|&v| v * route_w).collect();
+        let bf16: Vec<f32> = weighted.iter().map(|&v| bf16_rn(v)).collect();
+        let amax = bf16.iter().fold(0.0f32, |a, &v| a.max(v.abs())).max(1e-4);
+        let sc = fast_round_scale(amax);
+        debug_assert!(sc > 0.0 && (sc.log2().fract() == 0.0), "scale must be a power of two");
+        let _ = FP8_MAX;
+        let scale_exp = vec![((sc.to_bits() >> 23) & 0xFF) as f32; ROUTED_DOWN_DBG_BLOCK];
+        let dequant: Vec<f32> = bf16
+            .iter()
+            .map(|&v| e4m3_decode(e4m3_encode((v / sc).clamp(-448.0, 448.0))) * sc)
+            .collect();
+        Self {
+            pre: pre.to_vec(),
+            weighted,
+            bf16,
+            scale_exp,
+            dequant,
+        }
+    }
+
+    fn show(label: &str, a: &[f32], b: &[f32]) {
+        let mut worst = 0.0f32;
+        let mut all_zero = true;
+        for i in 0..ROUTED_DOWN_DBG_BLOCK {
+            let d = (a[i] - b[i]).abs();
+            worst = worst.max(d);
+            if d != 0.0 {
+                all_zero = false;
+            }
+        }
+        eprintln!(
+            "[routed-down-quant] {label}: kernel-vs-cpu max|diff| = {worst:e}{}",
+            if all_zero { " (bit-identical)" } else { "" }
+        );
+    }
+
+    /// Kernel vs CPU, group by group, element by element (the 5-column dump is
+    /// what makes a mismatch diagnosable rather than merely visible).
+    fn report(&self, cpu: &Self) {
+        eprintln!(
+            "[routed-down-quant] DSV41_ROUTED_DOWN_QUANT_DBG probe (ONE-SHOT) — block (row 0, \
+             slot 0, elements 0..{ROUTED_DOWN_DBG_BLOCK}); columns: ① pre-weight, ② post-weight, \
+             ③ post-bf16, ④ e8m0 exp byte, ⑤ post-quant"
+        );
+        for i in 0..ROUTED_DOWN_DBG_BLOCK {
+            eprintln!(
+                "[routed-down-quant]  i={i:02}  KERNEL {:>15.9e} {:>15.9e} {:>15.9e} {:>5.0} \
+                 {:>15.9e}  |  CPU {:>15.9e} {:>15.9e} {:>15.9e} {:>5.0} {:>15.9e}  |  D {:+.2e} \
+                 {:+.2e} {:+.2e} {:+.0e} {:+.2e}",
+                self.pre[i],
+                self.weighted[i],
+                self.bf16[i],
+                self.scale_exp[i],
+                self.dequant[i],
+                cpu.pre[i],
+                cpu.weighted[i],
+                cpu.bf16[i],
+                cpu.scale_exp[i],
+                cpu.dequant[i],
+                self.pre[i] - cpu.pre[i],
+                self.weighted[i] - cpu.weighted[i],
+                self.bf16[i] - cpu.bf16[i],
+                self.scale_exp[i] - cpu.scale_exp[i],
+                self.dequant[i] - cpu.dequant[i],
+            );
+        }
+        Self::show("① pre-weight ", &self.pre, &cpu.pre);
+        Self::show("② post-weight", &self.weighted, &cpu.weighted);
+        Self::show("③ post-bf16  ", &self.bf16, &cpu.bf16);
+        Self::show("④ e8m0 byte ", &self.scale_exp, &cpu.scale_exp);
+        Self::show("⑤ post-quant ", &self.dequant, &cpu.dequant);
+        let sc = f32::from_bits(((self.scale_exp[0] as u32) & 0xFF) << 23);
+        eprintln!(
+            "[routed-down-quant] block scale = {sc:e} (e8m0 byte {}) ; ⑤/③ = e4m3 round trip of the \
+             weight-scaled bf16 operand — this is what the reference's fp4_gemm multiplies",
+            self.scale_exp[0] as u32
+        );
+    }
+}
+
 /// Mirrors the CUDA launcher's `g_expert_fp4_mode` (dsv41_experts_mxf4.cu:694):
 /// unset => 2 (the shared-lut + split-accumulator path), else the parsed value
 /// (0 scalar / 1 vectorised, kept for bisection). `atoi` semantics on a
@@ -17583,6 +17801,34 @@ impl<'a> DevChain<'a> {
                     );
                 }
             }
+            // ---- ROUTED DOWN PREP (DSV41_ROUTED_DOWN_QUANT, default OFF) --------
+            // The official activation pipeline for the down direction
+            // (`model.py:846-849`): route weight, THEN the bf16 boundary, THEN
+            // `act_quant(e4m3, block=32)`'s round trip — applied in place, ONE
+            // launch, between the routed swiglu above and the down launch below.
+            // OFF: not one instruction runs and every pointer below is the one
+            // the previous code passed (`rw_eff == rw_base`).
+            // `tl_dn_done` means the TileLang down arm already consumed
+            // `ex_act_r` on its own weight path, so the prep must not touch it.
+            let q_on = routed_down_quant() && self.dev.supports_routed_down_prep();
+            if routed_down_quant() && !q_on {
+                routed_down_quant_skipped_note(ROUTED_DOWN_NO_SYMBOL);
+            }
+            if q_on && !tl_dn_done {
+                self.routed_down_prep_launch(
+                    self.s.ex_act_r.ptr as *mut f32,
+                    rw_base,
+                    m as i32,
+                    topk as i32,
+                    act_slot as i32,
+                    inter_local as i32,
+                )?;
+            }
+            // The weight is IN the activation now, so the down launch must not
+            // apply it a second time: `row_weight == nullptr` is the kernels'
+            // documented "no per-slot weight" path
+            // (dsv41_experts_mxf4.cu:2349 / :2886 / :852).
+            let rw_eff: *const f32 = if q_on { std::ptr::null() } else { rw_base };
             if !tl_dn_done && down_fuse() && self.dev.supports_down_fuse() && !grouped_down_ok {
                 // ONE rows = m launch: the fused down+reduce kernel's grid is
                 // (dim/warps, 1, rows) and it derives act_row =
@@ -17598,7 +17844,7 @@ impl<'a> DevChain<'a> {
                     m as i32,
                     dim as i32,
                     inter_local as i32,
-                    rw_base,
+                    rw_eff,
                     1,
                     topk as i32,
                     w2_base,
@@ -17622,7 +17868,7 @@ impl<'a> DevChain<'a> {
                     m as i32,
                     dim as i32,
                     inter_local as i32,
-                    rw_base,
+                    rw_eff,
                     1,
                     topk as i32,
                     w2_base,
@@ -19477,6 +19723,83 @@ fn oracle_tap() -> bool {
     /// A/B would read "no change" (the trap [`act_e4m3_skipped_note`] documents).
     ///
     /// The MoE-TileLang-bs arm is untouched: it has its own precision path.
+    /// The ONE routed-down prep launch both routed paths share (see
+    /// [`routed_down_quant`]): the official activation pipeline
+    /// (weight -> bf16 -> block-32 e4m3 round trip) applied IN PLACE to the
+    /// routed activation, so the down GEMV's operand is the operand the
+    /// reference's `fp4_gemm` multiplies.
+    ///
+    /// `rows` MUST be the row count the down launch will pass (`m` in
+    /// `moe_rows`, 1 in `moe`) and `pitch` the slot pitch the gate/up arm wrote
+    /// (`act_slot`): the kernel then addresses every (row, slot) slice and reads
+    /// `route_w[row*slots + slot]` EXACTLY as the down launcher does. The caller
+    /// must NOT pass `row_weight` to the down launch afterwards (nullptr means
+    /// "no per-slot weight") — the weight is applied here.
+    ///
+    /// The `DSV41_ROUTED_DOWN_QUANT_DBG` probe rides THIS launch rather than a
+    /// second one: the prep is not idempotent (a second round trip re-quantises
+    /// an already quantised operand), so a separate probe launch would perturb
+    /// the values it exists to observe.
+    fn routed_down_prep_launch(
+        &self,
+        act: *mut f32,
+        route_w: *const f32,
+        rows: i32,
+        slots: i32,
+        pitch: i32,
+        inter: i32,
+    ) -> Result<()> {
+        if !routed_down_quant_dbg() {
+            return self
+                .dev
+                .routed_down_prep(act, route_w, rows, slots, pitch, inter, None);
+        }
+        static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        if ONCE.get().is_some() {
+            return self
+                .dev
+                .routed_down_prep(act, route_w, rows, slots, pitch, inter, None);
+        }
+        // The probe needs a D2H readback, which is an illegal capture op — the
+        // same guard `moe_tilelang_tables_parity` uses. The GATE is untouched:
+        // only the probe is deferred to the first uncaptured routed pass.
+        if self.dev.capturing() {
+            static NOTE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            if NOTE.set(()).is_ok() {
+                eprintln!(
+                    "[routed-down-quant] DSV41_ROUTED_DOWN_QUANT_DBG is set but a capture is in \
+                     flight — the one-shot operand probe needs a D2H readback (illegal inside a \
+                     capture) and will run on the first UNCAPPED routed pass instead"
+                );
+            }
+            return self
+                .dev
+                .routed_down_prep(act, route_w, rows, slots, pitch, inter, None);
+        }
+        ONCE.set(()).ok();
+        let dbg = self.dev.alloc(ROUTED_DOWN_DBG_FLOATS * 4)?;
+        self.dev.routed_down_prep(
+            act,
+            route_w,
+            rows,
+            slots,
+            pitch,
+            inter,
+            Some(dbg.ptr as *mut f32),
+        )?;
+        let vals = self.dl(dbg.ptr as *const f32, ROUTED_DOWN_DBG_FLOATS)?;
+        let rw0 = self.dl(route_w, 1)?[0];
+        eprintln!(
+            "[routed-down-quant] probe context: rows={rows} slots={slots} pitch={pitch} \
+             inter={inter}, route_w[row 0, slot 0] = {rw0:e} (flat index 0 == the index the down \
+             launcher would have read at rw_stride = 1)"
+        );
+        let kern = RoutedDownDbg::from_device(&vals);
+        let cpu = RoutedDownDbg::cpu_reference(&kern.pre, rw0);
+        kern.report(&cpu);
+        Ok(())
+    }
+
     fn bf16_snap(&self, ptr: *mut f32, n: usize) -> Result<()> {
         if !bf16_truncate() || n == 0 {
             return Ok(());
@@ -21674,10 +21997,24 @@ fn oracle_tap() -> bool {
                 // row is what the down GEMV below reads. Same flat pitch: only the
                 // first `inter` floats of each slot are live, the rest are the stale
                 // `up` half (never read again), so rounding them is inert.
-                self.bf16_snap(
-                    self.s.ex_act_b.ptr as *mut f32,
-                    topk * act_slot as usize,
-                )?;
+                //
+                // ⚠️ DSV41_ROUTED_DOWN_QUANT=1 (default OFF) REPLACES this snap
+                // rather than adding to it: the reference rounds ONCE, and AFTER
+                // `x = weights * x` (`model.py:846-847`) — exactly what the prep
+                // launch below performs. Rounding the UNWEIGHTED activation here
+                // first and then rounding again after the weight multiply would be
+                // two roundings where the reference has one. OFF: this snap, byte
+                // for byte.
+                let q_on = routed_down_quant() && self.dev.supports_routed_down_prep();
+                if routed_down_quant() && !q_on {
+                    routed_down_quant_skipped_note(ROUTED_DOWN_NO_SYMBOL);
+                }
+                if !q_on {
+                    self.bf16_snap(
+                        self.s.ex_act_b.ptr as *mut f32,
+                        topk * act_slot as usize,
+                    )?;
+                }
                 // row_weight is PER SLOT here: route_w is [topk] and contiguous,
                 // so the kernel reads route_w[slot] (rw_stride = 1) — the exact
                 // scalar the sequential call passed as `route_w + slot`.
@@ -21756,6 +22093,38 @@ fn oracle_tap() -> bool {
                 // `ex_down_b` contiguously, and one flat `bf16_snap` puts every
                 // slot's row on the bf16 grid before the fixed-order sum — the
                 // reference's own order, slot by slot, in ascending index.
+                //
+                // ---- ROUTED DOWN PREP (DSV41_ROUTED_DOWN_QUANT, default OFF) -----
+                // The official activation pipeline for the down direction, in
+                // place, ONE launch (`model.py:846-849` + `kernel.py:75-95`): the
+                // route weight, then the bf16 boundary, then the block-32 e4m3
+                // quantise/dequantise whose f32 result is the operand the
+                // reference's `fp4_gemm` multiplies. `rows = 1` (the eager path
+                // has one row) and `act_slot` is the pitch the gate/up arm wrote,
+                // so the (row, slot) slices and the route weights are addressed
+                // exactly as the down launcher addresses them. `tl_dn_done` means
+                // the TileLang down arm already consumed `ex_act_b` on its own
+                // weight path, so the prep must not touch it.
+                if q_on && !tl_dn_done {
+                    self.routed_down_prep_launch(
+                        self.s.ex_act_b.ptr as *mut f32,
+                        self.s.route_w.ptr as *const f32,
+                        1,
+                        topk as i32,
+                        act_slot as i32,
+                        inter_local as i32,
+                    )?;
+                }
+                // The weight is IN the activation now, so the down launch must
+                // not apply it a second time: `row_weight == nullptr` is the
+                // kernels' documented "no per-slot weight" path
+                // (dsv41_experts_mxf4.cu:2349 / :2886 / :852). OFF: `rw_eff` IS
+                // `s.route_w.ptr`, the identical pointer the calls passed before.
+                let rw_eff: *const f32 = if q_on {
+                    std::ptr::null()
+                } else {
+                    self.s.route_w.ptr as *const f32
+                };
                 if !tl_dn_done && down_fuse() && !bf16_truncate() && self.dev.supports_down_fuse() {
                     self.dev.expert_down_reduce_fp4_batched(
                         self.s.ex_act_b.ptr as *const f32,
@@ -21764,7 +22133,7 @@ fn oracle_tap() -> bool {
                         1,
                         dim as i32,
                         inter_local as i32,
-                        self.s.route_w.ptr as *const f32,
+                        rw_eff,
                         1,
                         topk as i32,
                         w2_base,
@@ -21782,7 +22151,7 @@ fn oracle_tap() -> bool {
                         1,
                         dim as i32,
                         inter_local as i32,
-                        self.s.route_w.ptr as *const f32,
+                        rw_eff,
                         1,
                         topk as i32,
                         w2_base,
@@ -22263,6 +22632,185 @@ mod moe_tilelang_tests {
         // One segment wider than the MMA M-tile.
         let wide = vec![7i32; TILELANG_BM + 1];
         assert!(moe_align_host(&wide, 1).is_none());
+    }
+}
+
+// The CPU yardstick the DSV41_ROUTED_DOWN_QUANT_DBG probe prints next to the
+// kernel's own numbers must be right ON ITS OWN TERMS first — otherwise the
+// probe could "pass" with two implementations agreeing on the wrong operand.
+// Every case below is either hand-computed or an invariant the reference's
+// `act_quant` (ref_inference/kernel.py:41-95, round_scale=True) guarantees.
+#[cfg(test)]
+mod routed_down_prep_tests {
+    use super::{bf16_rn, RoutedDownDbg};
+
+    fn sc_of(r: &RoutedDownDbg) -> f32 {
+        f32::from_bits(((r.scale_exp[0] as u32) & 0xFF) << 23)
+    }
+
+    /// ① the bf16 boundary of `x.to(dtype)` — round-to-nearest-EVEN, so an exact
+    /// tie descends to the even mantissa.
+    #[test]
+    fn bf16_rn_is_round_to_nearest_even() {
+        const STEP: f32 = 1.0 / 128.0; // bf16 ulp above 1.0
+        assert_eq!(bf16_rn(1.0), 1.0);
+        assert_eq!(bf16_rn(1.0 + STEP / 4.0), 1.0);
+        assert_eq!(bf16_rn(1.0 + STEP / 2.0), 1.0); // exact tie -> even (mantissa 0)
+        assert_eq!(bf16_rn(1.0 + STEP * 1.5), 1.0 + 2.0 * STEP); // tie -> even (mantissa 2)
+        assert_eq!(bf16_rn(1.0 + STEP), 1.0 + STEP); // already on the grid
+        assert_eq!(bf16_rn(-0.0f32), -0.0f32);
+        assert_eq!(bf16_rn(-2.5f32), -2.5f32);
+    }
+
+    /// ② an all-ones block: amax 1.0, `sc = 2^ceil(log2(1/448)) = 2^-8`, and 256
+    /// IS an exact e4m3 code (`1.0 = 2^8 * 2^-8`), so this round trip is exact.
+    #[test]
+    fn cpu_reference_all_ones_block_is_exact() {
+        let r = RoutedDownDbg::cpu_reference(&vec![1.0f32; 32], 1.0);
+        assert_eq!(r.weighted, vec![1.0f32; 32]);
+        assert_eq!(r.bf16, vec![1.0f32; 32]);
+        assert_eq!(sc_of(&r), 2f32.powi(-8));
+        assert!(r.dequant.iter().all(|&v| v == 1.0));
+        assert_eq!(r.scale_exp[0] as u32, 127 - 8); // the ue8m0 exponent byte
+    }
+
+    /// ③ the route weight is applied BEFORE the bf16 boundary, so `2.0 * 0.5`
+    /// produces exactly the operand `1.0 * 1.0` produces (the whole point of the
+    /// alignment: the reference multiplies, THEN rounds).
+    #[test]
+    fn cpu_reference_applies_route_weight_before_bf16() {
+        let one = RoutedDownDbg::cpu_reference(&vec![1.0f32; 32], 1.0);
+        let scaled = RoutedDownDbg::cpu_reference(&vec![2.0f32; 32], 0.5);
+        assert_eq!(scaled.weighted, vec![1.0f32; 32]);
+        assert_eq!(scaled.bf16, one.bf16);
+        assert_eq!(scaled.dequant, one.dequant);
+        // ... and a weight that lands between bf16 codes rounds AFTER the
+        // multiply: 1.0 * 1.001953125 -> bf16 1.0, not 1.0 -> 1.001953125.
+        let w = RoutedDownDbg::cpu_reference(&vec![1.0f32; 32], 1.0 + 2f32.powi(-9));
+        assert_eq!(w.weighted[0], 1.0 + 2f32.powi(-9));
+        assert_eq!(w.bf16[0], 1.0);
+    }
+
+    /// ④ the reference's `max(amax, 1e-4)` floor (kernel.py:76): a block whose
+    /// amax is 1e-6 is quantised with the 1e-4 scale.
+    #[test]
+    fn cpu_reference_uses_the_reference_amax_floor() {
+        let r = RoutedDownDbg::cpu_reference(&vec![1e-6f32; 32], 1.0);
+        assert_eq!(sc_of(&r), 2f32.powi(-22)); // 2^ceil(log2(1e-4 / 448))
+        assert!(r.dequant[0] > 0.0);
+        // Without the floor the scale would be 2^-29 (1e-6 / 448), i.e. the
+        // operand would be quantised ~128x finer than the reference's.
+        assert_ne!(sc_of(&r), 2f32.powi(-29));
+    }
+
+    /// ⑤ the operand stays inside e4m3's `2^-4` maximum relative error and is
+    /// never zero for a nonzero block (the property a "looks right, numbers
+    /// wrong" operand would break first).
+    #[test]
+    fn cpu_reference_operand_respects_the_format() {
+        for v in [0.5f32, 1.0, 1.7, -3.25, 100.0, 448.0] {
+            let r = RoutedDownDbg::cpu_reference(&vec![v; 32], 1.0);
+            let (b, dq) = (r.bf16[0], r.dequant[0]);
+            assert!(dq.is_finite());
+            assert!(
+                dq != 0.0 && (dq - b).abs() <= b.abs() * 0.0625 + f32::MIN_POSITIVE,
+                "v={v}: operand {dq} vs bf16 {b}"
+            );
+        }
+        // A block that saturates (|x| > 448 * scale) must still be finite and
+        // must not be zero.
+        let big = RoutedDownDbg::cpu_reference(&vec![1000.0f32; 32], 1.0);
+        assert!(big.dequant[0].is_finite() && big.dequant[0] > 0.0);
+    }
+
+    /// The CPU reference vs a THIRD, independent implementation: a Python
+    /// recomputation of the same reference semantics
+    /// (`/tmp/routed_down_cpu_ref_check.py`, kept out of the repo because it is a
+    /// one-shot cross-check) that deliberately uses different methods — a
+    /// brute-force nearest-code e4m3 codebook, `math.frexp` for the power-of-two
+    /// scale, and neighbour-comparison bf16 rounding. The literal bit patterns
+    /// below are ITS output, pasted verbatim, so this test fails if either
+    /// implementation drifts. (It already earned its keep: the first Python run
+    /// put the bf16 of -0.0 on a DENORMAL neighbor, and the comparison is what
+    /// exposed it.)
+    #[test]
+    fn cpu_reference_matches_an_independent_python_implementation() {
+        fn vals(bits: &[u32; 32]) -> Vec<f32> {
+            bits.iter().map(|b| f32::from_bits(*b)).collect()
+        }
+        fn assert_bits(label: &str, got: &[f32], want: &[u32; 32]) {
+            let got: Vec<u32> = got.iter().map(|v| v.to_bits()).collect();
+            for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+                assert_eq!(g, w, "{label}[{i}]: got {g:#010X}, want {w:#010X}");
+            }
+        }
+
+        // ---- block a_mixed: route_w 1.0, amax 4.07 -> scale 2^-6 (byte 121) ----
+        let a_pre: [u32; 32] = [
+            0xC082_3D71, 0x3F8E_147B, 0xC00E_147B, 0x403D_70A4, 0xBEBD_70A4, 0xC06C_CCCD,
+            0x3FBD_70A4, 0xBFEC_CCCD, 0x4055_1EB8, 0x0000_0000, 0xC055_1EB8, 0x3FEC_CCCD,
+            0xBFBD_70A4, 0x406C_CCCD, 0x3EBD_70A4, 0xC03D_70A4, 0x400E_147B, 0xBF8E_147B,
+            0x4082_3D71, 0x3F3D_70A4, 0xC025_C28F, 0x4025_C28F, 0xBF3D_70A4, 0xC082_3D71,
+            0x3F8E_147B, 0xC00E_147B, 0x403D_70A4, 0xBEBD_70A4, 0xC06C_CCCD, 0x3FBD_70A4,
+            0xBFEC_CCCD, 0x4055_1EB8,
+        ];
+        let a_bf16: [u32; 32] = [
+            0xC082_0000, 0x3F8E_0000, 0xC00E_0000, 0x403D_0000, 0xBEBD_0000, 0xC06D_0000,
+            0x3FBD_0000, 0xBFED_0000, 0x4055_0000, 0x0000_0000, 0xC055_0000, 0x3FED_0000,
+            0xBFBD_0000, 0x406D_0000, 0x3EBD_0000, 0xC03D_0000, 0x400E_0000, 0xBF8E_0000,
+            0x4082_0000, 0x3F3D_0000, 0xC026_0000, 0x4026_0000, 0xBF3D_0000, 0xC082_0000,
+            0x3F8E_0000, 0xC00E_0000, 0x403D_0000, 0xBEBD_0000, 0xC06D_0000, 0x3FBD_0000,
+            0xBFED_0000, 0x4055_0000,
+        ];
+        let a_dq: [u32; 32] = [
+            0xC080_0000, 0x3F90_0000, 0xC010_0000, 0x4040_0000, 0xBEC0_0000, 0xC070_0000,
+            0x3FC0_0000, 0xBFF0_0000, 0x4050_0000, 0x0000_0000, 0xC050_0000, 0x3FF0_0000,
+            0xBFC0_0000, 0x4070_0000, 0x3EC0_0000, 0xC040_0000, 0x4010_0000, 0xBF90_0000,
+            0x4080_0000, 0x3F40_0000, 0xC020_0000, 0x4020_0000, 0xBF40_0000, 0xC080_0000,
+            0x3F90_0000, 0xC010_0000, 0x4040_0000, 0xBEC0_0000, 0xC070_0000, 0x3FC0_0000,
+            0xBFF0_0000, 0x4050_0000,
+        ];
+        let r = RoutedDownDbg::cpu_reference(&vals(&a_pre), 1.0);
+        assert_bits("a/bf16", &r.bf16, &a_bf16);
+        assert_bits("a/dequant", &r.dequant, &a_dq);
+        assert_eq!(r.scale_exp[0] as u32, 121);
+
+        // ---- block c: a weight BETWEEN bf16 codes (1 + 2^-9), saturation at
+        // 1000.0, -0.0, a f32 denormal, scale 2^2 (byte 129) ----
+        let c_pre: [u32; 32] = [
+            0x447A_0000, 0x8000_0000, 0x4306_6666, 0x0DA2_4260, 0xC133_3333, 0xC128_0000,
+            0xC11C_CCCD, 0xC111_999A, 0xC106_6666, 0xC0F6_6666, 0xC0E0_0000, 0xC0C9_999A,
+            0xC0B3_3333, 0xC09C_CCCD, 0xC086_6666, 0xC060_0000, 0xC033_3333, 0xC006_6666,
+            0xBFB3_3333, 0xBF33_3333, 0x0000_0000, 0x3F33_3333, 0x3FB3_3333, 0x4006_6666,
+            0x4033_3333, 0x4060_0000, 0x4086_6666, 0x409C_CCCD, 0x40B3_3333, 0x40C9_999A,
+            0x40E0_0000, 0x40F6_6666,
+        ];
+        let c_bf16: [u32; 32] = [
+            0x447A_0000, 0x8000_0000, 0x4307_0000, 0x0DA3_0000, 0xC134_0000, 0xC128_0000,
+            0xC11D_0000, 0xC112_0000, 0xC107_0000, 0xC0F7_0000, 0xC0E0_0000, 0xC0CA_0000,
+            0xC0B4_0000, 0xC09D_0000, 0xC087_0000, 0xC060_0000, 0xC034_0000, 0xC007_0000,
+            0xBFB4_0000, 0xBF34_0000, 0x0000_0000, 0x3F34_0000, 0x3FB4_0000, 0x4007_0000,
+            0x4034_0000, 0x4060_0000, 0x4087_0000, 0x409D_0000, 0x40B4_0000, 0x40CA_0000,
+            0x40E0_0000, 0x40F7_0000,
+        ];
+        let c_dq: [u32; 32] = [
+            0x4480_0000, 0x8000_0000, 0x4300_0000, 0x0000_0000, 0xC130_0000, 0xC120_0000,
+            0xC120_0000, 0xC110_0000, 0xC100_0000, 0xC0F0_0000, 0xC0E0_0000, 0xC0D0_0000,
+            0xC0B0_0000, 0xC0A0_0000, 0xC080_0000, 0xC060_0000, 0xC030_0000, 0xC000_0000,
+            0xBFB0_0000, 0xBF30_0000, 0x0000_0000, 0x3F30_0000, 0x3FB0_0000, 0x4000_0000,
+            0x4030_0000, 0x4060_0000, 0x4080_0000, 0x40A0_0000, 0x40B0_0000, 0x40D0_0000,
+            0x40E0_0000, 0x40F0_0000,
+        ];
+        let rw = f32::from_bits(0x3F80_4000); // 1 + 2^-9
+        let r = RoutedDownDbg::cpu_reference(&vals(&c_pre), rw);
+        assert_bits("c/bf16", &r.bf16, &c_bf16);
+        assert_bits("c/dequant", &r.dequant, &c_dq);
+        assert_eq!(r.scale_exp[0] as u32, 129);
+        // 1000.0 saturates: the operand lands on 1024.0, not on 1000.0.
+        assert_eq!(r.dequant[0], 1024.0);
+        // -0.0 survives the whole pipeline as -0.0 (the Python check's first run
+        // put it on a denormal — this is the assertion that caught that).
+        assert_eq!(r.bf16[1].to_bits(), 0x8000_0000);
     }
 }
 
