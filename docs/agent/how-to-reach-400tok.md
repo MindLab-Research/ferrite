@@ -168,3 +168,25 @@ W = **原生 fp4 nibble + ue8m0 标度面**（与官方 `fp4_gemm` 完全同格�
 - 生效判据：**`[verify_graph] captured …` 缺行 = 图一次都没 engage** ✓；有 captured 但 replays 少 = 反复 unanimity 失败 ✓。
 
 ⇒ **结论：凡是要和生产口径比的臂，必须显式 `DSV41_VERIFY_GRAPH=1 DSV41_GRAPH_STEP=1`**（覆盖 COMMON 的 0）✓。
+
+## 9. ⚠️⚠️ 最重要的一条：**eager ≠ verify**，只有 verify 的数才算数
+
+用户 2026-09-14 的纠正，必须放在最前面：
+
+- **MTP/spec 的 verify 走的是 `chain_dev.rs::moe_rows`（以及 `layer_rows` 系列）**；
+  **eager/decode 走的是 `chain_dev.rs::moe`（以及 `layer`）** —— **两套独立实现** ✗。
+- ⇒ **在 eager 路上量到的任何改进（图化、折叠、步长）对 MTP 的 tok/s 都没有意义** ✗。
+  （本会话此前的 P1/P2 就是犯了这个错：`DSV41_SPEC` 未设 ⇒ 量的是单行 decode 步 ✗。）
+- ⇒ **唯一有意义的判据**：`DSV41_SPEC=1` 下的 `[dsv41] step pos=` p50 ✓（`~/run_to_400.sh` 的每条臂都带它 ✓）。
+- ⇒ 而 **verify 的慢是"发射次数"性质**：~7000 次/verify（40 层 × ~170 节点）× ~2.9µs submit ≈ **20.3ms**
+  ⇒ 这就是为什么 **图化（`DSV41_VERIFY_GRAPH=1`）是针对 MTP 的头号杠杆** ✓，也是为什么
+  **`moe_rows` 里逐行发射（"one activation row per launch" + `for r in 0..m` 的 gate GEMV）必须合并** ✓。
+
+**MTP 专项杠杆清单（都在 verify 路上，按预期收益）**：
+| # | 杠杆 | env | 针对 verify 的什么 |
+|---|---|---|---|
+| 1 | **verify 图化** | `DSV41_VERIFY_GRAPH=1` | ~7000 次发射的提交时间（20.3ms → ~2.8ms） |
+| 2 | **m 行合并（MROWS 家族）** | `DSV41_GATE_MROWS=1 DSV41_GATE_MROWS_ROUTE=1 DSV41_ATTN_MROWS=1 DSV41_COMPRESSOR_PROJ_MROWS=1 DSV41_ENGRAM_{PROJ,GATHER}_MROWS=1` | `moe_rows` 的逐行发射 |
+| 3 | **同格式 grouped MoE** | `DSV41_EXPERT_GROUPED=1 DSV41_EXPERT_TCGEN05_E4M3=1` | 6 行共享专家权重的重复读（shared 10.4ms + routed 8.3ms） |
+| 4 | draft 图化 | `DSV41_DRAFT_GRAPH=1` | 草稿段的发射 |
+| 5 | 整步图 | `DSV41_GRAPH_STEP=1`（默认 ON，但 runner 的 `GRAPH_OFF` 会关掉 ⇒ 必须显式覆盖） | decode 侧单行步 |
