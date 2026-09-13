@@ -119,10 +119,14 @@ __device__ __forceinline__ void dn_tc_mma(uint32_t d_tmem, uint64_t a_desc, uint
 }
 
 __device__ __forceinline__ void dn_tc_commit(void* mbar) {
-    asm volatile(
-        "tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%0];" ::"r"(
-            (uint32_t)__cvta_generic_to_shared(mbar))
-        : "memory");
+    // Same fix as the gate/up arm, and the same latent trap: with `.shared::cluster` the `[mbar]`
+    // operand is resolved in the cluster window at object granularity, so several commits that differ
+    // only by an 8-byte slot step all signal the same object. This arm uses a single barrier today
+    // (which is why the defect is invisible), but leaving the qualifier in would silently collapse any
+    // ring/per-stage structure added later. PTX's own Example 1 omits the state space, which selects
+    // generic addressing, so the operand is the generic pointer.
+    asm volatile("tcgen05.commit.cta_group::1.mbarrier::arrive::one.b64 [%0];" ::"l"(mbar)
+                 : "memory");
 }
 
 // SMEM descriptor: start_addr[0:14) | lbo[16:30) | sbo[32:46) | version=1[46] | layout[61:64)
