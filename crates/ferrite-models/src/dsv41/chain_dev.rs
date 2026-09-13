@@ -1749,6 +1749,327 @@ impl LatentQuantDbg {
     }
 }
 
+// ===========================================================================
+// I3: the attention PV probability operand (DSV41_ATTN_P_BF16)
+// ===========================================================================
+// The official sparse-attention kernel (`ref_inference/kernel.py:363-380`)
+// computes, per 64-key block of the online softmax:
+//
+//   :373  acc_s = exp(acc_s * 1 - scores_max)      # the PROBABILITY, f32
+//   :374  reduce_sum(acc_s, scores_sum, dim=1)     # the DENOMINATOR, from the F32 prob
+//   :376  sum_exp = sum_exp * scores_scale + scores_sum
+//   :377  T.copy(acc_s, acc_s_cast)                # f32 -> BF16, round-to-nearest-even
+//   :379  acc_o[i,j] *= scores_scale[i]            # the rescale, on the ACCUMULATOR
+//   :380  T.gemm(acc_s_cast, kv_shared, acc_o)     # PV, with the BF16 probability
+//
+// The two facts that decide a correct implementation:
+//   * the rounding comes AFTER the exp and BEFORE the multiply, and
+//   * the online-softmax rescale is applied to the f32 ACCUMULATOR, not to the
+//     probability — so exactly one value (the current block's probability) is
+//     ever rounded, and only once.
+//
+// Ferrite instead multiplied the f32 probability at every PV site, i.e. it was
+// MORE precise than the reference. With this gate ON the kernels accumulate
+// `acc * corr + bf16(e) * kv` while `sum_exp` (f32 probability) and the
+// accumulator stay f32, and the final `acc / sum_exp` stays f32 — see
+// `dsv41_pv_prod` / `dsv41_pv_dbg` in kernels/cuda/dsv41_kernels.cu, which carry
+// the same argument at the code, and §68/§69 of
+// docs/agent/moe-bs-crash-investigation.md.
+//
+// DEFAULT OFF, read ONCE and cached, `1...` only. The gate is consumed inside
+// the CUDA launchers (`dsv41_sparse_attn_impl` / `dsv41_sparse_attn_orope_impl`
+// read the same env themselves, process-once), so this Rust-side copy exists for
+// the DBG path and for the notice; the two reads cannot disagree because both
+// are the same process-once `starts_with('1')` test.
+pub(crate) fn attn_p_bf16() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("DSV41_ATTN_P_BF16")
+            .map(|v| v.starts_with('1'))
+            .unwrap_or(false)
+    })
+}
+
+/// DSV41_ATTN_P_BF16_DBG=1 (default OFF, independent of the gate above) turns on
+/// the ONE-SHOT PV-operand probe. The sparse-attention kernel that the launcher
+/// selected writes, for one observed slot, 5 groups of 32 floats — the columns
+/// c = 0..31 — plus a small header; the host reads them back through the ADDED
+/// symbol `dsv41_attn_p_dbg_read`, recomputes the same groups from the raw
+/// q/kv/idxs by the OFFICIAL order, and prints both with their differences.
+///
+/// The probe ARMS INDEPENDENTLY of the gate: it always records both the f32 and
+/// the bf16 contribution, while the accumulation still follows the gate. A
+/// gate-OFF armed run therefore makes the gated delta visible (⑤ - ④) without
+/// changing any output — which is what makes the OFF arm's "no numerical change"
+/// claim falsifiable instead of asserted.
+pub(crate) fn attn_p_bf16_dbg() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("DSV41_ATTN_P_BF16_DBG")
+            .map(|v| v.starts_with('1'))
+            .unwrap_or(false)
+    })
+}
+
+/// The slot ORDINAL the probe observes: `DSV41_ATTN_P_BF16_DBG_SLOT=N` (default
+/// 0). The ordinal counts VALID slots (idx >= 0) in processing order for
+/// (row 0, head 0, warp 0) — chunk 0 for the key-split arm — so it names a
+/// well-defined point of the walk rather than a raw loop index.
+pub(crate) fn attn_p_dbg_slot() -> usize {
+    static F: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("DSV41_ATTN_P_BF16_DBG_SLOT")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0)
+    })
+}
+
+// ---------------------------------------------------------------------------
+// The probe's 5 groups and the host-side yardstick
+// ---------------------------------------------------------------------------
+const ATTN_P_DBG_COLS: usize = 32;
+const ATTN_P_DBG_FLOATS: usize = 5 * ATTN_P_DBG_COLS + 8;
+
+/// One slot's five column groups (kernel side or CPU side), as
+/// `dsv41_pv_dbg` lays them out.
+struct AttnPDbg {
+    /// ① the f32 probability `e` (the pre-I3 operand)
+    pre: Vec<f32>,
+    /// ② its bf16 round trip — what the official `acc_s_cast` holds
+    bf16: Vec<f32>,
+    /// ③ the KV element the slot multiplies
+    kv: Vec<f32>,
+    /// ④ the f32 contribution `e * kv`
+    c32: Vec<f32>,
+    /// ⑤ the gated contribution `bf16(e) * kv`
+    cbf: Vec<f32>,
+    /// [e, bf16(e), smax_prev, smax_after, corr, dot, slot, kernel id]
+    meta: [f32; 8],
+}
+
+impl AttnPDbg {
+    fn from_device(v: &[f32]) -> Self {
+        let g = |k: usize| v[k * ATTN_P_DBG_COLS..(k + 1) * ATTN_P_DBG_COLS].to_vec();
+        let mut meta = [0f32; 8];
+        meta.copy_from_slice(&v[5 * ATTN_P_DBG_COLS..5 * ATTN_P_DBG_COLS + 8]);
+        Self { pre: g(0), bf16: g(1), kv: g(2), c32: g(3), cbf: g(4), meta }
+    }
+
+    /// The same five groups computed on the CPU **by the official order**, from
+    /// the raw inputs — an independent implementation, not a second read of the
+    /// kernel's own numbers. `rows[i]` is the kv row of the i-th VALID slot
+    /// (i.e. of slot ordinal i), `q_row` is the observed row's q block, and
+    /// `scale` the softmax scale the launcher passed.
+    ///
+    /// The walk reproduces `kernel.py:367-380` exactly:
+    ///   dot = (q . k) * scale ; running max ; corr = exp(smax_prev - smax_new)
+    ///   e = exp(dot - smax_new)  [f32]  ; acc_o = acc_o*corr + bf16(e)*kv
+    /// Only `e` and its bf16 round trip are recorded for the target ordinal —
+    /// the accumulator's f32 rescale does not enter the five groups, which is
+    /// itself a consequence of the ordering the probe exists to pin down.
+    fn cpu_reference(q_row: &[f32], rows: &[Vec<f32>], scale: f32, ordinal: usize) -> Self {
+        let hd = q_row.len();
+        let mut smax = -1e30f32;
+        let mut e = 0f32;
+        let mut corr = 1f32;
+        let mut dot_scaled = 0f32;
+        let mut smax_prev = smax;
+        for (i, kr) in rows.iter().enumerate() {
+            let mut dot = 0f32;
+            for c in 0..hd {
+                dot += q_row[c] * kr[c];
+            }
+            let d = dot * scale;
+            let nm = smax.max(d);
+            corr = (smax - nm).exp();
+            e = (d - nm).exp();
+            smax_prev = smax;
+            smax = nm;
+            dot_scaled = d;
+            if i == ordinal {
+                let kv: Vec<f32> = (0..ATTN_P_DBG_COLS).map(|c| kr[c]).collect();
+                let pre: Vec<f32> = vec![e; ATTN_P_DBG_COLS];
+                let bf16: Vec<f32> = pre.iter().map(|&v| bf16_rn(v)).collect();
+                let bf16_0 = bf16[0];
+                let c32: Vec<f32> = (0..ATTN_P_DBG_COLS).map(|c| e * kv[c]).collect();
+                let cbf: Vec<f32> = (0..ATTN_P_DBG_COLS).map(|c| bf16[c] * kv[c]).collect();
+                return Self {
+                    pre,
+                    bf16,
+                    kv,
+                    c32,
+                    cbf,
+                    // slot/kernel id are kernel-side facts; the CPU reference
+                    // leaves them at 0 and `report` prints them from the kernel's.
+                    meta: [e, bf16_0, smax_prev, smax, corr, dot_scaled, 0.0, 0.0],
+                };
+            }
+        }
+        Self {
+            pre: vec![0f32; ATTN_P_DBG_COLS],
+            bf16: vec![0f32; ATTN_P_DBG_COLS],
+            kv: vec![0f32; ATTN_P_DBG_COLS],
+            c32: vec![0f32; ATTN_P_DBG_COLS],
+            cbf: vec![0f32; ATTN_P_DBG_COLS],
+            meta: [e, 0.0, smax_prev, smax, corr, dot_scaled, 0.0, 0.0],
+        }
+    }
+
+    /// The ALGEBRAIC identities the kernel's own groups must satisfy, element by
+    /// element. These are checked on the kernel's ① and ③ alone, so they hold
+    /// EXACTLY (no library-exp or reduction-order slack) and a nonzero result is
+    /// a real defect rather than two implementations arguing:
+    ///   ② == bf16_rn(①)   ④ == ① * ③   ⑤ == ② * ③
+    fn check_identities(&self) -> (f32, f32, f32) {
+        let mut a = (0f32, 0f32, 0f32);
+        for c in 0..ATTN_P_DBG_COLS {
+            a.0 = a.0.max((self.bf16[c] - bf16_rn(self.pre[c])).abs());
+            a.1 = a.1.max((self.c32[c] - self.pre[c] * self.kv[c]).abs());
+            a.2 = a.2.max((self.cbf[c] - self.bf16[c] * self.kv[c]).abs());
+        }
+        a
+    }
+
+    fn worst(a: &[f32], b: &[f32]) -> f32 {
+        (0..ATTN_P_DBG_COLS).map(|i| (a[i] - b[i]).abs()).fold(0f32, f32::max)
+    }
+
+    fn report(&self, cpu: &Self) {
+        const KID: [&str; 6] = ["?", "seq", "warp", "pf", "split", "orope"];
+        let kid = self.meta[7] as usize;
+        eprintln!(
+            "[attn-p-bf16] DSV41_ATTN_P_BF16_DBG probe (ONE-SHOT) — row 0, head 0, slot ordinal \
+             {} (kernel id {}), columns c = 0..{}; columns: ① f32 probability, ② bf16(①), \
+             ③ KV element, ④ ①*③ (f32 contribution), ⑤ ②*③ (gated contribution)",
+            self.meta[6] as i32,
+            KID.get(kid).copied().unwrap_or("?"),
+            ATTN_P_DBG_COLS - 1
+        );
+        eprintln!(
+            "[attn-p-bf16] header: smax_prev={:e} smax_after={:e} corr={:e} dot*scale={:e} \
+             e={:e} bf16(e)={:e}",
+            self.meta[2], self.meta[3], self.meta[4], self.meta[5], self.meta[0], self.meta[1]
+        );
+        for c in 0..ATTN_P_DBG_COLS {
+            eprintln!(
+                "[attn-p-bf16]  c={c:02} KERNEL {:>15.9e} {:>15.9e} {:>15.9e} {:>15.9e} {:>15.9e} \
+                 | CPU {:>15.9e} {:>15.9e} {:>15.9e} {:>15.9e} {:>15.9e} | D {:+.2e} {:+.2e} \
+                 {:+.2e} {:+.2e} {:+.2e}",
+                self.pre[c], self.bf16[c], self.kv[c], self.c32[c], self.cbf[c],
+                cpu.pre[c], cpu.bf16[c], cpu.kv[c], cpu.c32[c], cpu.cbf[c],
+                self.pre[c] - cpu.pre[c], self.bf16[c] - cpu.bf16[c], self.kv[c] - cpu.kv[c],
+                self.c32[c] - cpu.c32[c], self.cbf[c] - cpu.cbf[c],
+            );
+        }
+        let id = self.check_identities();
+        eprintln!(
+            "[attn-p-bf16] kernel-side identities (MUST be exactly 0): ②-bf16(①)={:e} \
+             ④-①*③={:e} ⑤-②*③={:e}",
+            id.0, id.1, id.2
+        );
+        eprintln!(
+            "[attn-p-bf16] kernel-vs-CPU-reference max|diff|: ① {:e} ② {:e} ③ {:e} ④ {:e} ⑤ {:e}",
+            Self::worst(&self.pre, &cpu.pre),
+            Self::worst(&self.bf16, &cpu.bf16),
+            Self::worst(&self.kv, &cpu.kv),
+            Self::worst(&self.c32, &cpu.c32),
+            Self::worst(&self.cbf, &cpu.cbf),
+        );
+        let dc = self.meta[0] - cpu.meta[0];
+        let dcorr = self.meta[4] - cpu.meta[4];
+        let ddot = self.meta[5] - cpu.meta[5];
+        let dsmax = self.meta[2] - cpu.meta[2];
+        eprintln!(
+            "[attn-p-bf16] header kernel-vs-CPU: Δe={dc:+.2e} Δcorr={dcorr:+.2e} \
+             Δ(dot*scale)={ddot:+.2e} Δsmax_prev={dsmax:+.2e}  (①③④⑤ exact ⇒ ②⑤ follow; ① and \
+             the header may differ in the last ULPs because the kernel's dot is a warp/thread \
+             reduction under --use_fast_math while this yardstick is a serial f32 sum)"
+        );
+        let dcb = Self::worst(&self.c32, &self.cbf);
+        eprintln!(
+            "[attn-p-bf16] the gate's per-element delta max(⑤-④) = {dcb:e} — with \
+             DSV41_ATTN_P_BF16=1 the accumulation differs from the OFF arm by exactly these ⑤-④ \
+             terms (and by their ℓ1 sum, which the printed columns give)"
+        );
+    }
+}
+
+/// The GPU yardstick must be right ON ITS OWN TERMS first, or the probe could
+/// "pass" with two implementations agreeing on the wrong order.
+#[cfg(test)]
+mod attn_p_dbg_tests {
+    use super::{bf16_rn, AttnPDbg};
+
+    /// The bf16 conversion is round-to-nearest, ties-to-EVEN — the same
+    /// `cvt.rn.bf16.f32` (`__float2bfloat16`) and `tensor.to(torch.bfloat16)`
+    /// perform, i.e. what the official's `T.copy(acc_s, acc_s_cast)` lowers to.
+    #[test]
+    fn bf16_rn_matches_rne() {
+        const STEP: f32 = 1.0 / 128.0;
+        assert_eq!(bf16_rn(1.0 + STEP / 2.0), 1.0);
+        assert_eq!(bf16_rn(1.0 + STEP * 1.5), 1.0 + 2.0 * STEP);
+        assert_eq!(bf16_rn(0.1), f32::from_bits((0.1f32.to_bits() + 0x7FFF + ((0.1f32.to_bits() >> 16) & 1)) & 0xFFFF_0000));
+    }
+
+    /// The CPU reference walks the official order and must reproduce, element by
+    /// element, the five groups of a hand-computed two-slot example.
+    #[test]
+    fn cpu_reference_reproduces_official_order() {
+        // hd = 32 so the printed columns are the whole row; q = 1s, kv = 2s.
+        let q = vec![1f32; 32];
+        let k0 = vec![2f32; 32];
+        let k1 = vec![4f32; 32];
+        let scale = 0.5f32;
+        // slot 0: dot = 32*2*0.5 = 32 ; smax = 32 ; corr = exp(-1e30 - 32) = 0
+        //         e = exp(0) = 1
+        // slot 1: dot = 32*4*0.5 = 64 ; nm = 64 ; corr = exp(32-64) = e^-32
+        //         e = 1
+        let r = AttnPDbg::cpu_reference(&q, &[k0.clone(), k1.clone()], scale, 1);
+        assert_eq!(r.pre[0], 1.0);
+        assert_eq!(r.kv[0], 4.0);
+        assert_eq!(r.c32[0], 4.0);
+        assert_eq!(r.cbf[0], 4.0); // 1.0 is exactly representable in bf16
+        assert!((r.meta[2] - 32.0).abs() < 1e-5, "smax_prev = {}", r.meta[2]);
+        assert!((r.meta[3] - 64.0).abs() < 1e-5, "smax_after = {}", r.meta[3]);
+        assert!((r.meta[4] - (-32f32).exp()).abs() < 1e-12, "corr = {}", r.meta[4]);
+        // and the ordinal 0 observation is the FIRST slot, not the last
+        let r0 = AttnPDbg::cpu_reference(&q, &[k0, k1], scale, 0);
+        assert_eq!(r0.kv[0], 2.0);
+        assert!((r0.meta[2] + 1e30).abs() < 1e30, "slot 0 seeds smax_prev from the floor");
+    }
+
+    /// A probability whose bf16 rounding is NOT exact must show ⑤ != ④: that is
+    /// the whole point of the gate, so the probe must be able to see it.
+    #[test]
+    fn gated_contribution_differs_on_a_non_representable_probability() {
+        let q = vec![1f32; 32];
+        // Pick the kv so the score lands off the bf16 grid: d = 1.0 + 1/256.
+        let mut k = vec![1f32; 32];
+        for v in k.iter_mut() {
+            *v = 1.0;
+        }
+        let r = AttnPDbg::cpu_reference(&q, &[k], 1.0 / 32.0, 0);
+        assert_eq!(r.pre[0], 1.0);
+        // e == 1 exactly here; force the interesting case through bf16_rn's grid
+        let x = 1.00390625f32 + 0.001953125f32; // 1 + 1/256 + 1/512 (off-grid)
+        assert!(bf16_rn(x) != x, "the test needs an off-grid value");
+        let id = AttnPDbg {
+            pre: vec![x; 32],
+            bf16: vec![bf16_rn(x); 32],
+            kv: vec![3f32; 32],
+            c32: vec![x * 3.0; 32],
+            cbf: vec![bf16_rn(x) * 3.0; 32],
+            meta: [x, bf16_rn(x), 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+        };
+        let chk = id.check_identities();
+        assert_eq!(chk.0, 0.0);
+        assert_eq!(chk.1, 0.0);
+        assert_eq!(chk.2, 0.0);
+        assert!(AttnPDbg::worst(&id.c32, &id.cbf) > 0.0);
+    }
+}
+
 /// Mirrors the CUDA launcher's `g_expert_fp4_mode` (dsv41_experts_mxf4.cu:694):
 /// unset => 2 (the shared-lut + split-accumulator path), else the parsed value
 /// (0 scalar / 1 vectorised, kept for bisection). `atoi` semantics on a
@@ -20460,6 +20781,136 @@ fn oracle_tap() -> bool {
         Ok(())
     }
 
+    /// The one-shot I3 probe (DSV41_ATTN_P_BF16_DBG) owner: read back the buffer
+    /// the selected sparse-attention kernel filled, recompute the same quantity on
+    /// the CPU by the OFFICIAL order, print both.
+    ///
+    /// Called right after a sparse-attention launch. Everything it needs is what
+    /// the launcher was handed: the (row 0, head 0) q block, the ring, the idx
+    /// row, the live compressed-length counter, the window / index_topk geometry
+    /// and the softmax scale.
+    ///
+    /// `kv_rows`: `Some((ptr, m, pos_r, pos_base))` for the deferred-append
+    /// (`DSV41_VERIFY_OROPE_MROWS`) arm, where the WINDOW slots are read from the
+    /// block's own `[m, d]` rows instead of the ring — the CPU side mirrors
+    /// `dsv41_kv_win_fetch` so the yardstick stays the kernel's own operand.
+    /// `None` is the plain ring arm (the eager decode path).
+    #[allow(clippy::too_many_arguments)]
+    fn attn_p_dbg_probe(
+        &self,
+        q: *const f32,
+        ring: *const f32,
+        idxs: *const i32,
+        clen: *const std::os::raw::c_int,
+        window: i32,
+        index_topk: i32,
+        hd: i32,
+        scale: f32,
+        kv_rows: Option<(*const f32, i32, i32, i32)>,
+    ) -> Result<()> {
+        if !attn_p_bf16_dbg() {
+            return Ok(());
+        }
+        static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        if ONCE.get().is_some() {
+            return Ok(());
+        }
+        if !self.dev.supports_attn_p_dbg_read() {
+            static NOTE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            NOTE.get_or_init(|| {
+                eprintln!(
+                    "[attn-p-bf16] DSV41_ATTN_P_BF16_DBG=1 but the loaded .so has no \
+                     `dsv41_attn_p_dbg_read` entry point (rebuild kernels/cuda: bash build.sh). \
+                     The probe is skipped — the GATE `DSV41_ATTN_P_BF16` itself is unaffected and \
+                     still lives entirely in the kernel launchers."
+                );
+            });
+            return Ok(());
+        }
+        // The readback is a D2H copy — an illegal capture op, the same guard the
+        // routed-down probe uses. Only the PROBE is deferred; the gate is not.
+        if self.dev.capturing() {
+            static NOTE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            NOTE.get_or_init(|| {
+                eprintln!(
+                    "[attn-p-bf16] DSV41_ATTN_P_BF16_DBG is set but a capture is in flight — the \
+                     one-shot probe needs a D2H readback (illegal inside a capture) and will run \
+                     on the first UNCAPPED attention pass instead"
+                );
+            });
+            return Ok(());
+        }
+        // `clen` is the live device counter (`*clen`), the same value `topk` is
+        // derived from inside the kernel; `window` / `index_topk` are host
+        // constants. Reading it costs one 4-byte copy, once.
+        let cl = (self.dl(clen as *const f32, 1)?[0].to_bits()) as i32;
+        if cl < 0 {
+            return Ok(());
+        }
+        let topk = window + cl.min(index_topk);
+        let pitch = topk.max(1) as usize;
+        let hdu = hd.max(0) as usize;
+        // `idx_stride == 0` on every path this probe is wired to, so the idx row
+        // pitch IS `topk` (see `sparse_attn_kernel`'s `irow`).
+        let idx_row: Vec<i32> =
+            self.dl(idxs as *const f32, pitch)?.iter().map(|x| x.to_bits() as i32).collect();
+        let ordinal = attn_p_dbg_slot();
+        let krows: Option<Vec<f32>> = match kv_rows {
+            Some((p, m, _, _)) => Some(self.dl(p, (m.max(1) as usize) * hdu)?),
+            None => None,
+        };
+        let mut rows: Vec<Vec<f32>> = Vec::new();
+        for &idx in idx_row.iter() {
+            if idx < 0 {
+                continue;
+            }
+            let mut row = self.dl(unsafe { ring.add(idx as usize * hdu) }, hdu)?;
+            if let (Some(kr), Some((_, _, pos_r, pos_base))) = (krows.as_ref(), kv_rows) {
+                if idx < window {
+                    let w = window.max(1);
+                    let mut dd = (pos_r - idx) % w;
+                    if dd < 0 {
+                        dd += w;
+                    }
+                    let p = pos_r - dd;
+                    if p >= pos_base {
+                        let off = (p - pos_base) as usize * hdu;
+                        row.copy_from_slice(&kr[off..off + hdu]);
+                    }
+                }
+            }
+            rows.push(row);
+            if rows.len() == ordinal + 1 {
+                break;
+            }
+        }
+        if rows.len() <= ordinal {
+            static NOTE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            NOTE.get_or_init(|| {
+                eprintln!(
+                    "[attn-p-bf16] the requested slot ordinal has fewer valid slots than that in \
+                     this row — nothing to compare (lower DSV41_ATTN_P_BF16_DBG_SLOT)"
+                );
+            });
+            return Ok(());
+        }
+        ONCE.set(()).ok();
+        let mut vals = vec![0f32; ATTN_P_DBG_FLOATS];
+        self.dev.attn_p_dbg_read(vals.as_mut_ptr(), ATTN_P_DBG_FLOATS as i32)?;
+        let kern = AttnPDbg::from_device(&vals);
+        let q_row = self.dl(q, hdu)?;
+        eprintln!(
+            "[attn-p-bf16] probe context: window={window} clen={cl} index_topk={index_topk} \
+             topk={topk} hd={hd} scale={scale:e} observed slot ordinal={ordinal} \
+             row-source={} ; gate DSV41_ATTN_P_BF16={}",
+            if krows.is_some() { "kv_rows (deferred append)" } else { "ring" },
+            if attn_p_bf16() { "ON" } else { "OFF" }
+        );
+        let cpu = AttnPDbg::cpu_reference(&q_row, &rows, scale, ordinal);
+        kern.report(&cpu);
+        Ok(())
+    }
+
     fn bf16_snap(&self, ptr: *mut f32, n: usize) -> Result<()> {
         if !bf16_truncate() || n == 0 {
             return Ok(());
@@ -21329,6 +21780,21 @@ fn oracle_tap() -> bool {
                 0,
             )?;
         }
+        // I3 (DSV41_ATTN_P_BF16_DBG, one-shot, a no-op unless armed): read back the
+        // PV probe the attention kernel just filled and compare it against the
+        // CPU's own walk of the OFFICIAL order. Placed after BOTH attention arms so
+        // the probe follows whichever kernel the launcher actually selected.
+        self.attn_p_dbg_probe(
+            self.s.q.as_f32(),
+            ring_ptr as *const f32,
+            idxs_ptr as *const i32,
+            (self.s.clen.ptr as *const std::os::raw::c_int).wrapping_add(owner),
+            win as i32,
+            cfg.index_topk as i32,
+            hd as i32,
+            1.0 / (hd as f32).sqrt(),
+            None,
+        )?;
         // B2 (DSV41_OROPE_Q, default ON): the inverse rope's epilogue emits the
         // fp8 of the whole `s.o` region (nlh*hd) in the same launch, which is
         // exactly what the `quant1(s.o)` below would have computed - so that

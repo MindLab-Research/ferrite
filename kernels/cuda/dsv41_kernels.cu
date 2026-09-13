@@ -962,6 +962,146 @@ __global__ void engram_gather_kernel(const uint8_t* __restrict__ table,
 
 // --------------------------------------------------------- sparse attention
 
+// ===========================================================================
+// I3 (DSV41_ATTN_P_BF16, default OFF): the PV probability operand's bf16 round trip
+// ===========================================================================
+// WHAT THE OFFICIAL DOES — `ref_inference/kernel.py`, `sparse_attn_kernel_`,
+// read line by line (the order is the whole point, so it is quoted in order):
+//
+//   :365  T.gemm(q_shared, kv_shared, acc_s, transpose_B=True)   # Q@K^T, f32 acc
+//   :367  acc_s[i,j] *= scale
+//   :369  T.reduce_max(acc_s, scores_max, clear=False)           # running max
+//   :371  scores_scale[i] = exp(scores_max_prev[i] - scores_max[i])
+//   :373  acc_s[i,j] = exp(acc_s[i,j] - scores_max[i])           # the PROBABILITY, f32
+//   :374  T.reduce_sum(acc_s, scores_sum, dim=1)                  # denominator: f32 prob
+//   :376  sum_exp[i] = sum_exp[i] * scores_scale[i] + scores_sum[i]
+//   :377  T.copy(acc_s, acc_s_cast)                               # f32 -> BF16, the rounding
+//   :379  acc_o[i,j] *= scores_scale[i]                           # rescale the ACCUMULATOR
+//   :380  T.gemm(acc_s_cast, kv_shared, acc_o)                    # PV with the BF16 probability
+//
+// So, answering the question that decides correctness:
+//   * The bf16 cast comes AFTER the exp and BEFORE the PV gemm (`:377` then
+//     `:380`) — the probability is rounded once, on its way into the multiply.
+//   * The online-softmax rescale `scores_scale` acts on the ACCUMULATOR
+//     (`:379`), NOT on the probability. Consequence: only the CURRENT block's
+//     probability ever needs the bf16 round trip; the previously accumulated
+//     `acc_o` is rescaled in f32, and it is never re-rounded.
+//   * `reduce_sum` at `:374` runs on the F32 `acc_s` — i.e. BEFORE the cast —
+//     so the softmax DENOMINATOR keeps the f32 probability. (Casting first and
+//     summing the bf16 values would be a different, wrong model.)
+//   * `acc_o` (the PV accumulator), `sum_exp` and the final `acc_o /= sum_exp`
+//     all stay f32.
+
+// The PV product for one slot/key: `p * kv`. With the gate OFF
+// (`p_bf16 == 0`) the operand is `e` itself and this is the pre-I3 multiply,
+// character for character — same operands, same expression shape, one rounding
+// of the product as part of the caller's `acc*corr + <product>` (the compiler
+// contracts that pair into an FMA exactly as it did before I3, because the
+// expression tree `acc*corr + e*kv` is unchanged). With the gate ON the
+// probability is first rounded to bf16 and brought back to f32 so the operand
+// type, the FMA shape and the accumulator are all unchanged — only the VALUE of
+// the probability moves, which is precisely what the official's
+// `acc_s_cast = acc_s.to(BF16)` does.
+//
+// ROUNDING MODE. `__float2bfloat16` is `cvt.rn.bf16.f32`: round to
+// nearest, ties to EVEN. That is the same conversion `torch.Tensor.to(torch.
+// bfloat16)` performs, which is what the official kernel's `T.copy` lowers to.
+__device__ __forceinline__ float dsv41_pv_prod(float e, float kv, int p_bf16) {
+    if (p_bf16) return __bfloat162float(__float2bfloat16(e)) * kv;
+    return e * kv;
+}
+
+// ---------------------------------------------------------------------------
+// The ONE-SHOT probe (DSV41_ATTN_P_BF16_DBG)
+// ---------------------------------------------------------------------------
+// The probe is filled by whichever PV site carries it and read back by the host
+// through the ADDED symbol `dsv41_attn_p_dbg_read` (adding a symbol does not
+// move any existing ABI — the launcher signatures are untouched by I3). The
+// layout is 5 groups of 32 floats — the columns c = 0..31 of the observed slot
+// — plus a 8-float header:
+//
+//   [  0, 32)  ① the f32 probability `e`             (what ferrite used before I3)
+//   [ 32, 64)  ② its bf16 round trip                 (what the official multiplies by)
+//   [ 64, 96)  ③ the KV element the slot multiplies
+//   [ 96,128)  ④ the f32 contribution  `e * kv`
+//   [128,160)  ⑤ the gated contribution `bf16(e) * kv`
+//   [160] ① of column 0      [161] ② of column 0     [162] smax before the update
+//   [163] smax after         [164] corr              [165] the slot's scaled dot
+//   [166] the slot ordinal   [167] the kernel id
+//
+// Why 5 groups rather than the two the gate strictly needs: the point of the
+// probe is to make "the gated step differs from the ungated step by exactly
+// bf16(e)*kv - e*kv, and `e` itself is the reference's exp()" checkable
+// element by element on real data, instead of arguable.
+//
+// The probe is ARMED INDEPENDENTLY of the gate: it always records BOTH
+// contributions, while the accumulation still follows the gate. A gate-OFF
+// armed run therefore shows exactly the delta the gate would introduce, which is
+// what makes the OFF arm's "no numerical change" claim falsifiable.
+#define DSV41_PV_DBG_FLOATS (5 * 32 + 8)
+
+// Kernel ids for the header's [167] — one per PV implementation.
+#define DSV41_PV_K_SEQ 1
+#define DSV41_PV_K_WARP 2
+#define DSV41_PV_K_PF 3
+#define DSV41_PV_K_SPLIT 4
+#define DSV41_PV_K_OROPE 5
+
+__device__ float g_attn_p_dbg[DSV41_PV_DBG_FLOATS];
+
+__device__ __forceinline__ void dsv41_pv_dbg(int on, int c, float e, float kv, float smax_prev,
+                                             float smax_after, float corr, float dot, int slot,
+                                             int kid) {
+    if (!on || c < 0 || c >= 32) return;
+    const float eb = __bfloat162float(__float2bfloat16(e));
+    g_attn_p_dbg[c] = e;
+    g_attn_p_dbg[32 + c] = eb;
+    g_attn_p_dbg[64 + c] = kv;
+    g_attn_p_dbg[96 + c] = e * kv;
+    g_attn_p_dbg[128 + c] = eb * kv;
+    if (c == 0) {
+        g_attn_p_dbg[160] = e;
+        g_attn_p_dbg[161] = eb;
+        g_attn_p_dbg[162] = smax_prev;
+        g_attn_p_dbg[163] = smax_after;
+        g_attn_p_dbg[164] = corr;
+        g_attn_p_dbg[165] = dot;
+        g_attn_p_dbg[166] = (float)slot;
+        g_attn_p_dbg[167] = (float)kid;
+    }
+}
+
+// The gate, read ONCE per process. Returns 1 only for an explicit `1...`
+// prefix; unset, `0` and anything else are OFF. Every existing gate in this
+// file is read this way on purpose: these launchers run per attention call (40
+// per step) and a per-call getenv is both the hot-path slip and a CUDA-graph
+// capture hazard.
+static int dsv41_attn_p_bf16() {
+    static const int on = [] {
+        const char* e = getenv("DSV41_ATTN_P_BF16");
+        return (e != nullptr && e[0] == '1') ? 1 : 0;
+    }();
+    return on;
+}
+
+// The probe arming, also read ONCE. Returns the slot ORDINAL to observe, or -1
+// when disarmed. `DSV41_ATTN_P_BF16_DBG=1` arms it and
+// `DSV41_ATTN_P_BF16_DBG_SLOT=N` (default 0) picks the ordinal: the N-th VALID
+// slot (idx >= 0) in processing order of (row 0, head 0, warp 0) — for the
+// split kernel, chunk 0. "Processing order" is warp 0's walk for the warp
+// kernels and the sequential slot walk for `sparse_attn_kernel`, so the ordinal
+// is a well-defined slot INDEX whose identity (row, head, chunk, ordinal) the
+// host prints next to the values.
+static int dsv41_attn_p_dbg_slot() {
+    static const int slot = [] {
+        const char* e = getenv("DSV41_ATTN_P_BF16_DBG");
+        if (e == nullptr || e[0] != '1') return -1;
+        const char* s = getenv("DSV41_ATTN_P_BF16_DBG_SLOT");
+        return (s != nullptr && atoi(s) >= 0) ? atoi(s) : 0;
+    }();
+    return slot;
+}
+
 // q[b,m,h,d] x kv[b,n,d] (ONE KV head) with idxs[b,m,topk]; online softmax with
 // the sink folded into the denominator after the loop.
 #define kMaxPer 8   // d <= 512 with blockDim >= 64; the launcher uses 128 (per = 4)
@@ -970,7 +1110,7 @@ __global__ void sparse_attn_kernel(const float* __restrict__ q, const float* __r
                                    float* __restrict__ out, int b, int m, int h, int d,
                                    const int* __restrict__ clen, int window, int index_topk,
                                    float scale, const int* __restrict__ clen_rows, int idx_stride,
-                                   int row_pitch) {
+                                   int row_pitch, int p_bf16, int p_dbg_slot) {
     const int row = blockIdx.x;  // flattened (b, m)
     if (row >= b * m) return;
     const int bb = row / m, mm = row % m;
@@ -1014,6 +1154,11 @@ __global__ void sparse_attn_kernel(const float* __restrict__ q, const float* __r
 #pragma unroll
         for (int i = 0; i < kMaxPer; ++i) acc[i] = 0.f;
         float smax = -1e30f, se = 0.f;
+        // I3 probe bookkeeping: the ordinal of the next VALID slot this block
+        // walks. `idx` (and therefore the `continue`) is block-uniform, so the
+        // counter is too. Disarmed => `pdbg0` is false and nothing below runs.
+        const bool pdbg0 = (p_dbg_slot >= 0) && (row == 0) && (hh == 0);
+        int vn = 0;
         for (int t = 0; t < topk; t++) {
             const int idx = irow[t];
             if (idx < 0) continue;
@@ -1048,14 +1193,21 @@ __global__ void sparse_attn_kernel(const float* __restrict__ q, const float* __r
             const float nm = fmaxf(smax, dot);
             const float corr = expf(smax - nm);
             const float e = expf(dot - nm);
+            // I3 probe (one-shot, disarmed => nothing): thread `c` ==
+            // threadIdx.x owns column c of slot `vn`, which is exactly the
+            // column this thread's `acc[0]` accumulates.
+            if (pdbg0 && vn == p_dbg_slot)
+                dsv41_pv_dbg(1, (int)threadIdx.x, e, kr[threadIdx.x], smax, nm, corr, dot, vn,
+                             DSV41_PV_K_SEQ);
 #pragma unroll
             for (int i = 0; i < kMaxPer; ++i) {
                 const int c = threadIdx.x + i * (int)blockDim.x;
-                if (c < d) acc[i] = acc[i] * corr + e * kr[c];
+                if (c < d) acc[i] = acc[i] * corr + dsv41_pv_prod(e, kr[c], p_bf16);
             }
             se = se * corr + e;
             smax = nm;
             __syncthreads();
+            vn++;
         }
         se += expf(sink[hh] - smax);
         float* orow = out + (size_t)(bb * m + mm) * rp + (size_t)hh * d;
@@ -1084,7 +1236,7 @@ __global__ void sparse_attn_warp_kernel(const float* __restrict__ q, const float
                                         int b, int m, int h, int d,
                                         const int* __restrict__ clen, int window, int index_topk,
                                         float scale, const int* __restrict__ clen_rows,
-                                        int idx_stride, int row_pitch) {
+                                        int idx_stride, int row_pitch, int p_bf16, int p_dbg_slot) {
     const int row = blockIdx.x;  // flattened (b, m)
     if (row >= b * m) return;
     const int bb = row / m, mm = row % m;
@@ -1103,6 +1255,10 @@ __global__ void sparse_attn_warp_kernel(const float* __restrict__ q, const float
 #pragma unroll
         for (int i = 0; i < kMaxPerW; ++i) my_acc[i] = 0.f;
         float my_smax = -1e30f, my_se = 0.f;
+        // I3 probe bookkeeping (see `dsv41_pv_dbg`): the ordinal of the next
+        // VALID slot THIS warp walks. Warp 0's walk is the observable one.
+        const bool pdbg0 = (p_dbg_slot >= 0) && (wid == 0) && (row == 0) && (hh == 0);
+        int vn = 0;
         for (int t = wid; t < topk; t += nwarp) {
             const int idx = irow[t];
             if (idx < 0) continue;
@@ -1118,13 +1274,18 @@ __global__ void sparse_attn_warp_kernel(const float* __restrict__ q, const float
             const float nm = fmaxf(my_smax, dot);
             const float corr = expf(my_smax - nm);
             const float e = expf(dot - nm);
+            // I3 probe: lane == c for the i == 0 accumulator slot, i.e. this
+            // lane owns column c == lane.
+            if (pdbg0 && vn == p_dbg_slot)
+                dsv41_pv_dbg(1, lane, e, kr[lane], my_smax, nm, corr, dot, vn, DSV41_PV_K_WARP);
 #pragma unroll
             for (int i = 0; i < kMaxPerW; ++i) {
                 const int c = lane + i * 32;
-                if (c < d) my_acc[i] = my_acc[i] * corr + e * kr[c];
+                if (c < d) my_acc[i] = my_acc[i] * corr + dsv41_pv_prod(e, kr[c], p_bf16);
             }
             my_se = my_se * corr + e;
             my_smax = nm;
+            vn++;
         }
         // ---- the ONLY barriers in this kernel: merge the warps' partials ----
         __shared__ float sh_smax[32], sh_se[32];
@@ -1175,7 +1336,7 @@ __global__ void sparse_attn_pf_kernel(const float* __restrict__ q, const float* 
                                       int b, int m, int h, int d,
                                       const int* __restrict__ clen, int window, int index_topk,
                                       float scale, const int* __restrict__ clen_rows,
-                                      int idx_stride, int row_pitch) {
+                                      int idx_stride, int row_pitch, int p_bf16, int p_dbg_slot) {
 #if __CUDA_ARCH__ >= 900
     // PDL (DSV41_PDL, see dsv41_pdl_or_plain): the launcher may have launched
     // this grid with programmatic stream serialization, so the grid is already
@@ -1215,6 +1376,10 @@ __global__ void sparse_attn_pf_kernel(const float* __restrict__ q, const float* 
 #pragma unroll
         for (int i = 0; i < kMaxPerW; ++i) my_acc[i] = 0.f;
         float my_smax = -1e30f, my_se = 0.f;
+        // I3 probe bookkeeping (see `dsv41_pv_dbg`): the ordinal of the next
+        // VALID slot THIS warp walks; warp 0 of (row 0, head 0) is the observed one.
+        const bool pdbg0 = (p_dbg_slot >= 0) && (wid == 0) && (row == 0) && (hh == 0);
+        int vn = 0;
         // Three kv-row buffers, rotating by slot; kBase is the row base.
         // (The two-deep form gave each row load one compute phase of distance;
         // three gives two, which the isolated probe measured as the last
@@ -1274,11 +1439,15 @@ __global__ void sparse_attn_pf_kernel(const float* __restrict__ q, const float* 
                 const float nm = fmaxf(my_smax, dot);
                 const float corr = expf(my_smax - nm);
                 const float e = expf(dot - nm);
+                // I3: the PV probability operand's bf16 round trip + the one-shot probe.
+                if (pdbg0 && vn == p_dbg_slot)
+                    dsv41_pv_dbg(1, lane, e, kb0[0], my_smax, nm, corr, dot, vn, DSV41_PV_K_PF);
 #pragma unroll
                 for (int i = 0; i < kMaxPerW; ++i) {
                     const int c = lane + i * 32;
-                    if (c < d) my_acc[i] = my_acc[i] * corr + e * kb0[i];
+                    if (c < d) my_acc[i] = my_acc[i] * corr + dsv41_pv_prod(e, kb0[i], p_bf16);
                 }
+                vn++;
                 my_se = my_se * corr + e;
                 my_smax = nm;
             }
@@ -1303,11 +1472,15 @@ __global__ void sparse_attn_pf_kernel(const float* __restrict__ q, const float* 
                 const float nm = fmaxf(my_smax, dot);
                 const float corr = expf(my_smax - nm);
                 const float e = expf(dot - nm);
+                // I3: the PV probability operand's bf16 round trip + the one-shot probe.
+                if (pdbg0 && vn == p_dbg_slot)
+                    dsv41_pv_dbg(1, lane, e, kb1[0], my_smax, nm, corr, dot, vn, DSV41_PV_K_PF);
 #pragma unroll
                 for (int i = 0; i < kMaxPerW; ++i) {
                     const int c = lane + i * 32;
-                    if (c < d) my_acc[i] = my_acc[i] * corr + e * kb1[i];
+                    if (c < d) my_acc[i] = my_acc[i] * corr + dsv41_pv_prod(e, kb1[i], p_bf16);
                 }
+                vn++;
                 my_se = my_se * corr + e;
                 my_smax = nm;
             }
@@ -1332,11 +1505,15 @@ __global__ void sparse_attn_pf_kernel(const float* __restrict__ q, const float* 
                 const float nm = fmaxf(my_smax, dot);
                 const float corr = expf(my_smax - nm);
                 const float e = expf(dot - nm);
+                // I3: the PV probability operand's bf16 round trip + the one-shot probe.
+                if (pdbg0 && vn == p_dbg_slot)
+                    dsv41_pv_dbg(1, lane, e, kb2[0], my_smax, nm, corr, dot, vn, DSV41_PV_K_PF);
 #pragma unroll
                 for (int i = 0; i < kMaxPerW; ++i) {
                     const int c = lane + i * 32;
-                    if (c < d) my_acc[i] = my_acc[i] * corr + e * kb2[i];
+                    if (c < d) my_acc[i] = my_acc[i] * corr + dsv41_pv_prod(e, kb2[i], p_bf16);
                 }
+                vn++;
                 my_se = my_se * corr + e;
                 my_smax = nm;
             }
@@ -1366,11 +1543,15 @@ __global__ void sparse_attn_pf_kernel(const float* __restrict__ q, const float* 
             const float nm = fmaxf(my_smax, dot);
             const float corr = expf(my_smax - nm);
             const float e = expf(dot - nm);
+            // I3: the PV probability operand's bf16 round trip + the one-shot probe.
+            if (pdbg0 && vn == p_dbg_slot)
+                dsv41_pv_dbg(1, lane, e, kb0[0], my_smax, nm, corr, dot, vn, DSV41_PV_K_PF);
 #pragma unroll
             for (int i = 0; i < kMaxPerW; ++i) {
                 const int c = lane + i * 32;
-                if (c < d) my_acc[i] = my_acc[i] * corr + e * kb0[i];
+                if (c < d) my_acc[i] = my_acc[i] * corr + dsv41_pv_prod(e, kb0[i], p_bf16);
             }
+            vn++;
             my_se = my_se * corr + e;
             my_smax = nm;
         }
@@ -1386,11 +1567,15 @@ __global__ void sparse_attn_pf_kernel(const float* __restrict__ q, const float* 
             const float nm = fmaxf(my_smax, dot);
             const float corr = expf(my_smax - nm);
             const float e = expf(dot - nm);
+            // I3: the PV probability operand's bf16 round trip + the one-shot probe.
+            if (pdbg0 && vn == p_dbg_slot)
+                dsv41_pv_dbg(1, lane, e, kb1[0], my_smax, nm, corr, dot, vn, DSV41_PV_K_PF);
 #pragma unroll
             for (int i = 0; i < kMaxPerW; ++i) {
                 const int c = lane + i * 32;
-                if (c < d) my_acc[i] = my_acc[i] * corr + e * kb1[i];
+                if (c < d) my_acc[i] = my_acc[i] * corr + dsv41_pv_prod(e, kb1[i], p_bf16);
             }
+            vn++;
             my_se = my_se * corr + e;
             my_smax = nm;
         }
@@ -1567,7 +1752,8 @@ __global__ void sparse_attn_split_kernel(const float* __restrict__ q,
                                          int index_topk, float scale, int C,
                                          const int* __restrict__ clen_rows, int idx_stride,
                                          int row_pitch, const int* __restrict__ base,
-                                         const float* __restrict__ kv_rows) {
+                                         const float* __restrict__ kv_rows, int p_bf16,
+                                         int p_dbg_slot) {
     const int ck = blockIdx.x;
     const int row = blockIdx.y;
     if (row >= b * m || ck >= C) return;
@@ -1609,6 +1795,11 @@ __global__ void sparse_attn_split_kernel(const float* __restrict__ q,
 #pragma unroll
     for (int i = 0; i < kMaxPerW; ++i) my_acc[i] = 0.f;
     float my_smax = -1e30f, my_se = 0.f;
+    // I3 probe bookkeeping (see `dsv41_pv_dbg`): the ordinal of the next VALID
+    // slot THIS warp walks; warp 0 of (chunk 0, row 0, head 0) is the observed one
+    // (chunk 0 because a later chunk's slot 0 is a different point of the walk).
+    const bool pdbg0 = (p_dbg_slot >= 0) && (wid == 0) && (ck == 0) && (row == 0) && (hh == 0);
+    int vn = 0;
     // Three kv-row buffers, rotating by slot; kBase is the row base (shared by
     // every head - the kv is one MLA latent per position). Same pipeline as the
     // pf kernel, walked over this chunk's [lo, hi) instead of [0, topk).
@@ -1666,11 +1857,15 @@ __global__ void sparse_attn_split_kernel(const float* __restrict__ q,
             const float nm = fmaxf(my_smax, dot);
             const float corr = expf(my_smax - nm);
             const float e = expf(dot - nm);
+            // I3: the PV probability operand's bf16 round trip + the one-shot probe.
+            if (pdbg0 && vn == p_dbg_slot)
+               dsv41_pv_dbg(1, lane, e, kb0[0], my_smax, nm, corr, dot, vn, DSV41_PV_K_SPLIT);
 #pragma unroll
             for (int i = 0; i < kMaxPerW; ++i) {
-                const int c = lane + i * 32;
-                if (c < d) my_acc[i] = my_acc[i] * corr + e * kb0[i];
+               const int c = lane + i * 32;
+               if (c < d) my_acc[i] = my_acc[i] * corr + dsv41_pv_prod(e, kb0[i], p_bf16);
             }
+            vn++;
             my_se = my_se * corr + e;
             my_smax = nm;
         }
@@ -1695,11 +1890,15 @@ __global__ void sparse_attn_split_kernel(const float* __restrict__ q,
             const float nm = fmaxf(my_smax, dot);
             const float corr = expf(my_smax - nm);
             const float e = expf(dot - nm);
+            // I3: the PV probability operand's bf16 round trip + the one-shot probe.
+            if (pdbg0 && vn == p_dbg_slot)
+               dsv41_pv_dbg(1, lane, e, kb1[0], my_smax, nm, corr, dot, vn, DSV41_PV_K_SPLIT);
 #pragma unroll
             for (int i = 0; i < kMaxPerW; ++i) {
-                const int c = lane + i * 32;
-                if (c < d) my_acc[i] = my_acc[i] * corr + e * kb1[i];
+               const int c = lane + i * 32;
+               if (c < d) my_acc[i] = my_acc[i] * corr + dsv41_pv_prod(e, kb1[i], p_bf16);
             }
+            vn++;
             my_se = my_se * corr + e;
             my_smax = nm;
         }
@@ -1724,11 +1923,15 @@ __global__ void sparse_attn_split_kernel(const float* __restrict__ q,
             const float nm = fmaxf(my_smax, dot);
             const float corr = expf(my_smax - nm);
             const float e = expf(dot - nm);
+            // I3: the PV probability operand's bf16 round trip + the one-shot probe.
+            if (pdbg0 && vn == p_dbg_slot)
+               dsv41_pv_dbg(1, lane, e, kb2[0], my_smax, nm, corr, dot, vn, DSV41_PV_K_SPLIT);
 #pragma unroll
             for (int i = 0; i < kMaxPerW; ++i) {
-                const int c = lane + i * 32;
-                if (c < d) my_acc[i] = my_acc[i] * corr + e * kb2[i];
+               const int c = lane + i * 32;
+               if (c < d) my_acc[i] = my_acc[i] * corr + dsv41_pv_prod(e, kb2[i], p_bf16);
             }
+            vn++;
             my_se = my_se * corr + e;
             my_smax = nm;
         }
@@ -1758,11 +1961,15 @@ __global__ void sparse_attn_split_kernel(const float* __restrict__ q,
         const float nm = fmaxf(my_smax, dot);
         const float corr = expf(my_smax - nm);
         const float e = expf(dot - nm);
+        // I3: the PV probability operand's bf16 round trip + the one-shot probe.
+        if (pdbg0 && vn == p_dbg_slot)
+           dsv41_pv_dbg(1, lane, e, kb0[0], my_smax, nm, corr, dot, vn, DSV41_PV_K_SPLIT);
 #pragma unroll
         for (int i = 0; i < kMaxPerW; ++i) {
-            const int c = lane + i * 32;
-            if (c < d) my_acc[i] = my_acc[i] * corr + e * kb0[i];
+           const int c = lane + i * 32;
+           if (c < d) my_acc[i] = my_acc[i] * corr + dsv41_pv_prod(e, kb0[i], p_bf16);
         }
+        vn++;
         my_se = my_se * corr + e;
         my_smax = nm;
     }
@@ -1778,11 +1985,15 @@ __global__ void sparse_attn_split_kernel(const float* __restrict__ q,
         const float nm = fmaxf(my_smax, dot);
         const float corr = expf(my_smax - nm);
         const float e = expf(dot - nm);
+        // I3: the PV probability operand's bf16 round trip + the one-shot probe.
+        if (pdbg0 && vn == p_dbg_slot)
+           dsv41_pv_dbg(1, lane, e, kb1[0], my_smax, nm, corr, dot, vn, DSV41_PV_K_SPLIT);
 #pragma unroll
         for (int i = 0; i < kMaxPerW; ++i) {
-            const int c = lane + i * 32;
-            if (c < d) my_acc[i] = my_acc[i] * corr + e * kb1[i];
+           const int c = lane + i * 32;
+           if (c < d) my_acc[i] = my_acc[i] * corr + dsv41_pv_prod(e, kb1[i], p_bf16);
         }
+        vn++;
         my_se = my_se * corr + e;
         my_smax = nm;
     }
@@ -2256,7 +2467,7 @@ __global__ void sparse_attn_orope_kernel(
     const int* __restrict__ base, int rope_rd, int half, int mul, int off, int step,
     int inverse, uint8_t* __restrict__ xq, float* __restrict__ xsc,
     const int* __restrict__ clen_rows, int idx_stride, int row_step, int row_pitch,
-    const float* __restrict__ kv_rows) {
+    const float* __restrict__ kv_rows, int p_bf16, int p_dbg_slot) {
     const int row = blockIdx.x;
     if (row >= b * m) return;
     const int bb = row / m, mm = row % m;
@@ -2296,6 +2507,10 @@ __global__ void sparse_attn_orope_kernel(
 #pragma unroll
         for (int i = 0; i < kMaxPerW; ++i) my_acc[i] = 0.f;
         float my_smax = -1e30f, my_se = 0.f;
+        // I3 probe bookkeeping (see `dsv41_pv_dbg`): the ordinal of the next
+        // VALID slot THIS warp walks; warp 0 of (row 0, head 0) is the observed one.
+        const bool pdbg0 = (p_dbg_slot >= 0) && (wid == 0) && (row == 0) && (hh == 0);
+        int vn = 0;
         // Three kv-row buffers, rotating by slot; kBase is the row base.
         float kb0[kMaxPerW], kb1[kMaxPerW], kb2[kMaxPerW];
         const size_t kBase = (size_t)bb * n * d;
@@ -2350,11 +2565,15 @@ __global__ void sparse_attn_orope_kernel(
                 const float nm = fmaxf(my_smax, dot);
                 const float corr = expf(my_smax - nm);
                 const float e = expf(dot - nm);
+                // I3: the PV probability operand's bf16 round trip + the one-shot probe.
+                if (pdbg0 && vn == p_dbg_slot)
+                    dsv41_pv_dbg(1, lane, e, kb0[0], my_smax, nm, corr, dot, vn, DSV41_PV_K_OROPE);
 #pragma unroll
                 for (int i = 0; i < kMaxPerW; ++i) {
                     const int c = lane + i * 32;
-                    if (c < d) my_acc[i] = my_acc[i] * corr + e * kb0[i];
+                    if (c < d) my_acc[i] = my_acc[i] * corr + dsv41_pv_prod(e, kb0[i], p_bf16);
                 }
+                vn++;
                 my_se = my_se * corr + e;
                 my_smax = nm;
             }
@@ -2379,11 +2598,15 @@ __global__ void sparse_attn_orope_kernel(
                 const float nm = fmaxf(my_smax, dot);
                 const float corr = expf(my_smax - nm);
                 const float e = expf(dot - nm);
+                // I3: the PV probability operand's bf16 round trip + the one-shot probe.
+                if (pdbg0 && vn == p_dbg_slot)
+                    dsv41_pv_dbg(1, lane, e, kb1[0], my_smax, nm, corr, dot, vn, DSV41_PV_K_OROPE);
 #pragma unroll
                 for (int i = 0; i < kMaxPerW; ++i) {
                     const int c = lane + i * 32;
-                    if (c < d) my_acc[i] = my_acc[i] * corr + e * kb1[i];
+                    if (c < d) my_acc[i] = my_acc[i] * corr + dsv41_pv_prod(e, kb1[i], p_bf16);
                 }
+                vn++;
                 my_se = my_se * corr + e;
                 my_smax = nm;
             }
@@ -2408,11 +2631,15 @@ __global__ void sparse_attn_orope_kernel(
                 const float nm = fmaxf(my_smax, dot);
                 const float corr = expf(my_smax - nm);
                 const float e = expf(dot - nm);
+                // I3: the PV probability operand's bf16 round trip + the one-shot probe.
+                if (pdbg0 && vn == p_dbg_slot)
+                    dsv41_pv_dbg(1, lane, e, kb2[0], my_smax, nm, corr, dot, vn, DSV41_PV_K_OROPE);
 #pragma unroll
                 for (int i = 0; i < kMaxPerW; ++i) {
                     const int c = lane + i * 32;
-                    if (c < d) my_acc[i] = my_acc[i] * corr + e * kb2[i];
+                    if (c < d) my_acc[i] = my_acc[i] * corr + dsv41_pv_prod(e, kb2[i], p_bf16);
                 }
+                vn++;
                 my_se = my_se * corr + e;
                 my_smax = nm;
             }
@@ -2442,11 +2669,15 @@ __global__ void sparse_attn_orope_kernel(
             const float nm = fmaxf(my_smax, dot);
             const float corr = expf(my_smax - nm);
             const float e = expf(dot - nm);
+            // I3: the PV probability operand's bf16 round trip + the one-shot probe.
+            if (pdbg0 && vn == p_dbg_slot)
+                dsv41_pv_dbg(1, lane, e, kb0[0], my_smax, nm, corr, dot, vn, DSV41_PV_K_OROPE);
 #pragma unroll
             for (int i = 0; i < kMaxPerW; ++i) {
                 const int c = lane + i * 32;
-                if (c < d) my_acc[i] = my_acc[i] * corr + e * kb0[i];
+                if (c < d) my_acc[i] = my_acc[i] * corr + dsv41_pv_prod(e, kb0[i], p_bf16);
             }
+            vn++;
             my_se = my_se * corr + e;
             my_smax = nm;
         }
@@ -2462,11 +2693,15 @@ __global__ void sparse_attn_orope_kernel(
             const float nm = fmaxf(my_smax, dot);
             const float corr = expf(my_smax - nm);
             const float e = expf(dot - nm);
+            // I3: the PV probability operand's bf16 round trip + the one-shot probe.
+            if (pdbg0 && vn == p_dbg_slot)
+                dsv41_pv_dbg(1, lane, e, kb1[0], my_smax, nm, corr, dot, vn, DSV41_PV_K_OROPE);
 #pragma unroll
             for (int i = 0; i < kMaxPerW; ++i) {
                 const int c = lane + i * 32;
-                if (c < d) my_acc[i] = my_acc[i] * corr + e * kb1[i];
+                if (c < d) my_acc[i] = my_acc[i] * corr + dsv41_pv_prod(e, kb1[i], p_bf16);
             }
+            vn++;
             my_se = my_se * corr + e;
             my_smax = nm;
         }
@@ -11325,6 +11560,10 @@ static int dsv41_sparse_attn_impl(const float* q, const float* kv, const float* 
         const char* e = getenv("DSV41_ATTN_PF");
         return e != nullptr && atoi(e) == 0;
     }();
+    // I3 (DSV41_ATTN_P_BF16 / _DBG): read ONCE, like every gate above, and handed
+    // to the selected kernel. `p_dbg_slot < 0` is the disarmed probe.
+    const int p_bf16 = dsv41_attn_p_bf16();
+    const int p_dbg_slot = dsv41_attn_p_dbg_slot();
     dim3 grid(b * m, h);
     if (!seq) {
         const int split_c = g_sparse_split_c;
@@ -11334,7 +11573,7 @@ static int dsv41_sparse_attn_impl(const float* q, const float* kv, const float* 
             // ON, so the old order would leave this arm unreachable.
             sparse_attn_warp_kernel<<<grid, 128, 0, s>>>(q, kv, sink, idxs, out, b, m, h, d, clen,
                                                          window, index_topk, scale, clen_rows,
-                                                         idx_stride, row_pitch);
+                                                         idx_stride, row_pitch, p_bf16, p_dbg_slot);
         } else if (split_c > 0 && split_c <= kAttnMaxC && b * m <= kAttnMaxBM &&
                    h <= kAttnMaxH) {
             // One block per (chunk, row, head); the split writes the partials,
@@ -11345,9 +11584,14 @@ static int dsv41_sparse_attn_impl(const float* q, const float* kv, const float* 
             sparse_attn_split_kernel<<<dim3((unsigned)split_c, (unsigned)(b * m),
                                             (unsigned)h), 128, 0, s>>>(
                 q, kv, idxs, b, m, h, d, clen, window, index_topk, scale, split_c, clen_rows,
-                idx_stride, row_pitch, nullptr, nullptr);
+                idx_stride, row_pitch, nullptr, nullptr, p_bf16, p_dbg_slot);
             cudaError_t e2 = cudaGetLastError();
             if (e2 != cudaSuccess) return (int)e2;
+            // I3 note: `sparse_attn_merge_kernel` carries NO PV accumulation — its
+            // `expf(P[0] - smax)` is the CROSS-CHUNK rescale applied to the f32
+            // chunk partial, which is exactly the official's `acc_o[i,j] *=
+            // scores_scale[i]` (kernel.py:379) on the ACCUMULATOR. There is no
+            // probability operand in it, so the gate does not reach this kernel.
             sparse_attn_merge_kernel<<<dim3((unsigned)(b * m), (unsigned)h), 128, 0, s>>>(
                 sink, out, b, m, h, d, split_c, nullptr, nullptr, nullptr, 0, 0, 0, 0, 0, 0,
                 nullptr, nullptr, 0, row_pitch);
@@ -11360,12 +11604,14 @@ static int dsv41_sparse_attn_impl(const float* q, const float* kv, const float* 
             // reads. The split/merge and warp A/B arms deliberately stay plain.
             cudaError_t le = dsv41_pdl_or_plain(sparse_attn_pf_kernel, grid, dim3(128), 0, s, q,
                                                kv, sink, idxs, out, b, m, h, d, clen, window,
-                                               index_topk, scale, clen_rows, idx_stride, row_pitch);
+                                               index_topk, scale, clen_rows, idx_stride, row_pitch,
+                                               p_bf16, p_dbg_slot);
             if (le != cudaSuccess) { (void)cudaGetLastError(); return (int)le; }
         }
     } else {
         sparse_attn_kernel<<<grid, 128, 0, s>>>(q, kv, sink, idxs, out, b, m, h, d, clen, window,
-                                                index_topk, scale, clen_rows, idx_stride, row_pitch);
+                                                index_topk, scale, clen_rows, idx_stride, row_pitch,
+                                                p_bf16, p_dbg_slot);
     }
     return (int)cudaGetLastError();
 }
@@ -11454,6 +11700,11 @@ static int dsv41_sparse_attn_orope_impl(
         return e != nullptr && atoi(e) == 0;
     }();
     const int split_c = g_sparse_split_c;
+    // I3 (DSV41_ATTN_P_BF16 / _DBG): same two process-once reads the plain
+    // launcher makes — the two entries MUST agree, or the fused path and its
+    // fallback would compute different numbers under the same env.
+    const int p_bf16 = dsv41_attn_p_bf16();
+    const int p_dbg_slot = dsv41_attn_p_dbg_slot();
     if (seq) return 2;
     // Mirror the plain launcher's order (warp arm before split): with the split
     // defaulting ON, a pf_off arm must still land on the warp kernel AND this
@@ -11468,7 +11719,7 @@ static int dsv41_sparse_attn_orope_impl(
         sparse_attn_split_kernel<<<dim3((unsigned)split_c, (unsigned)(b * m),
                                         (unsigned)h), 128, 0, s>>>(
             q, kv, idxs, b, m, h, d, clen, window, index_topk, scale, split_c, clen_rows,
-            idx_stride, row_pitch, base, kv_rows);
+            idx_stride, row_pitch, base, kv_rows, p_bf16, p_dbg_slot);
         cudaError_t e2 = cudaGetLastError();
         if (e2 != cudaSuccess) return (int)e2;
         sparse_attn_merge_kernel<<<dim3((unsigned)(b * m), (unsigned)h), 128, 0, s>>>(
@@ -11480,7 +11731,7 @@ static int dsv41_sparse_attn_orope_impl(
     sparse_attn_orope_kernel<<<dim3(b * m, h), 128, 0, s>>>(
         q, kv, sink, idxs, out, b, m, h, d, clen, window, index_topk, scale, cos, sin, base,
         rope_rd, half, mul, off, step, inverse, xq, xsc, clen_rows, idx_stride, row_step,
-        row_pitch, kv_rows);
+        row_pitch, kv_rows, p_bf16, p_dbg_slot);
     return (int)cudaGetLastError();
 }
 
@@ -11540,6 +11791,20 @@ extern "C" int dsv41_sparse_attn_orope_mrows(
                                         index_topk, scale, cos, sin, base, rope_rd, half, mul, off,
                                         step, inverse, xq, xsc, clen_rows, idx_stride, row_step,
                                         row_pitch, kv_rows, s);
+}
+
+// I3 readback (DSV41_ATTN_P_BF16_DBG): copy the one-shot probe buffer
+// (`g_attn_p_dbg`, see `dsv41_pv_dbg`) to the host. An ADDED symbol — no
+// existing launcher's signature moves, and a `.so` that predates I3 simply does
+// not carry it (the Rust side probes the symbol, like every other optional
+// entry). `n` is the float count, clamped to the buffer; returns a cudaError_t
+// as int, like every other dsv41 entry.
+extern "C" int dsv41_attn_p_dbg_read(float* host, int n, cudaStream_t s) {
+    if (host == nullptr) return (int)cudaErrorInvalidValue;
+    if (n <= 0 || n > DSV41_PV_DBG_FLOATS) n = DSV41_PV_DBG_FLOATS;
+    cudaError_t e = cudaMemcpyFromSymbolAsync(host, g_attn_p_dbg, (size_t)n * sizeof(float), 0,
+                                              cudaMemcpyDeviceToHost, s);
+    return (int)e;
 }
 
 // The launcher body, shared by the two entries below (as in `dsv41_sparse_attn` /

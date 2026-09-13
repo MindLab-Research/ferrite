@@ -1727,6 +1727,11 @@ struct Kernels {
             CuStream,
         ) -> c_int,
     >,
+    /// I3 (DSV41_ATTN_P_BF16_DBG): copy the attention PV probe buffer
+    /// (`g_attn_p_dbg`, filled by the sparse-attention kernels when that env is
+    /// set) to the host. An ADDED symbol: a `.so` without it simply cannot run
+    /// the probe, and the gate itself never needs it.
+    attn_p_dbg_read: Option<unsafe extern "C" fn(*mut f32, c_int, CuStream) -> c_int>,
     ar_reduce: Option<
         unsafe extern "C" fn(*mut f32, *const f32, i64, i64, c_int, *const c_uint, c_uint, CuStream) -> c_int,
     >,
@@ -2380,6 +2385,7 @@ impl Device {
             moe_bs_pack_wsf: ko!(rt, "dsv41_moe_bs_pack_wsf"),
             moe_bs_act_e4m3_cap: ko!(rt, "dsv41_moe_bs_act_e4m3_cap"),
             w2_l2_prewarm: ko!(rt, "dsv41_w2_l2_prewarm"),
+            attn_p_dbg_read: ko!(rt, "dsv41_attn_p_dbg_read"),
             swiglu_limit_batched: ko!(rt, "dsv41_swiglu_limit_batched"),
             routed_down_prep: ko!(rt, "dsv41_routed_down_prep"),
             indexer_fp4_rt: ko!(rt, "dsv41_indexer_fp4_rt"),
@@ -8952,6 +8958,28 @@ impl Device {
             f(act, route_w, rows, slots, pitch, inter, d, self.stream)
         };
         self.kerr(rc, "dsv41_routed_down_prep")
+    }
+
+    /// I3 (DSV41_ATTN_P_BF16_DBG): copy the sparse attention's PV probe buffer to
+    /// the host. The buffer is filled by whichever sparse-attention kernel the
+    /// launcher selected, when `DSV41_ATTN_P_BF16_DBG=1` armed it (the flag is
+    /// read in the launcher, not here — this method only reads back). Errors with
+    /// the missing-symbol reason when the loaded `.so` predates I3.
+    pub fn attn_p_dbg_read(&self, host: *mut f32, n: i32) -> Result<()> {
+        let f = self.need(self.kernels.attn_p_dbg_read, "dsv41_attn_p_dbg_read")?;
+        let rc = unsafe { f(host, n, self.stream) };
+        self.kerr(rc, "dsv41_attn_p_dbg_read")?;
+        // The copy is issued on the compute stream; the caller's `host` buffer is
+        // ordinary memory, so the stream must drain before it can be read. Doing it
+        // here keeps the one-shot probe's contract in one place.
+        self.sync()
+    }
+
+    /// Whether the loaded `.so` carries the I3 probe readback entry. The gate
+    /// `DSV41_ATTN_P_BF16` lives entirely in the kernel launchers and does NOT
+    /// need this; only the `_DBG` readback does.
+    pub fn supports_attn_p_dbg_read(&self) -> bool {
+        self.kernels.attn_p_dbg_read.is_some()
     }
 
     /// True when the loaded .so carries the routed-down prep entry point

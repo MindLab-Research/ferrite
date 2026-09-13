@@ -325,6 +325,52 @@ fn rmsnorm_rows(x: &mut [f32], rows: usize, cols: usize, w: &[f32], eps: f32) {
 // Sparse attention (window + compressed positions, one shared KV head)
 // ===========================================================================
 
+// ---------------------------------------------------------------------------
+// I3 (DSV41_ATTN_P_BF16, default OFF): the PV probability operand's bf16 round trip
+// ---------------------------------------------------------------------------
+// The official `sparse_attn_kernel_` (`ref_inference/kernel.py:363-380`) runs the
+// online softmax in this order:
+//     acc_s = exp(acc_s - scores_max)          # :373  the probability, f32
+//     reduce_sum(acc_s, scores_sum)            # :374  the DENOMINATOR, from the f32 probability
+//     acc_s_cast = acc_s.to(BF16)              # :377  f32 -> bf16, round-to-nearest-even
+//     acc_o *= scores_scale                    # :379  the rescale, on the ACCUMULATOR
+//     acc_o += acc_s_cast @ kv                 # :380  PV, with the bf16 probability
+// i.e. the probability is rounded ONCE, after the exp and before the multiply,
+// and the rescale never touches a probability (it rescales the f32 accumulator).
+// This CPU mirror multiplied the f32 probability directly — more precise than
+// the reference — and this gate closes that gap exactly as the CUDA kernels do
+// (`dsv41_pv_prod` in kernels/cuda/dsv41_kernels.cu; the two must agree).
+fn attn_p_bf16() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("DSV41_ATTN_P_BF16")
+            .map(|v| v.starts_with('1'))
+            .unwrap_or(false)
+    })
+}
+
+/// `x.to(torch.bfloat16)`, round-to-nearest, ties-to-EVEN — the same conversion
+/// CUDA's `__float2bfloat16` (`cvt.rn.bf16.f32`) and the official kernel's
+/// `T.copy(acc_s, acc_s_cast)` perform.
+fn bf16_rn(v: f32) -> f32 {
+    let bits = v.to_bits();
+    if (bits & 0x7F80_0000) == 0x7F80_0000 {
+        return v; // inf / NaN pass through
+    }
+    let lsb = (bits >> 16) & 1;
+    f32::from_bits(bits.wrapping_add(0x7FFF + lsb) & 0xFFFF_0000)
+}
+
+/// The PV product for one key: `p * kv`. With the gate OFF this is the plain f32
+/// multiply, bit for bit the pre-I3 expression.
+fn pv_product(e: f32, kv: f32, p_bf16: bool) -> f32 {
+    if p_bf16 {
+        bf16_rn(e) * kv
+    } else {
+        e * kv
+    }
+}
+
 /// `sparse_attn`: per (batch, query) gather `topk` positions from `kv`, run an
 /// online softmax, then fold in the learnable attention sink.
 ///
@@ -345,6 +391,9 @@ pub fn sparse_attn(
     scale: f32,
 ) -> Vec<f32> {
     let mut o = vec![0f32; b * m * h * d];
+    // I3: read ONCE, exactly as the CUDA launchers read it, so the CPU mirror and
+    // the kernels cannot disagree about which semantics is in force.
+    let p_bf16 = attn_p_bf16();
     for bb in 0..b {
         for mm in 0..m {
             for hh in 0..h {
@@ -369,7 +418,11 @@ pub fn sparse_attn(
                     let e = (s - new_max).exp();
                     sum_exp = sum_exp * corr + e;
                     for c in 0..d {
-                        acc[c] = acc[c] * corr + e * kr[c];
+                        // I3: the official rounds the PROBABILITY to bf16 before the
+                        // PV multiply (`kernel.py:377` then `:380`) while the
+                        // denominator above keeps the f32 probability (`:374`), and
+                        // `acc * corr` — the accumulator's rescale — stays f32 (`:379`).
+                        acc[c] = acc[c] * corr + pv_product(e, kr[c], p_bf16);
                     }
                     smax = new_max;
                 }
