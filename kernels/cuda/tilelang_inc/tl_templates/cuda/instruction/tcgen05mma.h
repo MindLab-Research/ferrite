@@ -690,12 +690,13 @@ TL_DEVICE void tcgen05mma_blockscaled_ss(uint64_t const & /*desc_a*/,
 }
 
 // FP8 E4M3 block-scaled
-// REVERTED (2026-09-14): the .scale_vec::1X + "memory" clobber experiment BROKE
-// the previously-working eager path (all MMAs → illegal instruction). The
-// verified hand-written code's .scale_vec::1X works for ITS data layout, but
-// our production layout (from TileLang codegen) is different. Reverting to the
-// original TileLang template form. The "memory" clobber alone might be safe
-// but reverting both to isolate variables.
+// BINARY-SEARCH FIX (2026-09-14): add ONLY the "memory" clobber (NOT the
+// .scale_vec::1X suffix — that broke eager in the previous experiment).
+// The clobber prevents the compiler from reordering memory operations
+// around the asm, which could race with the TMA loads in the pipeline.
+// The verified hand-written code (tests_tcgen05:781) has BOTH the clobber
+// and the suffix; the previous experiment added both and broke eager.
+// This test isolates: clobber only.
 template <>
 TL_DEVICE void tcgen05mma_blockscaled_ss<DataType::kFloat8_e4m3, false>(
     uint64_t const &desc_a, uint64_t const &desc_b, uint32_t const &tmem_c,
@@ -711,7 +712,8 @@ TL_DEVICE void tcgen05mma_blockscaled_ss<DataType::kFloat8_e4m3, false>(
         "}\n"
         :
         : "r"(tmem_c), "l"(desc_a), "l"(desc_b), "r"(desc_val), "r"(scalec),
-          "r"(tmem_sfa), "r"(tmem_sfb));
+          "r"(tmem_sfa), "r"(tmem_sfb)
+        : "memory");
   }
 }
 
