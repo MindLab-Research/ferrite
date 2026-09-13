@@ -75,6 +75,20 @@ LD_LIBRARY_PATH=$HOME/ferrite/kernels/cuda ./target/release/ferrite-serve --back
 | `DSV41_VERIFY_GRAPH=1` | verify 的 CUDA 图化 | OFF |
 | `DSV41_TIMING=1` | `[dspark] steps=` 计时行 | OFF |
 
+**2026-09-13 摊薄修复批新增 gate**（详见 `docs/agent/verify-amortization-lesion-audit.md` §9 + 各设计文档；全部默认 OFF、逐位论证、双门禁验证中）：
+
+| gate | 作用 | 前置 |
+|---|---|---|
+| `DSV41_ATTN_MROWS=1` | sparse attn m=6 批量（TP8 row_pitch 已修，world!=1 decline 已除） | 无（新符号 `_rp` 自动回落） |
+| `DSV41_COMPRESSOR_PROJ_MROWS=1` | compressor 投影 ONE launch（gemv_f32_v2_mrows） | `DSV41_GEMV_F32_V2` 默认路径 |
+| `DSV41_ENGRAM_PROJ_MROWS=1` | engram 投影 mrows 折行 | 无 |
+| `DSV41_ENGRAM_GATHER_MROWS=1` | engram gather rows 批量（id_stride） | 无 |
+| `DSV41_MROWS_MPAR=N/auto` | gemm_fp8_mrows 的 warp 级 M 并行（rpb=每块输出行数） | 无（OFF=逐字节旧程序） |
+| `DSV41_EXPERT_GROUPED_DOWN=1` | MoE down 的 expert 并集去重 | 需 `DSV41_EXPERT_GROUPED=1` 同臂 |
+| `DSV41_DRAFT_P3LITE_{SEED,KV,ATTN}=1` | draft 段融合三开关（单变量可切） | 无 |
+| `DSV41_SF_STRIDE_PAD=0` | w2 SF 根修逃生门（默认 ON） | — |
+| `DSV41_AR_PROBE=1` + site 分流 | AR device 探针（attn/moe 分桶符号 `ferrite_p2p_ar_v5_attn/_moe`） | 无 |
+
 ## 测量与工具纪律（用户裁决 2026-09-13，防遗忘）
 
 1. **step time 必须真实测量**：`[dspark] steps=` 的 draft/verify/commit 分解或 nsys per-kernel；**禁止吞吐反推**（受 prefill/accept 污染）。**每次 nsys 分析完必须给用户当前的时间 breakdown 表**（各项 ms/步 + 占比 + 修复载体 + 修复后目标——用户裁决 2026-09-13）。
