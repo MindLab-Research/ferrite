@@ -51,58 +51,10 @@ __device__ __forceinline__ void hw_tc_commit(void *mbar) {
                  :: "r"((uint32_t)__cvta_generic_to_shared(mbar)) : "memory");
 }
 
-// TMEM read: each thread reads N consecutive 32-bit values
-template <int N>
-__device__ __forceinline__ void hw_tc_ld(uint32_t taddr, uint32_t *dst) {
-    static_assert(N == 1 || N == 2 || N == 4 || N == 8 || N == 16 || N == 32 || N == 64 || N == 128,
-                  "N must be power of 2 (1-128)");
-    if constexpr (N == 128) {
-        asm volatile("tcgen05.ld.sync.aligned.32x32b.x128.b32 "
-                     "{%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15,"
-                     "%16,%17,%18,%19,%20,%21,%22,%23,%24,%25,%26,%27,%28,%29,%30,%31,"
-                     "%32,%33,%34,%35,%36,%37,%38,%39,%40,%41,%42,%43,%44,%45,%46,%47,"
-                     "%48,%49,%50,%51,%52,%53,%54,%55,%56,%57,%58,%59,%60,%61,%62,%63,"
-                     "%64,%65,%66,%67,%68,%69,%70,%71,%72,%73,%74,%75,%76,%77,%78,%79,"
-                     "%80,%81,%82,%83,%84,%85,%86,%87,%88,%89,%90,%91,%92,%93,%94,%95,"
-                     "%96,%97,%98,%99,%100,%101,%102,%103,%104,%105,%106,%107,%108,%109,"
-                     "%110,%111,%112,%113,%114,%115,%116,%117,%118,%119,%120,%121,%122,%123,"
-                     "%124,%125,%126,%127,%128}, [%129];"
-                     : "=r"(dst[0]), "=r"(dst[1]), "=r"(dst[2]), "=r"(dst[3]),
-                       "=r"(dst[4]), "=r"(dst[5]), "=r"(dst[6]), "=r"(dst[7]),
-                       "=r"(dst[8]), "=r"(dst[9]), "=r"(dst[10]), "=r"(dst[11]),
-                       "=r"(dst[12]), "=r"(dst[13]), "=r"(dst[14]), "=r"(dst[15]),
-                       "=r"(dst[16]), "=r"(dst[17]), "=r"(dst[18]), "=r"(dst[19]),
-                       "=r"(dst[20]), "=r"(dst[21]), "=r"(dst[22]), "=r"(dst[23]),
-                       "=r"(dst[24]), "=r"(dst[25]), "=r"(dst[26]), "=r"(dst[27]),
-                       "=r"(dst[28]), "=r"(dst[29]), "=r"(dst[30]), "=r"(dst[31]),
-                       "=r"(dst[32]), "=r"(dst[33]), "=r"(dst[34]), "=r"(dst[35]),
-                       "=r"(dst[36]), "=r"(dst[37]), "=r"(dst[38]), "=r"(dst[39]),
-                       "=r"(dst[40]), "=r"(dst[41]), "=r"(dst[42]), "=r"(dst[43]),
-                       "=r"(dst[44]), "=r"(dst[45]), "=r"(dst[46]), "=r"(dst[47]),
-                       "=r"(dst[48]), "=r"(dst[49]), "=r"(dst[50]), "=r"(dst[51]),
-                       "=r"(dst[52]), "=r"(dst[53]), "=r"(dst[54]), "=r"(dst[55]),
-                       "=r"(dst[56]), "=r"(dst[57]), "=r"(dst[58]), "=r"(dst[59]),
-                       "=r"(dst[60]), "=r"(dst[61]), "=r"(dst[62]), "=r"(dst[63]),
-                       "=r"(dst[64]), "=r"(dst[65]), "=r"(dst[66]), "=r"(dst[67]),
-                       "=r"(dst[68]), "=r"(dst[69]), "=r"(dst[70]), "=r"(dst[71]),
-                       "=r"(dst[72]), "=r"(dst[73]), "=r"(dst[74]), "=r"(dst[75]),
-                       "=r"(dst[76]), "=r"(dst[77]), "=r"(dst[78]), "=r"(dst[79]),
-                       "=r"(dst[80]), "=r"(dst[81]), "=r"(dst[82]), "=r"(dst[83]),
-                       "=r"(dst[84]), "=r"(dst[85]), "=r"(dst[86]), "=r"(dst[87]),
-                       "=r"(dst[88]), "=r"(dst[89]), "=r"(dst[90]), "=r"(dst[91]),
-                       "=r"(dst[92]), "=r"(dst[93]), "=r"(dst[94]), "=r"(dst[95]),
-                       "=r"(dst[96]), "=r"(dst[97]), "=r"(dst[98]), "=r"(dst[99]),
-                       "=r"(dst[100]), "=r"(dst[101]), "=r"(dst[102]), "=r"(dst[103]),
-                       "=r"(dst[104]), "=r"(dst[105]), "=r"(dst[106]), "=r"(dst[107]),
-                       "=r"(dst[108]), "=r"(dst[109]), "=r"(dst[110]), "=r"(dst[111]),
-                       "=r"(dst[112]), "=r"(dst[113]), "=r"(dst[114]), "=r"(dst[115]),
-                       "=r"(dst[116]), "=r"(dst[117]), "=r"(dst[118]), "=r"(dst[119]),
-                       "=r"(dst[120]), "=r"(dst[121]), "=r"(dst[122]), "=r"(dst[123]),
-                       "=r"(dst[124]), "=r"(dst[125]), "=r"(dst[126]), "=r"(dst[127])
-                     : "r"(taddr));
-    }
-    // (other N values omitted for brevity — only N=128 is used in this kernel)
-}
+// TMEM read: 使用 TileLang 已验证的 tcgen05_ld（避免 128-operand 自定义 asm 的 ICE）
+// tl::tcgen05_ld_32dp32bNx 在 moe_bs_up_tl.cu 的 include 链中已可用
+// (replaces the custom hw_tc_ld<128> which caused Internal Compiler Error
+//  "asm operand index larger than number of operands" with 128 constraints)
 
 // SMEM descriptor for tcgen05 MMA（从 verified make_desc 适配）
 // layout: start_addr[0:14) | lbo[16:30) | sbo[32:46) | version=1[46] | layout[61:64)
@@ -356,11 +308,8 @@ extern "C" __global__ __launch_bounds__(128, 1) void moe_bs_handwritten_kernel(
     // Thread t reads from lane (t % 32) + warp offset, columns 0-127
     {
         float C_reg[128];
-        // tcgen05.ld: reads from TMEM at [C_tmem + column_offset]
-        // 32x32b shape: 32 lanes × 32 bits, x128 = 128 values per thread
-        // Each thread reads 128 consecutive columns from its lane
-        const uint32_t tmem_addr = C_tmem;  // + lane offset is implicit in 32x32b
-        hw_tc_ld<128>(tmem_addr, (uint32_t*)C_reg);
+        // TileLang's verified TMEM read (replaces custom hw_tc_ld<128> that caused ICE)
+        tl::tcgen05_ld_32dp32bNx<128, false>(C_tmem, 0, C_reg);
 
         __syncthreads();  // ensure all threads have read TMEM before writing C_sh
 
