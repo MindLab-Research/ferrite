@@ -84,3 +84,15 @@ bash "$HOME/num100.sh" STEP_S4 \
   DSV41_SPEC=1 DSV41_MOE_TILELANG_BS=0 DSV41_MOE_BS_HANDWRITTEN=0 DSV41_VERIFY_GRAPH=1 \
   DSV41_EXPERT_GROUPED=1 DSV41_EXPERT_TCGEN05_E4M3=1
 judge "S4 (spec + verify graph + same-format grouped MoE)" "$HOME/armrun_STEP_S4.log"
+
+echo "############ S5: S2 with the OLD per-slot MoE (MOE_BATCH=0) — the m>1 A/B ############"
+# The user's reference is "eager 6.3 ms/step and a perfect 1..100", which this session's earlier
+# non-spec arms did NOT reproduce (10.19 ms and number skips). One candidate difference is that
+# DSV41_MOE_BATCH defaults to TRUE (moe_batch() returns true unless set to 0), so those arms took the
+# BATCHED expert path while the reference presumably took the per-(row,slot) one. At m=1 batching has
+# nothing to share and only adds setup; at m=6 it should win. S5 is the m=6 side of that A/B against
+# S2, so the pair says which default is right per mode rather than by assumption.
+bash "$HOME/num100.sh" STEP_S5 \
+  DSV41_SPEC=1 DSV41_MOE_TILELANG_BS=0 DSV41_MOE_BS_HANDWRITTEN=0 DSV41_VERIFY_GRAPH=1 \
+  DSV41_MOE_BATCH=0
+judge "S5 (spec + verify graph + OLD per-slot MoE)" "$HOME/armrun_STEP_S5.log"
