@@ -93,7 +93,7 @@ LD_LIBRARY_PATH=$HOME/ferrite/kernels/cuda ./target/release/ferrite-serve --back
 
 ## 测量与工具纪律（用户裁决 2026-09-13，防遗忘）
 
-1. **step time 必须真实测量且看 p50**：`[dspark] steps=` 的 draft/verify/commit 分解（累计均值）+ per-step `[dsv41] step pos=` 行的 **p50**（中位数，最后 200 步——用户裁决 2026-09-13）；**禁止吞吐反推**（受 prefill/accept 污染）。**每次 nsys 分析完必须给用户当前的时间 breakdown 表**（各项 ms/步 + 占比 + 修复载体 + 修复后目标——用户裁决 2026-09-13）。
+1. **step time 必须真实测量且看 p50**：`[dsv41] step pos=` 行的 **p50**（中位数，最后 200 步——用户裁决 2026-09-13）；**禁止吞吐反推**（受 prefill/accept 污染）。**⚠️ `[dspark] steps=` 的 draft/verify/commit 分解是累积均值，不是 per-step 真实值——verify 可以比 step 还长（含 prefill 污染），不能用它做性能判断（用户裁决 2026-09-14：verify > step 一定是错的）**。**每次 nsys 分析完必须给用户当前的时间 breakdown 表**（各项 ms/步 + 占比 + 修复载体 + 修复后目标——用户裁决 2026-09-13）。
 2. **NCU 只跑特定 kernel 的 micro bench**（tests_*.cu 二进制），**不能 e2e**；**必须 sudo + 绝对路径**（`sudo /usr/local/cuda-13.2/bin/ncu -c N -o <rep> -f <test_bin>`——无 sudo 时 report 静默不写，三次失败实证；sudo 后 5.4MB rep 秒级生成）。**subagent 编译纪律**：默认只做**单文件 compile-only**（`nvcc -c shim.cu -o /tmp/x.o`）；**禁止 subagent 跑完整 `build.sh 103a`**（8-TU 全量 ~3.5 分钟 + 多 subagent 同时编译争抢 CPU——完整产物重编是主 agent 的统一职责；唯一例外：接线验证可用 `/tmp` 隔离副本跑一次全链确认 SRCS/头路径）。**subagent GPU 纪律（用户裁决 2026-09-13，铁律）**：**禁止 subagent 在远端机器上做一切 GPU 操作**——包括 micro bench、tilelang/python 运行、AOT 生成（占 GPU）、任何 GPU 占用——**GPU 测量是主 agent 的专属职责**（多 subagent 的 bench 一起跑会争抢 GPU 互相污染数据）。subagent 的远端活动仅限：nvcc compile-only（CPU）+ 文件读写。GPU 需求一律写成"生成命令清单/验证手册"留给主 agent 执行。
 3. **nsys 多跑**（per-kernel 时间唯一来源）。**成功配方（v6，实测验证 116MB rep）**：对常驻 serve 用 `nsys profile --trace=cuda --sample=none --duration=<秒> --kill=SIGTERM -o <rep>`（vLLM/SGLang 社区标准）——duration 到时 nsys 自动停采集并杀 serve → finalize → rep 落盘；脚本侧再 `POST /shutdown` 双保险 + 轮询 rep 文件出现（finalize 大 rep 要几分钟，116MB 正常）。**无 sudo 可行**（--trace=cuda --sample=none 免 perf 权限；wave1 与 v6 双重实证）。**禁用外部 SIGINT**（多进程架构下单播 INT 破坏 finalize，四连败教训）；清理进程用 `pkill -x nsys`/`pkill -x ferrite-serve`（`pkill -f nsys` 会匹配 ssh 自身命令行自杀）。**死锁规避必带**：`DSV41_AR_V5=0 DSV41_GRAPH_STEP=0` + `env -u FERRITE_P2P` + `NCCL_NVLS_ENABLE=0`；nsys 轮只看 kernel 相对倍数（AR 形态已变），吞吐数字必须来自非 nsys 轮。**提交纪律**：工作树有 peer subagent 运行时**禁止 `git add -A`**（半成品会被扫入 HEAD 导致远端编译失败——dsv41_kv_win_fetch 未定义事件实证）——只 add 自己确认过的文件。
 4. **所有 e2e 必须 background 模式**（serve 启动的 ssh 会挂住前台）。
@@ -107,13 +107,26 @@ LD_LIBRARY_PATH=$HOME/ferrite/kernels/cuda ./target/release/ferrite-serve --back
 - serve 卡住/日志 mtime 停滞 = 挂了（查 `stat -c %y` + pgrep，别等）。
 - 加载错防线（三道 runtime + 三道编译期 + git hooks）见 `docs/agent/` 的加载防线文档。
 
-## 当前状态与下一步（2026-09-14 晚——🎉 根因定谳：TileLang pipeline 是 m>1 crash 触发器，手写 kernel 0 errors）
+## 当前状态与下一步（2026-09-14 深夜——🎉🎉 数值验证完美通过：手写 kernel = TileLang bit-exact）
 
-**🎉 重大突破**：手写 kernel（验证过的 tcgen05 原语 + 顺序执行 + 直接 global load + __syncthreads）**不 crash**（0 errors vs TileLang 的 10 errors）。
-- **根因**：TileLang kernel 的 pipeline 结构（TMA + mbarrier + 3-stage）在 m>1（verify）场景下触发 illegal instruction
-- tcgen05 MMA 指令、数据加载、SF 处理全部正确
-- Gate: `DSV41_MOE_BS_HANDWRITTEN=1`（默认 OFF）
-- 修复 cudaFuncSetAttribute 缺失（smem 65536 > 48KB 默认）后正在验证输出质量
+**🎉🎉 完整成功链**：
+1. TileLang pipeline m>1 crash（根因确认：TMA + mbarrier + 3-stage 结构）
+2. 手写 kernel（验证过的 tcgen05 原语 + 顺序执行）→ 0 errors
+3. 输出乱码（row-major vs core matrix 布局不匹配）
+4. Core matrix 修复（addr(m,k) = (m/8)*1024 + (k/16)*128 + (m%8)*16 + (k%16)）
+5. **数值对比 PASS：0/3840 mismatches，bit-exact！**
+
+**手写 kernel 现在可以用于生产**（`DSV41_MOE_BS_HANDWRITTEN=1`）
+- verify = 34.5ms（顺序执行，无 pipeline）
+- 需要 cp.async 双缓冲优化 → ~22ms
+
+**Core Matrix 布局要点**（关键知识）：
+- UMMA smem descriptor 期望 8行×16B 的 core matrix 原子格式
+- `addr(m, k) = (m/8)*1024 + (k/16)*128 + (m%8)*16 + (k%16)`
+- lbo = 16B（原子内行距）= 1（16B 单位）
+- sbo = 1024B（原子间距）= 64（16B 单位）
+- layout = 0（无 swizzle）
+- TileLang 的 TMA 自动写这个布局；手写必须手动实现
 
 **判别实验（在跑）**：
 1. no-swallow（DSV41_SWALLOW_STEP=0）：verify 用 m=5（legacy arm）而非 m=6（swallowed arm）
