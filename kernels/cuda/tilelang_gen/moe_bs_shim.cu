@@ -892,6 +892,43 @@ extern "C" int dsv41_moe_tilelang_gate_up_bs_dev(
         xq4, xsc4, g_a, g_sfa, order_dev, counts_dev, kDim, kDim / 32, kSfWords, (int)topk, nseg_dev);
     cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) return (int)e;
+    // VARIABLE-ISOLATION DIAGNOSTICS (DSV41_MOE_BS_ZERO_{SF,A,EID}, default OFF):
+    // after the gather fills the buffers, ZERO one of them before the MMA to
+    // isolate WHICH data variable triggers the m=6 crash. m=1 works with all
+    // real data; m=6 crashes. If zeroing X makes m=6 work, X is the trigger.
+    {
+        static const int g_zero_mode = []() {
+            const char* v = getenv("DSV41_MOE_BS_ZERO_SF");
+            if (v != nullptr && v[0] != '0') return 1;  // SF only
+            v = getenv("DSV41_MOE_BS_ZERO_A");
+            if (v != nullptr && v[0] != '0') return 2;  // A only
+            v = getenv("DSV41_MOE_BS_ZERO_EID");
+            if (v != nullptr && v[0] != '0') return 3;  // EID only
+            v = getenv("DSV41_MOE_BS_ZERO_ALL");
+            if (v != nullptr && v[0] != '0') return 4;  // everything
+            return 0;  // off
+        }();
+        if (g_zero_mode != 0) {
+            static bool noted = false;
+            if (!noted) {
+                noted = true;
+                const char* what = g_zero_mode == 1 ? "SF" : g_zero_mode == 2 ? "A" :
+                                   g_zero_mode == 3 ? "EID" : "ALL";
+                fprintf(stderr, "[moe-bs][ZERO-DIAG] mode=%d (%s) — MMA sees zeroed data\n",
+                        g_zero_mode, what);
+            }
+            if (g_zero_mode == 1 || g_zero_mode == 4)
+                cudaMemsetAsync(g_sfa, 0, (size_t)kSfWords * kSegCap * kBm * 4, s);
+            if (g_zero_mode == 2 || g_zero_mode == 4)
+                cudaMemsetAsync(g_a, 0, (size_t)kSegCap * kBm * kDim, s);
+            if (g_zero_mode == 3 || g_zero_mode == 4) {
+                int zeros[kSegCap];
+                for (int i = 0; i < (int)kSegCap; ++i) zeros[i] = 0;
+                cudaMemcpyAsync(const_cast<int*>(eid_dev), zeros, kSegCap * sizeof(int),
+                                cudaMemcpyHostToDevice, s);
+            }
+        }
+    }
     // SYNC-DIAG (DSV41_MOE_BS_SYNC_DIAG=1): per-kernel sync to isolate which
     // kernel faults. Default OFF (sync kills perf). Enable for debugging only.
     static const bool g_sync_diag = []() {
