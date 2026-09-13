@@ -2685,3 +2685,48 @@ compressor 投影 mrows、`ATTN_PROJ_ALIGN` 等**代码已在**，出货脚本�
 - `SG1` vs `SG0`：accept 若上升且红线不破 ⇒ **draft/verify 程序不一致确实是 accept 被压在 ~2.2 的成因之一**
   ⇒ 按 §87 的**精度门**规则转正；
 - `SG2` vs `SG0`：必须**逐位一致**（同 kernel 同实参，只是发射形状不同）⇒ 若一致且 p50 改善 ⇒ 按**性能门**规则转正。
+
+## §106 【口径更正 + 目标重算】accept 计量差 1；450 tok/s ⇒ step ≈ 7.2 ms（不是 4.9 ms）
+
+来源：subagent `accept-2p2-vs-5p5`（纯 CPU 只读，已在收到用户两次澄清后重框）。**它纠正了主 agent §99 的算术。**
+
+### 🔴 更正一：**accept 计量口径差 1**（我们被先天低估 1/3）
+- 我方 `mean-k = 2.240`（`serve.rs:663-691`）计的是**被接受的 draft token 数，不含 bonus**；
+- SGLang 的 "accept length" **含 bonus**：硬证据是 **block size 5 而 accept = 5.5 > 5** ——
+  若不含 bonus，上限只有 5，5.5 在算术上**不可能**；再叠论文脚注"accepted length … include the
+  target-generated bonus token" ✓。
+- ⇒ **同口径下我们的数是 `tok/step = mean-k + 1 = 3.24`**，**不是 2.24** ✓。
+  **拿 2.24 去比 5.5 是"少算一个 token 再比"，先天低估我们约 1/3** ✗（我 §98/§99 就是这么比的，记此更正）。
+
+### ✅ 更正二：目标 step 重算
+`tok/s = tok/step ÷ step = (mean-k + 1) / step` ⇒ **450 tok/s @ tok/step = 3.24 ⇒ step ≈ 7.2 ms**
+（**不是** §99 写的 4.9 ms —— 我那里误用了 acc 2.2 而非 tok/step 3.24）⇒ **目标比原先设想的宽松** ✓。
+
+### 🎯 结论：**450 是 step 问题，不是 accept 问题**（与用户判断一致）
+现况 step ≈ 32.5 ms（draft 3.87 + verify 28.17 + commit 0.47）下：
+| 动作 | 吞吐 |
+|---|---|
+| 现状（tok/step 3.24 @ 32.5 ms） | ~100 tok/s |
+| 把 acc(mean-k) 提到 3.0 / 3.5（step 不动） | ~123 / ~138 tok/s（+23% / +38%） |
+| **step 压到 10 ms（acc 不动）** | **~324 tok/s（+224%）** |
+⇒ **压 step 的杠杆比提 acc 大 2.7 倍以上** ⇒ 主线必须继续压在 **verify/step 削减**上（与 §102 一致）。
+
+### 结构与块数：**与官方逐项相同**（故不是差异来源 ✓）
+`DSPARK_DRAFTS = 5`（编译期常量，**无 env**，是 accept 宽度的**权威**；`dspark_block_size` 须 =5，`>5` 只会多采样仍只验 5）、
+`VERIFY_ROWS = 6`（含静态断言 `== DRAFTS + 1`）、config `dspark_block_size = 5`、**3 层 MTP**
+（`dspark_target_layer_ids = [37,38,39]`）、**Markov head 参与 draft 生成**、draft 采样 = argmax（与主链贪心一致）、
+接受判据 = 最长公共前缀、**bonus token 存在**（`emitted = [next] ++ verify_out[..k_acc]`）。
+
+### ⚠️ 发现一个**文档陷阱**（数据卫生）
+`docs/agent/r0-r1-accept-diagnosis-manual.md:80` 那条带 `p1=0.7919 / hist={…} / oracle rate=0.868` 的
+`[acc-hist-summary]` 行，**该文件 line 83 明写"数字是格式示意，不是测量值"** ⇒ **不得作为实测引用** ✗。
+**当前栈的 accept 直方图从未实测过**（`acc_hist.rs:16-18` 自述）⇒ 硬证据只有两条：
+① `mean-k = 2.240`（多文档一致）；② **数字任务实测 `k_acc = 5 5 5 5 5`（打满块长上限）**
+⇒ **机制上没有把 accept 压在 5 以下的结构缺陷** ✓。
+
+### 从这条线得到的**可执行项**
+1. **`DSV41_ACC_HISTOGRAM=1` 必须真跑一次**（当前栈从未测过）⇒ 拿到真实 `k_acc` 分布，
+   才能判断 2.24 是"draft 质量的合理值"还是"有条件被浪费"。
+2. `DSV41_ATTN_PROJ_ALIGN` 那条线索（§103）它已纳入分析（draft 走 TILE 程序、verify 走 mrows ⇒ 同一权重两侧不同程序）
+   ⇒ 与 §105 的实验脚本配套。
+3. 报告口径**统一改成 `tok/step`**（含 bonus）对外比较；`mean-k` 保留为内部量。
