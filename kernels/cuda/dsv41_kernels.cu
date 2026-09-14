@@ -5859,6 +5859,11 @@ gemm_fp8_sh_pair_kernel(const uint8_t* __restrict__ a, const float* __restrict__
                 // swiglu_limit_kernel's clamp + silu, term for term. `v` is the
                 // SAME register value both consumers below use (the f32 store and
                 // the fp8 amax), never a global re-read.
+                // The official's swiglu inputs are bf16-valued (the linear's
+                // output is bf16 — fp8_gemm returns dtype=get_default_dtype()
+                // = bf16 — and .float() upcasts the ALREADY-ROUNDED value).
+                g = orope_bf16_round(g);
+                u = orope_bf16_round(u);
                 if (limit > 0.f) {
                     g = fminf(g, limit);                    // gate clamp
                     u = fminf(fmaxf(u, -limit), limit);     // up clamp

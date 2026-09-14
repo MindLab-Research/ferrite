@@ -178,8 +178,13 @@ __global__ void swiglu_limit_kernel(float* __restrict__ gate_up, int rows, int i
         const int r = (int)(t / (size_t)inter);
         const int i = (int)(t % (size_t)inter);
         float* row = gate_up + (size_t)r * 2 * inter;
-        float g = row[i];
-        float u = row[inter + i];
+        // The official's swiglu inputs are BF16-valued: the linear (fp4_gemm /
+        // fp8_gemm) outputs `dtype=torch.get_default_dtype()` = bf16, and
+        // `gate = self.w1(x).float()` upcasts the ALREADY-ROUNDED value. Our
+        // gemv writes raw f32 — round here or the silu*up consumes ~0.4%-off
+        // activations (the T1 pattern's fifth instance).
+        float g = glue_bf16_round(row[i]);
+        float u = glue_bf16_round(row[inter + i]);
         if (limit > 0.f) {
             g = fminf(g, limit);
             u = fminf(fmaxf(u, -limit), limit);
@@ -281,8 +286,8 @@ __global__ void swiglu_limit_q_kernel(float* __restrict__ gate_up, int rows, int
         const int b = (int)(t % (size_t)nb);
         float* row = gate_up + (size_t)r * 2 * inter;
         const int i = (b << 5) + lane;
-        float g = row[i];
-        float u = row[inter + i];
+        float g = glue_bf16_round(row[i]);
+        float u = glue_bf16_round(row[inter + i]);
         if (limit > 0.f) {
             g = fminf(g, limit);
             u = fminf(fmaxf(u, -limit), limit);
@@ -1010,8 +1015,8 @@ __global__ void swiglu_limit_batched_kernel(float* __restrict__ gate_up, int row
         const int r = (int)(t / (size_t)inter);
         const int i = (int)(t % (size_t)inter);
         float* row = base + (size_t)r * 2 * inter;
-        float g = row[i];
-        float u = row[inter + i];
+        float g = glue_bf16_round(row[i]);
+        float u = glue_bf16_round(row[inter + i]);
         if (limit > 0.f) {
             g = fminf(g, limit);
             u = fminf(fmaxf(u, -limit), limit);
