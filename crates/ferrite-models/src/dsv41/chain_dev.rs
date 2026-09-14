@@ -798,6 +798,17 @@ fn bf16_kv() -> bool {
     *F.get_or_init(|| std::env::var("DSV41_BF16_KV").map(|v| v != "0").unwrap_or(true))
 }
 
+/// The official's attention OUTPUT chain carries the same bf16 boundaries: the
+/// wo_b GEMM's output is bf16 (fp8_gemm's out_dtype) BEFORE the all-reduce —
+/// the per-rank partial the f32 AR sums is the rounded value (model.py:271-278
+/// RowParallelLinear: y.float() -> all_reduce -> .type_as(x)) — and the
+/// post-AR/hc_post outputs round again. This gate covers the o-chain's
+/// boundary points. DEFAULT ON; `DSV41_BF16_O=0` opts out.
+fn bf16_o() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_BF16_O").map(|v| v != "0").unwrap_or(true))
+}
+
 /// The official's q chain carries the same bf16 boundaries (the wq_a GEMM's
 /// output, the q norm's output, the wq_b GEMV's output, the rope in-place on
 /// bf16) — the sparse_attn reads a bf16 q. Our chain stays f32. Measured: with
@@ -4062,6 +4073,12 @@ fn hc_tail_split() -> bool {
                     ol_local as i32,
                 )?;
             }
+        }
+        // The official's wo_b output is bf16 (fp8_gemm's out_dtype) BEFORE the
+        // all-reduce — the per-rank partial the f32 AR sums is the ROUNDED
+        // value (model.py:271-278: y.float() -> all_reduce -> .type_as(x)).
+        if bf16_o() {
+            self.dev.bf16_round_inplace(self.s.o.ptr as *mut f32, dim as i32)?;
         }
         let mut hc_folded = false;
         if let Some(c) = comm {
