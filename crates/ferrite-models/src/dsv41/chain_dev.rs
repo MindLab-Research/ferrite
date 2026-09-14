@@ -3176,6 +3176,33 @@ fn hc_tail_split() -> bool {
         // T1 (ffn side): the tail emitted the fp8 of the ffn-norm output, so the
         // MoE's quant1(xn) - its first xq consumer - is redundant and skips.
         self.s.xq_of_xn_valid.set(ffn_done && !ffn_nw.is_null());
+        // FFN-side mix probe, to be compared with the reference's instrumented
+        // `hc_mixes` (its [fm] L0 ffn lines): pre/post/comb come out of the SAME
+        // `hc_mixes` call as the attention's, but with hc_ffn_* and the
+        // post-attention x, so they must be checked separately.
+        //   kind 700+layer = ffn_pre (what the NEXT layer collapses with)
+        //   kind 750+layer = ffn_post
+        //   kind 800+layer = ffn_comb (hc*hc)
+        if let Ok(xdp) = std::env::var("DSV41_GT_XDUMP") {
+            self.gt_dump_vec(
+                &xdp,
+                700 + layer as u64,
+                self.premix_slot(2).ptr as *mut std::ffi::c_void,
+                hc,
+            )?;
+            self.gt_dump_vec(
+                &xdp,
+                750 + layer as u64,
+                self.s.post.ptr as *mut std::ffi::c_void,
+                hc,
+            )?;
+            self.gt_dump_vec(
+                &xdp,
+                800 + layer as u64,
+                self.s.comb.ptr as *mut std::ffi::c_void,
+                hc * hc,
+            )?;
+        }
         if phase_dbg() {
             eprintln!("[phs] L{layer} ffn={:?}", _t_moe.elapsed());
         }
