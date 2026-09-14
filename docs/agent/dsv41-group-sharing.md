@@ -114,6 +114,35 @@ Reference-side counterpart: `ref_attn2.py` patches the module-level `sparse_attn
 and dumps `(q, kv, idxs)` for a chosen `(layer, pos)` — the strict split of "our
 inputs differ" versus "our operator differs".
 
+## Where the remaining glitches are (offline analysis of the one-shot dump)
+
+`dumpall.sh 200` produced every artefact in `/opt/dlami/nvme/dbg` (our per-step
+logits `ours_logits.bin`, full toktr, stdout/stderr, the reference's
+`ref_top5.txt` and `ref_logits.bin`). `analyze_div.py` then runs in SECONDS and
+is re-runnable — changing a threshold never costs another GPU run.
+
+Result (`interior-best offset d=+13, 192/201 match`; the three interior
+mismatches are generated indices 133, 192, 194 — i.e. the tokens for positions
+148, 207 and 209; everything before index 133 agrees):
+
+```
+--- generated index 133 (token for position 148) ---
+  our token = 3045
+  ref top5  = [(3186, 27.90), (2973, 13.75), (3045, 13.54), (1, 12.32), (29017, 11.64)]
+  our top5  = [(3045, 26.58), (3186, 25.05), (5198, 24.25), (25, 23.24), (3259, 21.80)]
+  ref top1-top5 margin = 16.26
+```
+
+⇒ **NOT a near-tie flip**: the reference picks 3186 with 27.90 and our chosen
+3045 is only its 3rd candidate at 13.54, while OUR 3045 sits at 26.58 — i.e. our
+logit for that token is ~+13 too high. Indices 192/194 show the same shape with a
+stray token (2143, the `跃`/`都不要` class) carrying a high logit.
+
+So the remaining glitches are STRUCTURAL logit errors at specific steps, not
+numerical tie-flipping, and the next step is a per-layer residual / attention
+bisection at position 148 with the tools already in place (`DSV41_GT_HDUMP` +
+`REF_HDUMP`, and `ref_attn2.py`'s q/kv/idxs hooks).
+
 ## Measurement discipline (users' standing rules, 2026-09-14)
 
 1. **ONE run, dump EVERYTHING, then analyse offline.** A diagnostic run must
