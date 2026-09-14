@@ -2535,6 +2535,16 @@ impl<'a> DevChain<'a> {
         } else {
             self.stats("final logits", &self.s.logits, cfg.vocab_size)?;
         }
+        // op-level diagnostic: OUR logits — kind 42 — for the direct per-step
+        // comparison against the ref's REF_LOGITS_OUT (the divergence magnitude,
+        // the top-k drift, the EOS/'64' scores at the crash steps). In the
+        // sliced path only this rank's slice is resident (the FIRST vocab/world
+        // entries — which contain the small token ids the counting probes and
+        // the EOS live in, so the decisive scores are all comparable).
+        if let Ok(xdp) = std::env::var("DSV41_GT_XDUMP") {
+            let n = if sliced { seg } else { cfg.vocab_size };
+            self.gt_dump_vec(&xdp, 42, self.s.logits.ptr, n)?;
+        }
         // Device-side argmax (the GLM HEAD_DEV pattern): the next token lands
         // straight in s.ids, which the next step's embedding reads — no 517 KB
         // full-vocab download, no O(vocab) host scan, and the token itself never
