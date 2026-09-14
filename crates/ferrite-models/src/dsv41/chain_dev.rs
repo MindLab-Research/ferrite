@@ -5347,6 +5347,10 @@ fn hc_tail_split() -> bool {
                         const { std::cell::RefCell::new(None) };
                     static EX_DOWN: std::cell::RefCell<Option<DevBuf>> =
                         const { std::cell::RefCell::new(None) };
+                    static EX_DQ: std::cell::RefCell<Option<DevBuf>> =
+                        const { std::cell::RefCell::new(None) };
+                    static EX_DSC: std::cell::RefCell<Option<DevBuf>> =
+                        const { std::cell::RefCell::new(None) };
                 }
                 let w_need = (inter_local * dim).max(dim * inter_local) * 4;
                 EX_W.with(|c| {
@@ -5381,37 +5385,47 @@ fn hc_tail_split() -> bool {
                     EX_ACT.with(|c| c.borrow().as_ref().unwrap().ptr),
                     EX_DOWN.with(|c| c.borrow().as_ref().unwrap().ptr),
                 );
+                // EX_DQ: the down's act_quant'd e4m3 input [inter_local bytes]
+                // EX_DSC: its per-32 f32 scales [inter_local/32 + 8]
+                let sc_need = (inter_local / 32 + 8) * 4;
+                EX_DQ.with(|c| {
+                    if c.borrow().is_none() {
+                        *c.borrow_mut() = Some(self.dev.alloc(inter_local.max(8)).unwrap());
+                    }
+                });
+                EX_DSC.with(|c| {
+                    if c.borrow().is_none() {
+                        *c.borrow_mut() = Some(self.dev.alloc(sc_need).unwrap());
+                    }
+                });
+                let (dq_buf, dsc_buf) = (
+                    EX_DQ.with(|c| c.borrow().as_ref().unwrap().ptr),
+                    EX_DSC.with(|c| c.borrow().as_ref().unwrap().ptr),
+                );
                 for slot in 0..topk {
                     let eid = ids_h[slot] as i64;
                     let rw = wts_h[slot];
                     if eid < 0 || eid as usize >= ne {
                         continue;
                     }
-                    // gate: dequant w1[eid] → gemv_f32(xn, w1_f32)
+                    // gate: expert_fp4_gemm_official(xq, xs, w1, w1s) — the
+                    // official's computation order (block dot → scale → acc)
                     let w1p = unsafe { w1_base.offset((eid * w1_stride) as isize) };
                     let w1sp = unsafe { w1s_base.offset((eid * w1s_stride) as isize) };
-                    self.dev.dequant_fp4_e2m1(
-                        w1p, w1sp, w_buf as *mut f32,
+                    self.dev.expert_fp4_gemm_official(
+                        self.s.xq.as_u8(), self.s.xsc.as_f32(),
+                        w1p, w1sp,
+                        g_buf as *mut f32,
                         inter_local as i32, dim as i32,
                     )?;
-                    self.dev.gemm_f32(
-                        self.s.xn.ptr as *const std::ffi::c_void,
-                        w_buf as *const std::ffi::c_void,
-                        g_buf as *mut f32,
-                        1, inter_local as i32, dim as i32,
-                    )?;
-                    // up: dequant w3[eid] → gemv_f32(xn, w3_f32)
+                    // up
                     let w3p = unsafe { w3_base.offset((eid * w3_stride) as isize) };
                     let w3sp = unsafe { w3s_base.offset((eid * w3s_stride) as isize) };
-                    self.dev.dequant_fp4_e2m1(
-                        w3p, w3sp, w_buf as *mut f32,
-                        inter_local as i32, dim as i32,
-                    )?;
-                    self.dev.gemm_f32(
-                        self.s.xn.ptr as *const std::ffi::c_void,
-                        w_buf as *const std::ffi::c_void,
+                    self.dev.expert_fp4_gemm_official(
+                        self.s.xq.as_u8(), self.s.xsc.as_f32(),
+                        w3p, w3sp,
                         u_buf as *mut f32,
-                        1, inter_local as i32, dim as i32,
+                        inter_local as i32, dim as i32,
                     )?;
                     // swiglu + routing weight + bf16 round (the official's
                     // Expert.forward: x = weights * silu(clamp(g))*clamp(u))
@@ -5420,18 +5434,25 @@ fn hc_tail_split() -> bool {
                         a_buf as *mut f32,
                         inter_local as i32, cfg.swiglu_limit, rw,
                     )?;
-                    // down: dequant w2[eid] → gemv_f32(act, w2_f32) → down_p
+                    // down: quantise act to e4m3 (act_quant, per-32 f32 scale)
+                    // then the same official kernel
+                    self.dev.quant_fp8_on(
+                        a_buf as *const f32,
+                        dq_buf as *mut u8,
+                        dsc_buf as *mut f32,
+                        1,
+                        inter_local as i32,
+                        32,
+                        false,
+                        self.dev.stream(),
+                    )?;
                     let w2p = unsafe { w2_base.offset((eid * w2_stride) as isize) };
                     let w2sp = unsafe { w2s_base.offset((eid * w2s_stride) as isize) };
-                    self.dev.dequant_fp4_e2m1(
-                        w2p, w2sp, w_buf as *mut f32,
-                        dim as i32, inter_local as i32,
-                    )?;
-                    self.dev.gemm_f32(
-                        a_buf as *const std::ffi::c_void,
-                        w_buf as *const std::ffi::c_void,
+                    self.dev.expert_fp4_gemm_official(
+                        dq_buf as *const u8, dsc_buf as *const f32,
+                        w2p, w2sp,
                         d_buf as *mut f32,
-                        1, dim as i32, inter_local as i32,
+                        dim as i32, inter_local as i32,
                     )?;
                     // Accumulate: s.o += down_p (fixed ascending slot order,
                     // the official's `y[idx] += expert(...)` semantics)
