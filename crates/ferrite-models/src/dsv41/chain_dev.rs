@@ -1878,6 +1878,42 @@ impl<'a> DevChain<'a> {
                 (n_cols * ehd) as i32,
             )?;
         }
+        // ---- engram raw dump (DSV41_ENG_DUMP=<path>), layer 1, rank 0 ----
+        //
+        // Writes the four arrays the official `Engram.forward` is built from so
+        // the entire internal chain (gather -> wkv -> key/value split -> rstd ->
+        // dot -> gate -> write-back) can be replayed in numpy on BOTH engines'
+        // bytes and diffed elementwise. Wire format:
+        //   u64 n_cols, hc, dim, ehd
+        //   i64 x n_cols                  (the n-gram hashes)
+        //   f32 x hc*dim                  (h, PRE-engram = the official's `x`)
+        //   f32 x n_cols*ehd              (the gathered rows, POST all-reduce)
+        //   f32 x (hc+1)*dim              (the wkv output = [key | value])
+        if let Ok(path) = std::env::var("DSV41_ENG_DUMP") {
+            if layer == 1 && self.rank() == 0 {
+                let dev = self.dev;
+                let mut out: Vec<u8> = Vec::new();
+                for v in [n_cols as u64, hc as u64, dim as u64, ehd as u64] {
+                    out.extend_from_slice(&v.to_le_bytes());
+                }
+                let mut grab = |src: *mut std::ffi::c_void, nbytes: usize| -> Result<()> {
+                    let at = out.len();
+                    out.resize(at + nbytes, 0);
+                    {
+                        let b = Device::view(src, nbytes);
+                        dev.download_u8(&b, &mut out[at..])?;
+                    }
+                    Ok(())
+                };
+                grab(ids as *mut std::ffi::c_void, n_cols * 8)?;
+                grab(self.s.h.ptr, hc * dim * 4)?;
+                grab(self.s.eng_rows.ptr, n_cols * ehd * 4)?;
+                grab(self.s.eng_kv.ptr, (hc + 1) * dim * 4)?;
+                drop(grab);
+                std::fs::write(&path, &out)
+                    .map_err(|e| FerriteError::Config(format!("DSV41_ENG_DUMP: {e:?}")))?;
+            }
+        }
         // gated write-back into h (in place)
         self.dev.engram_apply(
             self.s.h.ptr as *mut f32,
