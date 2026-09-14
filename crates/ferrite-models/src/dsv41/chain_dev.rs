@@ -3143,6 +3143,19 @@ fn hc_tail_split() -> bool {
         self.dev
             .bf16_round_inplace(self.s.h.ptr as *mut f32, (hc * dim) as i32)?;
 
+        // Probe the residual stream right after THIS attention's hc_post, i.e.
+        // the value the reference prints as "[refp] L0 after_attn hc_post
+        // h_rms=...". Isolates which of the two hc_posts diverges.
+        //   kind 720+layer = h after the attention-side hc_post
+        if let Ok(xdp) = std::env::var("DSV41_GT_XDUMP") {
+            self.gt_dump_vec(
+                &xdp,
+                720 + layer as u64,
+                self.s.h.ptr as *mut std::ffi::c_void,
+                hc * dim,
+            )?;
+        }
+
         if phase_dbg() {
             eprintln!("[phs] L{layer} attn={:?}", _t_all.elapsed());
         }
