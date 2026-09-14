@@ -573,6 +573,22 @@ fn add_epi() -> bool {
 }
 
 /// DSV41_MIX_GATE=0 keeps the MoE gate and the shared expert as two launches.
+/// DSV41_EXPERT_OFFICIAL_ORDER=1 switches the routed experts' gate/up/down to
+/// the official's computation order (per-32-block FP8act x FP4w dot with the
+/// scales applied to the block accumulator, then the bf16 `y[idx] += expert(...)`
+/// accumulation). DEFAULT OFF: the measured A/B regressed (pos15 moe_o scale
+/// 0.9993 -> 0.3848, the count test stopped counting), so the mxf4 K=64 /
+/// scale-folded-into-elements order stays the production path until the
+/// discrepancy is understood.
+fn expert_official_order() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("DSV41_EXPERT_OFFICIAL_ORDER")
+            .map(|v| v != "0")
+            .unwrap_or(false)
+    })
+}
+
 /// DEFAULT OFF (round 25: 9.38 vs 9.71ms - the mixed kernel's fp8 branch,
 /// even WITH the LUT+a32 port, is a net loss against the separate path
 /// where the shared expert's mx2 already has the full optimization set).
@@ -5518,7 +5534,7 @@ fn hc_tail_split() -> bool {
                 // accumulator). gate and up land contiguously in `ex_act` so
                 // `swiglu_limit` below still sees [gate | up].
                 let mut ids_h = vec![0i32; topk];
-                if expert_act_e4m3() {
+                if expert_official_order() {
                     let b = Device::view(
                         self.s.route_idx.ptr as *mut std::ffi::c_void,
                         topk * 4,
@@ -5537,7 +5553,7 @@ fn hc_tail_split() -> bool {
                     // forms the per-expert weight pointer). Resolved once per
                     // slot, before the gate/up and the down below both use it.
                     let mut eid: i64 = 0;
-                    if expert_act_e4m3() {
+                    if expert_official_order() {
                         eid = ids_h[slot] as i64;
                         if eid < 0 || eid as usize >= ne {
                             continue;
@@ -5635,17 +5651,34 @@ fn hc_tail_split() -> bool {
                         // per-32 block dot, scales on the block accumulator) with
                         // the official `y[idx] += expert(...)` (bf16) accumulation
                         // into s.o.
-                        let w2p = unsafe { w2_base.offset((eid * w2_stride) as isize) };
-                        let w2sp = unsafe { w2s_base.offset((eid * w2s_stride) as isize) };
-                        self.dev.expert_fp4_gemm_official_accum(
+                        if expert_official_order() {
+                            let w2p = unsafe { w2_base.offset((eid * w2_stride) as isize) };
+                            let w2sp = unsafe { w2s_base.offset((eid * w2s_stride) as isize) };
+                            self.dev.expert_fp4_gemm_official_accum(
+                                self.s.ex_q.as_u8(),
+                                self.s.ex_s.as_f32(),
+                                w2p,
+                                w2sp,
+                                self.s.o.ptr as *mut f32,
+                                dim as i32,
+                                inter_local as i32,
+                            )?;
+                        } else {
+                        self.dev.expert_down_fp8act_indirect(
                             self.s.ex_q.as_u8(),
                             self.s.ex_s.as_f32(),
-                            w2p,
-                            w2sp,
                             self.s.o.ptr as *mut f32,
+                            1,
                             dim as i32,
                             inter_local as i32,
+                            w2_base,
+                            w2_stride,
+                            w2s_base,
+                            w2s_stride,
+                            ids,
+                            slot as i32,
                         )?;
+                        }
                     } else {
                         self.dev.expert_down_fp4_indirect(
                             self.s.ex_act.ptr as *const f32,
