@@ -3487,6 +3487,7 @@ fn hc_tail_split() -> bool {
                 1,
                 false,
                 cfg.norm_eps,
+                bf16_kv(),
                 kv_stream,
             )?;
         if !nr_fused {
@@ -3499,6 +3500,12 @@ fn hc_tail_split() -> bool {
             cfg.norm_eps,
             kv_stream,
         )?;
+        // The official's kv_norm output is `.to(dtype)` = bf16 — the rope reads
+        // the ROUNDED values (the fused rmsnorm_rope path applies this inside
+        // the kernel; the unfused fallback needs it between the two launches).
+        if bf16_kv() {
+            self.dev.bf16_round_inplace_on(self.s.kv.ptr as *mut f32, hd as i32, kv_stream)?;
+        }
         self.dev.apply_rope_on(
             self.s.kv.ptr as *mut f32,
             self.cos.as_f32(),

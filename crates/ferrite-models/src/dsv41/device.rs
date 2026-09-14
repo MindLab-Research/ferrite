@@ -282,7 +282,7 @@ struct Kernels {
     // pair). Optional: an older .so without it falls back to the two launches.
     rmsnorm_rope: Option<unsafe extern "C" fn(
         *const f32, *const f32, *mut f32, *const f32, *const f32, c_int, c_int, c_int, c_int,
-        *const c_int, c_int, c_int, c_int, c_int, f32, CuStream,
+        *const c_int, c_int, c_int, c_int, c_int, f32, c_int, CuStream,
     ) -> c_int>,
     // T2: rmsnorm that ALSO emits the fp8 (byte + per-32-block scale) of its own
     // normalised output, so the next fp8 activation consumer of that row (the
@@ -2257,10 +2257,11 @@ impl Device {
         step: i32,
         inverse: bool,
         eps: f32,
+        bf16_norm: bool,
     ) -> Result<bool> {
         self.rmsnorm_rope_on(
             x, w, out, cos, sin, n, dim, rope_len, half, base, mul, off, step, inverse, eps,
-            self.stream,
+            bf16_norm, self.stream,
         )
     }
 
@@ -2286,6 +2287,7 @@ impl Device {
         step: i32,
         inverse: bool,
         eps: f32,
+        bf16_norm: bool,
         s: CuStream,
     ) -> Result<bool> {
         let f = match self.kernels.rmsnorm_rope {
@@ -2294,7 +2296,7 @@ impl Device {
         };
         let rc = unsafe {
             f(x, w, out, cos, sin, n, dim, rope_len, half, base, mul, off, step, inverse as i32,
-              eps, s)
+              eps, bf16_norm as i32, s)
         };
         self.kerr(rc, "dsv41_rmsnorm_rope")?;
         Ok(true)
@@ -3090,6 +3092,14 @@ impl Device {
     pub fn bf16_round_inplace(&self, x: *mut f32, n: i32) -> Result<()> {
         let f = self.need(self.kernels.bf16_round_inplace, "dsv41_bf16_round_inplace")?;
         let rc = unsafe { f(x, n, self.stream) };
+        self.kerr(rc, "dsv41_bf16_round_inplace")
+    }
+
+    /// [`Self::bf16_round_inplace`] on an explicit stream — the kv chain's
+    /// DUAL_STREAM arm needs the round to land on `kv_stream`, not the main.
+    pub fn bf16_round_inplace_on(&self, x: *mut f32, n: i32, s: CuStream) -> Result<()> {
+        let f = self.need(self.kernels.bf16_round_inplace, "dsv41_bf16_round_inplace")?;
+        let rc = unsafe { f(x, n, s) };
         self.kerr(rc, "dsv41_bf16_round_inplace")
     }
 

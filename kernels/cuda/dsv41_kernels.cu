@@ -2317,7 +2317,7 @@ __global__ void rmsnorm_rope_kernel(const float* __restrict__ x, const float* __
                                     float* __restrict__ out, const float* __restrict__ cos,
                                     const float* __restrict__ sin, int n, int dim,
                                     int rope_len, int half, const int* __restrict__ base, int mul,
-                                    int off, int step, int inverse, float eps) {
+                                    int off, int step, int inverse, float eps, int bf16_norm) {
     const int row_i = blockIdx.x;
     if (row_i >= n) return;
     const float* xr = x + (size_t)row_i * dim;
@@ -2337,7 +2337,19 @@ __global__ void rmsnorm_rope_kernel(const float* __restrict__ x, const float* __
     }
     __syncthreads();
     const float inv = red[0];
-    for (int i = threadIdx.x; i < dim; i += blockDim.x) or_[i] = xr[i] * inv * w[i];
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        float v = xr[i] * inv * w[i];
+        // The official's norm output is `.to(dtype)` = bf16 — the rope (and
+        // every later consumer) reads the ROUNDED values. The fused path used
+        // to skip this boundary (the T1 pattern), feeding the rope ~0.4%-off
+        // un-rounded activations.
+        if (bf16_norm) {
+            uint32_t u = __float_as_uint(v);
+            u += 0x7fffu + ((u >> 16) & 1u);
+            v = __uint_as_float((uint32_t)((uint16_t)(u >> 16)) << 16);
+        }
+        or_[i] = v;
+    }
     if (rope_len <= 0) return;
     __syncthreads();   // the rope pass reads what the norm pass wrote
     const int t = (*base) * mul + off + row_i * step;
@@ -6927,10 +6939,10 @@ extern "C" int dsv41_apply_rope_q(float* x, const float* cos, const float* sin, 
 extern "C" int dsv41_rmsnorm_rope(const float* x, const float* w, float* out, const float* cos,
                                   const float* sin, int n, int dim, int rope_len, int half,
                                   const int* base, int mul, int off, int step, int inverse,
-                                  float eps, cudaStream_t s) {
+                                  float eps, int bf16_norm, cudaStream_t s) {
     if (n <= 0 || dim <= 0) return (int)cudaErrorInvalidValue;
     rmsnorm_rope_kernel<<<n, 1024, 0, s>>>(x, w, out, cos, sin, n, dim, rope_len, half, base, mul,
-                                          off, step, inverse, eps);
+                                          off, step, inverse, eps, bf16_norm);
     return (int)cudaGetLastError();
 }
 
