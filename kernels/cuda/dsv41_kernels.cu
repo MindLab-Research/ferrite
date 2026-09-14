@@ -7531,6 +7531,16 @@ __global__ void dsv41_hc_collapse_norm_kernel(const float* __restrict__ x,
     for (int c = threadIdx.x; c < dim; c += blockDim.x) {
         float acc = 0.f;
         for (int i = 0; i < hc; ++i) acc = fmaf(pre_r[i], x_r[(size_t)i * dim + c], acc);
+        // The reference's hc_pre ends with `.to(x.dtype)` and `x` is the bf16
+        // residual stream, so the collapse LANDS IN BF16 *before* the norm that
+        // consumes it (Block.forward: `x = self.hc_pre(x, pre_mix)` is followed
+        // by `x = self.attn_norm(x)`). Rounding only AFTER the norm normalises
+        // different low bits — at L0/pos0 the input happened to be bf16-exact
+        // already (the collapse is `[1,0,0,0] x h`), which is why the dump
+        // matched; from L1 on the weights are general and the gap shows.
+        uint32_t u = __float_as_uint(acc);
+        u += 0x7fffu + ((u >> 16) & 1u);
+        acc = __uint_as_float((uint32_t)((uint16_t)(u >> 16)) << 16);
         o_r[c] = acc;
         ss += acc * acc;
     }

@@ -2504,6 +2504,12 @@ impl<'a> DevChain<'a> {
             // the engram writes into the residual stream BEFORE the block runs
             if let Some(&(_, li)) = eng_layer_of.iter().find(|(l, _)| *l == layer) {
                 self.engram_apply(layer, li)?;
+                // The reference's Engram.forward also ends with `.to(x.dtype)` and
+                // x is the bf16 residual stream, so the engram add lands in bf16
+                // before the layer's pre-hook (Block.forward line 1322 sits inside
+                // the same loop iteration as the layer call).
+                self.dev
+                    .bf16_round_inplace(self.s.h.ptr as *mut f32, (hc * dim) as i32)?;
             }
             // Diagnostic per-layer residual dump: the INPUT h of this layer
             // (post-engram), matching the official reference's pre-hook
