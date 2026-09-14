@@ -2816,10 +2816,18 @@ __global__ void indexer_score_kernel_v2(const float* __restrict__ q, const float
         }
         if (WPR == 1) {
             // No K-split: this warp owns the whole dot and publishes directly.
-            const float sv = (live && lane < nh) ? fmaxf(dot, 0.f) * wrow[lane] : 0.f;
-            const float tot = idx_head_fold(sv);
+            // The official's score chain is bf16 end-to-end (model.py:555-557):
+            // the einsum's dot, the weights (with the scales FOLDED IN — D3),
+            // the per-head product, and the head sum all round to bf16; the
+            // store then carries no scale (it rides the weights).
+            const float d_bf = orope_bf16_round(dot);
+            const float w_s = orope_bf16_round(wrow[lane] * softmax_scale * head_scale);
+            const float sv = (live && lane < nh)
+                                 ? orope_bf16_round(fmaxf(d_bf, 0.f) * w_s)
+                                 : 0.f;
+            const float tot = orope_bf16_round(idx_head_fold(sv));
             if (lane == 0 && live)
-                idx_score_store(g_idx_score[row], p, cl, tot, softmax_scale, head_scale, cand, row,
+                idx_score_store(g_idx_score[row], p, cl, tot, 1.f, 1.f, cand, row,
                                 n_pos, uses_cand);
         } else {
             // Stage the per-slice partial of every head, fold the WPR slices in
@@ -2831,10 +2839,15 @@ __global__ void indexer_score_kernel_v2(const float* __restrict__ q, const float
                 float full = 0.f;
 #pragma unroll
                 for (int j = 0; j < WPR; ++j) full += s_part[g * WPR + j][lane];
-                const float sv = (live && lane < nh) ? fmaxf(full, 0.f) * wrow[lane] : 0.f;
-                const float tot = idx_head_fold(sv);
+                // The same bf16 score chain as the WPR==1 arm (see above).
+                const float d_bf = orope_bf16_round(full);
+                const float w_s = orope_bf16_round(wrow[lane] * softmax_scale * head_scale);
+                const float sv = (live && lane < nh)
+                                     ? orope_bf16_round(fmaxf(d_bf, 0.f) * w_s)
+                                     : 0.f;
+                const float tot = orope_bf16_round(idx_head_fold(sv));
                 if (lane == 0 && live)
-                    idx_score_store(g_idx_score[row], p, cl, tot, softmax_scale, head_scale, cand,
+                    idx_score_store(g_idx_score[row], p, cl, tot, 1.f, 1.f, cand,
                                     row, n_pos, uses_cand);
             }
             // Before the next round overwrites s_part.
