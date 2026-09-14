@@ -1048,7 +1048,13 @@ __global__ void sparse_attn_kernel(const float* __restrict__ q, const float* __r
             // (c - threadIdx.x) / blockDim.x (NOT c / blockDim.x: that is only
             // correct for thread 0).
             const int i = (c - (int)threadIdx.x) / (int)blockDim.x;
-            orow[c] = (se > 0.f) ? acc[i] / se : 0.f;
+            // The official's `o` is a BF16 tensor (`o = torch.empty_like(q)` with q
+            // BF16), so the normalised row enters the bf16 value domain. The
+            // split/merge arms already do this (sparse_attn_merge_kernel); this
+            // kernel did not, which left every output word ~2e-3 off (exactly a
+            // bf16 rounding) even where the arithmetic agreed.
+            const float vout = (se > 0.f) ? acc[i] / se : 0.f;
+            orow[c] = bf16_dom ? kattn_bf16_round(vout) : vout;
         }
     }
 }
