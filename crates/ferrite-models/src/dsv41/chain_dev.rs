@@ -4073,47 +4073,60 @@ fn hc_tail_split() -> bool {
         let mut woa_ok = false;
         if !wo_fuse && Self::woa_f32() && self.dev.supports_gemm_fp8_f32() {
             if Self::woa_cublas() {
-                // cuBLAS path: dequantize fp8 weights to f32 ONCE (cached by
-                // the weight pointer — the weights are constant), then call
-                // gemm_f32 per group — matching the official's einsum
-                // accumulation order (the o-proj chain is the 3× amplification
-                // source per the kind 50/51 bisection). The first version
-                // allocated on EVERY call (40 layers × 200 steps = 8000
-                // allocations) and OOM'd at 192.3 GiB.
+                // cuBLAS bf16 HMMA path — bit-exact with the official's
+                // einsum("bsgd,grd->bsgr", o_bf16, wo_a_bf16) which runs on
+                // cuBLAS BF16 tensor cores (HMMA k=16 tiles). The earlier
+                // gemm_f32 version used SIMT f32 FMA chains — a different
+                // accumulation order that flipped ~1/1024 outputs by 1 ulp
+                // (the wo_a oracle test, 2026-09-14).
+                // Weights: dequant fp8→f32→bf16 ONCE (cached, leaked).
+                // Activations: f32 (bf16-valued) → bf16 per call (temp).
                 thread_local! {
-                    static WOA_F32_CACHE: std::cell::RefCell<std::collections::HashMap<usize, usize>> =
+                    static WOA_BF16_CACHE: std::cell::RefCell<std::collections::HashMap<usize, usize>> =
                         std::cell::RefCell::new(std::collections::HashMap::new());
                 }
                 let w_key = ld.wo_a.as_ref().unwrap().as_u8() as usize;
-                let cached = WOA_F32_CACHE.with(|c| c.borrow().get(&w_key).copied());
-                let wf_base: *const f32 = match cached {
-                    Some(p) => p as *const f32,
+                let cached = WOA_BF16_CACHE.with(|c| c.borrow().get(&w_key).copied());
+                let wb_base: *const std::ffi::c_void = match cached {
+                    Some(p) => p as *const std::ffi::c_void,
                     None => {
                         let n_total = nlg * olg;
-                        // Leak the buffer: the weights are constant for the
-                        // process lifetime; 40 layers × ~512 KiB = ~20 MiB.
-                        let buf = Box::leak(Box::new(
-                            self.dev.alloc(n_total * k * 4)?,
-                        ));
+                        // f32 staging (dequant target) + bf16 storage (final)
+                        let f32_buf = Box::leak(Box::new(self.dev.alloc(n_total * k * 4)?));
+                        let bf16_buf = Box::leak(Box::new(self.dev.alloc(n_total * k * 2)?));
                         self.dev.dequant_fp8_ue8m0(
                             ld.wo_a.as_ref().unwrap().as_u8(),
                             ld.wo_a_scale.as_ref().unwrap().as_u8(),
-                            buf.ptr as *mut f32,
+                            f32_buf.ptr as *mut f32,
                             n_total as i32,
                             k as i32,
                         )?;
-                        let p = buf.ptr as usize;
-                        WOA_F32_CACHE.with(|c| c.borrow_mut().insert(w_key, p));
-                        p as *const f32
+                        self.dev.cast_f32_to_bf16(
+                            f32_buf.ptr as *const f32,
+                            bf16_buf.ptr as *mut std::ffi::c_void,
+                            (n_total * k) as i32,
+                        )?;
+                        let p = bf16_buf.ptr as usize;
+                        WOA_BF16_CACHE.with(|c| c.borrow_mut().insert(w_key, p));
+                        p as *const std::ffi::c_void
                     }
                 };
+                // Activations: cast this rank's o (f32, bf16-valued) → bf16
+                // storage, then one gemm_bf16 per group.
+                let n_act = nlg * k;
+                let act_bf16 = self.dev.alloc(n_act * 2)?;
+                self.dev.cast_f32_to_bf16(
+                    self.s.o.ptr as *const f32,
+                    act_bf16.ptr as *mut std::ffi::c_void,
+                    n_act as i32,
+                )?;
                 for g in 0..nlg {
-                    let af = (self.s.o.ptr as *const f32).wrapping_add(g * k);
-                    let wf = wf_base.wrapping_add(g * olg * k);
+                    let ab = (act_bf16.ptr as *const u8).wrapping_add(g * k * 2);
+                    let wb = (wb_base as *const u8).wrapping_add(g * olg * k * 2);
                     let out = (self.s.wo.ptr as *mut f32).wrapping_add(g * olg);
-                    self.dev.gemm_f32(
-                        af as *const std::ffi::c_void,
-                        wf as *const std::ffi::c_void,
+                    self.dev.gemm_bf16(
+                        ab as *const std::ffi::c_void,
+                        wb as *const std::ffi::c_void,
                         out,
                         1,
                         olg as i32,
@@ -4276,6 +4289,14 @@ fn hc_tail_split() -> bool {
                 // store already done by the fused epilogue; publish+reduce only.
                 // Must stay adjacent to the gemv above (same *epoch).
                 c.all_reduce_inplace_pubred_only(self.s.o.ptr as *mut std::ffi::c_void, fb(dim))?;
+                // The official's FINAL output is bf16 (model.py:278
+                // `return y.type_as(x)` — the AR result is rounded back to
+                // bf16 BEFORE hc_post consumes it). Without this round the
+                // AR's extra f32 precision leaks into the residual stream and
+                // compounds over 40 layers.
+                if bf16_o() {
+                    self.dev.bf16_round_inplace(self.s.o.ptr as *mut f32, dim as i32)?;
+                }
             } else {
                 // Segment-C fold: when it runs, the pubred epilogue has already
                 // written THIS layer's hc_post onto the residual stream, so
@@ -4290,6 +4311,11 @@ fn hc_tail_split() -> bool {
                 )?;
                 if !hc_folded {
                     c.all_reduce_inplace(self.s.o.ptr as *mut std::ffi::c_void, fb(dim))?;
+                    // Same final bf16 round as above (the official's
+                    // `y.type_as(x)` after the all-reduce).
+                    if bf16_o() {
+                        self.dev.bf16_round_inplace(self.s.o.ptr as *mut f32, dim as i32)?;
+                    }
                 }
             }
             c.end_round();

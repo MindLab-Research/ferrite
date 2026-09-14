@@ -370,6 +370,9 @@ struct Kernels {
     dequant_fp8_ue8m0: Option<
         unsafe extern "C" fn(*const u8, *const u8, *mut f32, c_int, c_int, CuStream) -> c_int,
     >,
+    cast_f32_to_bf16: Option<
+        unsafe extern "C" fn(*const f32, *mut c_void, c_int, CuStream) -> c_int,
+    >,
     comp_placeholder:
         Option<unsafe extern "C" fn(*mut i32, *const c_int, c_int, c_int, CuStream) -> c_int>,
     ring_append:
@@ -837,6 +840,7 @@ impl Device {
             bf16_round_inplace: ko!(rt, "dsv41_bf16_round_inplace"),
             vec_scale_bf16_round: ko!(rt, "dsv41_vec_scale_bf16_round"),
             dequant_fp8_ue8m0: ko!(rt, "dsv41_dequant_fp8_ue8m0"),
+            cast_f32_to_bf16: ko!(rt, "dsv41_cast_f32_to_bf16"),
             comp_placeholder: ko!(rt, "dsv41_comp_placeholder"),
             compress_commit: ko!(rt, "dsv41_compress_commit"),
             ring_append: ko!(rt, "dsv41_ring_append"),
@@ -3146,6 +3150,14 @@ impl Device {
         let f = self.need(self.kernels.dequant_fp8_ue8m0, "dsv41_dequant_fp8_ue8m0")?;
         let rc = unsafe { f(w, ws, out, n, k, self.stream) };
         self.kerr(rc, "dsv41_dequant_fp8_ue8m0")
+    }
+
+    /// Cast an f32 buffer into bf16 storage — the input layout for cuBLAS
+    /// bf16 HMMA (`gemm_bf16`), matching the official's `.to(torch.bfloat16)`.
+    pub fn cast_f32_to_bf16(&self, x: *const f32, y: *mut c_void, n: i32) -> Result<()> {
+        let f = self.need(self.kernels.cast_f32_to_bf16, "dsv41_cast_f32_to_bf16")?;
+        let rc = unsafe { f(x, y, n, self.stream) };
+        self.kerr(rc, "dsv41_cast_f32_to_bf16")
     }
 
     /// Publish the roped index key into the owner's group slot, with the slot

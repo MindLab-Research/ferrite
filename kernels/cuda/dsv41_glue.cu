@@ -663,6 +663,21 @@ extern "C" int dsv41_dequant_fp8_ue8m0(const uint8_t* w, const uint8_t* ws, floa
     return (int)cudaGetLastError();
 }
 
+// Cast an f32 buffer (typically bf16-valued) into bf16 storage — the input
+// layout for cuBLAS bf16 HMMA (gemm_bf16). The round is round-to-nearest-even
+// (same as __float2bfloat16 / the official's .to(torch.bfloat16)).
+__global__ void cast_f32_to_bf16_kernel(const float* __restrict__ x,
+                                        __nv_bfloat16* __restrict__ y, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] = __float2bfloat16(x[i]);
+}
+
+extern "C" int dsv41_cast_f32_to_bf16(const float* x, void* y, int n, cudaStream_t s) {
+    if (n <= 0) return 0;
+    cast_f32_to_bf16_kernel<<<(unsigned)((n + 255) / 256), 256, 0, s>>>(x, (__nv_bfloat16*)y, n);
+    return (int)cudaGetLastError();
+}
+
 extern "C" int dsv41_vec_scale_bf16_round(float* v, int n, const float* w, cudaStream_t s) {
     if (n <= 0) return (int)cudaSuccess;
     vec_scale_bf16_round_kernel<<<(unsigned)((n + 255) / 256), 256, 0, s>>>(v, n, w);
