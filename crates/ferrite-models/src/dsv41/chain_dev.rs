@@ -4222,6 +4222,13 @@ fn hc_tail_split() -> bool {
             )?;
         }
         if !wo_paired && !wb_f32 {
+            // op-level diagnostic: the wo_a output (= wo_b's input) — kind 52,
+            // n = nlg*olg. Layer 0 only; pairs with the ref's wobpre hook.
+            if let Ok(xdp) = std::env::var("DSV41_GT_XDUMP") {
+                if layer == 0 {
+                    self.gt_dump_vec(&xdp, 52, self.s.wo.ptr, (nlg * olg) as usize)?;
+                }
+            }
             let (wb_q, wb_sc) = if wo_fused {
                 (self.s.wo_q.as_u8(), self.s.wo_qsc.as_f32())
             } else {
