@@ -3925,6 +3925,37 @@ fn hc_tail_split() -> bool {
         if let Ok(xdp) = std::env::var("DSV41_GT_XDUMP") {
             if layer == 0 {
                 self.gt_dump_vec(&xdp, 50, self.s.q.ptr, (nlh * hd) as usize)?;
+                // The attention operator's REAL inputs, so the official kernel can
+                // be run on exactly what we feed ours (the strict split of "our
+                // inputs differ" vs "our operator differs"):
+                //   kind 31 = the ring kv's live rows (clen * hd)
+                //   kind 32 = the idxs (raw int32 bytes, win + index_topk of row 0)
+                //   kind 34 = [win, index_topk, scale, clen] as f32
+                let mut cl_h = [0i32; 1];
+                let cb = Device::view(
+                    (self.s.clen.ptr as *const i32).wrapping_add(owner) as *mut std::ffi::c_void,
+                    4,
+                );
+                self.dev.download_u8(&cb, unsafe {
+                    std::slice::from_raw_parts_mut(cl_h.as_mut_ptr() as *mut u8, 4)
+                })?;
+                let nkv = (cl_h[0].max(0) as usize)
+                    .saturating_mul(hd as usize)
+                    .min(65536);
+                if nkv > 0 {
+                    self.gt_dump_vec(&xdp, 31, ring_ptr, nkv)?;
+                }
+                let nix = (win + cfg.index_topk) as usize;
+                if nix > 0 {
+                    self.gt_dump_vec(&xdp, 32, idxs_ptr as *mut std::ffi::c_void, nix)?;
+                }
+                let sc = [
+                    win as f32,
+                    cfg.index_topk as f32,
+                    1.0f32 / (hd as f32).sqrt(),
+                    cl_h[0] as f32,
+                ];
+                self.gt_dump_vec(&xdp, 34, sc.as_ptr() as *mut std::ffi::c_void, 4)?;
             }
         }
 
