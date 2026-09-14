@@ -4283,6 +4283,15 @@ fn hc_tail_split() -> bool {
         if bf16_o() {
             self.dev.bf16_round_inplace(self.s.o.ptr as *mut f32, dim as i32)?;
         }
+        // op-level diagnostic: the wo_b pre-AR partial (= this rank's fp8 GEMM
+        // output, bf16-valued) — kind 53, n = dim. Layer 0 only. The wo_a fix
+        // showed attn_o unchanged, so the wo_b GEMM's accumulation order is
+        // the last suspect (gemm_fp8_mx_q vs tilelang fp8_gemm).
+        if let Ok(xdp) = std::env::var("DSV41_GT_XDUMP") {
+            if layer == 0 {
+                self.gt_dump_vec(&xdp, 53, self.s.o.ptr, dim as usize)?;
+            }
+        }
         let mut hc_folded = false;
         if let Some(c) = comm {
             if ar_store_fused {
