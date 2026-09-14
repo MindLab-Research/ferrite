@@ -1880,11 +1880,11 @@ impl<'a> DevChain<'a> {
         }
         // ---- engram raw dump (DSV41_ENG_DUMP=<path>), layer 1, rank 0 ----
         //
-        // Writes the four arrays the official `Engram.forward` is built from so
-        // the entire internal chain (gather -> wkv -> key/value split -> rstd ->
-        // dot -> gate -> write-back) can be replayed in numpy on BOTH engines'
-        // bytes and diffed elementwise. Wire format:
-        //   u64 n_cols, hc, dim, ehd
+        // Appends one record per call so the same arrays can be lined up with
+        // the official reference POSITION BY POSITION (a pos-0-only dump was
+        // compared against a non-pos-0 run and produced a bogus "ids differ"
+        // verdict). Wire format, little-endian:
+        //   u64 step_count, pos, token, n_cols, hc, dim, ehd
         //   i64 x n_cols                  (the n-gram hashes)
         //   f32 x hc*dim                  (h, PRE-engram = the official's `x`)
         //   f32 x n_cols*ehd              (the gathered rows, POST all-reduce)
@@ -1892,8 +1892,26 @@ impl<'a> DevChain<'a> {
         if let Ok(path) = std::env::var("DSV41_ENG_DUMP") {
             if layer == 1 && self.rank() == 0 {
                 let dev = self.dev;
+                let mut pos_h = [0i32; 1];
+                let pb = Device::view(self.s.pos_ctr.ptr, 4);
+                dev.download_u8(&pb, unsafe {
+                    std::slice::from_raw_parts_mut(pos_h.as_mut_ptr() as *mut u8, 4)
+                })?;
+                let mut tok_h = [0i32; 1];
+                let tb = Device::view(self.s.ids.ptr as *mut std::ffi::c_void, 4);
+                dev.download_u8(&tb, unsafe {
+                    std::slice::from_raw_parts_mut(tok_h.as_mut_ptr() as *mut u8, 4)
+                })?;
                 let mut out: Vec<u8> = Vec::new();
-                for v in [n_cols as u64, hc as u64, dim as u64, ehd as u64] {
+                for v in [
+                    self.step_count as u64,
+                    pos_h[0] as u64 & 0xffff_ffff,
+                    tok_h[0] as u64 & 0xffff_ffff,
+                    n_cols as u64,
+                    hc as u64,
+                    dim as u64,
+                    ehd as u64,
+                ] {
                     out.extend_from_slice(&v.to_le_bytes());
                 }
                 let mut grab = |src: *mut std::ffi::c_void, nbytes: usize| -> Result<()> {
@@ -1910,8 +1928,16 @@ impl<'a> DevChain<'a> {
                 grab(self.s.eng_rows.ptr, n_cols * ehd * 4)?;
                 grab(self.s.eng_kv.ptr, (hc + 1) * dim * 4)?;
                 drop(grab);
-                std::fs::write(&path, &out)
-                    .map_err(|e| FerriteError::Config(format!("DSV41_ENG_DUMP: {e:?}")))?;
+                {
+                    use std::io::Write as _;
+                    let mut f = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&path)
+                        .map_err(|e| FerriteError::Config(format!("DSV41_ENG_DUMP open: {e:?}")))?;
+                    f.write_all(&out)
+                        .map_err(|e| FerriteError::Config(format!("DSV41_ENG_DUMP: {e:?}")))?;
+                }
             }
         }
         // gated write-back into h (in place)
