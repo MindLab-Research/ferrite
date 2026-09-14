@@ -250,3 +250,31 @@ wo_a (0.254%→~0.4%) → wo_b (→~0.6%) → AR (→~0.7%) → hc_post (→0.79
 确实被进入。前一轮的 attn_o 0.79% 是 cuBLAS 路径生效时的读数（与基线相同）
 —— **wo_a 的 gemv vs cuBLAS 累加序差异不是 3× 放大的主源**（但前轮 OOM 崩溃可能污染了输出，
 需清洁复测）。
+
+## 🎯 rope 表位级修复——BIT_EXACT 定谳（2026-09-14 04:40，commit 40b812ea）
+
+**单元测试链路（用户指示"直接证明不猜"后的完整闭环）**：
+1. C 测试程序（/tmp/rope_test.c）dlopen .so 调用 dsv41_rope_precompute，dump cos/sin
+2. 官方侧 Python 逐行照抄 precompute_freqs_cis（model.py:369-389），torch.polar 生成表
+3. 逐位对比
+
+**定谳数据**：
+| 版本 | cos 差异 | sin 差异 | 结论 |
+|---|---|---|---|
+| 设备端 cosf（--use_fast_math） | 6436/8192 (78.6%) | 7693/8192 (93.9%) | 差 1-4 ulp |
+| host 完全照抄官方（40b812ea） | **0/8192** | **0/8192** | **BIT_EXACT** |
+
+**根因**：官方 precompute_freqs_cis 在 **CPU** 上运行（torch.arange 无 device 参数 → CPU；
+torch.polar → glibc cosf/sinf）。CUDA 设备端的 cosf/sinf 是完全不同的实现（fast math 下更是
+快速近似）。**位级一致唯一路径 = host 上用 glibc 的 cosf/sinf。**
+
+**修复的三个关键点**（之前 host 双精度版本失败的原因）：
+1. `1.0f / powf(base, q)`（正指数再倒数）——不是 `powf(base, -q)`（负指数），浮点结果不同
+2. `(float)tt * freqs[i]`（f32 乘法）——不是 `(double)tt * f`（double 乘法），舍入不同
+3. `cosf(a)/sinf(a)`（host glibc）——不是 `std::cos((double)a)`（虽然 glibc 内部也是 double，
+   但直接调 cosf 保证走完全相同的代码路径）
+
+**启动时一次 H2D**（与权重上传同类，非推理热路径）——用户确认 rope 表提前算好即可。
+
+**下一验证**：数数 1-100（rope 位级修复后 kv_RT 的 4/512 元素差应消除 → attention 0.254%
+应大幅下降 → attn_o 0.79% 应显著改善 → 数数断点应推进）。
