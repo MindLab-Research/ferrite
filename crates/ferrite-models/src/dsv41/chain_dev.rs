@@ -3126,6 +3126,16 @@ fn hc_tail_split() -> bool {
             )?;
             self.copy_h_back()?;
         }
+        // The official's hc_post ends with `return y.type_as(x)`, and `x` is the
+        // bf16 sublayer output — so the residual stream h is BF16 after EVERY
+        // hc_post. Keeping it in f32 here is "more accurate" but different: the
+        // next layer's hc_pre reads `x.float()` and sums, so the extra low bits
+        // leak into its collapse. Measured at L0/pos0: xn and o are bit-exact,
+        // yet the ffn-side input already differs by 8e-4 (bf16 scale) and the
+        // MoE output by 4.2% (routing amplification) — the whole residual
+        // trajectory then drifts and the 102nd token flips.
+        self.dev
+            .bf16_round_inplace(self.s.h.ptr as *mut f32, (hc * dim) as i32)?;
 
         if phase_dbg() {
             eprintln!("[phs] L{layer} attn={:?}", _t_all.elapsed());
@@ -3267,6 +3277,11 @@ fn hc_tail_split() -> bool {
             )?;
             self.copy_h_back()?;
         }
+        // Same dtype boundary as the attention side above: the official's hc_post
+        // returns bf16 (`.type_as(x)` with a bf16 sublayer output), so the h that
+        // the NEXT layer collapses with must be bf16-rounded here too.
+        self.dev
+            .bf16_round_inplace(self.s.h.ptr as *mut f32, (hc * dim) as i32)?;
         if phase_dbg() {
             eprintln!("[phs] L{layer} ffn_total={:?}", _t_moe.elapsed());
         }
