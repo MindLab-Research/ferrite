@@ -4714,9 +4714,19 @@ gemm_fp8_gemv_kernel(__grid_constant__ const GemvCore gc, __grid_constant__ cons
             // `row < n1` restricts this to family 1, whose element index IS `rrow`;
             // a family-2 row must never land in family-1's slots.
             if (staging_tbl != nullptr && row < n1) {
+                // The official's fp8 GEMM partial is BF16 (out_dtype) BEFORE
+                // the all-reduce (model.py:271-278: y = linear(...) → bf16;
+                // y.float() → dist.all_reduce) — every rank's partial enters
+                // the AR ALREADY rounded. This fused store is where our
+                // partial enters the AR (the peer staging), so round HERE.
+                // `v` itself stays unrounded: the local `out` write and the
+                // B1 quant epilogue below consume the f32 accumulator (the
+                // Rust side's bf16_round_inplace covers the local buffer
+                // after this kernel returns).
+                const float v_ar = __bfloat162float(__float2bfloat16(v));
                 #pragma unroll 2
                 for (int rr = 0; rr < world; rr++)
-                    staging_tbl[rr][ar_base + (size_t)rrow] = v;
+                    staging_tbl[rr][ar_base + (size_t)rrow] = v_ar;
             }
             // B1: hand this row to the block-level quant epilogue below. `v` is
             // the same register value the f32 store just wrote, so the byte the
