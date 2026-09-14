@@ -2881,6 +2881,22 @@ fn hc_tail_split() -> bool {
         let hc = cfg.hc_mult;
         let ld = &self.w.layers[layer];
 
+        // op-level diagnostic: the layer INPUT h (the residual entering this
+        // layer, pre-collapse pre-norm) for the per-layer divergence bisection
+        // against the ref's REF_HDUMP ([pos][layer][h]). kind 40 = layer 0,
+        // kind 41 = layer 39 — the layer is folded into the kind so the records
+        // stay addressable in the [step][kind] dump format. If layer 39's h
+        // diverges while layer 0's matches, the pollution accumulates inside
+        // the stack; if both match but the logits crash, the head is the
+        // amplifier.
+        if let Ok(xdp) = std::env::var("DSV41_GT_XDUMP") {
+            if layer == 0 {
+                self.gt_dump_vec(&xdp, 40, self.s.h.ptr, dim)?;
+            } else if layer == cfg.n_layers.saturating_sub(1) {
+                self.gt_dump_vec(&xdp, 41, self.s.h.ptr, dim)?;
+            }
+        }
+
         // ---------------- attention block ----------------
         // The fused front end, when it runs, also collapses and normalises; the
         // collapse reads `premix_slot(pa)` rather than the slot the mixes write,
