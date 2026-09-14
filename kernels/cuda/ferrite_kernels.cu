@@ -8352,6 +8352,18 @@ __global__ void p2p_ar_store_v5_kernel(
             const float4 b = b4[i4];
             v.x += b.x; v.y += b.y; v.z += b.z; v.w += b.w;
         }
+        // The official's fp8 GEMM partial is BF16 (out_dtype) BEFORE the
+        // all-reduce (model.py:271-278: y = linear(...) -> bf16; y.float() ->
+        // dist.all_reduce) — every rank's partial enters the AR ALREADY
+        // rounded. This store is where our partial enters the AR (the peer
+        // staging), so round HERE. Without this round the AR summed 8
+        // UNROUNDED f32 partials while the official sums 8 bf16-rounded
+        // ones — the systematic ~0.5 bf16 ulp offset that the 40-layer
+        // residual stream amplified to attn_o 0.63-0.73% / moe_o 1.7%.
+        v.x = __bfloat162float(__float2bfloat16(v.x));
+        v.y = __bfloat162float(__float2bfloat16(v.y));
+        v.z = __bfloat162float(__float2bfloat16(v.z));
+        v.w = __bfloat162float(__float2bfloat16(v.w));
         const size_t base = (size_t)((e & 1u) * (unsigned)world + (unsigned)my_rank) * (unsigned)stride + (size_t)i4 * 4;
         *reinterpret_cast<float4*>(staging_tbl[rr] + base) = v;
     }
@@ -8369,6 +8381,7 @@ __global__ void p2p_ar_pubred_v5_kernel(
     const float* __restrict__ staging_local,  // my [2][world][stride]
     const unsigned* __restrict__ ready_local, // my [world] flag row
     float* __restrict__ out,
+        v = __bfloat162float(__float2bfloat16(v));
     int world, int my_rank, int n, int stride) {
     // publish + reduce fused (2026-09-10): the publish used to be its own
     // 1-block kernel and the reduce another launch — 3 kernels per AR. v5's
