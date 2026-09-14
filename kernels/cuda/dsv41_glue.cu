@@ -757,7 +757,7 @@ __global__ void expert_fp4_gemm_official_kernel(
             const uint8_t byte = wrow[idx >> 1];
             const uint8_t nib = (idx & 1) ? (uint8_t)(byte >> 4) : (uint8_t)(byte & 0xFu);
             const float b = glue_e2m1_to_f(nib);
-            block_dot = __fmaf_rn(a, b, block_dot);
+            block_dot += a * b;
         }
         const float wsc = __uint_as_float(((uint32_t)wsrow[kb]) << 23);
         acc += block_dot * act_scale[kb] * wsc;
