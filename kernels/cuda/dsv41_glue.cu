@@ -242,10 +242,7 @@ __device__ __forceinline__ float glue_e4m3_byte_to_f(uint8_t b) {
     return __uint_as_float(s | ((e + 120u) << 23) | (m << 20));
 }
 
-// The bf16 boundary of `x.to(dtype)`: RN narrowing then the exact widening back.
-__device__ __forceinline__ float glue_bf16_round(float v) {
-    return __bfloat162float(__float2bfloat16(v));
-}
+// (glue_bf16_round is defined ABOVE, before swiglu_limit_kernel — its first consumer.)
 
 // The window-KV fp8 round trip, in place on one [cols] row in blocks of
 // `block` (= fp8_block_size = 32). The official `_window_kv` runs
