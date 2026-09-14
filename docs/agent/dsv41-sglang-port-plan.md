@@ -334,3 +334,25 @@ xn（0 元素差）→ kv_gemm（0 元素差）→ rmsnorm → rope → RT（全
 **下一步**：定位 q 链（wq_a→q_norm→wq_b→rope）或 sparse_attn 计算的差异。kind 50（q dump）
 的 106% 是布局伪影（用户指出：若 q 有根本差异，attn_o 不可能仅 0.63%），需要修 dump 可比
 性或写 q 链单元测试。
+
+## 🎯🎯 用户定谳最终根因：AR store 内核缺 bf16 舍入（2026-09-14 05:35，commit deb6471f）
+
+**用户指出的决定性证据链**：
+- `ar_store_fused` 路径下，`p2p_ar_store_v5_kernel` 写 peer staging 时**未做 bf16 舍入**
+- 官方语义（model.py:271-278）：`y = linear(...)` fp8_gemm 输出 **bf16**（out_dtype）→ `y.float()` → `dist.all_reduce`——AR 累加的是"**已 bf16 舍入**"的 partial
+- 我们：store 写入 staging 的是**未舍入的 f32 partial**（发生在 Rust 侧 bf16_round 之前——gemv 的 fused-store epilogue 先发射）
+- 8 个未舍入 partial 之和 vs 8 个已舍入 partial 之和 → 差 ~0.5 bf16 ulp → **attn_o 0.63-0.73%**（MoE down 同入口 → **moe_o 1.7%**）
+
+**这个根因同时解释了全部"位级一致"项**：q/kv/sparse_o 都不经过这条 AR 入口（store kernel）。
+
+**修复**：store 内核写入 staging 前对 v 做 bf16 往返（float4 + 标量两处）。第一版标量舍入误插到 pubred 内核参数列表（构建错），已修正（deb6471f）。
+
+**验证前的完整排除清单**（全部实证）：
+| 嫌疑 | 验证 | 结论 |
+|---|---|---|
+| sparse_attn rope 列 | o_rope[448:452] MATCH | 排除 |
+| o-rope | 同上 | 排除 |
+| wo_a | bf16 HMMA 修复后 attn_o 不变 | 排除 |
+| wo_b | oracle 0/5120 BIT_EXACT | 排除 |
+| AR 结合式 | ==NCCL 0/5120 | 排除 |
+| **AR store 舍入** | **未舍入（官方已舍入）** | **✓ 根因** |
