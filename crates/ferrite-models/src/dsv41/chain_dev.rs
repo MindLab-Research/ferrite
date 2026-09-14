@@ -5654,6 +5654,14 @@ fn hc_tail_split() -> bool {
                         if expert_official_order() {
                             let w2p = unsafe { w2_base.offset((eid * w2_stride) as isize) };
                             let w2sp = unsafe { w2s_base.offset((eid * w2s_stride) as isize) };
+                            // k MUST be the real (unpadded) local inter: the
+                            // per-rank weight slice is stored at padded_inter
+                            // (e.g. 384 rows for inter/world = 288) and the mxf4
+                            // path masks those padding rows out of the MMA. This
+                            // kernel computes every row, so passing inter_local
+                            // would fold three 32-wide padding blocks of
+                            // undefined weight content into the down's k-sum.
+                            let real_inter = (inter / self.world()) as i32;
                             self.dev.expert_fp4_gemm_official_accum(
                                 self.s.ex_q.as_u8(),
                                 self.s.ex_s.as_f32(),
@@ -5661,7 +5669,7 @@ fn hc_tail_split() -> bool {
                                 w2sp,
                                 self.s.o.ptr as *mut f32,
                                 dim as i32,
-                                inter_local as i32,
+                                real_inter,
                             )?;
                         } else {
                         self.dev.expert_down_fp8act_indirect(
