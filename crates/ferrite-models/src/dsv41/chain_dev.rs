@@ -4236,8 +4236,12 @@ fn hc_tail_split() -> bool {
                 //   kind 32 = the idxs (raw int32 bytes, win + index_topk of row 0)
                 //   kind 34 = [win, index_topk, scale, clen] as f32
                 let mut cl_h = [0i32; 1];
+                // The counter that matters is the KV SOURCE's: that is the one the
+                // launches below pass (`+ kv_src`), and a consumer's own counter is
+                // never advanced. Reading `owner` here made a fixed consumer still
+                // report clen=0 (a probe-only artifact).
                 let cb = Device::view(
-                    (self.s.clen.ptr as *const i32).wrapping_add(owner) as *mut std::ffi::c_void,
+                    (self.s.clen.ptr as *const i32).wrapping_add(kv_src) as *mut std::ffi::c_void,
                     4,
                 );
                 self.dev.download_u8(&cb, unsafe {
