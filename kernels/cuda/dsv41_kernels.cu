@@ -3252,6 +3252,14 @@ __global__ void compressor_pool_kernel(const float* __restrict__ kvp,
 
     // RMSNorm over the pooled row (weights + eps, exactly as the golden)
     {
+        // The reference's Compressor returns `self.norm(kv.to(dtype))` with dtype
+        // == bf16 (model.py:462/482/485), so the pooled row is ROUNDED TO BF16
+        // before the norm AND the norm's output is bf16. Without both boundaries
+        // the downstream fp4 round-trip quantises a different value: e2m1 has a
+        // 1-bit mantissa, so a 0.4% input shift flips near-boundary elements by a
+        // whole step (measured: our compressed rows vs the reference's stayed
+        // 8.0% off after the round-trip itself was added, because of exactly this).
+        for (int i = 0; i < nown; ++i) yv[i] = orope_bf16_round(yv[i]);
         float ss = 0.f;
         for (int i = 0; i < nown; ++i) ss += yv[i] * yv[i];
 #pragma unroll
@@ -3265,7 +3273,9 @@ __global__ void compressor_pool_kernel(const float* __restrict__ kvp,
         const float inv = rsqrtf(total / (float)hd + eps);
         for (int i = 0; i < nown; ++i) {
             const int c = cn[i];
-            latents[(size_t)out_row * hd + c] = yv[i] * inv * norm_w[c];
+            // bf16 output boundary (the reference's `.to(dtype)` inside
+            // `self.norm(...)`); see the note in compressor_pool_kernel.
+            latents[(size_t)out_row * hd + c] = orope_bf16_round(yv[i] * inv * norm_w[c]);
         }
     }
     (void)pos_ctr;
@@ -3364,6 +3374,10 @@ __global__ void compressor_fused_kernel(const float* __restrict__ kvp,
             yv[i] = den > 0.f ? acc / den : 0.f;
         }
         // RMSNorm over the pooled row (weights + eps, exactly as the golden)
+        // Same bf16 boundaries as compressor_pool_kernel: the reference's
+        // `self.norm(kv.to(dtype))` rounds the pooled row to bf16 BEFORE the norm
+        // and emits bf16 - keep the two bodies in sync.
+        for (int i = 0; i < nown; ++i) yv[i] = orope_bf16_round(yv[i]);
         float ss = 0.f;
         for (int i = 0; i < nown; ++i) ss += yv[i] * yv[i];
 #pragma unroll
@@ -3377,7 +3391,7 @@ __global__ void compressor_fused_kernel(const float* __restrict__ kvp,
         const float inv = rsqrtf(total / (float)hd + eps);
         for (int i = 0; i < nown; ++i) {
             const int c = cn[i];
-            latent[c] = yv[i] * inv * norm_w[c];  // out_row == bb == 0
+            latent[c] = orope_bf16_round(yv[i] * inv * norm_w[c]);  // out_row == bb == 0
         }
     }
     __syncthreads();
