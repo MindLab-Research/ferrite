@@ -4976,6 +4976,20 @@ fn hc_tail_split() -> bool {
                 )?;
             }
         }
+        // Op dump at the divergence point the user asked for: the gate's INPUT
+        // (`xn`, kind 23) and its OUTPUT scores (kind 22, n_routed) captured at
+        // the SAME site, so the routing can be recomputed off-line with the
+        // official's formula (model.py:826-839: linear(x.float(), w.float()) /
+        // gate_temp -> softplus().sqrt() -> + bias -> topk) and compared against
+        // both engines' ids. kind 0 (`xn`) is dumped at a different site and is
+        // NOT the gate's input -- recomputing from it produced act values ~0.84
+        // where both engines' kind-4 weights are the peaked 0.75/0.15 shape.
+        if layer == 0 {
+            if let Ok(xdp) = std::env::var("DSV41_GT_XDUMP") {
+                self.gt_dump_vec(&xdp, 22, self.s.scores.ptr, n_routed)?;
+                self.gt_dump_vec(&xdp, 23, self.s.xn.ptr, dim)?;
+            }
+        }
         if !routed {
             self.dev.route_topk(
                 self.s.scores.as_f32(),

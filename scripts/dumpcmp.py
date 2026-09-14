@@ -19,6 +19,8 @@ import sys
 SIZES = {
     0: 5120, 1: 5120, 2: 5120, 3: 6, 4: 6, 5: 512, 6: 512, 7: 160,
     8: 320, 9: 32, 10: 64, 11: 64, 12: 16, 13: 16, 20: 40, 21: 4,
+    22: 384,  # gate OUTPUT scores (ours only), dumped at the gate site
+    23: 5120,  # gate INPUT (ours only) -- kind 0 is a different site
     40: 5120, 41: 5120, 42: 16160, 50: 4096, 51: 4096, 52: 1024, 53: 5120,
 }
 for _k in range(14, 20):
