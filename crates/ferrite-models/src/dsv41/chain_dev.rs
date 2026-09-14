@@ -2985,6 +2985,21 @@ impl<'a> DevChain<'a> {
         Ok(())
     }
 
+    /// The layer the attention-op diagnostic dumps attach to (`DSV41_GT_LAYER`,
+    /// default 0). Layer 0/1 are `compress_ratio == 0` — pure sliding window,
+    /// no compressor and no indexer — so the compressed-KV / indexer SELECTION
+    /// can only be diffed on a layer that actually has one. Layer 2 is the first
+    /// `kv_source` (and the first `index_source`).
+    fn xdp_target(&self) -> usize {
+        static T: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *T.get_or_init(|| {
+            std::env::var("DSV41_GT_LAYER")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(0)
+        })
+    }
+
     /// Host-upload helper (kept: the prefill and probe paths use this family).
     #[allow(dead_code)]
     fn ul_i32(&self, dst: *mut c_void, v: &[i32]) -> Result<()> {
@@ -3593,7 +3608,7 @@ fn hc_tail_split() -> bool {
         // scales} from the fused norm+rope. Runs on the MAIN stream before the
         // dual fork, so the side-stream write race cannot occur.
         if let Ok(xdp) = std::env::var("DSV41_GT_XDUMP") {
-            if layer == 0 {
+            if layer == self.xdp_target() {
                 self.gt_dump_vec(&xdp, 6, self.s.kv.ptr, hd)?;
             }
         }
@@ -3927,7 +3942,7 @@ fn hc_tail_split() -> bool {
         // kind 5, n = head_dim, for the KV-chain bisection against the ref's
         // window_kv_cache slot.
         if let Ok(xdp) = std::env::var("DSV41_GT_XDUMP") {
-            if layer == 0 {
+            if layer == self.xdp_target() {
                 self.gt_dump_vec(&xdp, 5, self.s.kv.ptr, hd)?;
             }
         }
@@ -4157,7 +4172,7 @@ fn hc_tail_split() -> bool {
         // (wq_a → q_norm → wq_b → rope) is the source; if it matches, the
         // attention computation itself (scores/softmax/P·V) owns the error.
         if let Ok(xdp) = std::env::var("DSV41_GT_XDUMP") {
-            if layer == 0 {
+            if layer == self.xdp_target() {
                 self.gt_dump_vec(&xdp, 50, self.s.q.ptr, (nlh * hd) as usize)?;
                 // The attention operator's REAL inputs, so the official kernel can
                 // be run on exactly what we feed ours (the strict split of "our
@@ -4250,7 +4265,7 @@ fn hc_tail_split() -> bool {
         // empty_like(q), fully written by the kernel), so kind 55 is the
         // stage-comparable counterpart of ref_attn.bin's kind 4; kind 51 is the
         // post-o-rope value and differs in dims [d-rope_head_dim, d) by design.
-        if layer == 0 {
+        if layer == self.xdp_target() {
             if let Ok(xdp) = std::env::var("DSV41_GT_XDUMP") {
                 self.gt_dump_vec(&xdp, 55, self.s.o.ptr, (nlh * hd) as usize)?;
             }
@@ -4321,7 +4336,7 @@ fn hc_tail_split() -> bool {
         // computation itself (scores/softmax/P·V/o-rope) owns the error; if
         // it matches, the o-proj chain (wo_a/wo_b/AR/hc_post) is the source.
         if let Ok(xdp) = std::env::var("DSV41_GT_XDUMP") {
-            if layer == 0 {
+            if layer == self.xdp_target() {
                 self.gt_dump_vec(&xdp, 51, self.s.o.ptr, (nlh * hd) as usize)?;
             }
         }
