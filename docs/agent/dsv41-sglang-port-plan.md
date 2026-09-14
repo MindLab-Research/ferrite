@@ -292,3 +292,21 @@ torch.polar → glibc cosf/sinf）。CUDA 设备端的 cosf/sinf 是完全不同
 
 **教训**：hook 写 dump 时必须先 `o[0]` 去掉 batch 维再逐行迭代（oo.shape[0] 是 batch 不是
 seqlen）；解析侧 MISS 或荒谬数字（110%）时先查记录格式，不要直接采信。
+
+## 🎯 用户定谳：YaRN 参数用错是 kv_RT 差异的根因（2026-09-14 05:00，决定性证据）
+
+**证据链（列级精确吻合）**：
+- 表对比 pos=20：我们的表（YaRN 开）vs 官方滑窗表（YaRN 关）——**仅 i≥21（列 490-511）分叉**，i≤20（列≤488）完全相同
+- kv_RT 的 4 个差异列（491/497/504/510）**完全落在 DIFF 集合 {490..511} 内**，混合区外零差异
+
+**根因**：官方 model.py:688-700 **按层类型分叉**——纯滑窗层（compress_ratio=0）用 `original_seq_len=0`（**YaRN 关**）+ `rope_theta=10000`；压缩层用 `original_seq_len=65536` + `compress_rope_theta=160000`。我们的主表（query + window KV）错误传了 `cfg.original_seq_len`（65536）⇒ **YaRN 被错误开启**。
+
+**修复（一行）**：主表 `original_seq_len` 传 `0`（commit 已提交）。cos_comp/sin_comp 保持 65536 + 160000 不变（与官方压缩层一致 ✓）。
+
+**自证循环教训**：之前 rope 单元测试 BIT_EXACT 的"官方侧"是我自己写的 Python 复现（也带 YaRN）——两边同一个公式必然 0 差异。**真正的参照必须来自模型的实际表参数（每层的 original_seq_len 分叉），不能用自己复现的公式当参照。**
+
+**两点更正（用户指出）**：
+1. `apply_rotary_emb` 是 **in-place** 的（`y.copy_(x)`，docstring 明写 "Rotate x in place"）——返回值被丢弃不表示没生效，**q 确实被 rope 了**
+2. "q 前 448 列 100% 不同 ⇒ wq_b 根本差异"**不成立**：attn_o 仅 0.79%（≈2 bf16 ulp）证明 q 无根本差异；kind 50 的 106% 是 **dump 布局不可比的伪影**（head 级余弦"多对一"是错位特征）
+
+**已排除（单元测试 BIT_EXACT 全过）**：rope 表（glibc cosf/sinf 照抄公式）、rmsnorm、norm+rope、RT。**已排除（op-level 0.000%）**：xn、kv_gemm。o-proj 自身 0.03%。
