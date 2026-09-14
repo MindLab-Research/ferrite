@@ -156,6 +156,32 @@ block amax; then `s = (float)__nv_fp8_e4m3(amax / 6.f)` (with `amax` floored at
 `6 * 2^-9`), `d = clamp(x/s, +-6)`, the e2m1 nearest (the `mags[8]` table
 `idx_fp4_rt_kernel` uses, first-on-ties), and the write-back is `d * s`.
 
+**Measured (2026-09-14, layer 2, pos 116, before the fix)** — `dsv41_gt_layer=2`
+`gt_xdump_pos=116`, our kind 35 (ring rows `[128,160)`) versus the reference's
+`sparse_attn` `kv` rows `[128,160)` (ref_attn2 kind 11 = `[window(128) |
+compress(clen)]`, all 186 rows dumped):
+
+```
+our kind34 = [win=128, index_topk=512, scale=0.044194, clen=58]   # clen=58 = the reference's 58 compressed rows
+row 128: ours rms=0.19792  ref rms=0.19641  maxdiff=0.106
+row 129: ours rms=0.38329  ref rms=0.38181  maxdiff=0.148
+row 130: ours rms=0.38635  ref rms=0.38707  maxdiff=0.149
+row 131: ours rms=0.39126  ref rms=0.39009  maxdiff=0.157
+over 32 rows x 512: maxabs=0.208, rel=1.02e-01
+```
+
+⇒ the rows ARE the same latents (per-row rms matches to 4 digits) and the 10.2%
+is the fp4 signature (e2m1 has a 1-bit mantissa, ~25% per-element worst case,
+~10% RMS) — i.e. the missing round-trip is the whole of this difference.
+
+⚠️ **Parser trap that produced a bogus 146% first**: the reference's `kv` is a
+flat `[186 * 512]` array, so the compressed rows are
+`kv.reshape(-1, 512)[128:]` — a ROW slice. Slicing the flat vector
+(`kv[128:]`) starts 128 *elements* into row 0 and compares the window block
+against our compressed rows, which reports a meaningless ~146% (and a
+`reshape` failure, since 95104 is not a multiple of 512). Always reshape before
+slicing when the reference dump is flat.
+
 ## Known remaining difference (inert at short context, matters at long)
 
 Our `indexer()` ropes the indexer's k and q with the **main** rope tables
