@@ -5533,8 +5533,12 @@ fn hc_tail_split() -> bool {
                 for slot in 0..topk {
                     let w = (self.s.route_w.ptr as *const f32).wrapping_add(slot);
                     let ids = self.s.route_idx.ptr as *const i32;
+                    // The official order needs the expert id on the host (it
+                    // forms the per-expert weight pointer). Resolved once per
+                    // slot, before the gate/up and the down below both use it.
+                    let mut eid: i64 = 0;
                     if expert_act_e4m3() {
-                        let eid = ids_h[slot] as i64;
+                        eid = ids_h[slot] as i64;
                         if eid < 0 || eid as usize >= ne {
                             continue;
                         }
@@ -5627,19 +5631,20 @@ fn hc_tail_split() -> bool {
                             true,
                             self.dev.stream(),
                         )?;
-                        self.dev.expert_down_fp8act_indirect(
+                        // down in the SAME official order (FP8 act x FP4 weight,
+                        // per-32 block dot, scales on the block accumulator) with
+                        // the official `y[idx] += expert(...)` (bf16) accumulation
+                        // into s.o.
+                        let w2p = unsafe { w2_base.offset((eid * w2_stride) as isize) };
+                        let w2sp = unsafe { w2s_base.offset((eid * w2s_stride) as isize) };
+                        self.dev.expert_fp4_gemm_official_accum(
                             self.s.ex_q.as_u8(),
                             self.s.ex_s.as_f32(),
+                            w2p,
+                            w2sp,
                             self.s.o.ptr as *mut f32,
-                            1,
                             dim as i32,
                             inter_local as i32,
-                            w2_base,
-                            w2_stride,
-                            w2s_base,
-                            w2s_stride,
-                            ids,
-                            slot as i32,
                         )?;
                     } else {
                         self.dev.expert_down_fp4_indirect(

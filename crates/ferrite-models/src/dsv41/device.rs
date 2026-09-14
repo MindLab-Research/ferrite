@@ -376,6 +376,9 @@ struct Kernels {
     expert_fp4_gemm_official: Option<
         unsafe extern "C" fn(*const u8, *const f32, *const u8, *const u8, *mut f32, c_int, c_int, CuStream) -> c_int,
     >,
+    expert_fp4_gemm_official_accum: Option<
+        unsafe extern "C" fn(*const u8, *const f32, *const u8, *const u8, *mut f32, c_int, c_int, CuStream) -> c_int,
+    >,
     swiglu_route: Option<
         unsafe extern "C" fn(*const f32, *const f32, *mut f32, c_int, f32, f32, CuStream) -> c_int,
     >,
@@ -854,6 +857,7 @@ impl Device {
             dequant_fp8_ue8m0: ko!(rt, "dsv41_dequant_fp8_ue8m0"),
             dequant_fp4_e2m1: ko!(rt, "dsv41_dequant_fp4_e2m1"),
             expert_fp4_gemm_official: ko!(rt, "dsv41_expert_fp4_gemm_official"),
+            expert_fp4_gemm_official_accum: ko!(rt, "dsv41_expert_fp4_gemm_official_accum"),
             swiglu_route: ko!(rt, "dsv41_swiglu_route"),
             cast_f32_to_bf16: ko!(rt, "dsv41_cast_f32_to_bf16"),
             vec_scale_f32: ko!(rt, "dsv41_vec_scale_f32"),
@@ -3185,6 +3189,27 @@ impl Device {
         let f = self.need(self.kernels.expert_fp4_gemm_official, "dsv41_expert_fp4_gemm_official")?;
         let rc = unsafe { f(act, act_scale, w, ws, out, n, k, self.stream) };
         self.kerr(rc, "dsv41_expert_fp4_gemm_official")
+    }
+
+    /// The down projection in the same official order, but with the official
+    /// MoE.forward accumulation `y[idx] += expert(...)` (bf16-rounded expert
+    /// output added into the f32 destination row).
+    pub fn expert_fp4_gemm_official_accum(
+        &self,
+        act: *const u8,
+        act_scale: *const f32,
+        w: *const u8,
+        ws: *const u8,
+        out: *mut f32,
+        n: i32,
+        k: i32,
+    ) -> Result<()> {
+        let f = self.need(
+            self.kernels.expert_fp4_gemm_official_accum,
+            "dsv41_expert_fp4_gemm_official_accum",
+        )?;
+        let rc = unsafe { f(act, act_scale, w, ws, out, n, k, self.stream) };
+        self.kerr(rc, "dsv41_expert_fp4_gemm_official_accum")
     }
 
     pub fn dequant_fp4_e2m1(

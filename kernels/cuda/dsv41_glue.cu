@@ -752,6 +752,11 @@ __device__ __forceinline__ uint8_t glue_e2m1_to_e4m3(uint8_t nib) {
 //  Apply activation and weight scales to the accumulator."
 // One warp per output row; mma.sync m16n8k32 computes the EXACT 32-element
 // dot product (tensor core internal accumulation), scales applied after.
+// ACCUM=false: plain per-row f32 output (gate/up).
+// ACCUM=true : the official MoE.forward semantics, `y[idx] += expert(...)`
+//              where the expert's output is bf16 — round the accumulator to
+//              bf16 and add it into the destination row (down).
+template <bool ACCUM>
 __global__ void expert_fp4_gemm_official_kernel(
     const uint8_t* __restrict__ act,      // [k] e4m3 bytes (NOT scaled)
     const float* __restrict__ act_scale,  // [k/32] f32 power-of-two
@@ -811,7 +816,15 @@ __global__ void expert_fp4_gemm_official_kernel(
         const float wsc = __uint_as_float(((uint32_t)wsrow[kb]) << 23);
         acc += blk_dot * act_scale[kb] * wsc;
     }
-    if (lane == 0) out[warp_id] = acc;
+    if (lane == 0) {
+        if (ACCUM) {
+            // official MoE.forward: `y[idx] += expert(...)`; the expert returns
+            // bf16, so round first and add into the f32 accumulator row.
+            out[warp_id] += __bfloat162float(__float2bfloat16(acc));
+        } else {
+            out[warp_id] = acc;
+        }
+    }
 }
 
 
@@ -823,7 +836,22 @@ extern "C" int dsv41_expert_fp4_gemm_official(
     // One warp (32 threads) per output row
     const int warps_per_block = 4;  // 128 threads = 4 warps
     const int blocks = (n + warps_per_block - 1) / warps_per_block;
-    expert_fp4_gemm_official_kernel<<<blocks, warps_per_block * 32, 0, s>>>(
+    expert_fp4_gemm_official_kernel<false><<<blocks, warps_per_block * 32, 0, s>>>(
+        act, act_scale, w, ws, out, n, k);
+    return (int)cudaGetLastError();
+}
+
+// The down projection in the official's order: same FP8-act x FP4-weight GEMM
+// (per-32 block dot, scales applied to the block accumulator), but with the
+// official MoE.forward accumulation `y[idx] += expert(...)` (bf16-rounded).
+extern "C" int dsv41_expert_fp4_gemm_official_accum(
+    const uint8_t* act, const float* act_scale,
+    const uint8_t* w, const uint8_t* ws,
+    float* out, int n, int k, cudaStream_t s) {
+    if (n <= 0 || k <= 0) return (int)cudaErrorInvalidValue;
+    const int warps_per_block = 4;
+    const int blocks = (n + warps_per_block - 1) / warps_per_block;
+    expert_fp4_gemm_official_kernel<true><<<blocks, warps_per_block * 32, 0, s>>>(
         act, act_scale, w, ws, out, n, k);
     return (int)cudaGetLastError();
 }
