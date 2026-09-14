@@ -2647,6 +2647,50 @@ constexpr int kIdxScoreBlocksV2 = 1024;
 // hides. Default 1, DSV41_IDX_SCORE_WPR=2/4/8 for the short-context end.
 constexpr int kIdxScoreWprDefault = 1;
 
+// The indexer's fp4 round-trip — the official's fp4_act_quant(x, 32,
+// inplace=True) with FE8M0 scales (kernel.py:127-183; the indexer's calls at
+// model.py:546/552): block-32 amax -> the tiny floor (6*2^-126) -> the pow2
+// scale (fast_round_scale with fp4_max=6) -> the e2m1 RN encode of
+// clamp(x/s, +-6) -> the decode * s -> the bf16 write-back. Our chain kept
+// the raw f32 (the audit's D1).
+__global__ void idx_fp4_rt_kernel(float* __restrict__ x, int cols, int block) {
+    const int lane = (int)threadIdx.x;
+    const int b = (int)blockIdx.x;
+    if (lane >= 32) return;
+    float* blk = x + (size_t)b * (size_t)block;
+    float a = 0.f;
+    for (int i = lane; i < block; i += 32) a = fmaxf(a, fabsf(blk[i]));
+    for (int off = 16; off > 0; off >>= 1) a = fmaxf(a, __shfl_xor_sync(0xFFFFFFFFu, a, off));
+    const float amax = fmaxf(a, 6.0f * 1.1754943508222875e-38f);  // 6*2^-126
+    const float sc = fmaxf(fast_round_scale(amax, 1.0f / 6.0f), 1e-30f);
+    const float inv = 1.f / sc;  // exact: sc is a power of two
+    for (int i = lane; i < block; i += 32) {
+        const float v = fminf(fmaxf(blk[i] * inv, -6.0f), 6.0f);
+        // the e2m1 RN nearest (quant_fp4_fused_kernel's mags table and
+        // first-on-ties search — verified bit-exact against the official)
+        const float mags[8] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
+        const float av = fabsf(v);
+        int best = 0;
+        float bd = fabsf(av - mags[0]);
+#pragma unroll
+        for (int c = 1; c < 8; ++c) {
+            const float d = fabsf(av - mags[c]);
+            if (d < bd) { bd = d; best = c; }
+        }
+        const float dq = e2m1_to_f((uint8_t)(v < 0.f ? (best | 8) : best)) * sc;
+        // the bf16 write-back
+        uint32_t u = __float_as_uint(dq);
+        u += 0x7fffu + ((u >> 16) & 1u);
+        blk[i] = __uint_as_float((uint32_t)((uint16_t)(u >> 16)) << 16);
+    }
+}
+
+extern "C" int dsv41_idx_fp4_rt(float* x, int cols, int block, cudaStream_t s) {
+    if (cols <= 0 || block <= 0 || (cols % block) != 0) return (int)cudaErrorInvalidValue;
+    idx_fp4_rt_kernel<<<cols / block, 32, 0, s>>>(x, cols, block);
+    return (int)cudaGetLastError();
+}
+
 __global__ void indexer_score_kernel(const float* __restrict__ q, const float* __restrict__ ik,
                                      const float* __restrict__ w, const uint8_t* __restrict__ cand,
                                      const int32_t* __restrict__ lens, int m, int nh, int hd,

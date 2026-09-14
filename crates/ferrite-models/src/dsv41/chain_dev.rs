@@ -4232,6 +4232,12 @@ fn hc_tail_split() -> bool {
             1,
             false,
         )?;
+        // The official's fp4 round-trip on the indexer's key (model.py:546:
+        // fp4_act_quant(k, 32, inplace=True) with FE8M0 scales) — the audit's
+        // D1. Every head's 128 columns are 4 whole 32-blocks, so the flat-row
+        // round-trip matches the official's per-head blocking exactly.
+        self.dev
+            .idx_fp4_rt(self.s.idx_k.ptr as *mut f32, idx_hd as i32, 32)?;
         // DEVICE-derived destination: a host-computed group slot here is exactly
         // the frozen-address bug that made the window ring go stale under the
         // graph (the index key would land in the same group every replay).
@@ -4327,6 +4333,15 @@ fn hc_tail_split() -> bool {
                 false,
             )?;
         }
+        // The official's fp4 round-trip on the indexer's query (model.py:552)
+        // — the audit's D1. All the production paths above (fused or plain)
+        // have left the ROPED q here, so one round-trip covers them all; the
+        // flat row's 32-blocks align with the per-head 128-column boundaries.
+        self.dev.idx_fp4_rt(
+            self.s.idx_q.ptr as *mut f32,
+            (idx_nh * idx_hd) as i32,
+            32,
+        )?;
         // per-head weights; the reference folds softmax_scale * n_heads^-0.5 into
         // them, and our kernel applies softmax_scale * head_scale to the sum, so
         // the same factor can be passed there instead

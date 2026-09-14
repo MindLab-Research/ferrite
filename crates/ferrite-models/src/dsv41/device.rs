@@ -359,6 +359,7 @@ struct Kernels {
     argmax: Option<unsafe extern "C" fn(*const f32, *mut c_int, c_int, *mut c_int, CuStream) -> c_int>,
     window_idxs: Option<unsafe extern "C" fn(*mut i32, *const c_int, c_int, CuStream) -> c_int>,
     win_kv_quant_rt: Option<unsafe extern "C" fn(*mut f32, c_int, c_int, CuStream) -> c_int>,
+    idx_fp4_rt: Option<unsafe extern "C" fn(*mut f32, c_int, c_int, CuStream) -> c_int>,
     gate_gemv_f32: Option<
         unsafe extern "C" fn(*const f32, *const c_void, *mut f32, c_int, c_int, f32, CuStream) -> c_int,
     >,
@@ -828,6 +829,7 @@ impl Device {
             engram_hash_step: ko!(rt, "dsv41_engram_hash_step"),
             window_idxs: ko!(rt, "dsv41_window_idxs"),
             win_kv_quant_rt: ko!(rt, "dsv41_win_kv_quant_rt"),
+            idx_fp4_rt: ko!(rt, "dsv41_idx_fp4_rt"),
             gate_gemv_f32: ko!(rt, "dsv41_gate_gemv_f32"),
             bf16_round_inplace: ko!(rt, "dsv41_bf16_round_inplace"),
             vec_scale_bf16_round: ko!(rt, "dsv41_vec_scale_bf16_round"),
@@ -3067,6 +3069,16 @@ impl Device {
         let f = self.need(self.kernels.win_kv_quant_rt, "dsv41_win_kv_quant_rt")?;
         let rc = unsafe { f(kv, cols, block, self.stream) };
         self.kerr(rc, "dsv41_win_kv_quant_rt")
+    }
+
+    /// The official's indexer fp4 round-trip: fp4_act_quant(x, 32, inplace=True)
+    /// with FE8M0 scales — the e2m1 encode of clamp(x/s, ±6) decoded back and
+    /// written in the bf16 domain. The indexer's q and k both pass through it
+    /// (model.py:546/552) before scoring.
+    pub fn idx_fp4_rt(&self, x: *mut f32, cols: i32, block: i32) -> Result<()> {
+        let f = self.need(self.kernels.idx_fp4_rt, "dsv41_idx_fp4_rt")?;
+        let rc = unsafe { f(x, cols, block, self.stream) };
+        self.kerr(rc, "dsv41_idx_fp4_rt")
     }
 
     /// The official's gate domain: an f32 GEMV on bf16(x) × f32(bf16 w),
