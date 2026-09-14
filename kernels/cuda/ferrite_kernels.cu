@@ -8563,6 +8563,17 @@ extern "C" cudaError_t ferrite_p2p_ar_pubred_v5(
 // is unique per thread and no two blocks ever share a column: no barrier and no
 // cross-block handshake is needed, and `res` may be the caller's residual
 // stream while `out` stays a distinct buffer.
+// The bf16 round (the torch `.to(bfloat16)` boundary) — the same arithmetic
+// as dsv41_bf16_round_inplace. The AR's output and the hc_post's output are
+// both bf16 in the official (RowParallelLinear's .type_as(x) after the f32
+// all-reduce; hc_post's .type_as(x) after the f32 mix) — and the residual
+// stream the mix reads/writes is bf16-valued in the official too.
+__device__ __forceinline__ float ar5_bf16r(float v) {
+    uint32_t u = __float_as_uint(v);
+    u += 0x7fffu + ((u >> 16) & 1u);
+    return __uint_as_float((uint32_t)((uint16_t)(u >> 16)) << 16);
+}
+
 __device__ __forceinline__ void ar5_hc_post_col4(
     float* __restrict__ res, const float* __restrict__ post,
     const float* __restrict__ comb, int hc_n, int hc_h, int j, float4 xv) {
@@ -8590,6 +8601,11 @@ __device__ __forceinline__ void ar5_hc_post_col4(
             a.z = __fmaf_rn(c, r[k].z, a.z);
             a.w = __fmaf_rn(c, r[k].w, a.w);
         }
+        // The official's hc_post output is .type_as(x) = bf16 (and this write
+        // is the residual stream's bf16 boundary — the next layer's mix reads
+        // the rounded values).
+        a.x = ar5_bf16r(a.x); a.y = ar5_bf16r(a.y);
+        a.z = ar5_bf16r(a.z); a.w = ar5_bf16r(a.w);
         *reinterpret_cast<float4*>(res + (size_t)i * hc_h + j) = a;
     }
 }
@@ -8615,7 +8631,7 @@ __device__ __forceinline__ void ar5_hc_post_col1(
             if (k >= hc_n) break;
             a = __fmaf_rn(comb[(size_t)k * hc_n + i], r[k], a);
         }
-        res[(size_t)i * hc_h + j] = a;
+        res[(size_t)i * hc_h + j] = ar5_bf16r(a);
     }
 }
 
@@ -8665,6 +8681,10 @@ __global__ void p2p_ar_pubred_v5_hcpost_kernel(
                 staging_local + (size_t)((e & 1u) * world + r) * stride + (size_t)i4 * 4);
             acc.x += v.x; acc.y += v.y; acc.z += v.z; acc.w += v.w;
         }
+        // The official's AR output is .type_as(x) = bf16 — round before both
+        // the store and the hc_post mix (the fold's T1-pattern skip).
+        acc.x = ar5_bf16r(acc.x); acc.y = ar5_bf16r(acc.y);
+        acc.z = ar5_bf16r(acc.z); acc.w = ar5_bf16r(acc.w);
         *reinterpret_cast<float4*>(out + (size_t)i4 * 4) = acc;
         ar5_hc_post_col4(hc_res, hc_post, hc_comb, hc_n, hc_h, i4 << 2, acc);
     }
@@ -8672,6 +8692,7 @@ __global__ void p2p_ar_pubred_v5_hcpost_kernel(
         float acc = 0.f;
         for (int r = 0; r < world; r++)
             acc += staging_local[(size_t)((e & 1u) * world + r) * stride + ii];
+        acc = ar5_bf16r(acc);
         out[ii] = acc;
         ar5_hc_post_col1(hc_res, hc_post, hc_comb, hc_n, hc_h, ii, acc);
     }
