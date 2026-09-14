@@ -1183,11 +1183,18 @@ impl<'a> DevChain<'a> {
         let sin = dev.alloc(fb(table * half))?;
         let cos_comp = dev.alloc(fb(table * half))?;
         let sin_comp = dev.alloc(fb(table * half))?;
-        // main rope (theta=10000) for the query and window KV
+        // main rope (theta=10000) for the query and window KV.
+        // YaRN is OFF here: the official's per-layer fork (model.py:688-700)
+        // gives pure sliding-window layers (compress_ratio=0) an
+        // original_seq_len of 0 — the unscaled frequencies. The earlier
+        // version passed cfg.original_seq_len (65536), wrongly enabling the
+        // YaRN blend on this table: columns i>=21 (490..511 in the 512-wide
+        // row) diverged, exactly the columns where the kv_RT diffs lived.
         dev.rope_precompute(
             cos.ptr as *mut f32, sin.ptr as *mut f32,
             cfg.rope_head_dim as i32, table as i32,
-            cfg.original_seq_len as i32, cfg.rope_theta,
+            0,
+            cfg.rope_theta,
             cfg.rope_factor, cfg.beta_fast, cfg.beta_slow,
         )?;
         // compressor rope (theta=160000) for the compressed latent
