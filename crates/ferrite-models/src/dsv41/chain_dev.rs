@@ -2989,36 +2989,6 @@ fn hc_tail_split() -> bool {
         // the stack; if both match but the logits crash, the head is the
         // amplifier.
         if let Ok(xdp) = std::env::var("DSV41_GT_XDUMP") {
-            // The kv-source / consumer chain is what the prefill->decode handoff
-            // can break: `owner` picks a different layer's clen counter, and the
-            // source layer publishes `comp_len` for its consumers. Probe the
-            // layer groups plus the two ends (0 / 19 / 20 / 21) with LAYER-OFFSET
-            // kinds so the records cannot be confused:
-            //   kind 400+layer = [win, index_topk, 1/sqrt(hd), clen]  (4 f32)
-            //   kind 500+layer = the full idxs array (win + index_topk)
-            if layer == 0 || layer == 19 || layer == 20 || layer == 21 {
-                let mut cl_l = [0i32; 1];
-                let cbl = Device::view(
-                    (self.s.clen.ptr as *const i32).wrapping_add(owner) as *mut std::ffi::c_void,
-                    4,
-                );
-                self.dev.download_u8(&cbl, unsafe {
-                    std::slice::from_raw_parts_mut(cl_l.as_mut_ptr() as *mut u8, 4)
-                })?;
-                let scl = [
-                    win as f32,
-                    cfg.index_topk as f32,
-                    1.0f32 / (hd as f32).sqrt(),
-                    cl_l[0] as f32,
-                ];
-                self.gt_dump_vec(&xdp, 400 + layer as u64, scl.as_ptr() as *mut std::ffi::c_void, 4)?;
-                self.gt_dump_vec(
-                    &xdp,
-                    500 + layer as u64,
-                    idxs_ptr as *mut std::ffi::c_void,
-                    (win + cfg.index_topk) as usize,
-                )?;
-            }
             if layer == 0 {
                 self.gt_dump_vec(&xdp, 40, self.s.h.ptr, dim)?;
             } else if layer == cfg.n_layers.saturating_sub(1) {
