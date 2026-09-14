@@ -4795,8 +4795,8 @@ fn hc_tail_split() -> bool {
         )?;
         self.dev.apply_rope(
             self.s.idx_k.ptr as *mut f32,
-            self.cos.as_f32(),
-            self.sin.as_f32(),
+            self.cos_comp.as_f32(),
+            self.sin_comp.as_f32(),
             1,
             idx_hd as i32,
             rd as i32,
@@ -4897,8 +4897,8 @@ fn hc_tail_split() -> bool {
         if !idx_q_roped {
             self.dev.apply_rope(
                 self.s.idx_q.ptr as *mut f32,
-                self.cos.as_f32(),
-                self.sin.as_f32(),
+                self.cos_comp.as_f32(),
+                self.sin_comp.as_f32(),
                 idx_nh as i32,
                 idx_hd as i32,
                 rd as i32,
