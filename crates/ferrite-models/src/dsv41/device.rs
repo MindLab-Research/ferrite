@@ -373,6 +373,9 @@ struct Kernels {
     dequant_fp4_e2m1: Option<
         unsafe extern "C" fn(*const u8, *const u8, *mut f32, c_int, c_int, CuStream) -> c_int,
     >,
+    expert_fp4_gemm_official: Option<
+        unsafe extern "C" fn(*const u8, *const f32, *const u8, *const u8, *mut f32, c_int, c_int, CuStream) -> c_int,
+    >,
     swiglu_route: Option<
         unsafe extern "C" fn(*const f32, *const f32, *mut f32, c_int, f32, f32, CuStream) -> c_int,
     >,
@@ -847,6 +850,7 @@ impl Device {
             vec_scale_bf16_round: ko!(rt, "dsv41_vec_scale_bf16_round"),
             dequant_fp8_ue8m0: ko!(rt, "dsv41_dequant_fp8_ue8m0"),
             dequant_fp4_e2m1: ko!(rt, "dsv41_dequant_fp4_e2m1"),
+            expert_fp4_gemm_official: ko!(rt, "dsv41_expert_fp4_gemm_official"),
             swiglu_route: ko!(rt, "dsv41_swiglu_route"),
             cast_f32_to_bf16: ko!(rt, "dsv41_cast_f32_to_bf16"),
             comp_placeholder: ko!(rt, "dsv41_comp_placeholder"),
@@ -3162,6 +3166,23 @@ impl Device {
 
     /// Dequantize packed fp4 e2m1 weights with e8m0 block scales (per 32 on K)
     /// to f32 — the "reference mode" for the cuBLAS expert path.
+    /// The official's fp4_gemm computation order (kernel.py:478-558):
+    /// per-32-block FP8×FP4 dot (no per-element scale) → block × scales → acc.
+    pub fn expert_fp4_gemm_official(
+        &self,
+        act: *const u8,
+        act_scale: *const f32,
+        w: *const u8,
+        ws: *const u8,
+        out: *mut f32,
+        n: i32,
+        k: i32,
+    ) -> Result<()> {
+        let f = self.need(self.kernels.expert_fp4_gemm_official, "dsv41_expert_fp4_gemm_official")?;
+        let rc = unsafe { f(act, act_scale, w, ws, out, n, k, self.stream) };
+        self.kerr(rc, "dsv41_expert_fp4_gemm_official")
+    }
+
     pub fn dequant_fp4_e2m1(
         &self,
         w: *const u8,

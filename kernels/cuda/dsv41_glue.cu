@@ -710,6 +710,72 @@ extern "C" int dsv41_swiglu_route(const float* gate, const float* up, float* out
     return (int)cudaGetLastError();
 }
 
+// The official's fp4_gemm computation order (kernel.py:478-558), replicated
+// exactly: per-32-block FP8×FP4 dot product (NO per-element scale), then the
+// block result × act_scale × weight_scale, accumulated in f32.
+
+// Local copies of the fp4/fp8 decoders (the originals live in
+// dsv41_experts_mxf4.cu's translation unit; the tables are identical).
+__device__ __forceinline__ float glue_e2m1_to_f(uint8_t n) {
+    const float mag[8] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
+    const float m = mag[n & 7u];
+    return (n & 8u) ? -m : m;
+}
+__device__ __forceinline__ float glue_e4m3_to_f(uint8_t b) {
+    const uint32_t s = (uint32_t)(b & 0x80u) << 24;
+    const uint32_t be = (b >> 3) & 0xFu;
+    const uint32_t m = (uint32_t)(b & 0x7u);
+    if (be == 0u) {
+        // subnormal: mantissa * 2^-9
+        return __uint_as_float(s | (m << 14)) * 0.001953125f;
+    }
+    if (be == 15u && m == 7u) return nanf("");
+    return __uint_as_float(s | ((be + 120u) << 23) | (m << 20));
+}
+
+__global__ void expert_fp4_gemm_official_kernel(
+    const uint8_t* __restrict__ act,      // [k] e4m3 bytes (NOT scaled)
+    const float* __restrict__ act_scale,  // [k/32] f32 power-of-two
+    const uint8_t* __restrict__ w,        // [n, k/2] packed fp4 e2m1
+    const uint8_t* __restrict__ ws,       // [n, k/32] e8m0 bytes
+    float* __restrict__ out,              // [n]
+    int n, int k) {
+    const int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= n) return;
+    const int kbytes = k >> 1;
+    const int ksc = k >> 5;
+    const uint8_t* wrow = w + (size_t)row * kbytes;
+    const uint8_t* wsrow = ws + (size_t)row * ksc;
+    float acc = 0.f;
+    // Per-32-block: dot(act[kb*32..], weight[row][kb*32..]) then × scales
+    for (int kb = 0; kb < ksc; ++kb) {
+        float block_dot = 0.f;
+        #pragma unroll
+        for (int j = 0; j < 32; ++j) {
+            const int idx = kb * 32 + j;
+            const float a = dsv41_e4m3_to_f(act[idx]);
+            const uint8_t byte = wrow[idx >> 1];
+            const uint8_t nib = (idx & 1) ? (uint8_t)(byte >> 4) : (uint8_t)(byte & 0xFu);
+            const float b = dsv41_e2m1_to_f(nib);
+            block_dot += a * b;
+        }
+        const float wsc = __uint_as_float(((uint32_t)wsrow[kb]) << 23);
+        acc += block_dot * act_scale[kb] * wsc;
+    }
+    out[row] = acc;
+}
+
+extern "C" int dsv41_expert_fp4_gemm_official(
+    const uint8_t* act, const float* act_scale,
+    const uint8_t* w, const uint8_t* ws,
+    float* out, int n, int k, cudaStream_t s) {
+    if (n <= 0 || k <= 0) return (int)cudaErrorInvalidValue;
+    const int blocks = (n + 127) / 128;
+    expert_fp4_gemm_official_kernel<<<blocks, 128, 0, s>>>(
+        act, act_scale, w, ws, out, n, k);
+    return (int)cudaGetLastError();
+}
+
 extern "C" int dsv41_dequant_fp8_ue8m0(const uint8_t* w, const uint8_t* ws, float* out,
                                         int n, int k, cudaStream_t s) {
     const int total = n * k;
