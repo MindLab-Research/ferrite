@@ -1486,7 +1486,7 @@ __global__ void sparse_attn_split_kernel(const float* __restrict__ q,
                                          const float* __restrict__ kv,
                                          const int32_t* __restrict__ idxs, int b, int m, int h,
                                          int d, const int* __restrict__ clen, int window,
-                                         int index_topk, float scale, int C) {
+                                         int index_topk, float scale, int C, int bf16_dom) {
     const int n = window + *clen;
     const int topk = window + ((*clen < index_topk) ? *clen : index_topk);
     const int ck = blockIdx.x;
@@ -1571,10 +1571,13 @@ __global__ void sparse_attn_split_kernel(const float* __restrict__ q,
             const float nm = fmaxf(my_smax, dot);
             const float corr = expf(my_smax - nm);
             const float e = expf(dot - nm);
+            // The official's acc_s_cast: the P·V GEMM consumes BF16
+            // probabilities (the f32 `e` stays for the softmax sum).
+            const float e_bf = bf16_dom ? orope_bf16_round(e) : e;
 #pragma unroll
             for (int i = 0; i < kMaxPerW; ++i) {
-                const int c = lane + i * 32;
-                if (c < d) my_acc[i] = my_acc[i] * corr + e * kb0[i];
+               const int c = lane + i * 32;
+               if (c < d) my_acc[i] = my_acc[i] * corr + e_bf * kb0[i];
             }
             my_se = my_se * corr + e;
             my_smax = nm;
@@ -1600,10 +1603,11 @@ __global__ void sparse_attn_split_kernel(const float* __restrict__ q,
             const float nm = fmaxf(my_smax, dot);
             const float corr = expf(my_smax - nm);
             const float e = expf(dot - nm);
+            const float e_bf = bf16_dom ? orope_bf16_round(e) : e;
 #pragma unroll
             for (int i = 0; i < kMaxPerW; ++i) {
-                const int c = lane + i * 32;
-                if (c < d) my_acc[i] = my_acc[i] * corr + e * kb1[i];
+               const int c = lane + i * 32;
+               if (c < d) my_acc[i] = my_acc[i] * corr + e_bf * kb1[i];
             }
             my_se = my_se * corr + e;
             my_smax = nm;
@@ -1629,10 +1633,11 @@ __global__ void sparse_attn_split_kernel(const float* __restrict__ q,
             const float nm = fmaxf(my_smax, dot);
             const float corr = expf(my_smax - nm);
             const float e = expf(dot - nm);
+            const float e_bf = bf16_dom ? orope_bf16_round(e) : e;
 #pragma unroll
             for (int i = 0; i < kMaxPerW; ++i) {
-                const int c = lane + i * 32;
-                if (c < d) my_acc[i] = my_acc[i] * corr + e * kb2[i];
+               const int c = lane + i * 32;
+               if (c < d) my_acc[i] = my_acc[i] * corr + e_bf * kb2[i];
             }
             my_se = my_se * corr + e;
             my_smax = nm;
@@ -1663,10 +1668,11 @@ __global__ void sparse_attn_split_kernel(const float* __restrict__ q,
         const float nm = fmaxf(my_smax, dot);
         const float corr = expf(my_smax - nm);
         const float e = expf(dot - nm);
+        const float e_bf = bf16_dom ? orope_bf16_round(e) : e;
 #pragma unroll
         for (int i = 0; i < kMaxPerW; ++i) {
-            const int c = lane + i * 32;
-            if (c < d) my_acc[i] = my_acc[i] * corr + e * kb0[i];
+           const int c = lane + i * 32;
+           if (c < d) my_acc[i] = my_acc[i] * corr + e_bf * kb0[i];
         }
         my_se = my_se * corr + e;
         my_smax = nm;
@@ -1683,10 +1689,11 @@ __global__ void sparse_attn_split_kernel(const float* __restrict__ q,
         const float nm = fmaxf(my_smax, dot);
         const float corr = expf(my_smax - nm);
         const float e = expf(dot - nm);
+        const float e_bf = bf16_dom ? orope_bf16_round(e) : e;
 #pragma unroll
         for (int i = 0; i < kMaxPerW; ++i) {
-            const int c = lane + i * 32;
-            if (c < d) my_acc[i] = my_acc[i] * corr + e * kb1[i];
+           const int c = lane + i * 32;
+           if (c < d) my_acc[i] = my_acc[i] * corr + e_bf * kb1[i];
         }
         my_se = my_se * corr + e;
         my_smax = nm;
@@ -1747,7 +1754,7 @@ __global__ void sparse_attn_merge_kernel(
     const float* __restrict__ sink, float* __restrict__ out, int b, int m, int h, int d, int C,
     const float* __restrict__ cos, const float* __restrict__ sin, const int* __restrict__ base,
     int rope_rd, int half, int mul, int off, int step, int inverse, uint8_t* __restrict__ xq,
-    float* __restrict__ xsc) {
+    float* __restrict__ xsc, int bf16_dom) {
     const int row = blockIdx.x;
     if (row >= b * m) return;
     const int hh = blockIdx.y;
@@ -1776,7 +1783,10 @@ __global__ void sparse_attn_merge_kernel(
         float a = 0.f;
         for (int ck = 0; ck < C; ++ck)
             a += P[(size_t)ck * kAttnStride + 2 + c] * expf(P[(size_t)ck * kAttnStride] - smax);
-        sh_row[c] = (se > 0.f) ? a / se : 0.f;
+        // The official's `o` is BF16: the normalised row enters the bf16
+        // value domain before the rope consumes it (kernel.py's
+        // `T.copy(acc_o, o_shared)` with the BF16 `o`).
+        sh_row[c] = (se > 0.f) ? (bf16_dom ? orope_bf16_round(a / se) : a / se) : 0.f;
     }
     __syncthreads();   // sh_row complete before the rope reads it (and the quant below)
     if (cos != nullptr) {
@@ -1789,8 +1799,11 @@ __global__ void sparse_attn_merge_kernel(
             const float cc = cos[(size_t)tt * half + i];
             const float ss = sin[(size_t)tt * half + i] * (inverse ? -1.f : 1.f);
             const float x0 = rrow[2 * i], x1 = rrow[2 * i + 1];
-            rrow[2 * i] = x0 * cc - x1 * ss;
-            rrow[2 * i + 1] = x0 * ss + x1 * cc;
+            const float r0 = x0 * cc - x1 * ss, r1 = x0 * ss + x1 * cc;
+            // The rope's output is bf16 (the official's rope preserves the
+            // BF16 dtype of `o`).
+            rrow[2 * i] = bf16_dom ? orope_bf16_round(r0) : r0;
+            rrow[2 * i + 1] = bf16_dom ? orope_bf16_round(r1) : r1;
         }
         __syncthreads();   // rope writes visible before the store + quant
     }
@@ -1980,6 +1993,16 @@ __global__ void apply_rope_kernel(float* __restrict__ x, const float* __restrict
 // plain call would have selected `sparse_attn_pf_kernel` and the emission shape
 // is exact (d <= 512, d % 32 == 0, 0 < rope_rd <= d, rope_rd even); the caller
 // then runs the old three-launch sequence, bit-identical by construction.
+// The official's sparse_attn casts the softmax probabilities to BF16 before
+// the P·V GEMM (kernel.py's `acc_s_cast`) and writes the output `o` as BF16.
+// This rounds to the bf16 value domain without a header dependency — the same
+// arithmetic term-for-term as dsv41_bf16_round_inplace.
+__device__ __forceinline__ float orope_bf16_round(float v) {
+    uint32_t u = __float_as_uint(v);
+    u += 0x7fffu + ((u >> 16) & 1u);
+    return __uint_as_float((uint32_t)((uint16_t)(u >> 16)) << 16);
+}
+
 __global__ void sparse_attn_orope_kernel(
     const float* __restrict__ q, const float* __restrict__ kv,
     const float* __restrict__ sink, const int32_t* __restrict__ idxs,
@@ -1987,7 +2010,7 @@ __global__ void sparse_attn_orope_kernel(
     const int* __restrict__ clen, int window, int index_topk, float scale,
     const float* __restrict__ cos, const float* __restrict__ sin,
     const int* __restrict__ base, int rope_rd, int half, int mul, int off, int step,
-    int inverse, uint8_t* __restrict__ xq, float* __restrict__ xsc) {
+    int inverse, uint8_t* __restrict__ xq, float* __restrict__ xsc, int bf16_dom) {
     const int n = window + *clen;
     const int topk = window + ((*clen < index_topk) ? *clen : index_topk);
     const int row = blockIdx.x;
@@ -2068,10 +2091,14 @@ __global__ void sparse_attn_orope_kernel(
                 const float nm = fmaxf(my_smax, dot);
                 const float corr = expf(my_smax - nm);
                 const float e = expf(dot - nm);
+                // The official's acc_s_cast: the P·V GEMM consumes BF16
+                // probabilities (the f32 `e` stays for the softmax sum — the
+                // official accumulates the sum BEFORE the cast).
+                const float e_bf = bf16_dom ? orope_bf16_round(e) : e;
 #pragma unroll
                 for (int i = 0; i < kMaxPerW; ++i) {
                     const int c = lane + i * 32;
-                    if (c < d) my_acc[i] = my_acc[i] * corr + e * kb0[i];
+                    if (c < d) my_acc[i] = my_acc[i] * corr + e_bf * kb0[i];
                 }
                 my_se = my_se * corr + e;
                 my_smax = nm;
@@ -2097,10 +2124,11 @@ __global__ void sparse_attn_orope_kernel(
                 const float nm = fmaxf(my_smax, dot);
                 const float corr = expf(my_smax - nm);
                 const float e = expf(dot - nm);
+                const float e_bf = bf16_dom ? orope_bf16_round(e) : e;
 #pragma unroll
                 for (int i = 0; i < kMaxPerW; ++i) {
                     const int c = lane + i * 32;
-                    if (c < d) my_acc[i] = my_acc[i] * corr + e * kb1[i];
+                    if (c < d) my_acc[i] = my_acc[i] * corr + e_bf * kb1[i];
                 }
                 my_se = my_se * corr + e;
                 my_smax = nm;
@@ -2126,10 +2154,11 @@ __global__ void sparse_attn_orope_kernel(
                 const float nm = fmaxf(my_smax, dot);
                 const float corr = expf(my_smax - nm);
                 const float e = expf(dot - nm);
+                const float e_bf = bf16_dom ? orope_bf16_round(e) : e;
 #pragma unroll
                 for (int i = 0; i < kMaxPerW; ++i) {
                     const int c = lane + i * 32;
-                    if (c < d) my_acc[i] = my_acc[i] * corr + e * kb2[i];
+                    if (c < d) my_acc[i] = my_acc[i] * corr + e_bf * kb2[i];
                 }
                 my_se = my_se * corr + e;
                 my_smax = nm;
@@ -2160,10 +2189,11 @@ __global__ void sparse_attn_orope_kernel(
             const float nm = fmaxf(my_smax, dot);
             const float corr = expf(my_smax - nm);
             const float e = expf(dot - nm);
+            const float e_bf = bf16_dom ? orope_bf16_round(e) : e;
 #pragma unroll
             for (int i = 0; i < kMaxPerW; ++i) {
                 const int c = lane + i * 32;
-                if (c < d) my_acc[i] = my_acc[i] * corr + e * kb0[i];
+                if (c < d) my_acc[i] = my_acc[i] * corr + e_bf * kb0[i];
             }
             my_se = my_se * corr + e;
             my_smax = nm;
@@ -2180,10 +2210,11 @@ __global__ void sparse_attn_orope_kernel(
             const float nm = fmaxf(my_smax, dot);
             const float corr = expf(my_smax - nm);
             const float e = expf(dot - nm);
+            const float e_bf = bf16_dom ? orope_bf16_round(e) : e;
 #pragma unroll
             for (int i = 0; i < kMaxPerW; ++i) {
                 const int c = lane + i * 32;
-                if (c < d) my_acc[i] = my_acc[i] * corr + e * kb1[i];
+                if (c < d) my_acc[i] = my_acc[i] * corr + e_bf * kb1[i];
             }
             my_se = my_se * corr + e;
             my_smax = nm;
@@ -2217,7 +2248,10 @@ __global__ void sparse_attn_orope_kernel(
         for (int c = threadIdx.x; c < d; c += blockDim.x) {
             float a = 0.f;
             for (int w = 0; w < nwarp && w < 4; ++w) a += sh_acc[w][c] * wsc[w];
-            sh_row[c] = (se > 0.f) ? a / se : 0.f;
+            // The official's `o` is BF16: the normalised row enters the bf16
+            // value domain before the rope consumes it (kernel.py's
+            // `T.copy(acc_o, o_shared)` with the BF16 `o`).
+            sh_row[c] = (se > 0.f) ? (bf16_dom ? orope_bf16_round(a / se) : a / se) : 0.f;
         }
         __syncthreads();   // NEW #1: sh_row complete before the rope reads it
         // PHASE 2: inverse rope on the trailing `rope_rd` columns of this head's
@@ -2230,8 +2264,11 @@ __global__ void sparse_attn_orope_kernel(
                 const float cc = cos[(size_t)tt * half + i];
                 const float ss = sin[(size_t)tt * half + i] * (inverse ? -1.f : 1.f);
                 const float x0 = rrow[2 * i], x1 = rrow[2 * i + 1];
-                rrow[2 * i] = x0 * cc - x1 * ss;
-                rrow[2 * i + 1] = x0 * ss + x1 * cc;
+                const float r0 = x0 * cc - x1 * ss, r1 = x0 * ss + x1 * cc;
+                // The rope's output is bf16 (the official's rope preserves the
+                // BF16 dtype of `o`).
+                rrow[2 * i] = bf16_dom ? orope_bf16_round(r0) : r0;
+                rrow[2 * i + 1] = bf16_dom ? orope_bf16_round(r1) : r1;
             }
         }
         __syncthreads();   // NEW #2: rope writes visible before the store + quant
@@ -6494,7 +6531,7 @@ extern "C" int dsv41_sparse_attn_orope(
     const float* q, const float* kv, const float* sink, const int32_t* idxs, float* out, int b,
     int m, int h, int d, const int* clen, int window, int index_topk, float scale,
     const float* cos, const float* sin, const int* base, int rope_rd, int half, int mul, int off,
-    int step, int inverse, uint8_t* xq, float* xsc, cudaStream_t s) {
+    int step, int inverse, uint8_t* xq, float* xsc, int bf16_dom, cudaStream_t s) {
     if (b <= 0 || m <= 0 || h <= 0 || d <= 0) return 1;
     if (d > 512) return 1;              // accumulator is d-wide per thread group
     if ((d & 31) != 0) return 1;        // fp8 per-32-block index must stay head-local
@@ -6525,18 +6562,18 @@ extern "C" int dsv41_sparse_attn_orope(
         // program order makes the partials visible to the merge with no fence.
         sparse_attn_split_kernel<<<dim3((unsigned)split_c, (unsigned)(b * m),
                                         (unsigned)h), 128, 0, s>>>(
-            q, kv, idxs, b, m, h, d, clen, window, index_topk, scale, split_c);
+            q, kv, idxs, b, m, h, d, clen, window, index_topk, scale, split_c, bf16_dom);
         cudaError_t e2 = cudaGetLastError();
         if (e2 != cudaSuccess) return (int)e2;
         sparse_attn_merge_kernel<<<dim3((unsigned)(b * m), (unsigned)h), 128, 0, s>>>(
             sink, out, b, m, h, d, split_c, cos, sin, base, rope_rd, half, mul, off, step,
-            inverse, xq, xsc);
+            inverse, xq, xsc, bf16_dom);
         return (int)cudaGetLastError();
     }
     if (pf_off) return 2;
     sparse_attn_orope_kernel<<<dim3(b * m, h), 128, 0, s>>>(
         q, kv, sink, idxs, out, b, m, h, d, clen, window, index_topk, scale, cos, sin, base,
-        rope_rd, half, mul, off, step, inverse, xq, xsc);
+        rope_rd, half, mul, off, step, inverse, xq, xsc, bf16_dom);
     return (int)cudaGetLastError();
 }
 

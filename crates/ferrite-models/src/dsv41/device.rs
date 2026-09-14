@@ -257,7 +257,7 @@ struct Kernels {
         *const f32, *const f32, *const f32, *const i32, *mut f32,
         c_int, c_int, c_int, c_int, *const c_int, c_int, c_int, f32,
         *const f32, *const f32, *const c_int, c_int, c_int, c_int, c_int, c_int, c_int,
-        *mut u8, *mut f32, CuStream,
+        *mut u8, *mut f32, c_int, CuStream,
     ) -> c_int>,
     indexer_topk: unsafe extern "C" fn(
         *const f32, *const f32, *const f32, *const u8, *const i32, *mut i32,
@@ -2067,6 +2067,7 @@ impl Device {
         inverse: bool,
         xq: *mut u8,
         xsc: *mut f32,
+        bf16_dom: bool,
     ) -> Result<bool> {
         let f = match self.kernels.sparse_attn_orope {
             Some(f) => f,
@@ -2074,7 +2075,7 @@ impl Device {
         };
         let rc = unsafe {
             f(q, kv, sink, idxs, out, b, m, h, d, clen, window, index_topk, scale, cos, sin, base,
-              rope_rd, half, mul, off, step, inverse as i32, xq, xsc, self.stream)
+              rope_rd, half, mul, off, step, inverse as i32, xq, xsc, bf16_dom as i32, self.stream)
         };
         // 1/2/3 are the decline sentinels (see the C launcher); anything else is
         // a real launch error.

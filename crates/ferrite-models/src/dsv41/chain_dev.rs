@@ -752,6 +752,20 @@ fn sparse_orope() -> bool {
     *F.get_or_init(|| std::env::var("DSV41_SPARSE_OROPE").map(|v| v != "0").unwrap_or(true))
 }
 
+/// The official's sparse_attn computes with BF16 operands end-to-end
+/// (kernel.py: q/kv are BF16 in, the softmax probabilities are cast to BF16
+/// before the P·V GEMM — `acc_s_cast` — and the output `o` is BF16, with the
+/// rope preserving the dtype). Our chain keeps f32 buffers with bf16-valued
+/// boundaries (bf16_q / win_kv_quant_rt cover the q/kv side); this gate
+/// rounds the P·V probabilities and the output/rope rows into the bf16 value
+/// domain inside the attention kernels (the split/merge and the single-block
+/// fused arms). DEFAULT ON; `DSV41_ATTN_PBF16=0` reverts to the all-f32
+/// internals for A/B.
+fn attn_pbf16() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_ATTN_PBF16").map(|v| v != "0").unwrap_or(true))
+}
+
 /// B2 (DSV41_RING_WIN_FUSE, default ON): one launch does the window ring append
 /// and the window indices (two adjacent, mutually independent one-block
 /// kernels), saving 40 launches/step. "0" reverts; an .so without
@@ -3789,6 +3803,7 @@ fn hc_tail_split() -> bool {
                 true,
                 self.s.xq.ptr as *mut u8,
                 self.s.xsc.ptr as *mut f32,
+                attn_pbf16(),
             )?;
         if !s_orope {
             self.dev.sparse_attn(
