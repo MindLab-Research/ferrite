@@ -1482,6 +1482,17 @@ static int dsv41_resolve_sparse_split_c() {
 }
 
 // grid (C, b*m, h): block (ck, row, hh) owns keys [topk*ck/C, topk*(ck+1)/C).
+// The official's sparse_attn casts the softmax probabilities to BF16 before
+// the P·V GEMM (kernel.py's `acc_s_cast`) and writes the output `o` as BF16.
+// This rounds to the bf16 value domain without a header dependency — the same
+// arithmetic term-for-term as dsv41_bf16_round_inplace. Defined before the
+// first consumer (sparse_attn_split_kernel).
+__device__ __forceinline__ float orope_bf16_round(float v) {
+    uint32_t u = __float_as_uint(v);
+    u += 0x7fffu + ((u >> 16) & 1u);
+    return __uint_as_float((uint32_t)((uint16_t)(u >> 16)) << 16);
+}
+
 __global__ void sparse_attn_split_kernel(const float* __restrict__ q,
                                          const float* __restrict__ kv,
                                          const int32_t* __restrict__ idxs, int b, int m, int h,
@@ -1993,16 +2004,6 @@ __global__ void apply_rope_kernel(float* __restrict__ x, const float* __restrict
 // plain call would have selected `sparse_attn_pf_kernel` and the emission shape
 // is exact (d <= 512, d % 32 == 0, 0 < rope_rd <= d, rope_rd even); the caller
 // then runs the old three-launch sequence, bit-identical by construction.
-// The official's sparse_attn casts the softmax probabilities to BF16 before
-// the P·V GEMM (kernel.py's `acc_s_cast`) and writes the output `o` as BF16.
-// This rounds to the bf16 value domain without a header dependency — the same
-// arithmetic term-for-term as dsv41_bf16_round_inplace.
-__device__ __forceinline__ float orope_bf16_round(float v) {
-    uint32_t u = __float_as_uint(v);
-    u += 0x7fffu + ((u >> 16) & 1u);
-    return __uint_as_float((uint32_t)((uint16_t)(u >> 16)) << 16);
-}
-
 __global__ void sparse_attn_orope_kernel(
     const float* __restrict__ q, const float* __restrict__ kv,
     const float* __restrict__ sink, const int32_t* __restrict__ idxs,
@@ -6456,6 +6457,13 @@ extern "C" int dsv41_sparse_attn(const float* q, const float* kv, const float* s
         const char* e = getenv("DSV41_ATTN_PF");
         return e != nullptr && atoi(e) == 0;
     }();
+    // The same bf16 domain gate as the fused orope path (DSV41_ATTN_PBF16,
+    // default ON): both entries must agree or the fallback would compute in a
+    // different domain than the fused path it backs up.
+    static const int pbf16 = [] {
+        const char* e = getenv("DSV41_ATTN_PBF16");
+        return (e != nullptr && atoi(e) == 0) ? 0 : 1;
+    }();
     dim3 grid(b * m, h);
     if (!seq) {
         const int split_c = g_sparse_split_c;
@@ -6474,12 +6482,12 @@ extern "C" int dsv41_sparse_attn(const float* q, const float* kv, const float* s
             // partials visible to the merge with no fence and no sync.
             sparse_attn_split_kernel<<<dim3((unsigned)split_c, (unsigned)(b * m),
                                             (unsigned)h), 128, 0, s>>>(
-                q, kv, idxs, b, m, h, d, clen, window, index_topk, scale, split_c);
+                q, kv, idxs, b, m, h, d, clen, window, index_topk, scale, split_c, pbf16);
             cudaError_t e2 = cudaGetLastError();
             if (e2 != cudaSuccess) return (int)e2;
             sparse_attn_merge_kernel<<<dim3((unsigned)(b * m), (unsigned)h), 128, 0, s>>>(
                 sink, out, b, m, h, d, split_c, nullptr, nullptr, nullptr, 0, 0, 0, 0, 0, 0,
-                nullptr, nullptr);
+                nullptr, nullptr, pbf16);
             return (int)cudaGetLastError();
         } else {
             // PDL (see dsv41_pdl_or_plain): sparse_attn_pf is the consumer of
