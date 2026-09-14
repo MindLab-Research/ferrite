@@ -801,7 +801,7 @@ __global__ void expert_fp4_gemm_official_kernel(
         float c0 = 0.f, c1 = 0.f, c2 = 0.f, c3 = 0.f;
         asm volatile(
             "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
-            "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};"
+            "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
             : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
             : "r"(a_frag[0]), "r"(a_frag[1]), "r"(a_frag[2]), "r"(a_frag[3]),
               "r"(b_frag[0]), "r"(b_frag[1]));
