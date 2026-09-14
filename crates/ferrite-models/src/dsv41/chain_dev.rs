@@ -835,6 +835,23 @@ pub(crate) fn expert_act_e4m3() -> bool {
     *F.get_or_init(|| std::env::var("DSV41_EXPERT_ACT_E4M3").map(|v| v != "0").unwrap_or(true))
 }
 
+/// DSV41_EXPERT_CUBLAS (default OFF): the routed experts via dequantized f32
+/// weights + cuBLAS GEMMs — the "one-step reference mode" that replaces the
+/// fp4 GEMV chain entirely. The official computes gate/up as fp4_gemm(e4m3
+/// act × e2m1 weight, scale on the accumulator), applies the routing weight
+/// to the swiglu output BEFORE the down's quantisation, and downs with the
+/// same fp4_gemm. This path dequantizes the fp4 weights to f32 ONCE (cached)
+/// and runs the whole chain in f32 via cuBLAS — numerically the closest we
+/// can get without porting tilelang.
+pub(crate) fn expert_cublas() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("DSV41_EXPERT_CUBLAS")
+            .map(|v| v != "0")
+            .unwrap_or(false)
+    })
+}
+
 /// The official's gate domain: the reference computes the gate scores in FULL
 /// F32 (`linear(x.float(), weight.float()) / gate_temp` — model.py Gate.forward);
 /// our old bf16/fp8 gate paths differ by ~1-2%, which flipped near-tie expert
@@ -5276,6 +5293,152 @@ fn hc_tail_split() -> bool {
                         self.s.o.ptr as *mut f32,
                         dim as i32,
                         topk as i32,
+                    )?;
+                }
+            } else if expert_cublas() {
+                // DSV41_EXPERT_CUBLAS: the "one-step reference mode" —
+                // dequantize each selected expert's fp4 weights to f32 and run
+                // gate/up/swiglu/down via cuBLAS gemv_f32, matching the
+                // official's computation order exactly (Expert.forward):
+                //   gate = w1(x)  up = w3(x)  [fp4_gemm, scale on accumulator]
+                //   x = silu(clamp(g)) * clamp(u) * routing_weight  [f32 + bf16]
+                //   down = w2(x)  [fp4_gemm]
+                // The routing weight lands BEFORE the down's quantisation, the
+                // per-slot output is bf16-rounded (the official's
+                // `y[idx] += expert(...)` semantics).
+                //
+                // The expert ids live on the device (route_idx); read the
+                // topk ids + weights to the host ONCE per step (24+24 bytes).
+                let mut ids_h = vec![0i32; topk];
+                let mut wts_h = vec![0f32; topk];
+                {
+                    let b = Device::view(
+                        self.s.route_idx.ptr as *mut std::ffi::c_void,
+                        topk * 4,
+                    );
+                    self.dev.download_u8(&b, unsafe {
+                        std::slice::from_raw_parts_mut(
+                            ids_h.as_mut_ptr() as *mut u8,
+                            topk * 4,
+                        )
+                    })?;
+                    let b = Device::view(
+                        self.s.route_w.ptr as *mut std::ffi::c_void,
+                        topk * 4,
+                    );
+                    self.dev.download_u8(&b, unsafe {
+                        std::slice::from_raw_parts_mut(
+                            wts_h.as_mut_ptr() as *mut u8,
+                            topk * 4,
+                        )
+                    })?;
+                }
+                // Cached device buffers (allocated once, reused every step):
+                // w_f32: the dequantized weight (max of w1/w3 and w2 shapes)
+                // gate/up/act: [inter_local] each; down_p: [dim]
+                thread_local! {
+                    static EX_W: std::cell::RefCell<Option<DevBuf>> =
+                        const { std::cell::RefCell::new(None) };
+                    static EX_GATE: std::cell::RefCell<Option<DevBuf>> =
+                        const { std::cell::RefCell::new(None) };
+                    static EX_UP: std::cell::RefCell<Option<DevBuf>> =
+                        const { std::cell::RefCell::new(None) };
+                    static EX_ACT: std::cell::RefCell<Option<DevBuf>> =
+                        const { std::cell::RefCell::new(None) };
+                    static EX_DOWN: std::cell::RefCell<Option<DevBuf>> =
+                        const { std::cell::RefCell::new(None) };
+                }
+                let w_need = (inter_local * dim).max(dim * inter_local) * 4;
+                EX_W.with(|c| {
+                    if c.borrow().is_none() {
+                        *c.borrow_mut() = Some(self.dev.alloc(w_need).unwrap());
+                    }
+                });
+                EX_GATE.with(|c| {
+                    if c.borrow().is_none() {
+                        *c.borrow_mut() = Some(self.dev.alloc(inter_local * 4).unwrap());
+                    }
+                });
+                EX_UP.with(|c| {
+                    if c.borrow().is_none() {
+                        *c.borrow_mut() = Some(self.dev.alloc(inter_local * 4).unwrap());
+                    }
+                });
+                EX_ACT.with(|c| {
+                    if c.borrow().is_none() {
+                        *c.borrow_mut() = Some(self.dev.alloc(inter_local * 4).unwrap());
+                    }
+                });
+                EX_DOWN.with(|c| {
+                    if c.borrow().is_none() {
+                        *c.borrow_mut() = Some(self.dev.alloc(dim * 4).unwrap());
+                    }
+                });
+                let (w_buf, g_buf, u_buf, a_buf, d_buf) = (
+                    EX_W.with(|c| c.borrow().as_ref().unwrap().ptr),
+                    EX_GATE.with(|c| c.borrow().as_ref().unwrap().ptr),
+                    EX_UP.with(|c| c.borrow().as_ref().unwrap().ptr),
+                    EX_ACT.with(|c| c.borrow().as_ref().unwrap().ptr),
+                    EX_DOWN.with(|c| c.borrow().as_ref().unwrap().ptr),
+                );
+                for slot in 0..topk {
+                    let eid = ids_h[slot] as i64;
+                    let rw = wts_h[slot];
+                    if eid < 0 || eid as usize >= ne {
+                        continue;
+                    }
+                    // gate: dequant w1[eid] → gemv_f32(xn, w1_f32)
+                    let w1p = unsafe { w1_base.offset((eid * w1_stride) as isize) };
+                    let w1sp = unsafe { w1s_base.offset((eid * w1s_stride) as isize) };
+                    self.dev.dequant_fp4_e2m1(
+                        w1p, w1sp, w_buf as *mut f32,
+                        inter_local as i32, dim as i32,
+                    )?;
+                    self.dev.gemm_f32(
+                        self.s.xn.ptr as *const std::ffi::c_void,
+                        w_buf as *const std::ffi::c_void,
+                        g_buf as *mut f32,
+                        1, inter_local as i32, dim as i32,
+                    )?;
+                    // up: dequant w3[eid] → gemv_f32(xn, w3_f32)
+                    let w3p = unsafe { w3_base.offset((eid * w3_stride) as isize) };
+                    let w3sp = unsafe { w3s_base.offset((eid * w3s_stride) as isize) };
+                    self.dev.dequant_fp4_e2m1(
+                        w3p, w3sp, w_buf as *mut f32,
+                        inter_local as i32, dim as i32,
+                    )?;
+                    self.dev.gemm_f32(
+                        self.s.xn.ptr as *const std::ffi::c_void,
+                        w_buf as *const std::ffi::c_void,
+                        u_buf as *mut f32,
+                        1, inter_local as i32, dim as i32,
+                    )?;
+                    // swiglu + routing weight + bf16 round (the official's
+                    // Expert.forward: x = weights * silu(clamp(g))*clamp(u))
+                    self.dev.swiglu_route(
+                        g_buf as *const f32, u_buf as *const f32,
+                        a_buf as *mut f32,
+                        inter_local as i32, cfg.swiglu_limit, rw,
+                    )?;
+                    // down: dequant w2[eid] → gemv_f32(act, w2_f32) → down_p
+                    let w2p = unsafe { w2_base.offset((eid * w2_stride) as isize) };
+                    let w2sp = unsafe { w2s_base.offset((eid * w2s_stride) as isize) };
+                    self.dev.dequant_fp4_e2m1(
+                        w2p, w2sp, w_buf as *mut f32,
+                        dim as i32, inter_local as i32,
+                    )?;
+                    self.dev.gemm_f32(
+                        a_buf as *const std::ffi::c_void,
+                        w_buf as *const std::ffi::c_void,
+                        d_buf as *mut f32,
+                        1, dim as i32, inter_local as i32,
+                    )?;
+                    // Accumulate: s.o += down_p (fixed ascending slot order,
+                    // the official's `y[idx] += expert(...)` semantics)
+                    self.dev.add_inplace_raw(
+                        self.s.o.ptr as *mut std::ffi::c_void,
+                        d_buf as *const std::ffi::c_void,
+                        dim as i64,
                     )?;
                 }
             } else {

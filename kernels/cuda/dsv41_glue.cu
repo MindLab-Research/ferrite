@@ -655,6 +655,61 @@ __global__ void dequant_fp8_ue8m0_kernel(const uint8_t* __restrict__ w,
     out[idx] = v * sc;
 }
 
+// Dequantize packed fp4 e2m1 weights with e8m0 block scales (per 32 on K)
+// to f32 — the "reference mode" input for the cuBLAS expert path. The e2m1
+// decode matches dsv41_e2m1_to_f exactly (same 8-entry magnitude table).
+__global__ void dequant_fp4_e2m1_kernel(const uint8_t* __restrict__ w,
+                                        const uint8_t* __restrict__ ws,
+                                        float* __restrict__ out, int n, int k) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n * k) return;
+    const int row = idx / k, col = idx % k;
+    const float sc = __uint_as_float(((uint32_t)ws[(row) * (k >> 5) + (col >> 5)]) << 23);
+    const uint8_t byte = w[(size_t)row * (k >> 1) + (col >> 1)];
+    const uint8_t nib = (col & 1) ? (uint8_t)(byte >> 4) : (uint8_t)(byte & 0xFu);
+    const float mag[8] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
+    const float m = mag[nib & 7u];
+    out[idx] = (nib & 8u) ? -m * sc : m * sc;
+}
+
+extern "C" int dsv41_dequant_fp4_e2m1(const uint8_t* w, const uint8_t* ws, float* out,
+                                       int n, int k, cudaStream_t s) {
+    const int total = n * k;
+    if (total <= 0) return (int)cudaErrorInvalidValue;
+    dequant_fp4_e2m1_kernel<<<(unsigned)((total + 255) / 256), 256, 0, s>>>(w, ws, out, n, k);
+    return (int)cudaGetLastError();
+}
+
+// The official's expert chain epilogue (Expert.forward): clamp(gate, max=limit),
+// clamp(up, ±limit), silu(gate)*up, multiply by the routing weight, bf16 round.
+// This is ONE kernel so the routing weight lands BEFORE any quantisation of
+// the down input (the official's `x = weights * x; w2(x.to(dtype))`).
+__global__ void swiglu_route_kernel(const float* __restrict__ gate,
+                                     const float* __restrict__ up,
+                                     float* __restrict__ out, int n, float limit,
+                                     float weight) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float g = gate[i], u = up[i];
+    if (limit > 0.f) {
+        g = fminf(g, limit);
+        u = fminf(fmaxf(u, -limit), limit);
+    }
+    float v = (g / (1.f + expf(-g))) * u;
+    v *= weight;
+    // bf16 round (round-to-nearest-even, same as .to(torch.bfloat16))
+    uint32_t b = __float_as_uint(v);
+    b += 0x7fffu + ((b >> 16) & 1u);
+    out[i] = __uint_as_float((uint32_t)((uint16_t)(b >> 16)) << 16);
+}
+
+extern "C" int dsv41_swiglu_route(const float* gate, const float* up, float* out,
+                                   int n, float limit, float weight, cudaStream_t s) {
+    if (n <= 0) return 0;
+    swiglu_route_kernel<<<(unsigned)((n + 255) / 256), 256, 0, s>>>(gate, up, out, n, limit, weight);
+    return (int)cudaGetLastError();
+}
+
 extern "C" int dsv41_dequant_fp8_ue8m0(const uint8_t* w, const uint8_t* ws, float* out,
                                         int n, int k, cudaStream_t s) {
     const int total = n * k;

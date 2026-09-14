@@ -370,6 +370,12 @@ struct Kernels {
     dequant_fp8_ue8m0: Option<
         unsafe extern "C" fn(*const u8, *const u8, *mut f32, c_int, c_int, CuStream) -> c_int,
     >,
+    dequant_fp4_e2m1: Option<
+        unsafe extern "C" fn(*const u8, *const u8, *mut f32, c_int, c_int, CuStream) -> c_int,
+    >,
+    swiglu_route: Option<
+        unsafe extern "C" fn(*const f32, *const f32, *mut f32, c_int, f32, f32, CuStream) -> c_int,
+    >,
     cast_f32_to_bf16: Option<
         unsafe extern "C" fn(*const f32, *mut c_void, c_int, CuStream) -> c_int,
     >,
@@ -840,6 +846,8 @@ impl Device {
             bf16_round_inplace: ko!(rt, "dsv41_bf16_round_inplace"),
             vec_scale_bf16_round: ko!(rt, "dsv41_vec_scale_bf16_round"),
             dequant_fp8_ue8m0: ko!(rt, "dsv41_dequant_fp8_ue8m0"),
+            dequant_fp4_e2m1: ko!(rt, "dsv41_dequant_fp4_e2m1"),
+            swiglu_route: ko!(rt, "dsv41_swiglu_route"),
             cast_f32_to_bf16: ko!(rt, "dsv41_cast_f32_to_bf16"),
             comp_placeholder: ko!(rt, "dsv41_comp_placeholder"),
             compress_commit: ko!(rt, "dsv41_compress_commit"),
@@ -3150,6 +3158,37 @@ impl Device {
         let f = self.need(self.kernels.dequant_fp8_ue8m0, "dsv41_dequant_fp8_ue8m0")?;
         let rc = unsafe { f(w, ws, out, n, k, self.stream) };
         self.kerr(rc, "dsv41_dequant_fp8_ue8m0")
+    }
+
+    /// Dequantize packed fp4 e2m1 weights with e8m0 block scales (per 32 on K)
+    /// to f32 — the "reference mode" for the cuBLAS expert path.
+    pub fn dequant_fp4_e2m1(
+        &self,
+        w: *const u8,
+        ws: *const u8,
+        out: *mut f32,
+        n: i32,
+        k: i32,
+    ) -> Result<()> {
+        let f = self.need(self.kernels.dequant_fp4_e2m1, "dsv41_dequant_fp4_e2m1")?;
+        let rc = unsafe { f(w, ws, out, n, k, self.stream) };
+        self.kerr(rc, "dsv41_dequant_fp4_e2m1")
+    }
+
+    /// The official's expert chain epilogue: clamp + silu(gate)*up + routing
+    /// weight + bf16 round — the weight lands BEFORE the down's quantisation.
+    pub fn swiglu_route(
+        &self,
+        gate: *const f32,
+        up: *const f32,
+        out: *mut f32,
+        n: i32,
+        limit: f32,
+        weight: f32,
+    ) -> Result<()> {
+        let f = self.need(self.kernels.swiglu_route, "dsv41_swiglu_route")?;
+        let rc = unsafe { f(gate, up, out, n, limit, weight, self.stream) };
+        self.kerr(rc, "dsv41_swiglu_route")
     }
 
     /// Cast an f32 buffer into bf16 storage — the input layout for cuBLAS
