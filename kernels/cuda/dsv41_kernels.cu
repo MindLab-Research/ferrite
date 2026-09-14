@@ -2685,12 +2685,6 @@ __global__ void idx_fp4_rt_kernel(float* __restrict__ x, int cols, int block) {
     }
 }
 
-extern "C" int dsv41_idx_fp4_rt(float* x, int cols, int block, cudaStream_t s) {
-    if (cols <= 0 || block <= 0 || (cols % block) != 0) return (int)cudaErrorInvalidValue;
-    idx_fp4_rt_kernel<<<cols / block, 32, 0, s>>>(x, cols, block);
-    return (int)cudaGetLastError();
-}
-
 __global__ void indexer_score_kernel(const float* __restrict__ q, const float* __restrict__ ik,
                                      const float* __restrict__ w, const uint8_t* __restrict__ cand,
                                      const int32_t* __restrict__ lens, int m, int nh, int hd,
@@ -3368,6 +3362,18 @@ __global__ void compressor_fused_kernel(const float* __restrict__ kvp,
 }
 
 }  // namespace
+
+// The indexer's fp4 round-trip launcher — OUTSIDE the anonymous namespace:
+// an extern "C" definition inside it gets internal linkage and the symbol
+// never lands in the .so's dynamic table (the runtime then refuses the
+// launch with "kernel not in the loaded .so"). The kernel itself stays
+// inside (it uses the namespace's e2m1_to_f / fast_round_scale, and the
+// launcher here can still reference it — same TU).
+extern "C" int dsv41_idx_fp4_rt(float* x, int cols, int block, cudaStream_t s) {
+    if (cols <= 0 || block <= 0 || (cols % block) != 0) return (int)cudaErrorInvalidValue;
+    idx_fp4_rt_kernel<<<cols / block, 32, 0, s>>>(x, cols, block);
+    return (int)cudaGetLastError();
+}
 
 #define DSV41_LAUNCH_CHECK()                     \
     do {                                         \
