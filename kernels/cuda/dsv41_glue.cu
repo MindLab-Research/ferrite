@@ -753,10 +753,10 @@ __global__ void expert_fp4_gemm_official_kernel(
         #pragma unroll
         for (int j = 0; j < 32; ++j) {
             const int idx = kb * 32 + j;
-            const float a = dsv41_e4m3_to_f(act[idx]);
+            const float a = glue_e4m3_to_f(act[idx]);
             const uint8_t byte = wrow[idx >> 1];
             const uint8_t nib = (idx & 1) ? (uint8_t)(byte >> 4) : (uint8_t)(byte & 0xFu);
-            const float b = dsv41_e2m1_to_f(nib);
+            const float b = glue_e2m1_to_f(nib);
             block_dot += a * b;
         }
         const float wsc = __uint_as_float(((uint32_t)wsrow[kb]) << 23);
