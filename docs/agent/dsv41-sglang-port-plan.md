@@ -3,7 +3,16 @@
 > 用户指令链：① 参考官方 PyTorch 彻底改好正确性；② MTP block-5 step ≈ 7ms 即达标（同口径 > sglang 873.6 tok/s）；③ eager 之外的算子判垃圾，**照抄 SGLang**（BBuf/sglang@835c3909，V4.1-Flash 真源；master 无 V4.1）；④ 移植→确认正确→优化到比他们快。
 > 验证机：AWS b300-4（ubuntu@43.202.208.136，8×B300，模型 /opt/dlami/nvme/models/DeepSeek-V4.1-Flash）。
 
-## 🎯 当前战况（2026-09-14 深夜——两大域已对齐，剩余发散=深层 GEMM 累加序；读这节就够）
+## 🎯 当前战况（2026-09-14 深夜四——kv_gemm 已逐位对齐（T1 发射 bf16 修复）；剩余=attn_o 3.3-3.5% 的其它源；读这节就够）
+
+**本轮三大突破（全部默认配置验证）**：
+1. **kv_gemm = 0.00%（逐位一致！）**——根因=**T1 融合发射**（`hc_mixes_tail_kernel` 的 EARLY 半段内联产 xn 的 fp8）**跳过了 bf16 化**：写回 xn 无 bf16 舍入 + amax/量化用未舍入 f32，而官方 xn 是 bf16（hc_pre 末尾 `.to(x.dtype)`）。修复=内核加 `bf16_xn` 参数（`g_tail_bf16_xn` static 镜像 DSV41_BF16_XN）+ 发射循环写回前舍入 + 3 调用点传参（commit 5d0d4c2f）。**方法论黄金链**（复用于后续猎杀）：xn 逐位同（kind-0）→ 独立 quant 逐字节同官方 act_quant（真实 xn 微测 0/5120+0/160）→ GEMM 内核恒等（SIMT gemv≡swapab≡mx2≡官方 tilelang，模输出 bf16 cast 0.15%）→ FUSE_B1=0 隔离实锤（kv_gemm 0.495%→0.000%）。**教训：所有"融合发射=独立调用"的声明必须逐字节验证**（本声明失败造成 0.495% 隐蔽偏差，且 NORM_FUSE/PROJ_FUSE 门都不控制它）。
+2. **专家域三阶段 + sparse_attn 内部 bf16**（前两轮，见下表）。
+3. **官方栈澄清**：官方=PyTorch 模型代码（model.py）+ **tilelang JIT 算子**（kernel.py 的 @tilelang.jit）——参考值来自这套栈（dump 生成源码确认 `tl::mma_sync<m16n8k32,e4m3>` 与我们同指令；"GEMM 累加序不同"的旧理论**已死**）。
+
+**当前逐算子发散（默认配置，teacher-forced）**：xn 0.00% ✓ / **kv_gemm 0.00% ✓** / kv_RT 0.55-1.19% / attn_o 3.29-3.47% / moe_o 3.29-10.43%（上游泄漏+shared 内部）。数数 1..51 后断于 52（75 行）。
+
+**attn_o 剩余源（TODO #4，按优先级）**：①kv_RT 残余 0.55-1.19%（norm/rope/RT 链内部——**警惕同款 T1 式融合跳边界**：kv 链有 gemm_fp8_mx_rope_norm 融合！）②q 链（wq_b/rope/q_norm）③indexer 选择（topk_idxs vs 官方）④o-proj（wo_a/wo_b）。方法论同上：零重建微测+官方对拍+env 门隔离。
 
 **数数**：1..51 后断于 52（但继续输出至 98 行——"在数"而非退化）。正确性锚=官方 PyTorch（MP8 teacher-forced 对拍，kinds 0-21 dump 工具链）。
 
