@@ -114,6 +114,48 @@ Reference-side counterpart: `ref_attn2.py` patches the module-level `sparse_attn
 and dumps `(q, kv, idxs)` for a chosen `(layer, pos)` — the strict split of "our
 inputs differ" versus "our operator differs".
 
+## Next fix: the compressed latent is missing its fp4 round-trip
+
+The reference quantises each compressed latent **after the rope and before the
+cache write** (`model.py:758-761`):
+
+```python
+apply_rotary_emb(latent[..., -rope_head_dim:], freqs)
+# Compressed KV uses groups of 16 with E4M3 scales; the indexer uses 32 with E8M0.
+fp4_act_quant(latent, 16, True, scale_dtype=torch.float8_e4m3fn)
+self.compress_kv_cache[:bsz, start_pos // ratio : ...] = latent
+```
+
+and the two scale derivations are DIFFERENT (`kernel.py:129-184`):
+
+```python
+fp4_max = 6.0
+if scale_dtype == FP8:                  # compressed KV: block 16, E4M3 scale
+    amax = max(amax, 6 * 2**-9)
+    s    = float8_e4m3(amax / 6)        # NOT a power of two
+else:                                   # indexer: block 32, E8M0 (power-of-two)
+    amax = max(amax, 6 * 2**-126)
+    s    = fast_round_scale(amax, 1/fp4_max)
+# inplace writes the DEQUANTISED value back:
+Y = cast_e2m1(clamp(x / s, -6, 6)) * s
+```
+
+`dsv41_idx_fp4_rt` (`dsv41_kernels.cu:3419`, block 32 + `fast_round_scale(amax, 1/6)`)
+is exactly the **indexer** arm; it is called only on `idx_k`/`idx_q`
+(`chain_dev.rs:4819`, `:4919`). The **compressed latent gets no round-trip at
+all** — `compress_commit_kernel` (`dsv41_glue.cu:1053-1079`) ropes and stores, and
+its verbatim copy inside `compressor_fused_kernel`'s stage 3
+(`dsv41_kernels.cu:3385-3408`) does the same. Both bodies must change together
+(the file says so explicitly).
+
+Implementation sketch: inside the store loop, after the rope, each warp's 32
+lanes cover 32 consecutive columns = exactly two 16-element blocks, so a
+half-warp `__shfl_xor_sync` tree (masks 8/4/2/1, **exact masks only** — the
+`__shfl_xor_sync` mask-mismatch trap this project already hit once) gives the
+block amax; then `s = (float)__nv_fp8_e4m3(amax / 6.f)` (with `amax` floored at
+`6 * 2^-9`), `d = clamp(x/s, +-6)`, the e2m1 nearest (the `mags[8]` table
+`idx_fp4_rt_kernel` uses, first-on-ties), and the write-back is `d * s`.
+
 ## Known remaining difference (inert at short context, matters at long)
 
 Our `indexer()` ropes the indexer's k and q with the **main** rope tables
