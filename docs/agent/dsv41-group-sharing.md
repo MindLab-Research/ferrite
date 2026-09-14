@@ -114,6 +114,34 @@ Reference-side counterpart: `ref_attn2.py` patches the module-level `sparse_attn
 and dumps `(q, kv, idxs)` for a chosen `(layer, pos)` — the strict split of "our
 inputs differ" versus "our operator differs".
 
+## Position-0 segment table: where layer 0's decode drift actually is
+
+Both sides measured at position 0 (ours via `DSV41_L0DBG`, the reference via its
+own `[ref0]/[refa]/[refp]` prints plus a hook that prints the pos-0 values the
+reference itself only aggregates over all positions):
+
+| anchor (pos 0) | ours | reference | verdict |
+|---|---|---|---|
+| xin | 0.156114 | 0.156114 | identical |
+| attn_xn | 0.020054 (first4 all equal) | 0.020054 (xn[0..4] all equal) | identical |
+| attn_out | 0.586200 (first4 all equal) | 0.586200 (o[0..4] all equal) | identical |
+| **attn OUT (sparse_attn return)** | bit-identical to the reference's `out` | `out` | **0.0000e+00** |
+| post-rope q | — | — | 8.5e-06 (bf16 boundary) |
+| **ffn_in** | 0.127121, first4 `[0.14746094, 0.16015625, -0.11035156, -0.16113281]` | 0.127104, first4 `[0.1484375, 0.16015625, -0.10986328, -0.16113281]` | **differs by ~1e-3 on 2 of 4** |
+| moe_out | 2.292812 | 2.292886 | 3e-5 |
+
+⇒ layer 0's attention is bit-exact at pos 0 (per-element first4 equal AND the
+returned tensor identical), and the FIRST difference is `ffn_in` — whose input
+(`attn_out`) is bit-identical. So the remaining layer-0 drift is inside the
+**FFN-side hc chain** (`hc_mixes → hc_pre → ffn_norm`), not in the attention, not
+in the window KV, not in the rope, and not in the six decode switches.
+
+⚠️ Harness note: hooking `model.layers[0].attn` does NOT give `after_attn_h` —
+the reference does the attention-side `hc_post` inside `Block.forward`, so that
+module's return value IS `attn_out` (verified: the hook printed 0.586200, i.e.
+exactly attn_out). Comparing the attn-side hc_post needs a reimplementation of
+that step (as was done for the engram and the MoE), not a module hook.
+
 ## Narrowed lead: the window-KV WRITE path (and what the A/B ruled out)
 
 A/B of the six decode-only switches at layer 0 (each toggled off, then our L1 rel
