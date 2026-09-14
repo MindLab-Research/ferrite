@@ -114,6 +114,40 @@ Reference-side counterpart: `ref_attn2.py` patches the module-level `sparse_attn
 and dumps `(q, kv, idxs)` for a chosen `(layer, pos)` — the strict split of "our
 inputs differ" versus "our operator differs".
 
+## Layer bisection result: the drift is introduced by the DECODE-only path
+
+The reference's `REF_HDUMP` labels drift in its teacher-forced decode loop
+(`cur["start"]` does not advance by the chunk length: measured offsets are 0 for
+the 15 prefill records, +14 for 75 decode records, +34 for 2, and garbage for the
+rest; 42 records match nothing). So the two dumps are aligned by CONTENT instead:
+our L0 row is bit-identical to the reference's L0 at any position where both
+engines saw the same token, so `md5(our L0)` gives an exact label -> position map
+(`hcmp3.py`). 187 labels map cleanly that way.
+
+Using the closest mapped position below the first wrong token (147, whose logits
+produce the wrong token at 148):
+
+```
+L 0 rel=0.0000e+00     <- bit-identical (validates the whole comparison)
+L 1 rel=2.0083e-02     <- layer 0's output is ALREADY 2% off at a decode position
+L 2 rel=8.4268e-02     <- first layer over 3e-2
+L 3 rel=1.4356e-01
+L 4..39 rel ~1.4e-01..1.7e-01   (saturated)
+```
+
+⇒ The drift is not an isolated wrong value in one kernel: it ENTERS DURING LAYER 0
+at decode positions, even though layer 0 was verified bit-exact at pos 0 (prefill).
+A ~2%/layer accumulation across 40 layers is what flips the counted token at
+position ~148 - which is exactly why the first 62 numbers are correct and the
+63rd is not.
+
+Next (cheapest decisive test): A/B the **decode-only** switches on layer 0 at
+position 147 and watch L1's rel — `DSV41_MOE_DUAL=0`, `DSV41_COMP_FUSE=0`,
+`DSV41_MOE_EPI_ADD=0`, `DSV41_HCPOST_EPI=0`, `DSV41_FUSE_B1=0`. Whichever drives
+L1 to ~1e-3 is the decode path that is numerically different from the prefill
+path. (Fixing the MoE_DUAL RACE does not make that path bit-exact - it only
+removed the overlapping-buffer corruption.)
+
 ## Where the remaining glitches are (offline analysis of the one-shot dump)
 
 `dumpall.sh 200` produced every artefact in `/opt/dlami/nvme/dbg` (our per-step
