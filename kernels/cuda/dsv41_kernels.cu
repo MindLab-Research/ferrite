@@ -7454,6 +7454,13 @@ __global__ void hc_mix_dots_kernel(const float* __restrict__ x, const float* __r
 #define HC_TAIL_FULL 0
 #define HC_TAIL_EARLY 1
 #define HC_TAIL_LATE 2
+// The DSV41_BF16_XN mirror for the fused T1 emission (see the kernel's
+// emission note): read once like the other host-side gates.
+static const int g_tail_bf16_xn = [] {
+    const char* e = getenv("DSV41_BF16_XN");
+    return (e != nullptr && e[0] == '0') ? 0 : 1;
+}();
+
 __global__ void hc_mixes_tail_kernel(const float* __restrict__ x,
                                      const float* __restrict__ hc_scale,
                                      const float* __restrict__ hc_base, float* __restrict__ pre,
@@ -7462,7 +7469,8 @@ __global__ void hc_mixes_tail_kernel(const float* __restrict__ x,
                                      const float* __restrict__ w_norm,
                                      const float* __restrict__ pre_collapse,
                                      float* __restrict__ out, float eps_norm, int ss_in,
-                                     uint8_t* __restrict__ xq, float* __restrict__ xsc, int mode) {
+                                     uint8_t* __restrict__ xq, float* __restrict__ xsc, int mode,
+                                     int bf16_xn) {
     const int r = blockIdx.x;
     const int mix = hc * (2 + hc);
     const int hc_dim = hc * dim;
@@ -7589,7 +7597,17 @@ __global__ void hc_mixes_tail_kernel(const float* __restrict__ x,
         // emitted pair is bit-identical to the launch it replaces.
         const int lane31 = threadIdx.x & 31;
         for (int c = threadIdx.x; c < dim; c += blockDim.x) {
-            const float v = o_r[c] * inv2 * w_norm[c];
+            float v = o_r[c] * inv2 * w_norm[c];
+            // The bf16 boundary the standalone path applies via DSV41_BF16_XN:
+            // the official's hc_pre ends with `.to(x.dtype)`, so the write-back
+            // AND the fp8 emission must both consume the bf16-rounded value.
+            // Without this the T1 skip silently substitutes ~0.5%-off bytes for
+            // the standalone quant1's (the kv_gemm 0.495% divergence).
+            if (bf16_xn) {
+                uint32_t u = __float_as_uint(v);
+                u += 0x7fffu + ((u >> 16) & 1u);
+                v = __uint_as_float((uint32_t)((uint16_t)(u >> 16)) << 16);
+            }
             o_r[c] = v;
             if (xq != nullptr) {
                 float a = fabsf(v);
@@ -8593,7 +8611,7 @@ extern "C" int dsv41_hc_front(const float* x, const float* hc_fn, const float* h
     if (e != cudaSuccess) return (int)e;
     hc_mixes_tail_kernel<<<(unsigned)rows, 1024, (64 + 64) * sizeof(float), s>>>(
         x, hc_scale, hc_base, pre, post, comb, hc, dim, sinkhorn_iters, eps, mix * 32, w_norm,
-        pre_collapse, out, eps_norm, g_hc_ss ? 1 : 0, xq, xsc, HC_TAIL_FULL);
+        pre_collapse, out, eps_norm, g_hc_ss ? 1 : 0, xq, xsc, HC_TAIL_FULL, g_tail_bf16_xn);
     return (int)cudaGetLastError();
 }
 
@@ -8755,7 +8773,8 @@ extern "C" int dsv41_hc_front_split(const float* x, const float* hc_fn, const fl
     // 1024-thread block as dsv41_hc_front's EARLY ⇒ bit-identical bytes.
     hc_mixes_tail_kernel<<<(unsigned)rows, 1024, (64 + 64) * sizeof(float), side>>>(
         x, hc_scale, hc_base, nullptr, nullptr, nullptr, hc, dim, sinkhorn_iters, eps, mix * 32,
-        w_norm, pre_collapse, out, eps_norm, g_hc_ss ? 1 : 0, xq, xsc, HC_TAIL_EARLY);
+        w_norm, pre_collapse, out, eps_norm, g_hc_ss ? 1 : 0, xq, xsc, HC_TAIL_EARLY,
+        g_tail_bf16_xn);
     e = cudaGetLastError();
     if (e != cudaSuccess) return (int)e;
     // (2) EARLY-done edge, side -> main: record `fork_ev` on `side` right after
@@ -8852,7 +8871,8 @@ extern "C" int dsv41_hc_front_split(const float* x, const float* hc_fn, const fl
     const unsigned late_t = (g_hc_ss ? (unsigned)g_hc_late_t : 1024u);
     hc_mixes_tail_kernel<<<(unsigned)rows, late_t, (64 + 64) * sizeof(float), dl>>>(
         x, hc_scale, hc_base, pre, post, comb, hc, dim, sinkhorn_iters, eps, mix * 32, nullptr,
-        nullptr, nullptr, eps_norm, g_hc_ss ? 1 : 0, nullptr, nullptr, HC_TAIL_LATE);
+        nullptr, nullptr, eps_norm, g_hc_ss ? 1 : 0, nullptr, nullptr, HC_TAIL_LATE,
+        g_tail_bf16_xn);
     e = cudaGetLastError();
     if (e != cudaSuccess) return (int)e;
     }   // end of the `if (!dl_merged)` two-launch fallback / A/B arm
