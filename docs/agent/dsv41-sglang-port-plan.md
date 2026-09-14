@@ -310,3 +310,27 @@ seqlen）；解析侧 MISS 或荒谬数字（110%）时先查记录格式，不�
 2. "q 前 448 列 100% 不同 ⇒ wq_b 根本差异"**不成立**：attn_o 仅 0.79%（≈2 bf16 ulp）证明 q 无根本差异；kind 50 的 106% 是 **dump 布局不可比的伪影**（head 级余弦"多对一"是错位特征）
 
 **已排除（单元测试 BIT_EXACT 全过）**：rope 表（glibc cosf/sinf 照抄公式）、rmsnorm、norm+rope、RT。**已排除（op-level 0.000%）**：xn、kv_gemm。o-proj 自身 0.03%。
+
+## 🎉 YaRN 修复验证成功——kv 链全链路位级一致（2026-09-14 05:05，commit 64c1d9a1）
+
+**修复后 op-level 对拍（YaRN off，主表 original_seq_len=0）**：
+```
+pos 20  xn:0.000%(0) kv_gemm:0.000%(0) kv_RT:0.000%(0) attn_o:0.732% moe_o:1.711%
+pos 50  xn:0.000%(0) kv_gemm:0.000%(0) kv_RT:0.000%(0) attn_o:0.644% moe_o:1.700%
+pos100  xn:0.000%(0) kv_gemm:0.000%(0) kv_RT:0.000%(0) attn_o:0.630% moe_o:1.912%
+```
+
+**kv_RT 从 0.08-0.57% → 0.000%（0 元素差）**——kv 链从层输入到缓存全链路逐位一致：
+xn（0 元素差）→ kv_gemm（0 元素差）→ rmsnorm → rope → RT（全部 0 元素差）。
+
+用户的列级证据（差异列 491/497/504/510 完全落在 YaRN DIFF 集合 {490..511} 内）被验证 100% 正确。
+
+**剩余差异结构**：
+- attn_o: 0.63-0.73%（比修复前 0.76-0.94% 略降）——kv 已排除，来源是 q 链或 sparse_attn 计算
+- moe_o: 1.7-1.9%
+- o-proj 自身: 0.03%（已证明干净）
+- 数数仍断在 52
+
+**下一步**：定位 q 链（wq_a→q_norm→wq_b→rope）或 sparse_attn 计算的差异。kind 50（q dump）
+的 106% 是布局伪影（用户指出：若 q 有根本差异，attn_o 不可能仅 0.63%），需要修 dump 可比
+性或写 q 链单元测试。
