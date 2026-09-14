@@ -776,6 +776,34 @@ extern "C" int dsv41_expert_fp4_gemm_official(
     return (int)cudaGetLastError();
 }
 
+// Convert a bf16 tensor to f32 (each bf16 halfword → one f32 word). Used by
+// the gate's cuBLAS path: the official computes scores as
+// linear(x.float(), weight.float()) — an f32 GEMM on the bf16-upcast weight.
+__global__ void bf16_to_f32_kernel(const uint16_t* __restrict__ x,
+                                    float* __restrict__ y, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] = __bfloat162float(__nv_bfloat16(x[i]));
+}
+
+extern "C" int dsv41_bf16_to_f32(const void* x, float* y, int n, cudaStream_t s) {
+    if (n <= 0) return 0;
+    bf16_to_f32_kernel<<<(unsigned)((n + 255) / 256), 256, 0, s>>>(
+        (const uint16_t*)x, y, n);
+    return (int)cudaGetLastError();
+}
+
+// Scale an f32 vector by a constant (no bf16 round — pure f32).
+__global__ void vec_scale_f32_kernel(float* __restrict__ v, int n, float s) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) v[i] *= s;
+}
+
+extern "C" int dsv41_vec_scale_f32(float* v, int n, float s, cudaStream_t st) {
+    if (n <= 0) return 0;
+    vec_scale_f32_kernel<<<(unsigned)((n + 255) / 256), 256, 0, st>>>(v, n, s);
+    return (int)cudaGetLastError();
+}
+
 extern "C" int dsv41_dequant_fp8_ue8m0(const uint8_t* w, const uint8_t* ws, float* out,
                                         int n, int k, cudaStream_t s) {
     const int total = n * k;

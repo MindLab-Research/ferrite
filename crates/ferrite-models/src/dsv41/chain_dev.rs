@@ -4870,6 +4870,46 @@ fn hc_tail_split() -> bool {
         }
         let mut routed = false;
         if gate_f32() {
+            if expert_cublas() {
+                // DSV41_GATE_CUBLAS (with EXPERT_CUBLAS): the gate via cuBLAS
+                // f32 GEMM — the official's linear(x.float(), weight.float())
+                // accumulation order. The bf16 gate weight is upcast to f32
+                // ONCE (cached per weight pointer), then gemm_f32 + /gate_temp.
+                thread_local! {
+                    static GATE_F32: std::cell::RefCell<std::collections::HashMap<usize, usize>> =
+                        std::cell::RefCell::new(std::collections::HashMap::new());
+                }
+                let g_key = ld.gate_w.as_ref().unwrap().ptr() as usize;
+                let cached = GATE_F32.with(|c| c.borrow().get(&g_key).copied());
+                let gw_f32: *const f32 = match cached {
+                    Some(p) => p as *const f32,
+                    None => {
+                        let n_total = n_routed * dim;
+                        let buf = Box::leak(Box::new(self.dev.alloc(n_total * 4)?));
+                        self.dev.bf16_to_f32(
+                            ld.gate_w.as_ref().unwrap().ptr(),
+                            buf.ptr as *mut std::ffi::c_void,
+                            n_total as i64,
+                        )?;
+                        let p = buf.ptr as usize;
+                        GATE_F32.with(|c| c.borrow_mut().insert(g_key, p));
+                        p as *const f32
+                    }
+                };
+                self.dev.gemm_f32(
+                    self.s.xn.ptr as *const std::ffi::c_void,
+                    gw_f32 as *const std::ffi::c_void,
+                    self.s.scores.ptr as *mut f32,
+                    1,
+                    n_routed as i32,
+                    dim as i32,
+                )?;
+                self.dev.vec_scale_f32(
+                    self.s.scores.ptr as *mut f32,
+                    n_routed as i32,
+                    1.0 / cfg.gate_temp,
+                )?;
+            } else {
             // The official's gate domain: an f32 GEMV on bf16(x) × f32(bf16 w)
             // / gate_temp. Runs AFTER the mixed GEMM (whose gate output this
             // overwrites — MIX_GATE forces the serial path, so no stream race)
@@ -4883,6 +4923,7 @@ fn hc_tail_split() -> bool {
                 dim as i32,
                 cfg.gate_temp,
             )?;
+            }
         } else if !sh_via_mixed {
             // Fused gate GEMV + route: the gate's LAST block runs the top-6
             // selection over the 384 finished scores (DSV41_ROUTE_FUSE, default

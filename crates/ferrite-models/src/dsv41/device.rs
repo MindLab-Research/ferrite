@@ -382,6 +382,9 @@ struct Kernels {
     cast_f32_to_bf16: Option<
         unsafe extern "C" fn(*const f32, *mut c_void, c_int, CuStream) -> c_int,
     >,
+    vec_scale_f32: Option<
+        unsafe extern "C" fn(*mut f32, c_int, f32, CuStream) -> c_int,
+    >,
     comp_placeholder:
         Option<unsafe extern "C" fn(*mut i32, *const c_int, c_int, c_int, CuStream) -> c_int>,
     ring_append:
@@ -853,6 +856,7 @@ impl Device {
             expert_fp4_gemm_official: ko!(rt, "dsv41_expert_fp4_gemm_official"),
             swiglu_route: ko!(rt, "dsv41_swiglu_route"),
             cast_f32_to_bf16: ko!(rt, "dsv41_cast_f32_to_bf16"),
+            vec_scale_f32: ko!(rt, "dsv41_vec_scale_f32"),
             comp_placeholder: ko!(rt, "dsv41_comp_placeholder"),
             compress_commit: ko!(rt, "dsv41_compress_commit"),
             ring_append: ko!(rt, "dsv41_ring_append"),
@@ -3214,6 +3218,13 @@ impl Device {
 
     /// Cast an f32 buffer into bf16 storage — the input layout for cuBLAS
     /// bf16 HMMA (`gemm_bf16`), matching the official's `.to(torch.bfloat16)`.
+    /// Scale an f32 vector by a constant (pure f32, no bf16 round).
+    pub fn vec_scale_f32(&self, v: *mut f32, n: i32, s: f32) -> Result<()> {
+        let f = self.need(self.kernels.vec_scale_f32, "dsv41_vec_scale_f32")?;
+        let rc = unsafe { f(v, n, s, self.stream) };
+        self.kerr(rc, "dsv41_vec_scale_f32")
+    }
+
     pub fn cast_f32_to_bf16(&self, x: *const f32, y: *mut c_void, n: i32) -> Result<()> {
         let f = self.need(self.kernels.cast_f32_to_bf16, "dsv41_cast_f32_to_bf16")?;
         let rc = unsafe { f(x, y, n, self.stream) };
