@@ -6595,10 +6595,17 @@ extern "C" int dsv41_sparse_attn(const float* q, const float* kv, const float* s
                                  const int* clen, int window, int index_topk, float scale,
                                  cudaStream_t s) {
     if (d > 512) return (int)cudaErrorInvalidValue;  // the accumulator is d-wide per thread group
-    // Flash-decode split by default; DSV41_ATTN_SEQ=1 restores the sequential
-    // version for A/B. Cached in a static: this runs per attention call, and a
-    // per-call getenv is exactly the hot-path slip this project has been bitten by.
-    static const bool seq = [] { return getenv("DSV41_ATTN_SEQ") != nullptr; }();
+    // DEFAULT: the sequential kernel. It is the ONLY arm whose online-softmax
+    // structure matches the official's (kernel.py:311-389): per-64-key-tile
+    // rescale, bf16 probabilities before the P·V, bf16 output row. The split /
+    // warp / pf arms rescale PER KEY and split the slots by stride, and the
+    // split's merge recombines per-warp partials with their own maxima — a
+    // structure the official simply does not have, so no split arm can be
+    // bit-identical to it. `DSV41_ATTN_SEQ=0` selects the old fast arm for A/B.
+    static const bool seq = [] {
+        const char* e = getenv("DSV41_ATTN_SEQ");
+        return e == nullptr || atoi(e) != 0;
+    }();
     // Chunked key split with the three-deep prefetch pipeline. The chunk count
     // comes from `dsv41_resolve_sparse_split_c()` (DSV41_ATTN_SPLIT >
     // DSV41_ATTN_PF_SPLIT > DSV41_SPARSE_SPLIT > kSparseSplitDefault = 4), read
@@ -6703,10 +6710,14 @@ extern "C" int dsv41_sparse_attn_orope(
     if (half != rope_rd / 2) return 1;
     if (cos == nullptr || sin == nullptr || base == nullptr) return 1;
     if (xq == nullptr || xsc == nullptr) return 1;
-    // Same selection the plain launcher makes, through the SAME resolver (the env
-    // is read once per process either way, and the two must agree or the fused
-    // path declines shapes it could have carried).
-    static const bool seq = [] { return getenv("DSV41_ATTN_SEQ") != nullptr; }();
+    // Same selection the plain launcher makes (see its comment: the sequential
+    // kernel is the only arm whose online-softmax structure matches the
+    // official's, so it is the default here too). Both must agree or the fused
+    // path declines shapes it could have carried.
+    static const bool seq = [] {
+        const char* e = getenv("DSV41_ATTN_SEQ");
+        return e == nullptr || atoi(e) != 0;
+    }();
     static const int g_sparse_split_c = dsv41_resolve_sparse_split_c();
     static const bool pf_off = [] {
         const char* e = getenv("DSV41_ATTN_PF");
