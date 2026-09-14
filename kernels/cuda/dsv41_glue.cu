@@ -170,6 +170,13 @@ __global__ void engram_apply_kernel(float* __restrict__ x, const float* __restri
 // The up half is never written (no out-of-bounds store either way). limit <= 0
 // disables the clamps. This is the epilogue of dsv41_expert_gate_up_fp4's
 // output layout (gate first, up second), silu = g / (1 + exp(-g)).
+// The bf16 boundary of `x.to(dtype)`: RN narrowing then the exact widening back.
+// (Moved BEFORE the first consumer — swiglu_limit_kernel at :~190 — the
+// identifier is undefined if it stays below it.)
+__device__ __forceinline__ float glue_bf16_round(float v) {
+    return __bfloat162float(__float2bfloat16(v));
+}
+
 __global__ void swiglu_limit_kernel(float* __restrict__ gate_up, int rows, int inter,
                                     float limit) {
     const size_t total = (size_t)rows * inter;
