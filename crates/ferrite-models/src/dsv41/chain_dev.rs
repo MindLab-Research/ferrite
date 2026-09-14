@@ -1796,6 +1796,18 @@ impl<'a> DevChain<'a> {
         let global_rows = cfg.engram_num_embeddings.get(li).copied().unwrap_or(0) as usize;
         let per = global_rows.div_ceil(world);
         let ids = (self.s.eng_ids.ptr as *const i64).wrapping_add(li * n_cols);
+        // Probe the token n-gram hashes actually fed to this layer's engram, to be
+        // compared with the reference's instrumented Engram.forward
+        // (layer 1 pos0 = [5702652, 24393184, 39183301, 61503783, 78984481, 90144770]).
+        if std::env::var("DSV41_ENG_DBG").is_ok() && layer == 1 {
+            let k = n_cols.min(8);
+            let mut v = vec![0i64; k];
+            let b = Device::view(ids as *mut std::ffi::c_void, k * 8);
+            self.dev.download_u8(&b, unsafe {
+                std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, k * 8)
+            })?;
+            eprintln!("[engdbg] L{layer} pos0 ids={:?}", v);
+        }
         self.dev.engram_gather(
             table.ptr() as *const u8,
             tsc.ptr() as *const u8,
