@@ -114,6 +114,56 @@ Reference-side counterpart: `ref_attn2.py` patches the module-level `sparse_attn
 and dumps `(q, kv, idxs)` for a chosen `(layer, pos)` — the strict split of "our
 inputs differ" versus "our operator differs".
 
+## The rope table is PER-LAYER (found 2026-09-14; this was the real "KV/rope" bug)
+
+The reference builds ONE `freqs_cis` per layer (`Attention.__init__`,
+model.py:685-698), forked on `compress_ratio`:
+
+```python
+if self.compress_ratio:
+    original_seq_len, rope_theta = args.original_seq_len, args.compress_rope_theta  # 65536, 160000
+else:
+    # disable YaRN and use base rope_theta in pure sliding-window attention
+    original_seq_len, rope_theta = 0, args.rope_theta                               # 0, 10000
+freqs_cis = precompute_freqs_cis(rope_head_dim, max_seq_len, original_seq_len, rope_theta,
+                                 factor, beta_fast, beta_slow)
+```
+
+and that ONE table is used by FOUR rope sites:
+
+| site | reference line |
+|---|---|
+| the q rope | `apply_rotary_emb(q[..., -rd:], self.freqs_cis[start_pos:end_pos])` (:551) |
+| the **window-KV** rope | `_window_kv(x, freqs_cis, start_pos)` (:700) → `apply_rotary_emb(kv[..., -rd:], freqs_cis)` (:706) |
+| the indexer's q/k rope | `self.indexer.freqs_cis = self.freqs_cis` (:733-734) |
+| the compressor's latent rope | (:754-756) |
+
+So layers 0 and 1 (`compress_ratio == 0`) rotate with theta 10000 and NO YaRN,
+while **every layer 2..39 rotates with theta 160000 plus the YaRN blend** — for
+q, the window KV, the indexer and the latent alike. We applied the main table to
+q and the window KV for EVERY layer (the latent and the indexer were already on
+the compression table), i.e. 38 of 40 layers were rotated with a 16x-wrong theta
+and no YaRN.
+
+**Measured with the dumps already in hand (layer 2, pos 116, no GPU needed)**:
+
+```
+q (post-rope)    rel = 6.87e-01   with MATCHING rms (ours 1.640 vs ref 1.631)
+   -> a PHASE error, not a magnitude error: the rope-table signature.
+q rope lanes 448:452  ours [-3.45312, -0.91016,  0.25195, -0.49414]
+                      ref  [-3.39062, -0.92578, -0.05518, -0.42383]
+window-KV rows   rel = 6.4e-02 / 9.2e-02 / 8.1e-02 / 1.2e-01
+   -> small on purpose: the rope only touches the trailing 64 of 512 lanes.
+```
+
+**Fix (5cc28b09)**: `comp_rope` (a `Cell<bool>`, set in `attention()` from
+`compress_ratio(layer) > 0` **before any rope runs**) plus `rope_cos()` /
+`rope_sin()` accessors that all nine shared rope call sites now use — the three
+helpers (`lin_rope`, `lin_rope_norm`, `lin2_rope`, i.e. all three q-rope paths),
+`attention()`'s explicit q / window-KV / o-rope sites, and the kv-rope fallbacks.
+The indexer's `lin_rope` fallback therefore lands on the compression table by
+construction, which is what `indexer.freqs_cis = self.freqs_cis` means.
+
 ## Next fix: the compressed latent is missing its fp4 round-trip
 
 The reference quantises each compressed latent **after the rope and before the
