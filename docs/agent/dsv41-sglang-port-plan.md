@@ -194,3 +194,29 @@ head 折叠必须 v1 序（`head_gemv_bf16_v1_mrows`）；lm_head fp32 累加 K 
 - 探针（D2H+同步类）绝不进默认路径（多 rank lockstep 死锁）。
 - 移植的 kernel 一律带 env 门（`DSV41_PORT_*`），默认 OFF 验证后转正；ON/OFF 双路可测。
 - 参考实现三份：官方 ref_inference（数值权威）> sglang-bbuf（工程真源）> 我们 tag（eager 锚）。docs/agent 旧结论一律不作证据。
+
+## 🎯 kind 50/51 定谳 + o-proj 修复计划（2026-09-15 上午——TODO #9）
+
+**kind 50/51 dump 结果（pos 20, layer 0）**：
+| 链段 | 误差 | 说明 |
+|---|---|---|
+| q_post_rope (kind 50) | **0.073%** | q 链几乎完美 ✓ |
+| attn_pre_woa (kind 51) | **0.254%** | attention 计算加了 ~0.18%（softmax 正常放大） |
+| attn_o (kind 1) | **0.79%** | **o-proj 链 3× 放大 ← 最大来源！** |
+
+**o-proj 链的 3× 放大分解**（每步约翻倍，f32 不同累加序的典型复合）：
+wo_a (0.254%→~0.4%) → wo_b (→~0.6%) → AR (→~0.7%) → hc_post (→0.79%)
+
+**修复方案：用 cuBLAS 替代自定义 gemv**——官方的 einsum/Linear 底层就是 cuBLAS（PyTorch matmul → cuBLAS）。用相同的库、相同的 tile 参数、相同的累加序 ⇒ 位级一致。
+- wo_a: 官方 einsum("bsgd,grd->bsgr") → cuBLAS bf16 GEMV。我们当前用 gemm_fp8_mx_f32（自定义 warp K-split gemv）。替换为 cuBLAS 调用（bf16 权重 + bf16 激活）。
+- wo_b: 官方 RowParallelLinear → cuBLAS fp8 GEMM。我们当前用 gemm_fp8_mx。替换为 cuBLAS。
+- AR: 官方 NCCL vs 我们 P2P v5——求和序可能不同。可用 NCCL 替代测试。
+
+**实施步骤**：
+1. 在 chain_dev.rs 的 wo_a 路径（WOA_F32 分支）添加 cuBLAS 调用选项
+2. 权重需从 fp8 反量化到 bf16（启动时一次性或按需）
+3. 激活已 bf16 值域 ✓（bf16_o 舍入）
+4. 用 cublasGemmEx with BF16 data type
+5. A/B 验证 attn_o 降幅
+
+**注意**：ref 的 kind=6 prefill 记录是 7680 f32s（wkvpost 写 [1,15,512] 一条合并记录），解析需变长处理。ref 的 kind 50/51 n=4096 ✓。
