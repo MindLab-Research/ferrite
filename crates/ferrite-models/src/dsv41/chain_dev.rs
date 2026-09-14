@@ -3024,17 +3024,24 @@ fn hc_tail_split() -> bool {
         // the attention - is redundant and quant1 skips it (pointer-gated).
         self.s.xq_of_xn_valid.set(hc_done && !hc_nw.is_null());
         let _t_all = std::time::Instant::now();
-        if layer == 0 && hc_dbg() {
+        if hc_dbg() {
+            // The two MHC cross-layer variables, dumped for EVERY layer (the
+            // official threads them the same way: `pre_mix` is produced by layer
+            // L -- Block.forward returns it -- and consumed by layer L+1's
+            // hc_pre, with `make_identity_pre_mix` seeding the very first one;
+            // `post`/`comb` come from the same block's LATE half). Dumping both
+            // slots per layer shows the handoff and where the first token's 4.4%
+            // is introduced.
             let attn_pre = self.dl(self.premix_slot(1).as_f32(), hc)?;
+            let cur_pre = self.dl(self.premix_slot(0).as_f32(), hc)?;
             let po = self.dl(self.s.post.as_f32(), hc)?;
             let cb = self.dl(self.s.comb.as_f32(), hc * hc)?;
-            eprintln!("[mine] L0 pre={attn_pre:?}");
-            eprintln!("[mine] L0 post={po:?}");
-            eprintln!("[mine] L0 comb={cb:?}");
             let rs: Vec<f32> = (0..hc)
                 .map(|j| (0..hc).map(|k| cb[j * hc + k]).sum())
                 .collect();
-            eprintln!("[mine] L0 comb_rowsum={rs:?}");
+            eprintln!(
+                "[mhc] L{layer} pre_in={cur_pre:?} pre_prev={attn_pre:?} post={po:?} comb={cb:?} comb_rowsum={rs:?}"
+            );
         }
         if Self::fuse_b1() {
             if !hc_done {
