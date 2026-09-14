@@ -142,6 +142,24 @@ module's return value IS `attn_out` (verified: the hook printed 0.586200, i.e.
 exactly attn_out). Comparing the attn-side hc_post needs a reimplementation of
 that step (as was done for the engram and the MoE), not a module hook.
 
+## Ruled out by measurement (do not re-test)
+
+| hypothesis | test | result |
+|---|---|---|
+| `--use_fast_math` skews the sigmoid -> the 1.3e-4 `hc_mixes.pre` gap | rebuild with `FERRITE_NO_FAST_MATH=1`, same pos-0 probe | `pre_prev[0]` 0.17029852 -> **0.17029853** (1e-8) and `ffn_in` **unchanged** at 0.127121 (reference 0.17028567 / 0.127104) -> dead |
+| the FFN-side hc switches (`HC_MIX_KS=16`, `HC_FUSE=0`, `FUSE_B1=0`, `MIX_GATE=0`, `HC_MIX_PAIR=0`) | 6-way batch at pos 0 | every variant gives `ffn_in` **0.127121**, identical to base |
+| the six decode switches (`MOE_DUAL`, `COMP_FUSE`, `MOE_EPI_ADD`, `FUSE_B1`, `HCPOST_EPI`, `WIN_KV_QUANT`) | batch at layer 0 | layer-0 `L1` rel identical (8.193e-02) except a 0.2pp move for `HCPOST_EPI`/`WIN_KV_QUANT` |
+| the window-KV write path incl. our fp8 RT | our `kind 5` vs the reference's `sparse_attn` kv at layer 0 / pos 0 | **0.0000e+00** (bit-identical); turning the RT off gives 2.9e-2, so the RT is needed and correct |
+| layer 0's attention operator + q + rope | our attention output vs the reference's `sparse_attn` return at pos 0 | **0.0000e+00**; post-rope q 8.5e-06 |
+| the attn-side hc_post | re-implemented in the harness with the model's own `hc_mixes`/`hc_post` | `after_attn_h` 0.16423400 with first4 `[0.16796875, 0.17578125, -0.115234375, -0.19140625]` = OURS exactly |
+
+Where that leaves it: at pos 0 every anchor is bit-identical EXCEPT
+`hc_mixes.pre` (0.17028567 vs 0.17029852, 1.3e-4), which feeds the collapse and
+the FFN chain -> `ffn_in` 1e-4 -> 40 layers of ~1e-4..1e-3 drift. `pre` is produced
+by `rsqrt -> GEMV(hc_fn) -> *rsqrt -> sigmoid` only (the sinkhorn does not touch
+it), so the next measurement is those four intermediates on both sides - our probe
+must print them (currently it only prints the final pre/post/comb).
+
 ## Narrowed lead: the window-KV WRITE path (and what the A/B ruled out)
 
 A/B of the six decode-only switches at layer 0 (each toggled off, then our L1 rel
