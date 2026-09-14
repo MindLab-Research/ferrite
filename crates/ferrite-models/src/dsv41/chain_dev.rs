@@ -2958,6 +2958,22 @@ impl<'a> DevChain<'a> {
         Ok(v)
     }
 
+    /// `DSV41_L0DBG` = the layer-0 / position-0 anchors the official
+    /// `Block.forward` prints itself ([refp]/[refa] L0 ...), so the two engines
+    /// can be compared segment by segment without any dump-format parsing.
+    fn l0_probe(&self, tag: &str, ptr: *const f32, n: usize) -> Result<()> {
+        if std::env::var("DSV41_L0DBG").is_err() || self.rank() != 0 {
+            return Ok(());
+        }
+        let mut v = vec![0f32; n];
+        let b = Device::view(ptr as *mut c_void, n * 4);
+        self.dev.download_f32(&b, &mut v)?;
+        let r = (v.iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>() / n as f64).sqrt();
+        let f4: Vec<f32> = v.iter().take(4).copied().collect();
+        eprintln!("[l0] {tag} rms={r:.6} first4={f4:?}");
+        Ok(())
+    }
+
     /// Host-upload helper (kept: the prefill and probe paths use this family).
     #[allow(dead_code)]
     fn ul_i32(&self, dst: *mut c_void, v: &[i32]) -> Result<()> {
@@ -3053,6 +3069,11 @@ fn hc_tail_split() -> bool {
         let dim = cfg.dim;
         let hc = cfg.hc_mult;
         let ld = &self.w.layers[layer];
+        // official `Block.forward` anchor: `[refp] L0 xin_rms` (the residual
+        // stream entering the block, pre-collapse)
+        if layer == 0 {
+            self.l0_probe("xin", self.s.h.ptr as *const f32, hc * dim)?;
+        }
 
         // op-level diagnostic: the layer INPUT h (the residual entering this
         // layer, pre-collapse pre-norm) for the per-layer divergence bisection
@@ -3160,6 +3181,10 @@ fn hc_tail_split() -> bool {
         if bf16_xn() {
             self.dev.bf16_round_inplace(self.s.xn.ptr as *mut f32, dim as i32)?;
         }
+        // official anchor: `[refa] L0 xn_rms` (the collapse + attn_norm output)
+        if layer == 0 {
+            self.l0_probe("attn_xn", self.s.xn.ptr as *const f32, dim)?;
+        }
         // op-level diagnostic dumps for the layer-0 bisection: the collapse
         // output (xn, kind 0) before attention, and the attention output
         // (o, kind 1) after it. Format [u64 step][u64 kind][f32*n], rank 0.
@@ -3174,6 +3199,11 @@ fn hc_tail_split() -> bool {
             if layer == 0 {
                 self.gt_dump_vec(xdp, 1, self.s.o.ptr, dim)?;
             }
+        }
+        // official anchor: `[refa] L0 attn_out_rms` (the attention sublayer's
+        // output, before its hc_post)
+        if layer == 0 {
+            self.l0_probe("attn_out", self.s.o.ptr as *const f32, dim)?;
         }
         // Tail split join: the attention (projections + AR) has now consumed the
         // EARLY half, so the LATE half's `comb` must be visible to hc_post. A
@@ -3216,6 +3246,11 @@ fn hc_tail_split() -> bool {
         // trajectory then drifts and the 102nd token flips.
         self.dev
             .bf16_round_inplace(self.s.h.ptr as *mut f32, (hc * dim) as i32)?;
+
+        // official anchor: `[refp] L0 after_attn hc_post h_rms`
+        if layer == 0 {
+            self.l0_probe("after_attn_h", self.s.h.ptr as *const f32, hc * dim)?;
+        }
 
         // Probe the residual stream right after THIS attention's hc_post, i.e.
         // the value the reference prints as "[refp] L0 after_attn hc_post
@@ -3331,6 +3366,10 @@ fn hc_tail_split() -> bool {
         if bf16_xn() {
             self.dev.bf16_round_inplace(self.s.xn.ptr as *mut f32, dim as i32)?;
         }
+        // official anchor: `[refa] L0 ffn_in_rms` (collapse + ffn_norm output)
+        if layer == 0 {
+            self.l0_probe("ffn_in", self.s.xn.ptr as *const f32, dim)?;
+        }
         let _t_moeonly = std::time::Instant::now();
         // DSV41_GRAPH_MOE=1 captures the host-free part of the MoE (everything up
         // to the all-reduce) into one per-layer graph. The first step warms every
@@ -3359,6 +3398,11 @@ fn hc_tail_split() -> bool {
             self.moe(layer, ld)?;
         }
         let moe_hc_folded = self.moe_reduce(layer)?;
+        // official anchor: `[refa] L0 moe_out_rms` (the MoE sublayer's output,
+        // before its hc_post)
+        if layer == 0 {
+            self.l0_probe("moe_out", self.s.o.ptr as *const f32, dim)?;
+        }
         // op-level diagnostic: the MoE sublayer's output (kind 2), the same
         // bisection contract as xn (0) and the attention o (1).
         if let Some(xdp) = &xdump {
