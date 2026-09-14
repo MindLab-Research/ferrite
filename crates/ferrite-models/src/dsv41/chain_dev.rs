@@ -1437,10 +1437,18 @@ impl<'a> DevChain<'a> {
     /// skips the fp8 round trip and is strictly more accurate (wo_b -> AR sum ->
     /// hc_post tolerates the tighter value). "0" restores the (quant1, gemm_fp8_mx)
     /// pair; a stale `.so` (no symbol) falls back the same way.
+    /// WOB_F32: DEFAULT OFF (correctness, 2026-09-14): the official's wo_b is
+    /// an fp8 linear whose input IS act_quant-ised (model.py:181-207
+    /// linear()) — the f32 path skips that quantisation and is strictly MORE
+    /// accurate than the official, which the bit-exactness red line forbids
+    /// ("不能高也不能低"). The wo_a f32 switch (WOA_F32) keeps s.wo in the
+    /// official's bf16 domain, so the quantised path (quant1(s.wo) ->
+    /// gemm_fp8_mx) IS the official's arithmetic. "=1" restores the f32 path
+    /// for the perf A/B.
     fn wob_f32() -> bool {
         static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *F.get_or_init(|| {
-            std::env::var("DSV41_WOB_F32").map(|v| v != "0").unwrap_or(true)
+            std::env::var("DSV41_WOB_F32").map(|v| v == "1").unwrap_or(false)
         })
     }
 
