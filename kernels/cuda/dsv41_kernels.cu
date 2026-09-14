@@ -4751,7 +4751,14 @@ gemm_fp8_gemv_kernel(__grid_constant__ const GemvCore gc, __grid_constant__ cons
             // straddles a block, so warp 31 is never a pair head); the guard only
             // protects the slot against a mis-shaped launch.
             if (warp + 1 < nwarps && lane_in >= sect && ((lane_in - sect) & 1) == 0) {
-                const float x0 = s_rows[warp], x1 = s_rows[warp + 1];
+                // The official's wq_b linear outputs bf16 (fp8_gemm returns
+                // dtype=get_default_dtype()=bf16) and the rope reads the
+                // ALREADY-ROUNDED values. Our gemv accumulator is raw f32 —
+                // round before the rotation or the rope consumes ~0.4%-off
+                // activations (the q chain's T1 pattern; the softmax then
+                // exponentially amplifies the difference).
+                const float x0 = orope_bf16_round(s_rows[warp]);
+                const float x1 = orope_bf16_round(s_rows[warp + 1]);
                 const int i = (lane_in - sect) >> 1;
                 const int t = (*rope_base) * rope_mul + rope_off + h * rope_step;
                 const float c = rope_cos[(size_t)t * (rope_rd >> 1) + i];
