@@ -3401,6 +3401,43 @@ __global__ void compressor_fused_kernel(const float* __restrict__ kvp,
                 const float sv = sn_row[j];
                 v = (c == base) ? (x0 * cv - x1 * sv) : (x0 * sv + x1 * cv);
             }
+            // ---- the reference's compressed-KV round-trip -------------------
+            // fp4 (e2m1) with ONE float8_e4m3 scale per 16 elements, applied
+            // AFTER the rope and BEFORE the cache write (model.py:758-761:
+            // `fp4_act_quant(latent, 16, True, scale_dtype=float8_e4m3fn)`).
+            // This is NOT the indexer's arm (block 32 + power-of-two scale, the
+            // `dsv41_idx_fp4_rt` we already had): here
+            //     s = float8_e4m3(amax / 6),  amax floored at 6 * 2^-9
+            // (kernel.py:129-184, the `scale_dtype == FP8` branch) - an e4m3
+            // scale, not a power of two. A warp's 32 consecutive columns are
+            // exactly two 16-wide blocks, so the amax is a HALF-WARP shuffle and
+            // the mask must name exactly those 16 lanes.
+            {
+                const unsigned m16 = (threadIdx.x & 16) ? 0xFFFF0000u : 0x0000FFFFu;
+                float a = fabsf(v);
+                for (int off = 8; off > 0; off >>= 1)
+                    a = fmaxf(a, __shfl_xor_sync(m16, a, off));
+                const __nv_fp8_e4m3 s8 = __nv_fp8_e4m3(fmaxf(a, 6.0f * 1.953125e-3f) / 6.0f);
+                const float s = (float)s8;
+                if (s > 0.f) {
+                    const float q = fminf(fmaxf(v / s, -6.0f), 6.0f);
+                    const float mags[8] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
+                    const float av = fabsf(q);
+                    int best = 0;
+                    float bd = fabsf(av - mags[0]);
+#pragma unroll
+                    for (int i = 1; i < 8; ++i) {
+                        const float d = fabsf(av - mags[i]);
+                        if (d < bd) { bd = d; best = i; }
+                    }
+                    // inplace=True writes the DEQUANTISED value back, in the
+                    // latent's own dtype (bf16: `out_dtype = in_dtype`).
+                    v = mags[best] * (q < 0.f ? -s : s);
+                    uint32_t u = __float_as_uint(v);
+                    u += 0x7fffu + ((u >> 16) & 1u);
+                    v = __uint_as_float((uint32_t)((uint16_t)(u >> 16)) << 16);
+                }
+            }
             dst[c] = v;
         }
         __syncthreads();  // every latent read is done before the bump
