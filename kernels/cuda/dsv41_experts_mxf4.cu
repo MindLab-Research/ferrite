@@ -1667,7 +1667,7 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
                     g = fminf(g, limit);                     // gate clamp
                     u = fminf(fmaxf(u, -limit), limit);      // up clamp
                 }
-                out[(size_t)row] = (g / (1.f + expf(-g))) * u;   // silu(gate) * up
+                out[(size_t)row] = (g * (1.f / (1.f + expf(-g)))) * u;   // silu(gate) * up
             }
             continue;
         }

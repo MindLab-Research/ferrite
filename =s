@@ -1,0 +1,13 @@
+168:    def forward(self, x: torch.Tensor) -> torch.Tensor:
+242:    def forward(self, x: torch.Tensor) -> torch.Tensor:
+256:    def forward(self, x: torch.Tensor) -> torch.Tensor:
+271:    def forward(self, x: torch.Tensor) -> torch.Tensor:
+288:    def forward(self, x: torch.Tensor):
+312:    def forward(self, indices: torch.Tensor) -> torch.Tensor:
+350:    def forward(self, x: torch.Tensor, hash_ids: torch.Tensor, token_mask: torch.Tensor | None = None) -> torch.Tensor:
+458:    def forward(self, x: torch.Tensor, start_pos: int) -> torch.Tensor | None:
+527:    def forward(self, x: torch.Tensor, qr: torch.Tensor, latent: torch.Tensor, start_pos: int, offset: int):
+765:    def forward(self, x: torch.Tensor, start_pos: int):
+824:    def forward(self, x: torch.Tensor, image_mask: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+861:    def forward(self, x: torch.Tensor, weights: torch.Tensor | None = None) -> torch.Tensor:
+=== Transformer.forward 的层循环（含 hc/mhc 变量传递）===

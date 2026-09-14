@@ -196,7 +196,13 @@ __global__ void swiglu_limit_kernel(float* __restrict__ gate_up, int rows, int i
             g = fminf(g, limit);
             u = fminf(fmaxf(u, -limit), limit);
         }
-        row[i] = (g / (1.f + expf(-g))) * u;
+        // silu must follow the official's rounding path, not just its algebra:
+        // torch's F.silu(x) is x * sigmoid(x) with sigmoid(x) = 1/(1+exp(-x)),
+        // i.e. a reciprocal and THEN a multiply. Writing it as g/(1+exp(-g))
+        // is algebraically identical but rounds differently (one division
+        // instead of a reciprocal + multiply), which is exactly the class of
+        // rewrite that produced the attention's per-key-vs-per-tile drift.
+        row[i] = (g * (1.f / (1.f + expf(-g)))) * u;
     }
 }
 
@@ -296,7 +302,7 @@ __global__ void swiglu_limit_q_kernel(float* __restrict__ gate_up, int rows, int
             g = fminf(g, limit);
             u = fminf(fmaxf(u, -limit), limit);
         }
-        const float v = (g / (1.f + expf(-g))) * u;   // identical to swiglu_limit_kernel
+        const float v = (g * (1.f / (1.f + expf(-g)))) * u;   // identical to swiglu_limit_kernel
         row[i] = v;                                   // f32 write-back, unchanged
         float a = fabsf(v);
         for (int off = 16; off > 0; off >>= 1)
@@ -695,7 +701,7 @@ __global__ void swiglu_route_kernel(const float* __restrict__ gate,
         g = fminf(g, limit);
         u = fminf(fmaxf(u, -limit), limit);
     }
-    float v = (g / (1.f + expf(-g))) * u;
+    float v = (g * (1.f / (1.f + expf(-g)))) * u;
     v *= weight;
     // bf16 round (round-to-nearest-even, same as .to(torch.bfloat16))
     uint32_t b = __float_as_uint(v);
@@ -1304,7 +1310,7 @@ __global__ void swiglu_limit_batched_kernel(float* __restrict__ gate_up, int row
             g = fminf(g, limit);
             u = fminf(fmaxf(u, -limit), limit);
         }
-        row[i] = (g / (1.f + expf(-g))) * u;
+        row[i] = (g * (1.f / (1.f + expf(-g)))) * u;
     }
 }
 
