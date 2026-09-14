@@ -24,7 +24,7 @@
 
 **o 链三修复（重大突破，37e197f0 验证）**：wo_a f32 切换（官方纯 bf16×bf16 einsum 无量化——fp8×2^e 权重解码在 f32 精确=官方 bf16 权重，s.o 已 bf16 值域，gemm_fp8_mx_f32 零成本复用）+ WOB_F32 默认 OFF（官方 wo_b 有 act_quant，我们跳过=精度过高）+ AR+hc_post 内核舍入（残差流 bf16 域）。**attn_o 3.17-3.41%→0.76-0.94%（4 倍降）！moe_o 10.4→1.89%（专家翻转消失）！**
 
-**indexer 战况**：D2+D3（分数链 bf16+scale 折叠，30978c7c）已验证——**attn_o 无变化**（分数链舍入贡献小）。**D1（fp4 e2m1 往返）已提交构建中**：官方对 indexer 的 q/k 做 fp4_act_quant(x,32,inplace)（FE8M0 scale，amax→floor(6×2⁻¹²⁶)→pow2 scale(1/6)→e2m1 RN 编码 clamp(x/s,±6)→解码×s→bf16 写回），我们全 f32=精度偏高 3-6%⇒topk 选择偏移。新内核 idx_fp4_rt_kernel（mags 表 RN 编码=quant_fp4_fused 的已验证逻辑）应用于 k（rope 后发布前）和 q（rope 汇聚后）。
+**indexer 战况**：D2+D3（分数链 bf16+scale 折叠，30978c7c）已验证——**attn_o 无变化**（分数链舍入贡献小）。**D1（fp4 e2m1 往返）**：官方对 indexer 的 q/k 做 fp4_act_quant(x,32,inplace)（FE8M0 scale，amax→floor(6×2⁻¹²⁶)→pow2 scale(1/6)→e2m1 RN 编码 clamp(x/s,±6)→解码×s→bf16 写回），我们全 f32=精度偏高 3-6%⇒topk 选择偏移。新内核 idx_fp4_rt_kernel（mags 表 RN 编码=quant_fp4_fused 的已验证逻辑）应用于 k（rope 后发布前）和 q（rope 汇聚后）。**首验证失败→根因=launcher 误入 dsv41_kernels.cu 的匿名命名空间（:44-3370）→ extern "C" 也被内部链接→符号不进 .so 动态表**（症状：build 成功但运行时"kernel not in the loaded .so"；nm -D 空；单文件编译的 mangled `_GLOBAL__N__` stub 暴露真身）。修复=launcher 移到 `} // namespace` 之后（bfc6a985），重建带 `nm -D | grep -c` 符号自检。**教训（两条）：①新增 extern "C" launcher 必须在匿名命名空间外；②验证轮前先 nm 自检符号（省一轮白跑）。**
 
 **T1 模式定义**：融合内核内联产激活/量化但跳过官方有的 bf16 边界（官方每个算子输出都是 `.to(dtype)`=bf16）。三例：
 1. **T1 原版**（hc_mixes_tail_kernel 的 xn fp8 发射）——已修 ✓ kv_gemm 0.00%
