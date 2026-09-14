@@ -237,3 +237,16 @@ wo_a (0.254%→~0.4%) → wo_b (→~0.6%) → AR (→~0.7%) → hc_post (→0.79
 
 **注意**：ref 的 kind=6（kv_gemm）prefill 记录是 7680 f32s（wkvpost 写 [1,15,512] 一条合并记录），
 解析需变长处理。ref 的 kind 50/51 n=4096 ✓。
+
+## wo_a cuBLAS OOM 修复（2026-09-15 上午，commit 0767df4e）
+
+**第一版 bug**：每次 wo_a 调用都 `alloc` 新 DevBuf（40 层 × 200 步 = 8000 次分配）
+→ `cudaMalloc(16.0 MiB) failed, this rank has already allocated 192.3 GiB`（OOM 崩溃，RC=1）。
+
+**修复**：thread_local HashMap 按权重指针缓存 + `Box::leak`（权重是常量，
+40 层 × ~512 KiB ≈ 20 MiB 总量）。反量化只做一次。
+
+**关键确认**：wo_quant_fuse 默认 OFF（`unwrap_or(false)`）→ WOA_F32 块（含 cuBLAS 分支）
+确实被进入。前一轮的 attn_o 0.79% 是 cuBLAS 路径生效时的读数（与基线相同）
+—— **wo_a 的 gemv vs cuBLAS 累加序差异不是 3× 放大的主源**（但前轮 OOM 崩溃可能污染了输出，
+需清洁复测）。
