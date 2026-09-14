@@ -3942,7 +3942,10 @@ fn hc_tail_split() -> bool {
                 let nkv = 32usize * hd as usize; // FIXED so the fixed-size record
                                                 // table can parse it (clen <= 32)
                 self.gt_dump_vec(&xdp, 31, ring_ptr, nkv)?;
-                let nix = 64usize; // FIXED: the idxs' first 64 entries
+                // The FULL idxs array (window + index_topk slots) -- the engine's
+                // real call passes win/index_topk and this array, so a harness that
+                // wants to reproduce the call needs all of it, not the first 64.
+                let nix = (win + cfg.index_topk) as usize;
                 self.gt_dump_vec(&xdp, 32, idxs_ptr as *mut std::ffi::c_void, nix)?;
                 let sc = [
                     win as f32,
