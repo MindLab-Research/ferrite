@@ -5920,6 +5920,18 @@ fn hc_tail_split() -> bool {
                         sh_il as i32,
                         sh_st,
                     )?;
+                    if layer == 0 {
+                        if let Ok(xdp) = std::env::var("DSV41_GT_XDUMP") {
+                            // kind 56 = the routed experts' accumulation in `s.o`
+                            // (captured BEFORE the shared half is merged); kind 57 =
+                            // the shared expert's own output. The MoE output is
+                            // systematically 4.4% low at the FIRST token only
+                            // (rec0 scale 0.9558, every later position ~1.000), so
+                            // splitting the two terms shows which one is short.
+                            self.gt_dump_vec(&xdp, 56, self.s.o.ptr, dim as usize)?;
+                            self.gt_dump_vec(&xdp, 57, self.s.ex_out.ptr, dim as usize)?;
+                        }
+                    }
                     if !dual {
                         // ADD_EPI: defer the merge into the MoE all-reduce's
                         // store epilogue when the .so carries the biased entry
