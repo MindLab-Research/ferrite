@@ -6005,6 +6005,10 @@ fn hc_tail_split() -> bool {
             }
         }
 
+        // official anchor (REF_ABLATE=routed): the routed experts' term at layer 0
+        if layer == 0 {
+            self.l0_probe("routed", self.s.o.ptr as *const f32, dim)?;
+        }
         // shared expert: fp8, every token. Its weights are replicated, so under
         // a collective exactly one rank may contribute it — otherwise the
         // all-reduce below would sum it `world` times. (`shared_rank` is computed
@@ -6143,6 +6147,9 @@ fn hc_tail_split() -> bool {
                         sh_il as i32,
                         sh_st,
                     )?;
+                    if layer == 0 {
+                        self.l0_probe("shared", self.s.ex_out.ptr as *const f32, dim)?;
+                    }
                     if layer == 0 {
                         if let Ok(xdp) = std::env::var("DSV41_GT_XDUMP") {
                             // kind 56 = the routed experts' accumulation in `s.o`
