@@ -3939,16 +3939,11 @@ fn hc_tail_split() -> bool {
                 self.dev.download_u8(&cb, unsafe {
                     std::slice::from_raw_parts_mut(cl_h.as_mut_ptr() as *mut u8, 4)
                 })?;
-                let nkv = (cl_h[0].max(0) as usize)
-                    .saturating_mul(hd as usize)
-                    .min(65536);
-                if nkv > 0 {
-                    self.gt_dump_vec(&xdp, 31, ring_ptr, nkv)?;
-                }
-                let nix = (win + cfg.index_topk) as usize;
-                if nix > 0 {
-                    self.gt_dump_vec(&xdp, 32, idxs_ptr as *mut std::ffi::c_void, nix)?;
-                }
+                let nkv = 32usize * hd as usize; // FIXED so the fixed-size record
+                                                // table can parse it (clen <= 32)
+                self.gt_dump_vec(&xdp, 31, ring_ptr, nkv)?;
+                let nix = 64usize; // FIXED: the idxs' first 64 entries
+                self.gt_dump_vec(&xdp, 32, idxs_ptr as *mut std::ffi::c_void, nix)?;
                 let sc = [
                     win as f32,
                     cfg.index_topk as f32,
