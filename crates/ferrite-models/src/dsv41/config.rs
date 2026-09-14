@@ -406,6 +406,27 @@ impl Dsv41Config {
         self.is_kv_source(layer)
     }
 
+    /// The layer whose SELECTION (topk_idxs) a non-index-source `layer` reuses:
+    /// the most recent index source at or before it.
+    ///
+    /// The reference keeps `topk_idxs` in ONE shared slot (`SharedAttn.topk_idxs`
+    /// in shared_attn; `model.py:725-726` `if not self.is_index_source: return
+    /// shared_attn.topk_idxs`), which each index source overwrites as it runs and
+    /// every non-source layer reads back. So the layer whose selection a consumer
+    /// sees is the LAST index source, which is NOT the KV owner:
+    ///
+    ///   compress_ratio == 1 group: kv_source = {20} only, but the index sources
+    ///   are {20, 24, 28, 32, 36} — layers 25..27 must read 24's selection, not
+    ///   20's. (For the ratio-2 group index_source == kv_source == {2,8,14}, so
+    ///   the two roles coincide and the older "read the KV owner's buffer" code
+    ///   happened to be right there — which is why the divergence only showed up
+    ///   after layer 20.)
+    pub fn index_source_for(&self, layer: usize) -> Option<usize> {
+        (0..=layer.min(self.n_layers.saturating_sub(1)))
+            .rev()
+            .find(|&l| self.is_index_source(l))
+    }
+
     pub fn kv_mode(&self, layer: usize) -> KvMode {
         match self.compress_ratio(layer) {
             0 => KvMode::WindowOnly,

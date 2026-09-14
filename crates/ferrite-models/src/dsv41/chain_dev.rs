@@ -3975,9 +3975,17 @@ fn hc_tail_split() -> bool {
         };
         let ring_ptr = self.layers[owner].ring.ptr;
         // index-source layers compute their OWN selection into their OWN buffer;
-        // non-index layers read the owner's (shared) selection
+        // every other layer reuses the selection of the MOST RECENT index source
+        // (the reference's single shared `topk_idxs` slot, model.py:725-726) —
+        // NOT the KV owner's buffer. The two coincide inside the ratio-2 group
+        // (index_source == kv_source == {2,8,14}) but NOT after layer 20, where
+        // the index sources are {20,24,28,32,36} while the KV source is 20 alone:
+        // layers 25..39 must read 24/28/32/36's selection, and reading 20's gave
+        // them a selection computed for a different (unmasked) candidate set.
         let idxs_ptr = if cfg.is_index_source(layer) {
             self.layers[layer].idxs.ptr
+        } else if let Some(src) = cfg.index_source_for(layer) {
+            self.layers[src].idxs.ptr
         } else {
             self.layers[owner].idxs.ptr
         };
