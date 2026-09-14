@@ -164,6 +164,28 @@ helpers (`lin_rope`, `lin_rope_norm`, `lin2_rope`, i.e. all three q-rope paths),
 The indexer's `lin_rope` fallback therefore lands on the compression table by
 construction, which is what `indexer.freqs_cis = self.freqs_cis` means.
 
+**Post-fix measurement (same layer/pos, same reference dump):**
+
+| | before | after |
+|---|---|---|
+| q (post-rope) rel | 6.88e-01 | **7.88e-02** |
+| window-KV row0 rel | 6.4e-02 | 6.42e-02 |
+| window-KV row1 rel | 9.2e-02 | 9.30e-02 |
+| window-KV row2 rel | 8.1e-02 | **4.86e-02** |
+| window-KV row3 rel | 1.15e-01 | **3.90e-02** |
+
+The split is a self-consistency proof of the direction: the rope phase is
+`pos * omega`, so at pos 0/1 the two tables agree to within rounding (those rows
+must NOT move) while the difference grows with position (rows 2/3 must improve) —
+which is exactly what happened. The residual 4-8% is the residual-stream drift
+already present at pos 116 (h rel ~1e-2) plus the bf16/fp8 boundaries, not phase.
+The q rope lanes confirm it: lane 450 went from `+0.252` to `-0.249`, i.e. to the
+same SIDE as the reference's `-0.055`; the remainder is the pre-rope value.
+
+Layers 0/1 are provably untouched by the fix (`compress_ratio == 0` ⇒
+`comp_rope == false` ⇒ the accessors return the very same main-table pointers),
+so the previously verified layer-0 bit-exactness cannot regress.
+
 ## Next fix: the compressed latent is missing its fp4 round-trip
 
 The reference quantises each compressed latent **after the rope and before the
