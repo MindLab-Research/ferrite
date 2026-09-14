@@ -4066,22 +4066,43 @@ fn hc_tail_split() -> bool {
         let mut woa_ok = false;
         if !wo_fuse && Self::woa_f32() && self.dev.supports_gemm_fp8_f32() {
             if Self::woa_cublas() {
-                // cuBLAS path: dequantize fp8 weights to f32, call gemm_f32 per
-                // group — matching the official's einsum accumulation order
-                // (the o-proj chain is the 3× amplification source per the
-                // kind 50/51 bisection).
-                let n_total = nlg * olg;
-                let w_f32 = self.dev.alloc(n_total * k * 4)?;
-                self.dev.dequant_fp8_ue8m0(
-                    ld.wo_a.as_ref().unwrap().as_u8(),
-                    ld.wo_a_scale.as_ref().unwrap().as_u8(),
-                    w_f32.ptr as *mut f32,
-                    n_total as i32,
-                    k as i32,
-                )?;
+                // cuBLAS path: dequantize fp8 weights to f32 ONCE (cached by
+                // the weight pointer — the weights are constant), then call
+                // gemm_f32 per group — matching the official's einsum
+                // accumulation order (the o-proj chain is the 3× amplification
+                // source per the kind 50/51 bisection). The first version
+                // allocated on EVERY call (40 layers × 200 steps = 8000
+                // allocations) and OOM'd at 192.3 GiB.
+                thread_local! {
+                    static WOA_F32_CACHE: std::cell::RefCell<std::collections::HashMap<usize, usize>> =
+                        std::cell::RefCell::new(std::collections::HashMap::new());
+                }
+                let w_key = ld.wo_a.as_ref().unwrap().as_u8() as usize;
+                let cached = WOA_F32_CACHE.with(|c| c.borrow().get(&w_key).copied());
+                let wf_base: *const f32 = match cached {
+                    Some(p) => p as *const f32,
+                    None => {
+                        let n_total = nlg * olg;
+                        // Leak the buffer: the weights are constant for the
+                        // process lifetime; 40 layers × ~512 KiB = ~20 MiB.
+                        let buf = Box::leak(Box::new(
+                            self.dev.alloc(n_total * k * 4)?,
+                        ));
+                        self.dev.dequant_fp8_ue8m0(
+                            ld.wo_a.as_ref().unwrap().as_u8(),
+                            ld.wo_a_scale.as_ref().unwrap().as_u8(),
+                            buf.ptr as *mut f32,
+                            n_total as i32,
+                            k as i32,
+                        )?;
+                        let p = buf.ptr as usize;
+                        WOA_F32_CACHE.with(|c| c.borrow_mut().insert(w_key, p));
+                        p as *const f32
+                    }
+                };
                 for g in 0..nlg {
                     let af = (self.s.o.ptr as *const f32).wrapping_add(g * k);
-                    let wf = (w_f32.ptr as *const f32).wrapping_add(g * olg * k);
+                    let wf = wf_base.wrapping_add(g * olg * k);
                     let out = (self.s.wo.ptr as *mut f32).wrapping_add(g * olg);
                     self.dev.gemm_f32(
                         af as *const std::ffi::c_void,
