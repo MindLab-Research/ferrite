@@ -460,7 +460,19 @@ pub fn padded_inter(n: usize) -> usize {
 /// weight spec and the consumer; both read this one function.
 pub fn shared_expert_tp() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *F.get_or_init(|| std::env::var("DSV41_SHARED_TP").map(|v| v != "0").unwrap_or(true))
+    // DEFAULT OFF: with the flag ON each rank computes only its `inter/world`
+    // slice of the shared expert, and those eight partials are NOT summed back
+    // (measured at layer 0 / pos 0: ex_out = 0.018595 == shared_only/8, and the
+    // MoE output came out 2.196 == the reference's routed_only instead of the
+    // full 2.293). The reference's shared expert is a single Expert over the
+    // whole moe_inter_dim. See the pending fix in chain_dev.rs (the shards must
+    // join the MoE all-reduce); until then the replicated layout is the only
+    // numerically correct one.
+    *F.get_or_init(|| {
+        std::env::var("DSV41_SHARED_TP")
+            .map(|v| v != "0")
+            .unwrap_or(false)
+    })
 }
 
 /// DSV41_EXPERT_ILV (default ON): store the ROUTED experts' w1 (gate) and w3 (up)
