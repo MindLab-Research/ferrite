@@ -114,6 +114,33 @@ Reference-side counterpart: `ref_attn2.py` patches the module-level `sparse_attn
 and dumps `(q, kv, idxs)` for a chosen `(layer, pos)` — the strict split of "our
 inputs differ" versus "our operator differs".
 
+## Narrowed lead: the window-KV WRITE path (and what the A/B ruled out)
+
+A/B of the six decode-only switches at layer 0 (each toggled off, then our L1 rel
+at a content-aligned decode position compared against the reference's):
+
+```
+position 33 (ref label 47)     L0         L1         L2         L3         L4
+  base                      0.000e+00  8.193e-02  2.021e-01  2.606e-01  3.087e-01
+  no_dual / no_compfuse / no_epiadd / no_fuseb1 : IDENTICAL to base
+  no_epifold                0.000e+00  8.223e-02  2.021e-01  2.583e-01  3.088e-01
+  no_winrt                  0.000e+00  7.987e-02  2.003e-01  2.547e-01  3.017e-01
+```
+
+⇒ the drift is NOT in `DSV41_MOE_DUAL` / `COMP_FUSE` / `MOE_EPI_ADD` / `FUSE_B1`
+(bit-identical outcomes) and only marginally in `HCPOST_EPI` / `WIN_KV_QUANT`.
+Those six lines are closed.
+
+What remains is the window-KV write path, because of this earlier measurement:
+our ring rows `[0,32)` differ from the reference's `kv` rows by **6.4% / 9.3% /
+8.1% / 11.5%** while our L0 INPUT is **bit-identical** - so the difference is
+inside `self.kv_norm(self.wkv(x))` → rope → `act_quant(kv, fp32_block_size=32,
+scale_fmt='ue8m0', scale_dtype=e8m0, True)` (model.py:704-707), and the 6-9%
+matches the 8.2% seen in layer 0's decode OUTPUT. `no_winrt` moving L1 by only
+0.2pp says our quantiser is close to the reference's, which leaves `wkv` and
+`kv_norm` as the suspects to diff next (dump our pre-norm kv, kind 6, and compare
+it against the same row reconstructed from the reference's post-quant row).
+
 ## Layer bisection result: the drift is introduced by the DECODE-only path
 
 The reference's `REF_HDUMP` labels drift in its teacher-forced decode loop
