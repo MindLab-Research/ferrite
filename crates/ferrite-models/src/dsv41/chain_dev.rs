@@ -5506,9 +5506,63 @@ fn hc_tail_split() -> bool {
                     )?;
                 }
             } else {
+                // The `if batched` arm above is guarded by `!expert_act_e4m3()`,
+                // yet its body feeds the official-order kernel (`xq4/xsc4` are
+                // the e4m3 act_quant buffers exactly when e4m3 is ON). With the
+                // default (e4m3 ON) that arm was therefore unreachable and the
+                // official order never ran. Reproduce it here on the live path:
+                // read the top-k ids once to the host (24 bytes/step/layer) so
+                // the per-expert weight pointers can be formed, then run the
+                // FP8-act x FP4-weight GEMM in the official's order (per-32
+                // block dot, act_scale * weight_scale applied to the block
+                // accumulator). gate and up land contiguously in `ex_act` so
+                // `swiglu_limit` below still sees [gate | up].
+                let mut ids_h = vec![0i32; topk];
+                if expert_act_e4m3() {
+                    let b = Device::view(
+                        self.s.route_idx.ptr as *mut std::ffi::c_void,
+                        topk * 4,
+                    );
+                    self.dev.download_u8(&b, unsafe {
+                        std::slice::from_raw_parts_mut(
+                            ids_h.as_mut_ptr() as *mut u8,
+                            topk * 4,
+                        )
+                    })?;
+                }
                 for slot in 0..topk {
                     let w = (self.s.route_w.ptr as *const f32).wrapping_add(slot);
                     let ids = self.s.route_idx.ptr as *const i32;
+                    if expert_act_e4m3() {
+                        let eid = ids_h[slot] as i64;
+                        if eid < 0 || eid as usize >= ne {
+                            continue;
+                        }
+                        let w1p = unsafe { w1_base.offset((eid * w1_stride) as isize) };
+                        let w1sp = unsafe { w1s_base.offset((eid * w1s_stride) as isize) };
+                        let w3p = unsafe { w3_base.offset((eid * w3_stride) as isize) };
+                        let w3sp = unsafe { w3s_base.offset((eid * w3s_stride) as isize) };
+                        let g_ptr = self.s.ex_act.ptr as *mut f32;
+                        let u_ptr = unsafe { (self.s.ex_act.ptr as *mut f32).add(inter_local) };
+                        self.dev.expert_fp4_gemm_official(
+                            self.s.xq4.as_u8(),
+                            self.s.xsc4.as_f32(),
+                            w1p,
+                            w1sp,
+                            g_ptr,
+                            inter_local as i32,
+                            dim as i32,
+                        )?;
+                        self.dev.expert_fp4_gemm_official(
+                            self.s.xq4.as_u8(),
+                            self.s.xsc4.as_f32(),
+                            w3p,
+                            w3sp,
+                            u_ptr,
+                            inter_local as i32,
+                            dim as i32,
+                        )?;
+                    } else {
                     self.dev.expert_gate_up_fp4_indirect(
                         self.s.xq4.as_u8(),
                         self.s.xsc4.as_f32(),
@@ -5529,6 +5583,7 @@ fn hc_tail_split() -> bool {
                         slot as i32,
                         expert_act_e4m3() as i32,
                     )?;
+                    }
                     self.dev.swiglu_limit(
                         self.s.ex_act.ptr as *mut f32,
                         1,
