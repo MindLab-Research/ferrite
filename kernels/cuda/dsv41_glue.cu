@@ -608,6 +608,23 @@ extern "C" int dsv41_bf16_round_inplace(float* x, int n, cudaStream_t s) {
     return (int)cudaGetLastError();
 }
 
+// The official's down-input chain (Expert.forward): `x = weights * x` then
+// `x.to(dtype)` (bf16) before w2's act_quant. One launch: scale by the DEVICE
+// route weight (route_w + slot — no host D2H sync on the decode path) and
+// round to bf16, in place on the swiglu'd [inter] row.
+__global__ void vec_scale_bf16_round_kernel(float* __restrict__ v, int n,
+                                            const float* __restrict__ w) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    v[i] = glue_bf16_round(v[i] * w[0]);
+}
+
+extern "C" int dsv41_vec_scale_bf16_round(float* v, int n, const float* w, cudaStream_t s) {
+    if (n <= 0) return (int)cudaSuccess;
+    vec_scale_bf16_round_kernel<<<(unsigned)((n + 255) / 256), 256, 0, s>>>(v, n, w);
+    return (int)cudaGetLastError();
+}
+
 // The decode-step n-gram hash on the device: removes the LAST per-step H2D on
 // the decode path (the host used to run NgramHashState::forward_row and upload
 // the ids) and makes the whole step graph-capturable. Faithful port of

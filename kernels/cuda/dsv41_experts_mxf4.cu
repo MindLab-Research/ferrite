@@ -682,6 +682,16 @@ __global__ void expert_gemv_fp4_kernel(const float* __restrict__ a_f32,
                 if (row_weight != nullptr) x *= row_weight[0];
             }
             if (epi_mode == 3) out[(size_t)row] += x;
+            else if (epi_mode == 4) {
+                // The official's per-expert output round: the expert's w2
+                // output is bf16 (linear() returns the model dtype),
+                // accumulated into the f32 y — MoE.forward's
+                // `y[idx] += expert(x[idx], weights[...])`. Same rounding
+                // arithmetic as dsv41_bf16_round_inplace.
+                uint32_t u = __float_as_uint(x);
+                u += 0x7fffu + ((u >> 16) & 1u);
+                out[(size_t)row] += __uint_as_float((uint32_t)((uint16_t)(u >> 16)) << 16);
+            }
             else out[(size_t)row] = x;
         }
     }
@@ -2300,6 +2310,20 @@ extern "C" int dsv41_expert_down_fp4_indirect(
     return (int)launch_mxf4_indirect(nullptr, nullptr, act, out, rows, dim, inter, -1, 3, 0.f,
                                      row_weight, true, w2_base, w2_stride, w2s_base, w2s_stride,
                                      w2_base, w2_stride, w2s_base, w2s_stride, ids, slot, 0, stream);
+}
+
+// down, indirect, e4m3 ACTIVATIONS (the official's act_quant domain for w2's
+// input): no epilogue weight (the route weight was applied to the swiglu
+// output BEFORE the quant — Expert.forward's `x = weights * x`), per-slot
+// bf16-rounded output accumulated into `out` (epi_mode 4 — MoE.forward's
+// `y[idx] += expert(...)` with the expert's bf16 output).
+extern "C" int dsv41_expert_down_fp8act_indirect(
+    const uint8_t* a, const float* a_scale, float* out, int rows, int dim, int inter,
+    const uint8_t* w2_base, long w2_stride, const uint8_t* w2s_base, long w2s_stride,
+    const int* ids, int slot, cudaStream_t stream) {
+    return (int)launch_mxf4_indirect(a, a_scale, nullptr, out, rows, dim, inter, -1, 4, 0.f,
+                                     nullptr, false, w2_base, w2_stride, w2s_base, w2s_stride,
+                                     w2_base, w2_stride, w2s_base, w2s_stride, ids, slot, 1, stream);
 }
 
 extern "C" int dsv41_expert_down_fp4(const float* act, const uint8_t* w2,

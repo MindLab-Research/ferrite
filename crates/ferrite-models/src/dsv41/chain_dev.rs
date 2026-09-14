@@ -159,6 +159,8 @@ struct Scratch {
     route_ctr: DevBuf,
     ex_in: DevBuf,     // [dim]
     ex_act: DevBuf,    // [2*inter]
+    ex_q: DevBuf,      // [inter_local] e4m3 bytes — the down's act_quant'd input
+    ex_s: DevBuf,      // [inter_local/32] f32 pow2 scales — the down's act_quant'd scales
     ex_out: DevBuf,    // [dim]
     /// DSV41_MOE_BATCH only: the per-slot gate/up outputs, `[topk][2*inter]`.
     /// The sequential loop reused ONE ex_act per slot (overwrite); the batched
@@ -1090,6 +1092,8 @@ impl<'a> DevChain<'a> {
             route_ctr: dev.alloc(4)?,
             ex_in: dev.alloc(fb(dim))?,
             ex_act: dev.alloc(fb(2 * inter.max(dim)))?,
+            ex_q: dev.alloc(inter.max(8))?,
+            ex_s: dev.alloc(fb(inter / 32 + 8))?,
             ex_out: dev.alloc(fb(dim))?,
             // DSV41_MOE_BATCH scratch (allocated unconditionally: it is a few
             // hundred KB and keeps the allocation graph static). Sized by the
@@ -5011,20 +5015,58 @@ fn hc_tail_split() -> bool {
                             self.gt_dump_vec(&xdp, 11, self.s.ex_act.ptr, 64)?;
                         }
                     }
-                    self.dev.expert_down_fp4_indirect(
-                        self.s.ex_act.ptr as *const f32,
-                        self.s.o.ptr as *mut f32,
-                        1,
-                        dim as i32,
-                        inter_local as i32,
-                        w,
-                        w2_base,
-                        w2_stride,
-                        w2s_base,
-                        w2s_stride,
-                        ids,
-                        slot as i32,
-                    )?;
+                    if expert_act_e4m3() {
+                        // The official's down-input chain (Expert.forward):
+                        // `x = weights * x` then `w2(x.to(bf16 → act_quant
+                        // e4m3))` — the weight BEFORE the quant, the e4m3
+                        // activation domain for w2, and the per-slot
+                        // bf16-rounded accumulation (MoE.forward's
+                        // `y[idx] += expert(...)`, the expert's bf16 output).
+                        self.dev.vec_scale_bf16_round(
+                            self.s.ex_act.ptr as *mut f32,
+                            inter_local as i32,
+                            w,
+                        )?;
+                        self.dev.quant_fp8_on(
+                            self.s.ex_act.ptr as *const f32,
+                            self.s.ex_q.ptr as *mut u8,
+                            self.s.ex_s.ptr as *mut f32,
+                            1,
+                            inter_local as i32,
+                            32,
+                            true,
+                            self.dev.stream(),
+                        )?;
+                        self.dev.expert_down_fp8act_indirect(
+                            self.s.ex_q.as_u8(),
+                            self.s.ex_s.as_f32(),
+                            self.s.o.ptr as *mut f32,
+                            1,
+                            dim as i32,
+                            inter_local as i32,
+                            w2_base,
+                            w2_stride,
+                            w2s_base,
+                            w2s_stride,
+                            ids,
+                            slot as i32,
+                        )?;
+                    } else {
+                        self.dev.expert_down_fp4_indirect(
+                            self.s.ex_act.ptr as *const f32,
+                            self.s.o.ptr as *mut f32,
+                            1,
+                            dim as i32,
+                            inter_local as i32,
+                            w,
+                            w2_base,
+                            w2_stride,
+                            w2s_base,
+                            w2s_stride,
+                            ids,
+                            slot as i32,
+                        )?;
+                    }
                     // op-level diagnostic: s.o after THIS slot's down — kind
                     // 14+slot — locating the first exploding slot in the
                     // e4m3-vs-e2m1 bisection.

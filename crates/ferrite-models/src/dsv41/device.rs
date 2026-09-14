@@ -363,6 +363,9 @@ struct Kernels {
         unsafe extern "C" fn(*const f32, *const c_void, *mut f32, c_int, c_int, f32, CuStream) -> c_int,
     >,
     bf16_round_inplace: Option<unsafe extern "C" fn(*mut f32, c_int, CuStream) -> c_int>,
+    vec_scale_bf16_round: Option<
+        unsafe extern "C" fn(*mut f32, c_int, *const f32, CuStream) -> c_int,
+    >,
     comp_placeholder:
         Option<unsafe extern "C" fn(*mut i32, *const c_int, c_int, c_int, CuStream) -> c_int>,
     ring_append:
@@ -435,6 +438,12 @@ struct Kernels {
     expert_down_fp4_indirect: Option<
         unsafe extern "C" fn(
             *const f32, *mut f32, c_int, c_int, c_int, *const f32,
+            *const u8, i64, *const u8, i64, *const c_int, c_int, CuStream,
+        ) -> c_int,
+    >,
+    expert_down_fp8act_indirect: Option<
+        unsafe extern "C" fn(
+            *const u8, *const f32, *mut f32, c_int, c_int, c_int,
             *const u8, i64, *const u8, i64, *const c_int, c_int, CuStream,
         ) -> c_int,
     >,
@@ -821,6 +830,7 @@ impl Device {
             win_kv_quant_rt: ko!(rt, "dsv41_win_kv_quant_rt"),
             gate_gemv_f32: ko!(rt, "dsv41_gate_gemv_f32"),
             bf16_round_inplace: ko!(rt, "dsv41_bf16_round_inplace"),
+            vec_scale_bf16_round: ko!(rt, "dsv41_vec_scale_bf16_round"),
             comp_placeholder: ko!(rt, "dsv41_comp_placeholder"),
             compress_commit: ko!(rt, "dsv41_compress_commit"),
             ring_append: ko!(rt, "dsv41_ring_append"),
@@ -830,6 +840,7 @@ impl Device {
             index_k_publish: ko!(rt, "dsv41_index_k_publish"),
             expert_gate_up_fp4_indirect: ko!(rt, "dsv41_expert_gate_up_fp4_indirect"),
             expert_down_fp4_indirect: ko!(rt, "dsv41_expert_down_fp4_indirect"),
+            expert_down_fp8act_indirect: ko!(rt, "dsv41_expert_down_fp8act_indirect"),
             expert_gate_up_fp4_batched: ko!(rt, "dsv41_expert_gate_up_fp4_batched"),
             expert_tcgen05_gate_up_mxf4: ko!(rt, "dsv41_expert_tcgen05_gate_up_mxf4"),
             interleave_gateup_fp4: ko!(rt, "dsv41_interleave_gateup_fp4"),
@@ -3081,6 +3092,15 @@ impl Device {
         self.kerr(rc, "dsv41_bf16_round_inplace")
     }
 
+    /// The official's down-input chain: scale by the DEVICE route weight then
+    /// round to bf16, in place — Expert.forward's `x = weights * x` followed
+    /// by `x.to(dtype)` before w2's act_quant.
+    pub fn vec_scale_bf16_round(&self, v: *mut f32, n: i32, w: *const f32) -> Result<()> {
+        let f = self.need(self.kernels.vec_scale_bf16_round, "dsv41_vec_scale_bf16_round")?;
+        let rc = unsafe { f(v, n, w, self.stream) };
+        self.kerr(rc, "dsv41_vec_scale_bf16_round")
+    }
+
     /// Publish the roped index key into the owner's group slot, with the slot
     /// derived from the DEVICE latent counter (a host-computed destination would
     /// be frozen by a graph capture - the same class as the ring append).
@@ -3380,6 +3400,39 @@ impl Device {
             )
         };
         self.kerr(rc, "dsv41_expert_down_fp4_indirect")
+    }
+
+    /// Indirect expert down with e4m3 ACTIVATIONS (the official's act_quant
+    /// domain for w2's input — the route weight was applied to the swiglu
+    /// output BEFORE the quant) and the per-slot bf16-rounded accumulation
+    /// (MoE.forward's `y[idx] += expert(...)`, the expert's bf16 output).
+    #[allow(clippy::too_many_arguments)]
+    pub fn expert_down_fp8act_indirect(
+        &self,
+        a: *const u8,
+        a_scale: *const f32,
+        out: *mut f32,
+        rows: i32,
+        dim: i32,
+        inter: i32,
+        w2_base: *const u8,
+        w2_stride: i64,
+        w2s_base: *const u8,
+        w2s_stride: i64,
+        ids: *const i32,
+        slot: i32,
+    ) -> Result<()> {
+        let f = self.need(
+            self.kernels.expert_down_fp8act_indirect,
+            "dsv41_expert_down_fp8act_indirect",
+        )?;
+        let rc = unsafe {
+            f(
+                a, a_scale, out, rows, dim, inter, w2_base, w2_stride, w2s_base, w2s_stride,
+                ids, slot, self.stream,
+            )
+        };
+        self.kerr(rc, "dsv41_expert_down_fp8act_indirect")
     }
 
     /// Batched indirect expert gate/up: ONE launch covers all `slots` top-k
