@@ -220,3 +220,20 @@ wo_a (0.254%→~0.4%) → wo_b (→~0.6%) → AR (→~0.7%) → hc_post (→0.79
 5. A/B 验证 attn_o 降幅
 
 **注意**：ref 的 kind=6 prefill 记录是 7680 f32s（wkvpost 写 [1,15,512] 一条合并记录），解析需变长处理。ref 的 kind 50/51 n=4096 ✓。
+
+## wo_a cuBLAS 路径实施完成（2026-09-15 上午，commit a2ee46c9）
+
+**实施内容**：
+1. `kernels/cuda/dsv41_glue.cu`：新增 `dsv41_dequant_fp8_ue8m0` 内核（fp8 e4m3 + ue8m0 块 scale → f32）
+2. `crates/ferrite-models/src/dsv41/device.rs`：FFI 类型声明 + 符号加载 + `dequant_fp8_ue8m0` wrapper
+3. `crates/ferrite-models/src/dsv41/chain_dev.rs`：`woa_cublas()` gate（DSV41_WOA_CUBLAS，默认 OFF）+ cuBLAS 分支
+   - 每次调用反量化权重到 f32（测试路径，后续可缓存）
+   - 逐 group 调用 `gemm_f32`（cuBLAS GEMV，匹配官方 einsum 的累加序）
+
+**AR 排除测试（62a1c849）**：DSV41_AR_V5=0（NCCL 路径）attn_o = 0.77%——与 P2P v5（0.76-0.94%）相同
+⇒ **AR 求和序不是 o-proj 3× 放大的主源**，wo_a/wo_b gemv 的计算顺序是剩余嫌疑
+
+**待验证**：DSV41_WOA_CUBLAS=1 的 attn_o 是否从 0.79% 下降（验证轮 0e231742 在飞）
+
+**注意**：ref 的 kind=6（kv_gemm）prefill 记录是 7680 f32s（wkvpost 写 [1,15,512] 一条合并记录），
+解析需变长处理。ref 的 kind 50/51 n=4096 ✓。
