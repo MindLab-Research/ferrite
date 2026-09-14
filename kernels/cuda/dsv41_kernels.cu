@@ -6992,9 +6992,6 @@ extern "C" int dsv41_compressor(const float* x, const uint8_t* wkv, const uint8_
 extern "C" int dsv41_rope_precompute(float* cos, float* sin, int dim, int seqlen,
                                      int original_seq_len, float base, float factor, float beta_fast,
                                      float beta_slow, cudaStream_t s) {
-    // TRACE: prove this code path runs (the "did the fix take effect" check).
-    printf("[rope-precompute] dim=%d seqlen=%d orig=%d base=%g factor=%g bf=%g bs=%g\n",
-           dim, seqlen, original_seq_len, base, factor, beta_fast, beta_slow);
     // HOST-side, bit-exact replica of the official precompute_freqs_cis
     // (model.py:369-389). The official runs on CPU (torch.arange without a
     // device → CPU; torch.polar → glibc cosf/sinf), so the ONLY way to match

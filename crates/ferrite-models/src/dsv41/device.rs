@@ -2184,6 +2184,11 @@ impl Device {
         beta_fast: f32,
         beta_slow: f32,
     ) -> Result<()> {
+        // TRACE: prove the .so's rope_precompute actually runs (the
+        // "did-the-fix-take-effect" check the user demanded).
+        eprintln!(
+            "[rope-precompute] dim={dim} seqlen={seqlen} orig={original_seq_len} base={base} factor={factor} bf={beta_fast} bs={beta_slow}"
+        );
         let rc = unsafe {
             (self.kernels.rope_precompute)(
                 cos, sin, dim, seqlen, original_seq_len, base, factor, beta_fast, beta_slow,
