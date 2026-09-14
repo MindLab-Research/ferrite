@@ -8370,6 +8370,7 @@ __global__ void p2p_ar_store_v5_kernel(
     for (int ii = n4 * 4 + blockIdx.x * blockDim.x + threadIdx.x; ii < n; ii += step) {
         float v = partial[ii];
         if (bias != nullptr) v += bias[ii];
+        v = __bfloat162float(__float2bfloat16(v));
         const size_t base = (size_t)((e & 1u) * (unsigned)world + (unsigned)my_rank) * (unsigned)stride + (unsigned)ii;
         staging_tbl[rr][base] = v;
     }
@@ -8381,7 +8382,6 @@ __global__ void p2p_ar_pubred_v5_kernel(
     const float* __restrict__ staging_local,  // my [2][world][stride]
     const unsigned* __restrict__ ready_local, // my [world] flag row
     float* __restrict__ out,
-        v = __bfloat162float(__float2bfloat16(v));
     int world, int my_rank, int n, int stride) {
     // publish + reduce fused (2026-09-10): the publish used to be its own
     // 1-block kernel and the reduce another launch — 3 kernels per AR. v5's
