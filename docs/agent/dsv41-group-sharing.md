@@ -114,6 +114,33 @@ Reference-side counterpart: `ref_attn2.py` patches the module-level `sparse_attn
 and dumps `(q, kv, idxs)` for a chosen `(layer, pos)` — the strict split of "our
 inputs differ" versus "our operator differs".
 
+## Measurement discipline (users' standing rules, 2026-09-14)
+
+1. **ONE run, dump EVERYTHING, then analyse offline.** A diagnostic run must
+   write all of: our per-step logits (`DSV41_GT_LOGITS_DUMP`), the full toktr,
+   the full stdout/stderr, the official's `[reftop5]` and its logits. Analysis
+   then happens in a re-runnable offline script (`/tmp/dumpall.sh` +
+   `/opt/dlami/nvme/dbg/analyze_div.py`) — changing an alignment, a threshold or
+   a window costs seconds instead of another 2-minute GPU run.
+2. **Never hardcode the alignment between our token stream and the reference's
+   records.** `[toktr] pos=p` reports the argmax computed AT position `p`, i.e.
+   the token for position `p+1`, while `ref_diff.py`'s record `i` is the top-1 at
+   its own dump position. I burned a full diagnostic on an off-by-one here: the
+   symptom is an alternating "newline vs number" pattern in the diff, and it
+   makes EVERY position look like a mismatch. Auto-scan the offset over
+   `-3..+3` and assert the match count is large before trusting any divergence.
+3. **A flat reference dump needs a ROW slice.** `sparse_attn`'s `kv` is dumped as
+   a flat `[rows * 512]`; `kv[128:]` starts 128 *elements* into row 0 (the window
+   block) and reported a bogus ~146% "compressed-latent" difference. Always
+   `reshape(-1, 512)` first (`compkvcmp.py` carried this for one round).
+4. **Make the run long enough to reach the divergence.** The first wrong number
+   moved 52 -> 61 -> 63 as the fixes landed, i.e. beyond ~120 generated tokens;
+   `--max-tokens 110` could not see it at all.
+5. **Never stack 8-rank jobs** (three concurrent ones took decode from 36 to 9.3
+   tok/s), and **kill exactly by PID** — a `task_kill` of a wrapper script has
+   left `dsv41-run` orphans holding 79 GB/GPU for 49 minutes and 704% CPU, which
+   then polluted every subsequent measurement.
+
 ## The rope table is PER-LAYER (found 2026-09-14; this was the real "KV/rope" bug)
 
 The reference builds ONE `freqs_cis` per layer (`Attention.__init__`,
