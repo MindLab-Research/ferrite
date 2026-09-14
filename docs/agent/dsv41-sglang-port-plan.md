@@ -356,3 +356,23 @@ xn（0 元素差）→ kv_gemm（0 元素差）→ rmsnorm → rope → RT（全
 | wo_b | oracle 0/5120 BIT_EXACT | 排除 |
 | AR 结合式 | ==NCCL 0/5120 | 排除 |
 | **AR store 舍入** | **未舍入（官方已舍入）** | **✓ 根因** |
+
+## 🎯 DSV41_EXPERT_CUBLAS：一步到位 GEMM 参考模式（2026-09-14 07:00，最新提交）
+
+**用户的完整调查链**（moe_o 8.88% pos 0 的根因定位）：
+1. 完整 dump 显示 moe_o 从 pos 0 就有 8.88%（attn_o 位级！）——MoE 链是唯一剩余问题
+2. 路由索引对比：6/75 位置翻转（pos 35 的 122 vs 118 = moe_o 15.79% 突变根因）
+3. E4M3 A/B with dump：开关生效（act_scales 160/160 不同）但 token 碰巧相同
+4. w2 权重字节一致 ✓ 但 **scale 有 4/16 字节不同**（byte 9: our=0x00 vs ref=0x79——一个 32 块的 scale 为零）
+5. mp8 分片与原始 checkpoint 的 scale 一致 ✓（排除加载路径差异）
+6. **用户结论**："按能产生 8.88% 量级的标准，剩下的唯一候选是 fp4 权重的 scale 布局/块大小"
+
+**用户指令**："直接一步到位 gemm 搞定"
+
+**实施方案（DSV41_EXPERT_CUBLAS=1，默认 OFF）**：
+- 反量化每个选中专家的 fp4 权重（e2m1 + e8m0 per-32 scale）到 f32
+- 完整链路走 cuBLAS gemv_f32：gate/up GEMM → swiglu_route（clamp+silu+路由权重+bf16）→ down GEMM → 升序 slot 累加
+- 与官方 Expert.forward 计算序完全一致
+- 新内核：dsv41_dequant_fp4_e2m1（packed fp4 + e8m0 scale → f32）+ dsv41_swiglu_route
+
+**验证标准**（用户定的判定）：pos 0 的 moe_o 从 8.8775% → 期望 ≈0
