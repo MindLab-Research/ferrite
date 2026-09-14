@@ -2250,6 +2250,17 @@ impl<'a> DevChain<'a> {
         if self.comm.as_ref().map(|c| c.rank).unwrap_or(0) != 0 {
             return Ok(());
         }
+        // Position filter: an UNRESTRICTED dump writes ~10 MB per step (the
+        // per-layer hc kinds alone are 3 x hc*dim f32 x 40 layers) and issues
+        // \~2000 blocking D2H copies per step, which makes a 120-step run take
+        // tens of minutes. `DSV41_GT_XDUMP_POS=<pos>` restricts the dump to one
+        // step (the only thing a single-position bisection needs), skipping the
+        // download entirely for every other step.
+        if let Ok(want) = std::env::var("DSV41_GT_XDUMP_POS") {
+            if want.trim().parse::<u64>().ok() != Some(self.step_count as u64) {
+                return Ok(());
+            }
+        }
         let mut v = vec![0f32; n];
         let b = Device::view(ptr, n * 4);
         self.dev.download_f32(&b, &mut v)?;
