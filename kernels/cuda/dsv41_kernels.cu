@@ -2361,8 +2361,14 @@ __global__ void rmsnorm_rope_kernel(const float* __restrict__ x, const float* __
         const float c = cos[(size_t)t * half + i];
         const float s = sin[(size_t)t * half + i] * (inverse ? -1.f : 1.f);
         const float x0 = rr[2 * i], x1 = rr[2 * i + 1];
-        rr[2 * i] = x0 * c - x1 * s;
-        rr[2 * i + 1] = x0 * s + x1 * c;
+        // The official's rope output is bf16 (`y.copy_(x)` where y is the
+        // bf16 kv tensor) — the RT then quantises the ROUNDED values. Our
+        // rope wrote raw f32, leaving the RT's amax/quant consuming extra
+        // precision the official doesn't have (the kv chain's T1 pattern).
+        const float r0 = x0 * c - x1 * s;
+        const float r1 = x0 * s + x1 * c;
+        rr[2 * i] = bf16_norm ? orope_bf16_round(r0) : r0;
+        rr[2 * i + 1] = bf16_norm ? orope_bf16_round(r1) : r1;
     }
 }
 
