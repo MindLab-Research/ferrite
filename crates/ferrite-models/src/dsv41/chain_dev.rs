@@ -3835,6 +3835,15 @@ fn hc_tail_split() -> bool {
         if bf16_q() {
             self.dev.bf16_round_inplace(self.s.q.ptr as *mut f32, (nlh * hd) as i32)?;
         }
+        // op-level diagnostic: the POST-ROPE q (the attention's key input) —
+        // kind 50, n = nlh*hd. If this diverges from the official, the q chain
+        // (wq_a → q_norm → wq_b → rope) is the source; if it matches, the
+        // attention computation itself (scores/softmax/P·V) owns the error.
+        if let Ok(xdp) = std::env::var("DSV41_GT_XDUMP") {
+            if layer == 0 {
+                self.gt_dump_vec(&xdp, 50, self.s.q.ptr, (nlh * hd) as usize)?;
+            }
+        }
 
         // P1 (DSV41_SPARSE_OROPE, default ON): the sparse attention's epilogue
         // also runs the inverse o-rope and emits the fp8 of the roped output
@@ -3948,6 +3957,16 @@ fn hc_tail_split() -> bool {
         // only the fallback path still quantises here.
         if !s_orope && !o_q_epi {
             self.quant1(self.s.o.ptr as *const f32, (nlh * hd) as i32)?;
+        }
+        // op-level diagnostic: the attention output BEFORE the o-proj chain —
+        // kind 51, n = nlh*hd (the sparse attention + o-rope result, what
+        // wo_a consumes). If this diverges from the official, the attention
+        // computation itself (scores/softmax/P·V/o-rope) owns the error; if
+        // it matches, the o-proj chain (wo_a/wo_b/AR/hc_post) is the source.
+        if let Ok(xdp) = std::env::var("DSV41_GT_XDUMP") {
+            if layer == 0 {
+                self.gt_dump_vec(&xdp, 51, self.s.o.ptr, (nlh * hd) as usize)?;
+            }
         }
         // B1 (DSV41_WO_QUANT_FUSE): the wo_a gemv's epilogue emits the fp8 of its
         // own output into `wo_q`/`wo_qsc` with quant_kernel's arithmetic, so the
