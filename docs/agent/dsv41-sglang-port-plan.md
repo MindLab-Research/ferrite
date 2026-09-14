@@ -3,22 +3,25 @@
 > 用户指令链：① 参考官方 PyTorch 彻底改好正确性；② MTP block-5 step ≈ 7ms 即达标（同口径 > sglang 873.6 tok/s）；③ eager 之外的算子判垃圾，**照抄 SGLang**（BBuf/sglang@835c3909，V4.1-Flash 真源；master 无 V4.1）；④ 移植→确认正确→优化到比他们快。
 > 验证机：AWS b300-4（ubuntu@43.202.208.136，8×B300，模型 /opt/dlami/nvme/models/DeepSeek-V4.1-Flash）。
 
-## 🎯 当前战况（2026-09-14 下午，正确性收敛中——读这节就够）
+## 🎯 当前战况（2026-09-14 深夜——两大域已对齐，剩余发散=深层 GEMM 累加序；读这节就够）
 
-**数数红线进展：1..63 全对（此前 35/52 崩）**——逐域对齐官方的效果在累积。
+**数数**：1..51 后断于 52（但继续输出至 98 行——"在数"而非退化）。正确性锚=官方 PyTorch（MP8 teacher-forced 对拍，kinds 0-21 dump 工具链）。
 
-**已落库的修复（全部默认 ON，DSV41_*=0 可回退）**：`bf16_xn`（xn 与官方逐位一致 0.18%→0.00%）、`win_kv_quant_rt`（fp8 往返+bf16 写回）、`bf16_kv`（kv 链两处边界，kv_RT→1.08-1.53%）、`bf16_q`（qr/s.q 两处边界，数数→1..63）、`gate_gemv_f32`（gate 分数官方 f32 域）、kinds 0-19 op 级 dump 探针（teacher-forced 逐算子对拍工具链）。
+**已落库的域对齐（全部默认 ON）**：
+| 域 | 状态 |
+|---|---|
+| `bf16_xn`/`bf16_kv`/`bf16_q`/`win_kv_quant_rt`/`gate_gemv_f32` | xn 逐位 0.00% ✓，kv_gemm 0.49%，kv_RT 1.1-1.5% |
+| **专家域三阶段**（e4m3 激活 + down 链对齐 + ILV 修复） | moe_o 4.7-10.9%→**6.7-14.3%（受 attn 泄漏主导）**；40× 爆炸根因=ILV 交错池+强制 sequential+未清零 s.o（已修） |
+| **sparse_attn 内部 bf16**（P·V 概率 acc_s_cast + 输出/rope bf16，DSV41_ATTN_PBF16） | attn_o 3.5-3.84%→**3.46-3.66%（微降）**——P·V 概率非主源 |
 
-**当前逐算子发散**：xn 0.00% ✓ / kv_gemm 0.49% ✓ / kv_RT 1.1-1.5% / attn_o 3.5-3.8%（q 链内部融合边界+sparse_attn 内部 bf16 未覆盖）/ **moe_o 4.7-10.9%（专家 e2m1 激活域=最大剩余项）**。
-
-**⚠️ e4m3 专家激活域调查（完整悖论，默认已回退 OFF）**：官方对 fp4 权重用 act_quant（fp8 e4m3+幂次 scale）激活，我们 e2m1（8× 粗）。已实现完整 e4m3 路径（内核 staging 臂+launcher 管道+quant_fp8_on 写 xq4/xsc4），但真机 40× 爆炸。**证据表**：微测试（链接 .so）三项全过（QUANT_OK/GEMV_E4M3_OK out=5127.8125 逐位/DOWN_OK so=820450 全行一致）；真机中间 dump 全部正常（k7 尺度 160/160 幂次 ✓、k10 点积 0.2-1.3× ✓、k8/k11 slot 0/1 swiglu 0.5-1.0× ✓、k3/4 路由权重与 ids 逐位同 ✓、k12==k13 无 clobber ✓）；**每槽 dump（k14-19）显示 slot 0 的 down 已满幅爆炸（0.7231）且后续槽几乎不增**——但 slot 0 的 swiglu 输入仅 0.0487 rms，算术上 down 无法放大 15×。**悖论结论：某"已验证"环节在真机组合下失效。下一假设**：①swiglu 的写入位置/是否真正运行（dump ex_act 于 swiglu 前后对照——k10 本意是 pre-swiglu 但误放在 post 位置！）；②`expert_fp4_mode()` 与 sequential 路径的交互；③ex_act 的 gate|up 布局（拼接 vs 交错）与 swiglu 期望的匹配。**MOE_BATCH 默认实为 ON**（`unwrap_or(true)`，注释"default OFF"过时）——e2m1 一直走 batched，e4m3 被禁用 batched 后强制走 sequential（e2m1+sequential 也正常 ⇒ 病在 e4m3+sequential 组合）。
+**剩余发散的因果链（定谳）**：`kv_gemm 0.49%（fp8 gemm 累加序≠官方 tilelang 结构）→ kv_RT 1.1-1.5% → attn_o ~3.5%（注意力放大 kv 误差）→ moe_o 7-14%（FFN 侧泄漏）`。**根子 = fp8 GEMM 的分块/累加序**——官方用 tilelang 的 fp8_gemm_kernel（确定性但 tile 特定），我们的 gemm 累加序不同 ⇒ ~0.5%/层，经链路放大。
 
 **下一步（按序）**：
-1. **e4m3 猎杀**（上文三假设；微测试+真机 dump 都已就绪，kinds 14-19 可复用）。
-2. sparse_attn 内部 bf16（q/kv/P 都是 BF16，acc_s_cast BF16——kernel.py:328-390）+ q 链内部融合边界。
-3. 数数 1..100 完美 → spec_gt 复测 → S2-S7 性能线（450 tok/s / bench >908.9）。
+1. **kv_gemm 逐位对齐**：对照官方 tilelang fp8_gemm_kernel 的分块/累加结构（kernel.py:280-305），重排我们的 gemm 累加序（或融合边界）——目标 kv_gemm 0.49%→~0.1%。**这是正确性的最后一座大山**（其后 kv/attn/moe 全链坍缩）。
+2. 数数 1..100 → spec_gt 复测 → S2-S7 性能线（450 tok/s / bench >908.9）。
+3. 性能线注意：e4m3+sequential（ILV 排除）是正确性配置；性能需给 batched 内核加 e4m3 臂（ILV 恢复）。
 
-**关键工具链（远端）**：`~/ref_diff.py`（teacher-forced kinds 0-6 hooks）+ `DSV41_GT_XDUMP`（kinds 0-19）；官方 MP8 分片 `/opt/dlami/nvme/dsv41_mp8`；同口径参考 908.9 tok/s（sglang TP8/acc5.49）；微测试 `/tmp/tests_gemv2.cu`、`/tmp/tests_down.cu`（链接 .so 验证内核逐位）。
+**关键工具链（远端）**：`~/ref_diff.py`（teacher-forced，kinds 0-6 hooks）+ `DSV41_GT_XDUMP`（kinds 0-21，注意分析脚本需带全 kind 尺寸——`~/`下历次对拍脚本可复用）；官方 MP8 `/opt/dlami/nvme/dsv41_mp8`；微测试 `/tmp/tests_gemv2.cu`、`/tmp/tests_down.cu`（链接 .so 逐位验证内核）。
 
 ## ⚠️ 战况修订（2026-09-13 深夜，实测推翻假设）
 
