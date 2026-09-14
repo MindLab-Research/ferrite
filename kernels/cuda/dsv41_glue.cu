@@ -827,14 +827,6 @@ extern "C" int dsv41_expert_fp4_gemm_official(
         act, act_scale, w, ws, out, n, k);
     return (int)cudaGetLastError();
 }
-    const uint8_t* w, const uint8_t* ws,
-    float* out, int n, int k, cudaStream_t s) {
-    if (n <= 0 || k <= 0) return (int)cudaErrorInvalidValue;
-    const int blocks = (n + 127) / 128;
-    expert_fp4_gemm_official_kernel<<<blocks, 128, 0, s>>>(
-        act, act_scale, w, ws, out, n, k);
-    return (int)cudaGetLastError();
-}
 
 // Convert a bf16 tensor to f32 (each bf16 halfword → one f32 word). Used by
 // the gate's cuBLAS path: the official computes scores as
