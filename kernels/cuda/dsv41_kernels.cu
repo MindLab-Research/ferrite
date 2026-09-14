@@ -6989,51 +6989,47 @@ extern "C" int dsv41_compressor(const float* x, const uint8_t* wkv, const uint8_
     return (int)cudaGetLastError();
 }
 
+// Device-side rope table: one thread per column i, iterating the seqlen rows.
+// All arithmetic in f32 on the device — the same domain the official's
+// precompute_freqs_cis (torch.polar) runs in. No host vectors, no H2D copies.
+__global__ void rope_precompute_dev_kernel(float* __restrict__ cos, float* __restrict__ sin,
+                                            int dim, int seqlen, int original_seq_len,
+                                            float base, float factor, float beta_fast,
+                                            float beta_slow) {
+    const int half = dim / 2;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= half) return;
+    const float PI_F = 3.14159274101257324f;
+    float f = powf(base, -2.0f * (float)i / (float)dim);
+    if (original_seq_len > 0) {
+        // YaRN — the official's precompute_freqs_cis (model.py:382-383)
+        // FLOORS corrected_dim(beta_fast) and CEILS corrected_dim(beta_slow).
+        const float cd = (float)dim * logf((float)original_seq_len / (beta_fast * 2.0f * PI_F)) /
+                         (2.0f * logf(base));
+        const float cd2 = (float)dim * logf((float)original_seq_len / (beta_slow * 2.0f * PI_F)) /
+                          (2.0f * logf(base));
+        const float lo = fmaxf(floorf(cd), 0.0f);
+        const float hi = fminf(ceilf(cd2), (float)(dim - 1));
+        const float t = fminf(fmaxf(((float)i - lo) / fmaxf(hi - lo, 1e-3f), 0.0f), 1.0f);
+        const float smooth = 1.0f - t;
+        f = f / factor * (1.0f - smooth) + f * smooth;
+    }
+    for (int tt = 0; tt < seqlen; ++tt) {
+        const float a = (float)tt * f;
+        cos[(size_t)tt * half + i] = cosf(a);
+        sin[(size_t)tt * half + i] = sinf(a);
+    }
+}
+
 extern "C" int dsv41_rope_precompute(float* cos, float* sin, int dim, int seqlen,
                                      int original_seq_len, float base, float factor, float beta_fast,
                                      float beta_slow, cudaStream_t s) {
-    // HOST-side double-precision precompute: the build's --use_fast_math makes
-    // the device's cosf/sinf/powf/logf fast approximations (~2^-21 relative),
-    // and the 40-layer hc residual amplification turns the rope's per-column
-    // error into a 66-117% logits deviation (the kind-42 finding) — the EOS
-    // inflation flips the argmax at the boundary steps. The official
-    // (torch.polar) computes in libm precision; this host pass matches it by
-    // evaluating the whole table in double and rounding once at the f32 store.
-    // The table is built once at startup, so the synchronous copies are free.
     const int half = dim / 2;
     if (half <= 0 || seqlen <= 0) return (int)cudaErrorInvalidValue;
-    std::vector<float> hc((size_t)seqlen * half), hs((size_t)seqlen * half);
-    const double PI = 3.14159265358979323846;
-    for (int i = 0; i < half; ++i) {
-        double f = std::pow((double)base, -2.0 * (double)i / (double)dim);
-        if (original_seq_len > 0) {
-            // YaRN — the official's precompute_freqs_cis (model.py:382-383)
-            // FLOORS corrected_dim(beta_fast) and CEILS corrected_dim(beta_slow).
-            const double cd = (double)dim * std::log((double)original_seq_len /
-                                   ((double)beta_fast * 2.0 * PI)) /
-                               (2.0 * std::log((double)base));
-            const double cd2 = (double)dim * std::log((double)original_seq_len /
-                                    ((double)beta_slow * 2.0 * PI)) /
-                                (2.0 * std::log((double)base));
-            const double lo = std::max(std::floor(cd), 0.0);
-            const double hi = std::min(std::ceil(cd2), (double)(dim - 1));
-            const double t = std::min(std::max(((double)i - lo) / std::max(hi - lo, 1e-3), 0.0), 1.0);
-            const double smooth = 1.0 - t;
-            f = f / (double)factor * (1.0 - smooth) + f * smooth;
-        }
-        for (int tt = 0; tt < seqlen; ++tt) {
-            const double a = (double)tt * f;
-            hc[(size_t)tt * half + i] = (float)std::cos(a);
-            hs[(size_t)tt * half + i] = (float)std::sin(a);
-        }
-    }
-    const size_t bytes = (size_t)seqlen * half * sizeof(float);
-    // Synchronous copies (startup-only path): the host vectors die at the
-    // return, so async copies would be use-after-free.
-    cudaError_t e1 = cudaMemcpy(cos, hc.data(), bytes, cudaMemcpyHostToDevice);
-    if (e1 != cudaSuccess) return (int)e1;
-    (void)s;
-    return (int)cudaMemcpy(sin, hs.data(), bytes, cudaMemcpyHostToDevice);
+    const int blocks = (half + 127) / 128;
+    rope_precompute_dev_kernel<<<blocks, 128, 0, s>>>(cos, sin, dim, seqlen, original_seq_len,
+                                                      base, factor, beta_fast, beta_slow);
+    return (int)cudaGetLastError();
 }
 
 extern "C" int dsv41_apply_rope(float* x, const float* cos, const float* sin, int rows, int row_len,
