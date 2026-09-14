@@ -14,6 +14,23 @@
 
 **attn_o 剩余源（TODO #4，按优先级）**：①kv_RT 残余 0.55-1.19%（norm/rope/RT 链内部——**警惕同款 T1 式融合跳边界**：kv 链有 gemm_fp8_mx_rope_norm 融合！）②q 链（wq_b/rope/q_norm）③indexer 选择（topk_idxs vs 官方）④o-proj（wo_a/wo_b）。方法论同上：零重建微测+官方对拍+env 门隔离。
 
+## 🎯 T1 模式连环修复（2026-09-14 深夜五——三例已修，构建验证中）
+
+**T1 模式定义**：融合内核内联产激活/量化但跳过官方有的 bf16 边界（官方每个算子输出都是 `.to(dtype)`=bf16）。三例：
+1. **T1 原版**（hc_mixes_tail_kernel 的 xn fp8 发射）——已修 ✓ kv_gemm 0.00%
+2. **第二例**（rmsnorm_rope_kernel 的 kv norm+rope 融合：norm 输出无 bf16 舍入、rope 读未舍入值）——已修 ✓（bf16_norm 参数穿线 + 独立路径中间舍入 bf16_round_inplace_on）待验证
+3. **第三例 Q-1**（gemm_fp8_gemv_kernel 的 NORM_FUSE prologue：q_norm 输出 f32 直出 fp8）——已修 ✓（prologue 内加舍入）待验证
+
+**YaRN rope 边界修复**（floor/ceil 对齐官方 model.py:382-383）——已验证无效果（kv_RT 离群 3/5/10 个仍在）但无回归，保留。
+
+## 三份审计报告的发现（subagent 只读调研，2026-09-14）
+
+**qchain-audit（q 链）**：官方 q 链 4 个 bf16 边界（wq_a 出/q_norm 出/wq_b 出/rope 出）；我们有 B1(qr)/B4(q post-rope) 两处，**Q-1（q_norm 出，NORM_FUSE prologue）已修**；wq_b 输出（pre-rope q）的 bf16 边界仍缺（低优先——rope 后有 B4 舍入）。
+
+**indexer-audit（选择链）**：🔴D1 官方对 indexer 的 k 和 q 都做 `fp4_act_quant(x,32,inplace)`（fp4 e2m1 往返写回 dequant 值）——我们全 f32 无量化！🔴D2 官方 index_score 全程 bf16（einsum/逐头乘/sum 都 bf16）——我们 f32。🟡D3 scale 折叠位置（官方折进 per-head weights）。🟡D4 candidate blocks 未启用（仅 seqlen>16384）。**D1+D2 是大工程（内核改造），修好后 topk_idxs 应与官方一致。**
+
+**oproj-audit（输出链）**：官方输出链全程 bf16 残差流。🔴wo_a 是纯 bf16×bf16 einsum（无量化！）——**我们把激活额外压 fp8（quant1→gemm_fp8_mx_q）= 精度过低**；wo_b 后 AR f32→bf16（我们无边界）；hc_post f32 混合→bf16（我们无边界）。**wo_a 修复=bf16 gemv 路径（fp8 权重精确反量化到 bf16 + f32 累加 + 输出 bf16 舍入）——gemv_bf16_kernel（glue.cu）可参考。**
+
 **数数**：1..51 后断于 52（但继续输出至 98 行——"在数"而非退化）。正确性锚=官方 PyTorch（MP8 teacher-forced 对拍，kinds 0-21 dump 工具链）。
 
 **已落库的域对齐（全部默认 ON）**：
