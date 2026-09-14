@@ -52,9 +52,24 @@ def ids_of(raw, is_int):
 
 
 def main():
-    ours, ref = sys.argv[1], sys.argv[2]
-    only = set(int(x) for x in sys.argv[3:]) or None
+    args = sys.argv[1:]
+    maxpos = None
+    while args and args[0].startswith("--"):
+        if args[0].startswith("--max-pos="):
+            maxpos = int(args[0].split("=", 1)[1])
+        args = args[1:]
+    if len(args) < 2:
+        print(__doc__)
+        return
+    ours, ref = args[0], args[1]
+    only = set(int(x) for x in args[2:]) or None
     A, B = load(ours), load(ref)
+    if maxpos is not None:
+        # Only the identical-prompt prefix is comparable: once the two runs
+        # generate different tokens the per-position rows describe different
+        # inputs and any "difference" is a token mismatch, not a kernel error.
+        A = {k: v for k, v in A.items() if k[0] <= maxpos}
+        B = {k: v for k, v in B.items() if k[0] <= maxpos}
     keys = sorted(set(A) | set(B), key=lambda kv: (kv[1], kv[0]))
     print("ours records=%d  ref records=%d" % (len(A), len(B)))
     kinds = sorted({k for _, k in keys})
