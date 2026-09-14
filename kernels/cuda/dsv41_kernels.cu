@@ -1891,20 +1891,24 @@ __global__ void rope_precompute_kernel(float* __restrict__ cos, float* __restric
         float f = powf(base, -2.0f * (float)i / (float)dim);
         if (original_seq_len > 0) {
             // YaRN: the rotation band between beta_fast and beta_slow is divided
-            // by `factor`, faded in with a linear ramp.
+            // by `factor`, faded in with a linear ramp. The official's
+            // precompute_freqs_cis (model.py:382-383) FLOORS corrected_dim(beta_fast)
+            // and CEILS corrected_dim(beta_slow) before the clamp; our raw-float
+            // boundaries left the ramp's endpoints off by fractions of a dim,
+            // shifting the band's frequencies and putting the rope's cos/sin
+            // wrong for those columns (the kv_RT outliers in the trailing rope
+            // region). Use the passed betas, not hard-coded 32/1.
             const float cd = (float)dim * logf((float)original_seq_len /
-                                               (32.0f * 2.0f * 3.14159265358979f)) /
+                                               (beta_fast * 2.0f * 3.14159265358979f)) /
                              (2.0f * logf(base));
             const float cd2 = (float)dim * logf((float)original_seq_len /
-                                                (1.0f * 2.0f * 3.14159265358979f)) /
-                              (2.0f * logf(base));
-            const float lo = fmaxf(cd, 0.f), hi = fminf(cd2, (float)(dim - 1));
+                                                (beta_slow * 2.0f * 3.14159265358979f)) /
+                             (2.0f * logf(base));
+            const float lo = fmaxf(floorf(cd), 0.f), hi = fminf(ceilf(cd2), (float)(dim - 1));
             const float t = fminf(fmaxf(((float)i - lo) / fmaxf(hi - lo, 1e-3f), 0.f), 1.f);
             const float smooth = 1.0f - t;
             f = f / factor * (1.0f - smooth) + f * smooth;
         }
-        (void)beta_fast;
-        (void)beta_slow;
         for (int tt = 0; tt < seqlen; tt++) {
             const float a = (float)tt * f;
             cos[(size_t)tt * half + i] = cosf(a);
