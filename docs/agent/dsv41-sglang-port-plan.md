@@ -14,7 +14,17 @@
 
 **attn_o 剩余源（TODO #4，按优先级）**：①kv_RT 残余 0.55-1.19%（norm/rope/RT 链内部——**警惕同款 T1 式融合跳边界**：kv 链有 gemm_fp8_mx_rope_norm 融合！）②q 链（wq_b/rope/q_norm）③indexer 选择（topk_idxs vs 官方）④o-proj（wo_a/wo_b）。方法论同上：零重建微测+官方对拍+env 门隔离。
 
-## 🎯 T1 模式连环修复（2026-09-14 深夜五——三例已修，构建验证中）
+## 🎯 T1 模式连环修复（2026-09-14 深夜六——四例已修验证；o 链 4 倍降！indexer D1 构建中）
+
+**T1 模式定义**：融合内核内联产激活/量化但跳过官方有的 bf16 边界（官方每个算子输出都是 `.to(dtype)`=bf16）。四例全部修复：
+1. **T1 原版**（hc_mixes_tail_kernel 的 xn fp8 发射）✓ kv_gemm 0.00%
+2. **第二例**（rmsnorm_rope_kernel 的 kv norm+rope 融合）✓ kv_RT 1.19→0.08%
+3. **第三例 Q-1**（gemm_fp8_gemv_kernel 的 NORM_FUSE prologue）✓
+4. **第四例**（p2p_ar_pubred_v5_hcpost_kernel 的 AR 输出+hc_post 输出）✓
+
+**o 链三修复（重大突破，37e197f0 验证）**：wo_a f32 切换（官方纯 bf16×bf16 einsum 无量化——fp8×2^e 权重解码在 f32 精确=官方 bf16 权重，s.o 已 bf16 值域，gemm_fp8_mx_f32 零成本复用）+ WOB_F32 默认 OFF（官方 wo_b 有 act_quant，我们跳过=精度过高）+ AR+hc_post 内核舍入（残差流 bf16 域）。**attn_o 3.17-3.41%→0.76-0.94%（4 倍降）！moe_o 10.4→1.89%（专家翻转消失）！**
+
+**indexer 战况**：D2+D3（分数链 bf16+scale 折叠，30978c7c）已验证——**attn_o 无变化**（分数链舍入贡献小）。**D1（fp4 e2m1 往返）已提交构建中**：官方对 indexer 的 q/k 做 fp4_act_quant(x,32,inplace)（FE8M0 scale，amax→floor(6×2⁻¹²⁶)→pow2 scale(1/6)→e2m1 RN 编码 clamp(x/s,±6)→解码×s→bf16 写回），我们全 f32=精度偏高 3-6%⇒topk 选择偏移。新内核 idx_fp4_rt_kernel（mags 表 RN 编码=quant_fp4_fused 的已验证逻辑）应用于 k（rope 后发布前）和 q（rope 汇聚后）。
 
 **T1 模式定义**：融合内核内联产激活/量化但跳过官方有的 bf16 边界（官方每个算子输出都是 `.to(dtype)`=bf16）。三例：
 1. **T1 原版**（hc_mixes_tail_kernel 的 xn fp8 发射）——已修 ✓ kv_gemm 0.00%
