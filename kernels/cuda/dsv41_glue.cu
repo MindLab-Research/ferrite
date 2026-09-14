@@ -749,7 +749,14 @@ __global__ void expert_fp4_gemm_official_kernel(
     float acc = 0.f;
     // Per-32-block: dot(act[kb*32..], weight[row][kb*32..]) then × scales
     for (int kb = 0; kb < ksc; ++kb) {
-        float block_dot = 0.f;
+        // DOUBLE accumulation: each f32×f32 product is EXACT in f64
+        // (24+24=48 bits < 53-bit f64 mantissa), and the sum of 32 products
+        // (< 2^23 dynamic range) is also exact in f64. ONE rounding to f32
+        // at the end — this replicates the official FP8 tensor core's
+        // "exact block dot, scales on the accumulator" semantics (kernel.py
+        // docstring: "cast FP4 to FP8 via float, then do FP8xFP8 GEMM.
+        // Apply activation and weight scales to the accumulator").
+        double block_dot = 0.0;
         #pragma unroll
         for (int j = 0; j < 32; ++j) {
             const int idx = kb * 32 + j;
@@ -757,10 +764,10 @@ __global__ void expert_fp4_gemm_official_kernel(
             const uint8_t byte = wrow[idx >> 1];
             const uint8_t nib = (idx & 1) ? (uint8_t)(byte >> 4) : (uint8_t)(byte & 0xFu);
             const float b = glue_e2m1_to_f(nib);
-            block_dot += a * b;
+            block_dot += (double)a * (double)b;
         }
         const float wsc = __uint_as_float(((uint32_t)wsrow[kb]) << 23);
-        acc += block_dot * act_scale[kb] * wsc;
+        acc += (float)block_dot * act_scale[kb] * wsc;
     }
     out[row] = acc;
 }
