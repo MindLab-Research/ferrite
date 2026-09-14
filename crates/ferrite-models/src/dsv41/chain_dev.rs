@@ -807,7 +807,7 @@ fn bf16_q() -> bool {
 /// domain.
 pub(crate) fn expert_act_e4m3() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *F.get_or_init(|| std::env::var("DSV41_EXPERT_ACT_E4M3").map(|v| v == "1").unwrap_or(false))
+    *F.get_or_init(|| std::env::var("DSV41_EXPERT_ACT_E4M3").map(|v| v != "0").unwrap_or(true))
 }
 
 /// The official's gate domain: the reference computes the gate scores in FULL
