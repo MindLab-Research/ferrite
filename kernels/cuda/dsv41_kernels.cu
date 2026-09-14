@@ -4328,7 +4328,15 @@ gemm_fp8_gemv_kernel(__grid_constant__ const GemvCore gc, __grid_constant__ cons
         const float inv = s_norm_red[0];
         const int lane31 = threadIdx.x & 31;
         for (int i = threadIdx.x; i < k; i += blockDim.x) {
-            const float v = qr_raw[i] * inv * qr_w[i];
+            float v = qr_raw[i] * inv * qr_w[i];
+            // The official's q_norm output is `.to(dtype)` = bf16 and act_quant
+            // consumes the ROUNDED values (the T1 pattern's third instance:
+            // this prologue used to encode the fp8 straight from the f32).
+            {
+                uint32_t u = __float_as_uint(v);
+                u += 0x7fffu + ((u >> 16) & 1u);
+                v = __uint_as_float((uint32_t)((uint16_t)(u >> 16)) << 16);
+            }
             float am = fabsf(v);
             for (int off = 16; off > 0; off >>= 1)
                 am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, off));
