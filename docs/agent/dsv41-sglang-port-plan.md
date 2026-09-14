@@ -376,3 +376,24 @@ xn（0 元素差）→ kv_gemm（0 元素差）→ rmsnorm → rope → RT（全
 - 新内核：dsv41_dequant_fp4_e2m1（packed fp4 + e8m0 scale → f32）+ dsv41_swiglu_route
 
 **验证标准**（用户定的判定）：pos 0 的 moe_o 从 8.8775% → 期望 ≈0
+
+## 🎯 expert_fp4_gemm_official：完全照抄官方计算序（2026-09-14 07:30，最新提交）
+
+**EXPERT_CUBLAS 第一轮验证结果**：
+- pos 0 moe_o: 8.88% → **1.84%**（4.8× 改善）——fp4 权重 scale 布局是 pos 0 大偏差的根因 ✓
+- attn_o pos 0: **0.000%**（位级）✓
+- 剩余 moe_o ~1.7%：cuBLAS f32（元素级 scale）vs tilelang FP8×FP8（块级 scale）的舍入差
+
+**expert_fp4_gemm_official 内核**（完全照抄官方 kernel.py:478-558）：
+```
+Per-32-block: FP8×FP4 dot（无 per-element scale）→ block × act_scale × weight_scale → f32 累加
+```
+vs 当前的 gemv（元素级 scale 乘法，每元素 3 次舍入 vs 官方块级 1 次）。
+
+**完整调用链**：
+1. 激活 quant_fp8_on → e4m3 + per-32 f32 scale（不乘 scale）
+2. gate/up = expert_fp4_gemm_official(xq, xsc, w_packed, w_scale)
+3. swiglu_route（clamp + silu + 路由权重 + bf16 round）
+4. down 输入 quant_fp8_on → EX_DQ/EX_DSC 缓冲
+5. down = expert_fp4_gemm_official(dq, dsc, w2, w2s)
+6. s.o += down（升序 slot 累加）
