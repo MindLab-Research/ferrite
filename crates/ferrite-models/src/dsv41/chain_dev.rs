@@ -686,6 +686,17 @@ fn ring_owner_shared() -> bool {
     *F.get_or_init(|| std::env::var("DSV41_RING_OWNER").map(|v| v != "0").unwrap_or(false))
 }
 
+/// `DSV41_RING_COMP_COPY` (default ON): a consumer layer copies the kv source's
+/// compressed rows into its own ring, because the kernel takes ONE ring and the
+/// reference presents this layer's window concatenated with the source's
+/// `compress_kv` (model.py:779-787). The copy's row count comes from the host
+/// mirror of `clen`, so a CUDA graph captured with it on would freeze that step's
+/// row count; `=0` disables it (the correctness harness runs with the graph off).
+fn ring_comp_copy() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_RING_COMP_COPY").map(|v| v != "0").unwrap_or(true))
+}
+
 /// DSV41_AR_STORE_FUSE=1 re-enables the wo_b all-reduce store epilogue.
 fn ar_store_fuse() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -3968,27 +3979,34 @@ fn hc_tail_split() -> bool {
         // exactly why layer 2 (the owner) matched the official while layer 3, the
         // first consumer, dropped ~15%. DSV41_RING_OWNER=1 restores the old
         // shared-ring behaviour for A/B.
+        // The WINDOW ring is PER-LAYER (the reference's `_window_kv` runs for
+        // every layer with that layer's own wkv and input) while the COMPRESSED
+        // rows come from the group's kv source (`shared_attn.compress_kv`,
+        // model.py:744-763). The reference concatenates the two before its single
+        // `sparse_attn` call (`kv = cat([window_kv, compress_kv])`, model.py:779-787),
+        // i.e. ONE tensor whose [0, win) rows are this layer's window and whose
+        // [win, win+clen) rows are the source's latents. So a consumer needs the
+        // source's compressed block COPIED into its own ring — nothing else ever
+        // writes it there (only a kv source runs the compressor).
         let owner = if ring_owner_shared() {
             self.kv_owner(layer)
         } else {
             layer
         };
-        let ring_ptr = self.layers[owner].ring.ptr;
-        // index-source layers compute their OWN selection into their OWN buffer;
-        // every other layer reuses the selection of the MOST RECENT index source
-        // (the reference's single shared `topk_idxs` slot, model.py:725-726) —
-        // NOT the KV owner's buffer. The two coincide inside the ratio-2 group
-        // (index_source == kv_source == {2,8,14}) but NOT after layer 20, where
-        // the index sources are {20,24,28,32,36} while the KV source is 20 alone:
-        // layers 25..39 must read 24/28/32/36's selection, and reading 20's gave
-        // them a selection computed for a different (unmasked) candidate set.
-        let idxs_ptr = if cfg.is_index_source(layer) {
-            self.layers[layer].idxs.ptr
-        } else if let Some(src) = cfg.index_source_for(layer) {
-            self.layers[src].idxs.ptr
+        // the layer that owns the compressed KV + the `clen` counter
+        let kv_src = self.kv_owner(layer);
+        // The layer whose SELECTION this layer attends with: its own when it runs
+        // an indexer, otherwise the most recent index source's (the reference's
+        // single shared `topk_idxs`, model.py:725-726). NOT necessarily the KV
+        // owner: after layer 20 the index sources are {20,24,28,32,36} while the
+        // KV source is 20 alone.
+        let sel_src = if cfg.is_index_source(layer) {
+            layer
         } else {
-            self.layers[owner].idxs.ptr
+            cfg.index_source_for(layer).unwrap_or(kv_src)
         };
+        let ring_ptr = self.layers[owner].ring.ptr;
+        let idxs_ptr = self.layers[sel_src].idxs.ptr;
         let cache = &self.layers[owner];
         let owns_kv = owner == layer;
         // B2 (DSV41_RING_WIN_FUSE, default ON): the ring append and the window
@@ -4019,8 +4037,13 @@ fn hc_tail_split() -> bool {
         // `kv_source` (2/8/14/20) is also an `index_source`, so those layers are
         // already excluded. A config where a compress source is NOT an index
         // source keeps the standalone launch below, unchanged.
+        // `ph_ok` also requires that this layer OWNS its selection (`sel_src ==
+        // layer`). `idxs_ptr` points at the most recent index source's buffer
+        // whenever this layer INHERITS, and the fused placeholder half would then
+        // overwrite the selection that source computed for the whole group.
         let ph_ok = comp_ph_fuse()
             && owns_kv
+            && sel_src == layer
             && !cfg.is_index_source(layer)
             && !cfg.is_kv_source(layer)
             && cfg.compress_ratio(layer) > 0;
@@ -4035,7 +4058,7 @@ fn hc_tail_split() -> bool {
             // an excluded layer reproduces `ring_win_fuse` byte for byte.
             let (clen_p, topk) = if ph_ok {
                 (
-                    (self.s.clen.ptr as *const std::os::raw::c_int).wrapping_add(owner),
+                    (self.s.clen.ptr as *const std::os::raw::c_int).wrapping_add(kv_src),
                     cfg.index_topk as i32,
                 )
             } else {
@@ -4141,6 +4164,25 @@ fn hc_tail_split() -> bool {
         if pending_comp_join {
             self.dev.compress_side_join()?;
         }
+        // A consumer must SEE the source's compressed rows: the kernel takes ONE
+        // ring whose [win, win+clen) rows hold the latents, and nothing ever
+        // writes a consumer's own copy (only a kv source runs the compressor).
+        // The reference builds the same picture by concatenating this layer's
+        // `window_kv` with `shared_attn.compress_kv` before its single call.
+        // ⚠️ The size is the host mirror of `clen`, so under DSV41_GRAPH_STEP=1
+        // the captured node keeps the capture step's row count: the graphs are
+        // built with this path OFF (DSV41_RING_COMP_COPY=0) until a device-driven
+        // copy exists; the correctness harness runs with the graph off.
+        if ring_comp_copy() && kv_src != layer && comp_len > 0 {
+            let off = (win * hd * 4) as usize;
+            let bytes = comp_len * hd * 4;
+            self.dev.memcpy_d2d(
+                (self.layers[layer].ring.ptr as *mut u8).wrapping_add(off) as *mut std::ffi::c_void,
+                (self.layers[kv_src].ring.ptr as *const u8).wrapping_add(off)
+                    as *const std::ffi::c_void,
+                bytes,
+            )?;
+        }
         if comp_len > 0 && cfg.is_index_source(layer) {
             // EVERY index-source layer runs its own indexer (into its own
             // buffer) — the reference creates one for each, and non-source
@@ -4149,9 +4191,14 @@ fn hc_tail_split() -> bool {
             if self.indexer(layer, pos, win, comp_len)? {
             // the kernel wrote `comp_len.min(index_topk)` entries at [win, ..)
             }
-        } else if !owns_kv && comp_len > 0 {
-            // a non-index consumer reads the owner's selection, which the owner
-            // (an index-source) filled earlier this step — do nothing
+        } else if sel_src != layer && comp_len > 0 {
+            // This layer INHERITS the most recent index source's selection
+            // (model.py:725-726): that source already wrote it into the buffer
+            // `idxs_ptr` points at, window entries included — the window indices
+            // are layer-INDEPENDENT (they depend only on pos/window), so reusing
+            // the source's whole row is exactly the reference's `shared_attn.topk_idxs`
+            // read-back. Nothing to compute here (and the placeholder must NOT
+            // run: it would clobber that selection).
         } else if comp_len > 0 {
             // the owner has no indexer: recency placeholder (safety net)
             // B3: `ph_fused` means the `ring_win_fuse` launch above already wrote
@@ -4162,7 +4209,7 @@ fn hc_tail_split() -> bool {
             if !ph_fused {
                 self.dev.comp_placeholder(
                     idxs_ptr as *mut i32,
-                    (self.s.clen.ptr as *const std::os::raw::c_int).wrapping_add(owner),
+                    (self.s.clen.ptr as *const std::os::raw::c_int).wrapping_add(kv_src),
                     win as i32,
                     cfg.index_topk as i32,
                 )?;
@@ -4233,7 +4280,7 @@ fn hc_tail_split() -> bool {
                 1,
                 nlh as i32,
                 hd as i32,
-                (self.s.clen.ptr as *const std::os::raw::c_int).wrapping_add(owner),
+                (self.s.clen.ptr as *const std::os::raw::c_int).wrapping_add(kv_src),
                 win as i32,
                 cfg.index_topk as i32,
                 1.0 / (hd as f32).sqrt(),
@@ -4261,7 +4308,7 @@ fn hc_tail_split() -> bool {
                 1,
                 nlh as i32,
                 hd as i32,
-                (self.s.clen.ptr as *const std::os::raw::c_int).wrapping_add(owner),
+                (self.s.clen.ptr as *const std::os::raw::c_int).wrapping_add(kv_src),
                 win as i32,
                 cfg.index_topk as i32,
                 1.0 / (hd as f32).sqrt(),
