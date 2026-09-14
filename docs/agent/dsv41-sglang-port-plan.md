@@ -431,3 +431,24 @@ pos 15  attn_o:0.618% moe_o:5.865%  ← 包含 51→60 跳跃的语义差
 - P+D 一致性：两处 batched 条件加了 !expert_cublas()
 
 **验证标准**：数数 1..51 → 1..100 完美（路由翻转消除）
+
+## 🎯 用户 100% 确认：专家 GEMM 的三处结构差异（2026-09-14 07:35）
+
+**官方（kernel.py:478-520 tilelang 源码 docstring）**：
+```python
+Strategy: load FP4 sub-blocks of size [block_N, sub_K] (sub_K=32),
+          **cast FP4 to FP8 via float, then do FP8xFP8 GEMM.**
+          **Apply activation and weight scales to the accumulator.**
+```
+
+| 差异点 | 官方 | 我们（mxf4 gemv） |
+|---|---|---|
+| MMA 操作数 | **e4m3 × e4m3**（FP8×FP8 tensor core） | **e2m1 × e2m1**（kind::mxf4） |
+| k 块粒度 | **32**（block_K = weight_group_size = 32） | **64**（K=64 per instruction） |
+| scale 施加点 | **块内积之后**（乘在累加器上） | **折进每个元素再 dot** |
+
+**修复（double 精度 dot product，c74bf6f4）**：
+- f64 乘法对 f32 值是**精确的**（24+24=48 bits < f64 的 53-bit 尾数）
+- 32 项 f64 求和也是**精确的**（动态范围 < 2^23）
+- 转回 f32 时**一次舍入**——4 次舍入/块 vs 官方 3 次
+- 数学上等价于 tensor core 的 "精确块内积 + scale on accumulator"
