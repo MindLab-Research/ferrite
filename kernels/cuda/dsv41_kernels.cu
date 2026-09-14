@@ -939,11 +939,20 @@ __global__ void engram_gather_kernel(const uint8_t* __restrict__ table,
 // q[b,m,h,d] x kv[b,n,d] (ONE KV head) with idxs[b,m,topk]; online softmax with
 // the sink folded into the denominator after the loop.
 #define kMaxPer 8   // d <= 512 with blockDim >= 64; the launcher uses 128 (per = 4)
+// The official's sparse_attn casts the softmax probabilities to BF16 before the
+// P·V GEMM (kernel.py's `acc_s_cast`) and writes `o` as BF16. Same arithmetic as
+// orope_bf16_round, hoisted above `sparse_attn_kernel` so that kernel can use it.
+__device__ __forceinline__ float kattn_bf16_round(float v) {
+    uint32_t u = __float_as_uint(v);
+    u += 0x7fffu + ((u >> 16) & 1u);
+    return __uint_as_float((uint32_t)((uint16_t)(u >> 16)) << 16);
+}
+
 __global__ void sparse_attn_kernel(const float* __restrict__ q, const float* __restrict__ kv,
                                    const float* __restrict__ sink, const int32_t* __restrict__ idxs,
                                    float* __restrict__ out, int b, int m, int h, int d,
                                    const int* __restrict__ clen, int window, int index_topk,
-                                   float scale) {
+                                   float scale, int bf16_dom) {
     // n and topk used to be host arguments derived from this layer's compress_len;
     // they change per step, so a captured graph would freeze them. The counter now
     // lives on the device (the compressor's commit kernel advances it).
@@ -966,47 +975,70 @@ __global__ void sparse_attn_kernel(const float* __restrict__ q, const float* __r
 #pragma unroll
         for (int i = 0; i < kMaxPer; ++i) acc[i] = 0.f;
         float smax = -1e30f, se = 0.f;
-        for (int t = 0; t < topk; t++) {
-            const int idx = idxs[(size_t)(bb * m + mm) * topk + t];
-            if (idx < 0) continue;
-            const float* kr = kv + ((size_t)bb * n + idx) * d;
-            float dot = 0.f;
+        // The official's online softmax (kernel.py:328-389) rescales the
+        // accumulator ONCE PER 64-KEY TILE (block = 64, num_blocks = cdiv(topk, 64)):
+        // the tile's max is taken over the WHOLE tile and `scores_scale` applied
+        // once, so every key inside a tile uses that single max. The per-key form
+        // this kernel used before is algebraically identical but rounds differently
+        // for every key after a max rise — a last-bit difference in `o` that flips
+        // near-tie router selections downstream.
+        const int kt = 64;
+        __shared__ float sdot_t[64];
+        __shared__ float wpart[32];
+        const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
+        const int nw = (blockDim.x + 31) >> 5;
+        for (int base = 0; base < topk; base += kt) {
+            const int nj = (topk - base < kt) ? (topk - base) : kt;
+            // pass 1: the tile's scores. Same per-thread partials and the same
+            // warp/block reduction order as the per-key version, so the scores
+            // themselves are bit-identical to what that path produced.
+            for (int j = 0; j < kt; ++j) {
+                const int idx = (j < nj) ? idxs[(size_t)(bb * m + mm) * topk + base + j] : -1;
+                float part = 0.f;
+                if (idx >= 0) {
+                    const float* kr = kv + ((size_t)bb * n + idx) * d;
 #pragma unroll
-            for (int i = 0; i < kMaxPer; ++i) {
-                const int c = threadIdx.x + i * (int)blockDim.x;
-                if (c < d) dot += qr[c] * kr[c];
+                    for (int i = 0; i < kMaxPer; ++i) {
+                        const int c = threadIdx.x + i * (int)blockDim.x;
+                        if (c < d) part += qr[c] * kr[c];
+                    }
+                }
+                for (int off = 16; off > 0; off >>= 1)
+                    part += __shfl_xor_sync(0xFFFFFFFFu, part, off);
+                if (lane == 0) wpart[wid] = part;
+                __syncthreads();
+                if (threadIdx.x == 0) {
+                    float s = 0.f;
+                    for (int w = 0; w < nw; w++) s += wpart[w];
+                    sdot_t[j] = (idx >= 0) ? s * scale : -1e30f;
+                }
+                __syncthreads();
             }
-            // Two-stage dot reduction. The warp shuffle only covers 32 lanes, so
-            // on its own it drops every warp but the first: with blockDim=128 and
-            // d=512 each thread sums 4 elements, and taking only warp 0's partial
-            // made the score ~1/4 of its true value — which collapsed the softmax
-            // weight (0.95 -> 0.67 for a single visible key) and therefore the
-            // whole attention output. The per-warp sums must be combined across
-            // the block. (Same class of bug as the hc_mixes ss reduction.)
-            for (int off = 16; off > 0; off >>= 1) dot += __shfl_xor_sync(0xFFFFFFFFu, dot, off);
-            __shared__ float sdot;
-            __shared__ float wpart[32];
-            const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
-            if (lane == 0) wpart[wid] = dot;
-            __syncthreads();
-            if (threadIdx.x == 0) {
-                const int nw = (blockDim.x + 31) >> 5;
-                float s = 0.f;
-                for (int w = 0; w < nw; w++) s += wpart[w];
-                sdot = s;
-            }
-            __syncthreads();
-            dot = sdot * scale;
-            const float nm = fmaxf(smax, dot);
+            // the tile's max (redundant per thread; 64 shared reads is free)
+            float bm = -1e30f;
+            for (int j = 0; j < kt; ++j) bm = fmaxf(bm, sdot_t[j]);
+            const float nm = fmaxf(smax, bm);
             const float corr = expf(smax - nm);
-            const float e = expf(dot - nm);
 #pragma unroll
-            for (int i = 0; i < kMaxPer; ++i) {
-                const int c = threadIdx.x + i * (int)blockDim.x;
-                if (c < d) acc[i] = acc[i] * corr + e * kr[c];
-            }
-            se = se * corr + e;
+            for (int i = 0; i < kMaxPer; ++i) acc[i] *= corr;
+            se *= corr;
             smax = nm;
+            // pass 2: accumulate the tile against that ONE max (no per-key rescale)
+            for (int j = 0; j < nj; ++j) {
+                const int idx = idxs[(size_t)(bb * m + mm) * topk + base + j];
+                if (idx < 0) continue;
+                const float* kr = kv + ((size_t)bb * n + idx) * d;
+                const float e = expf(sdot_t[j] - nm);
+                // The official's acc_s_cast: the P·V GEMM consumes BF16
+                // probabilities while the f32 `e` stays for the softmax sum.
+                const float e_bf = bf16_dom ? kattn_bf16_round(e) : e;
+#pragma unroll
+                for (int i = 0; i < kMaxPer; ++i) {
+                    const int c = threadIdx.x + i * (int)blockDim.x;
+                    if (c < d) acc[i] += e_bf * kr[c];
+                }
+                se += e;
+            }
             __syncthreads();
         }
         se += expf(sink[hh] - smax);
@@ -6619,7 +6651,7 @@ extern "C" int dsv41_sparse_attn(const float* q, const float* kv, const float* s
             if (le != cudaSuccess) { (void)cudaGetLastError(); return (int)le; }
         }
     } else {
-        sparse_attn_kernel<<<grid, 128, 0, s>>>(q, kv, sink, idxs, out, b, m, h, d, clen, window, index_topk, scale);
+        sparse_attn_kernel<<<grid, 128, 0, s>>>(q, kv, sink, idxs, out, b, m, h, d, clen, window, index_topk, scale, pbf16);
     }
     return (int)cudaGetLastError();
 }
