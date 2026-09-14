@@ -768,6 +768,11 @@ impl<'a> Loader<'a> {
             && cd::gateup_fuse()
             && cd::expert_fp4_mode() == 2
             && !cd::no_gemv_fp4()
+            // The e4m3 activation domain forces the SEQUENTIAL expert path
+            // (the fused batched kernel has no e4m3 arm), and only the fused
+            // batched reader can address the interleaved layout — so with
+            // e4m3 on, load the pools NON-interleaved.
+            && !cd::expert_act_e4m3()
             && cfg.dim % 512 == 0
             && self.dev.supports_moe_batch()
             && self.dev.supports_gateup_fuse()
