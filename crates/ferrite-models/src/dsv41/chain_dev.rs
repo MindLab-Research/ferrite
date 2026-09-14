@@ -4978,7 +4978,8 @@ fn hc_tail_split() -> bool {
             && topk > 0
             && ne >= 2
             && self.dev.supports_moe_batch()
-            && !expert_act_e4m3();
+            && !expert_act_e4m3()
+            && !expert_cublas();
         // The routed experts' gate/up pools may be stored INTERLEAVED
         // (DSV41_EXPERT_ILV, decided at load time). Only the FUSED batched
         // gate/up read can address that layout, so the batched path stops being
@@ -5135,6 +5136,7 @@ fn hc_tail_split() -> bool {
                 // e2m1 nibble layout; it has no e4m3 arm yet, so the official
                 // activation domain forces the sequential (default) path.
                 && !expert_act_e4m3()
+                && !expert_cublas()
                 && self.dev.supports_moe_batch();
             if batched {
                 // Per-slot strides. `ex_act_b` holds [topk][?] where ? is
