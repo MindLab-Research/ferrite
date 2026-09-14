@@ -989,6 +989,19 @@ pub struct DevChain<'a> {
     /// without separate tables every rope call uses the main theta
     cos_comp: DevBuf,
     sin_comp: DevBuf,
+    /// Which rope table the CURRENT layer's rope calls must use. The reference
+    /// builds ONE `freqs_cis` per layer (`Attention.__init__`, model.py:685-698):
+    /// `(original_seq_len, compress_rope_theta) = (65536, 160000)` when
+    /// `compress_ratio` is non-zero, and `(0, rope_theta) = (0, 10000)` for the
+    /// pure sliding-window layers - and that table feeds the q rope
+    /// (model.py:551), the window-KV rope (`_window_kv` -> :706), the compressor's
+    /// latent rope (:754) AND the indexer's own q/k rope
+    /// (`self.indexer.freqs_cis = self.freqs_cis`, :733-734). So layers 0/1 use
+    /// the main table and layers 2..39 use the compression table (theta 160000
+    /// with the YaRN blend). `attention()` sets this from
+    /// `compress_ratio(layer) > 0` before any rope runs; the accessors below
+    /// resolve it inside the shared rope helpers.
+    comp_rope: std::cell::Cell<bool>,
     // ---- engram ----
     /// Per-layer MoE-segment graphs (only with DSV41_GRAPH_MOE=1). The segment is
     /// everything up to the all-reduce; the AR stays host-issued.
@@ -1274,6 +1287,7 @@ impl<'a> DevChain<'a> {
             sin,
             cos_comp,
             sin_comp,
+            comp_rope: std::cell::Cell::new(false),
             moe_graph: vec![None; cfg.n_layers],
             moe_graph_armed: false,
             step_count: 0,
@@ -1622,8 +1636,8 @@ impl<'a> DevChain<'a> {
             out,
             n_out,
             k,
-            self.cos.as_f32(),
-            self.sin.as_f32(),
+            self.rope_cos(),
+            self.rope_sin(),
             self.s.pos_ctr.ptr as *const std::os::raw::c_int,
             1,
             0,
@@ -1673,8 +1687,8 @@ impl<'a> DevChain<'a> {
             out2,
             n2,
             k,
-            self.cos.as_f32(),
-            self.sin.as_f32(),
+            self.rope_cos(),
+            self.rope_sin(),
             self.s.pos_ctr.ptr as *const std::os::raw::c_int,
             1,
             0,
@@ -1720,8 +1734,8 @@ impl<'a> DevChain<'a> {
             out,
             n_out,
             k,
-            self.cos.as_f32(),
-            self.sin.as_f32(),
+            self.rope_cos(),
+            self.rope_sin(),
             self.s.pos_ctr.ptr as *const std::os::raw::c_int,
             1,
             0,
@@ -2996,6 +3010,26 @@ impl<'a> DevChain<'a> {
         Ok(())
     }
 
+    /// The rope table the CURRENT layer's rope calls must use - see `comp_rope`.
+    /// Layers 0/1 (compress_ratio == 0) take the main table; every other layer
+    /// takes the compression table, exactly as the reference's per-layer
+    /// `freqs_cis` fork does.
+    fn rope_cos(&self) -> *const f32 {
+        if self.comp_rope.get() {
+            self.cos_comp.as_f32()
+        } else {
+            self.cos.as_f32()
+        }
+    }
+
+    fn rope_sin(&self) -> *const f32 {
+        if self.comp_rope.get() {
+            self.sin_comp.as_f32()
+        } else {
+            self.sin.as_f32()
+        }
+    }
+
     /// The layer the attention-op diagnostic dumps attach to (`DSV41_GT_LAYER`,
     /// default 0). Layer 0/1 are `compress_ratio == 0` — pure sliding window,
     /// no compressor and no indexer — so the compressed-KV / indexer SELECTION
@@ -3569,6 +3603,19 @@ fn hc_tail_split() -> bool {
     fn attention(&mut self, layer: usize, pos: usize) -> Result<bool> {
         let cfg = self.cfg;
         let dim = cfg.dim;
+        // The reference builds ONE `freqs_cis` per layer, forked on
+        // `compress_ratio` (model.py:685-698): `(original_seq_len, rope_theta) =
+        // (65536, 160000)` when the ratio is non-zero, `(0, 10000)` for the pure
+        // sliding-window layers. That single table feeds the q rope (:551), the
+        // window-KV rope (`_window_kv` -> :706), the indexer's own q/k rope
+        // (:733-734) AND the compressor's latent rope (:754) - so every rope of a
+        // layer 2..39 rotation must use the COMPRESSION table. Our q and
+        // window-KV ropes used the main table for every layer, which is a 16x
+        // theta difference plus the YaRN blend on the low-frequency bands.
+        // The shared rope helpers resolve their table through
+        // `rope_cos()`/`rope_sin()`, which read this flag, so it must be set
+        // BEFORE any rope of this layer is issued.
+        self.comp_rope.set(cfg.compress_ratio(layer) > 0);
         let hd = cfg.head_dim;
         let nh = cfg.n_heads;
         let ql = cfg.q_lora_rank;
@@ -3836,8 +3883,8 @@ fn hc_tail_split() -> bool {
         if !q_roped {
             self.dev.apply_rope(
                 self.s.q.ptr as *mut f32,
-                self.cos.as_f32(),
-                self.sin.as_f32(),
+                self.rope_cos(),
+                self.rope_sin(),
                 nlh as i32,
                 hd as i32,
                 cfg.rope_head_dim as i32,
@@ -3880,8 +3927,8 @@ fn hc_tail_split() -> bool {
                 self.s.kv.ptr as *const f32,
                 ld.kv_norm.as_ref().unwrap().as_f32(),
                 self.s.kv.ptr as *mut f32,
-                self.cos.as_f32(),
-                self.sin.as_f32(),
+                self.rope_cos(),
+                self.rope_sin(),
                 1,
                 hd as i32,
                 cfg.rope_head_dim as i32,
@@ -3911,8 +3958,8 @@ fn hc_tail_split() -> bool {
         }
         self.dev.apply_rope_on(
             self.s.kv.ptr as *mut f32,
-            self.cos.as_f32(),
-            self.sin.as_f32(),
+            self.rope_cos(),
+            self.rope_sin(),
             1,
             hd as i32,
             cfg.rope_head_dim as i32,
@@ -4295,8 +4342,8 @@ fn hc_tail_split() -> bool {
                 win as i32,
                 cfg.index_topk as i32,
                 1.0 / (hd as f32).sqrt(),
-                self.cos.as_f32(),
-                self.sin.as_f32(),
+                self.rope_cos(),
+                self.rope_sin(),
                 self.s.pos_ctr.ptr as *const std::os::raw::c_int,
                 cfg.rope_head_dim as i32,
                 (cfg.rope_head_dim / 2) as i32,
@@ -4347,8 +4394,8 @@ fn hc_tail_split() -> bool {
             && orope_q()
             && self.dev.apply_rope_q(
                 self.s.o.ptr as *mut f32,
-                self.cos.as_f32(),
-                self.sin.as_f32(),
+                self.rope_cos(),
+                self.rope_sin(),
                 nlh as i32,
                 hd as i32,
                 cfg.rope_head_dim as i32,
@@ -4362,8 +4409,8 @@ fn hc_tail_split() -> bool {
         if !s_orope && !o_q_epi {
             self.dev.apply_rope(
                 self.s.o.ptr as *mut f32,
-                self.cos.as_f32(),
-                self.sin.as_f32(),
+                self.rope_cos(),
+                self.rope_sin(),
                 nlh as i32,
                 hd as i32,
                 cfg.rope_head_dim as i32,
