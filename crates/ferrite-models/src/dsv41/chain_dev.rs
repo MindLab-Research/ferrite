@@ -1444,6 +1444,21 @@ impl<'a> DevChain<'a> {
         })
     }
 
+    /// WOA_F32: wo_a as the official computes it — a pure bf16×bf16 einsum
+    /// (model.py:786) with NO activation quantisation. The fp8 weight's
+    /// e4m3×2^e decode is exact in f32 (= the official's convert-time bf16
+    /// weights), and `s.o` is already bf16-valued (attn_pbf16 rounds the
+    /// attention's output), so `gemm_fp8_mx_f32` reading the raw f32 IS the
+    /// official's arithmetic. The output rounds to bf16 (the einsum's output
+    /// dtype) so wo_b's act_quant consumes the official's domain. "0" restores
+    /// the (quant1, gemm_fp8_mx) pair.
+    fn woa_f32() -> bool {
+        static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *F.get_or_init(|| {
+            std::env::var("DSV41_WOA_F32").map(|v| v != "0").unwrap_or(true)
+        })
+    }
+
     /// chain-pair-grid-sync (DSV41_WO_PAIR, default OFF): the wo_a -> wo_b pair as
     /// ONE grid-sync launch (`dsv41_gemm_fp8_wo_pair`) instead of two, with a
     /// sense-reversing device-wide barrier between the phases. Each row is still
@@ -3974,6 +3989,45 @@ fn hc_tail_split() -> bool {
         }
         let mut wo_fused = false;
         if !wo_paired {
+        // WOA_F32 (default ON): the official's wo_a is a pure bf16×bf16 einsum
+        // (model.py:786) — NO activation quantisation. The fp8 weight's
+        // e4m3×2^e decode is exact in f32 (= the official's convert-time bf16
+        // weights), and `s.o` is already bf16-valued (attn_pbf16), so the f32
+        // gemv IS the official's arithmetic. The output rounds to bf16 (the
+        // einsum's output dtype) so wo_b's act_quant consumes the official's
+        // domain. The wo_fuse/B1 path (whose epilogue emits wo_q) stays fp8.
+        let mut woa_ok = false;
+        if !wo_fuse && Self::woa_f32() && self.dev.supports_gemm_fp8_f32() {
+            woa_ok = true;
+            for g in 0..nlg {
+                let af = (self.s.o.ptr as *const f32).wrapping_add(g * k);
+                let wp = ld.wo_a.as_ref().unwrap().as_u8().wrapping_add(g * olg * k);
+                let wsp = ld
+                    .wo_a_scale
+                    .as_ref()
+                    .unwrap()
+                    .as_u8()
+                    .wrapping_add((g * olg / 32) * (k / 32));
+                let out = (self.s.wo.ptr as *mut f32).wrapping_add(g * olg);
+                if !self.dev.gemm_fp8_mx_f32(
+                    af,
+                    wp,
+                    wsp,
+                    std::ptr::null(),
+                    out,
+                    olg as i32,
+                    k as i32,
+                )? {
+                    woa_ok = false;
+                    break;
+                }
+            }
+            if woa_ok && bf16_o() {
+                self.dev
+                    .bf16_round_inplace(self.s.wo.ptr as *mut f32, (nlg * olg) as i32)?;
+            }
+        }
+        if !woa_ok {
         for g in 0..nlg {
             // The weight tensor is ALREADY the rank's local slice (Shard::Groups
             // cut it at load time), so every offset must be LOCAL: group g of
@@ -4013,6 +4067,7 @@ fn hc_tail_split() -> bool {
                 }
             }
             self.gemm_fp8_mx_or_swap(a, asc, wp, wsp, std::ptr::null(), out, olg as i32, k as i32)?;
+        }
         }
         }
         // wo_b's activation, in priority order:
