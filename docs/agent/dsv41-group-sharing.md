@@ -186,6 +186,18 @@ Layers 0/1 are provably untouched by the fix (`compress_ratio == 0` ⇒
 `comp_rope == false` ⇒ the accessors return the very same main-table pointers),
 so the previously verified layer-0 bit-exactness cannot regress.
 
+**Effect on the acceptance test (same prompt, greedy, `--max-tokens 400`):**
+
+| build | correct prefix | what follows |
+|---|---|---|
+| before any fix | 1..51 | jumps to 92, 93, 95, 95, 96 … 100 |
+| + A2 (shared-KV inheritance) | 1..60 | 31, 32, … |
+| **+ the per-layer rope table** | **1..62** | reaches **100** (92 numbers out of 100: 63/64/65, 78, 89 skipped, `95` doubled, a few stray glyphs) |
+
+So the rope table was the dominant single defect on this path (38 of 40 layers
+were rotating q and the window KV with the wrong table); the remaining glitches
+are isolated single-token events rather than a systematic mis-count.
+
 ## Next fix: the compressed latent is missing its fp4 round-trip
 
 The reference quantises each compressed latent **after the rope and before the
