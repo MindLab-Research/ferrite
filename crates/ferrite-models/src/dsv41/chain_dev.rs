@@ -3320,7 +3320,11 @@ fn hc_tail_split() -> bool {
         }
         if Self::fuse_c() {
             // Segment-C P1: same fold as the attention side, on the MoE AR.
-            if !moe_hc_folded {
+            // TEST: probe showed the fold already wrote the correct post-hc_post
+            // residual into s.h (kind 730 == the reference's value), yet the
+            // final layer output differed ⇒ the guard below let the standalone
+            // run a SECOND time. Force-skip it to prove the double application.
+            if !moe_hc_folded && std::env::var("DSV41_HC_SKIP_2ND").is_err() {
                 self.dev.hc_post_inplace(
                     self.s.h.ptr as *mut f32,
                     self.s.o.ptr as *const f32,
@@ -3348,6 +3352,19 @@ fn hc_tail_split() -> bool {
         // the NEXT layer collapses with must be bf16-rounded here too.
         self.dev
             .bf16_round_inplace(self.s.h.ptr as *mut f32, (hc * dim) as i32)?;
+        // Probe the FINAL residual of this layer's body (after both hc_posts and
+        // the bf16 boundary). The reference's harness prints the same value out
+        // of `L0.hc_post`'s return, i.e. BEFORE the next layer's engram runs, so
+        // this dump is the apples-to-apples counterpart of it.
+        //   kind 770+layer = the layer's output h (before the next engram)
+        if let Ok(xdp) = std::env::var("DSV41_GT_XDUMP") {
+            self.gt_dump_vec(
+                &xdp,
+                770 + layer as u64,
+                self.s.h.ptr as *mut std::ffi::c_void,
+                hc * dim,
+            )?;
+        }
         if phase_dbg() {
             eprintln!("[phs] L{layer} ffn_total={:?}", _t_moe.elapsed());
         }
