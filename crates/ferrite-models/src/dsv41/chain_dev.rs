@@ -2163,6 +2163,35 @@ impl<'a> DevChain<'a> {
         Ok(())
     }
 
+    /// Dump a u32 vector (route indices, token ids, ...) — same wire format as
+    /// gt_dump_vec (pos + kind + n×4B) but the payload is u32, so the
+    /// consumer parses indices instead of denormalised f32 garbage.
+    fn gt_dump_u32(&self, path: &str, kind: u64, ptr: *mut std::ffi::c_void, n: usize) -> Result<()> {
+        if self.comm.as_ref().map(|c| c.rank).unwrap_or(0) != 0 {
+            return Ok(());
+        }
+        let mut v = vec![0u32; n];
+        let b = Device::view(ptr, n * 4);
+        self.dev.download_u8(&b, unsafe {
+            std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, n * 4)
+        })?;
+        let sc = self.step_count as u64;
+        let io = (|| -> std::io::Result<()> {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+            f.write_all(&sc.to_le_bytes())?;
+            f.write_all(&kind.to_le_bytes())?;
+            for x in &v {
+                f.write_all(&x.to_le_bytes())?;
+            }
+            Ok(())
+        })();
+        if io.is_err() {
+            return Err(FerriteError::Config(format!("DSV41_GT_XDUMP: {io:?}")));
+        }
+        Ok(())
+    }
+
     /// One ground-truth DSpark spec step at block base `pos` with anchor
     /// `token`. Returns the committed tokens (1..=6 of them), which are exactly
     /// the tokens the eager stream would emit at positions pos+1..=pos+k+1.
@@ -4897,7 +4926,7 @@ fn hc_tail_split() -> bool {
         // kind 4 = the routing weights), n = topk.
         if let Ok(xdp) = std::env::var("DSV41_GT_XDUMP") {
             if layer == 0 {
-                self.gt_dump_vec(&xdp, 3, self.s.route_idx.ptr, topk)?;
+                self.gt_dump_u32(&xdp, 3, self.s.route_idx.ptr, topk)?;
                 self.gt_dump_vec(&xdp, 4, self.s.route_w.ptr, topk)?;
             }
         }
