@@ -733,6 +733,25 @@ __device__ __forceinline__ float glue_e4m3_to_f(uint8_t b) {
     return __uint_as_float(s | ((be + 120u) << 23) | (m << 20));
 }
 
+// e2m1 nibble → e4m3 byte (lossless: e2m1 values are a subset of e4m3)
+__device__ __forceinline__ uint8_t glue_e2m1_to_e4m3(uint8_t nib) {
+    const uint8_t mant = nib & 1u;
+    const uint8_t exp  = (nib >> 1) & 3u;
+    const uint8_t sign = (nib >> 3) & 1u;
+    uint8_t e;
+    if (exp == 0u) {
+        e = mant ? 0x30u : 0x00u;
+    } else {
+        e = (uint8_t)((6u + exp) << 3) | (mant ? 4u : 0u);
+    }
+    return sign ? (uint8_t)(0x80u | e) : e;
+}
+
+// The official's fp4_gemm (kernel.py:478-520) with REAL FP8 tensor core MMA:
+// "cast FP4 to FP8 via float, then do FP8xFP8 GEMM.
+//  Apply activation and weight scales to the accumulator."
+// One warp per output row; mma.sync m16n8k32 computes the EXACT 32-element
+// dot product (tensor core internal accumulation), scales applied after.
 __global__ void expert_fp4_gemm_official_kernel(
     const uint8_t* __restrict__ act,      // [k] e4m3 bytes (NOT scaled)
     const float* __restrict__ act_scale,  // [k/32] f32 power-of-two
@@ -740,40 +759,74 @@ __global__ void expert_fp4_gemm_official_kernel(
     const uint8_t* __restrict__ ws,       // [n, k/32] e8m0 bytes
     float* __restrict__ out,              // [n]
     int n, int k) {
-    const int row = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row >= n) return;
+    const int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    const int lane = threadIdx.x & 31;
+    if (warp_id >= n) return;
     const int kbytes = k >> 1;
     const int ksc = k >> 5;
-    const uint8_t* wrow = w + (size_t)row * kbytes;
-    const uint8_t* wsrow = ws + (size_t)row * ksc;
+    const uint8_t* wrow = w + (size_t)warp_id * kbytes;
+    const uint8_t* wsrow = ws + (size_t)warp_id * ksc;
     float acc = 0.f;
-    // Per-32-block: dot(act[kb*32..], weight[row][kb*32..]) then × scales
     for (int kb = 0; kb < ksc; ++kb) {
-        // DOUBLE accumulation: each f32×f32 product is EXACT in f64
-        // (24+24=48 bits < 53-bit f64 mantissa), and the sum of 32 products
-        // (< 2^23 dynamic range) is also exact in f64. ONE rounding to f32
-        // at the end — this replicates the official FP8 tensor core's
-        // "exact block dot, scales on the accumulator" semantics (kernel.py
-        // docstring: "cast FP4 to FP8 via float, then do FP8xFP8 GEMM.
-        // Apply activation and weight scales to the accumulator").
-        double block_dot = 0.0;
-        #pragma unroll
-        for (int j = 0; j < 32; ++j) {
-            const int idx = kb * 32 + j;
-            const float a = glue_e4m3_to_f(act[idx]);
-            const uint8_t byte = wrow[idx >> 1];
-            const uint8_t nib = (idx & 1) ? (uint8_t)(byte >> 4) : (uint8_t)(byte & 0xFu);
-            const float b = glue_e2m1_to_f(nib);
-            block_dot += (double)a * (double)b;
+        // A fragment: 16×32 e4m3 (row 0 = activation, rows 1-15 = zeros)
+        uint32_t a_frag[4] = {0u, 0u, 0u, 0u};
+        if (lane < 4) {
+            const int col = (lane & 3) * 4;
+            a_frag[0] = *(const uint32_t*)(act + kb * 32 + col);
+            a_frag[2] = *(const uint32_t*)(act + kb * 32 + col + 16);
         }
+        // B fragment: 32×8 e4m3 (col 0 = weight fp4→e4m3, cols 1-7 = zeros)
+        uint32_t b_frag[2] = {0u, 0u};
+        if (lane < 4) {
+            const int base = (lane & 3) * 4;
+            uint8_t be[4];
+            for (int j = 0; j < 4; ++j) {
+                const int idx = kb * 32 + base + j;
+                const uint8_t byte = wrow[idx >> 1];
+                const uint8_t nib = (idx & 1) ? (uint8_t)(byte >> 4) : (uint8_t)(byte & 0xFu);
+                be[j] = glue_e2m1_to_e4m3(nib);
+            }
+            b_frag[0] = (uint32_t)be[0] | ((uint32_t)be[1] << 8) |
+                        ((uint32_t)be[2] << 16) | ((uint32_t)be[3] << 24);
+            for (int j = 0; j < 4; ++j) {
+                const int idx = kb * 32 + base + 16 + j;
+                const uint8_t byte = wrow[idx >> 1];
+                const uint8_t nib = (idx & 1) ? (uint8_t)(byte >> 4) : (uint8_t)(byte & 0xFu);
+                be[j] = glue_e2m1_to_e4m3(nib);
+            }
+            b_frag[1] = (uint32_t)be[0] | ((uint32_t)be[1] << 8) |
+                        ((uint32_t)be[2] << 16) | ((uint32_t)be[3] << 24);
+        }
+        // FP8 MMA: e4m3 × e4m3 → f32 (EXACT 32-element dot, 0 roundings)
+        float c0 = 0.f, c1 = 0.f, c2 = 0.f, c3 = 0.f;
+        asm volatile(
+            "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+            "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};"
+            : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
+            : "r"(a_frag[0]), "r"(a_frag[1]), "r"(a_frag[2]), "r"(a_frag[3]),
+              "r"(b_frag[0]), "r"(b_frag[1]));
+        // C[0][0] is lane 0's c0 — broadcast
+        const float blk_dot = __shfl_sync(0xffffffffu, c0, 0);
+        // Scales on the accumulator (the official's semantics)
         const float wsc = __uint_as_float(((uint32_t)wsrow[kb]) << 23);
-        acc += (float)block_dot * act_scale[kb] * wsc;
+        acc += blk_dot * act_scale[kb] * wsc;
     }
-    out[row] = acc;
+    if (lane == 0) out[warp_id] = acc;
 }
+
 
 extern "C" int dsv41_expert_fp4_gemm_official(
     const uint8_t* act, const float* act_scale,
+    const uint8_t* w, const uint8_t* ws,
+    float* out, int n, int k, cudaStream_t s) {
+    if (n <= 0 || k <= 0) return (int)cudaErrorInvalidValue;
+    // One warp (32 threads) per output row
+    const int warps_per_block = 4;  // 128 threads = 4 warps
+    const int blocks = (n + warps_per_block - 1) / warps_per_block;
+    expert_fp4_gemm_official_kernel<<<blocks, warps_per_block * 32, 0, s>>>(
+        act, act_scale, w, ws, out, n, k);
+    return (int)cudaGetLastError();
+}
     const uint8_t* w, const uint8_t* ws,
     float* out, int n, int k, cudaStream_t s) {
     if (n <= 0 || k <= 0) return (int)cudaErrorInvalidValue;
