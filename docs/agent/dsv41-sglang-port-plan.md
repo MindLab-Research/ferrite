@@ -419,3 +419,15 @@ pos 15  attn_o:0.618% moe_o:5.865%  ← 包含 51→60 跳跃的语义差
 - 最终到 100 = 模型理解了任务语义（用户之前观察到的"后期突然出错前期完全没错"）
 
 **验证方法修正**：RMS 数字在 token 序列发散后无意义，需用同 token 序列（短生成到发散点前）对比。
+
+## 🎯 gate cuBLAS：消除路由翻转（2026-09-14 08:00，01e3564a）
+
+**根因**：gate 分数差 → top-k 边界翻转 → 6/75 位置选了不同专家 → 51 处数数跳跃
+
+**修复**：gate 用 cuBLAS f32 GEMM 替换自定义 gate_gemv_f32
+- bf16 gate 权重上转 f32 一次（thread_local 缓存 per weight pointer）
+- gemm_f32（cuBLAS）——官方 linear(x.float(), weight.float()) 的累加序
+- vec_scale_f32 除以 gate_temp（新内核，纯 f32 无 bf16 舍入）
+- P+D 一致性：两处 batched 条件加了 !expert_cublas()
+
+**验证标准**：数数 1..51 → 1..100 完美（路由翻转消除）
