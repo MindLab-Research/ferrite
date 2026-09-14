@@ -180,7 +180,38 @@ flat `[186 * 512]` array, so the compressed rows are
 (`kv[128:]`) starts 128 *elements* into row 0 and compares the window block
 against our compressed rows, which reports a meaningless ~146% (and a
 `reshape` failure, since 95104 is not a multiple of 512). Always reshape before
-slicing when the reference dump is flat.
+slicing when the reference dump is flat. (`compkvcmp.py` carried this bug for
+one round; it now reshapes first.)
+
+**Measured AFTER the fix (same layer/pos, same command):**
+
+| | rel | maxabs |
+|---|---|---|
+| before | 1.02e-01 | 0.208 |
+| after (block-16 E4M3 RT in place) | 8.02e-02 | 0.312 |
+
+Only 10.2% -> 8.0%, and the reason is a SECOND missing boundary: the reference
+feeds the round-trip a value that is **already bf16** (`Compressor.forward`
+returns `self.norm(kv.to(dtype))`, dtype = bf16), while our
+`compressor_pool_kernel` writes the norm result as raw f32. e2m1 has a 1-bit
+mantissa, so a 0.4% input difference flips near-boundary elements by a whole
+step (1.0 -> 1.5, 25%) and the RMS difference survives. **Next: round the pooled
+latent to bf16 before the rope/RT** (the `norm(kv.to(dtype))` boundary).
+
+**And the round-trip is NOT what breaks the token count** — measured with the
+same binary and prompt:
+
+```
+before: 1..60 correct, then (61,31),(62,32)                       -> 62 numbers
+after : 1..60 correct, then (61,31),(62,32),(63,33),(64,44),(65,45) -> 65 numbers
+```
+
+The correct prefix and the first wrong number are UNCHANGED (still the 61st),
+so the compressed latents' 8-10% error is not the cause at that step — which
+fits the geometry: at pos ~135 the sliding window still covers all but the first
+seven tokens, so the compressed rows are a small correction there. Look
+elsewhere (the window KV's own `win_kv_quant_rt`, or that step's hc/MoE
+precision).
 
 ## Known remaining difference (inert at short context, matters at long)
 
