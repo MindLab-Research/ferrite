@@ -4010,6 +4010,17 @@ fn hc_tail_split() -> bool {
                 1.0 / (hd as f32).sqrt(),
             )?;
         }
+        // The RAW attention output, captured BEFORE the inverse o-rope (which
+        // rewrites the trailing rope_head_dim lanes) and before the fp8 quant.
+        // The official's `sparse_attn` returns exactly this tensor (o =
+        // empty_like(q), fully written by the kernel), so kind 55 is the
+        // stage-comparable counterpart of ref_attn.bin's kind 4; kind 51 is the
+        // post-o-rope value and differs in dims [d-rope_head_dim, d) by design.
+        if layer == 0 {
+            if let Ok(xdp) = std::env::var("DSV41_GT_XDUMP") {
+                self.gt_dump_vec(&xdp, 55, self.s.o.ptr, (nlh * hd) as usize)?;
+            }
+        }
         // B2 (DSV41_OROPE_Q, default ON): the inverse rope's epilogue emits the
         // fp8 of the whole `s.o` region (nlh*hd) in the same launch, which is
         // exactly what the `quant1(s.o)` below would have computed - so that
