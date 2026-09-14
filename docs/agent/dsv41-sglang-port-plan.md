@@ -24,7 +24,23 @@
 
 **o 链三修复（重大突破，37e197f0 验证）**：wo_a f32 切换（官方纯 bf16×bf16 einsum 无量化——fp8×2^e 权重解码在 f32 精确=官方 bf16 权重，s.o 已 bf16 值域，gemm_fp8_mx_f32 零成本复用）+ WOB_F32 默认 OFF（官方 wo_b 有 act_quant，我们跳过=精度过高）+ AR+hc_post 内核舍入（残差流 bf16 域）。**attn_o 3.17-3.41%→0.76-0.94%（4 倍降）！moe_o 10.4→1.89%（专家翻转消失）！**
 
-**indexer 战况**：D2+D3（分数链 bf16+scale 折叠，30978c7c）已验证——**attn_o 无变化**（分数链舍入贡献小）。**D1（fp4 e2m1 往返）**：官方对 indexer 的 q/k 做 fp4_act_quant(x,32,inplace)（FE8M0 scale，amax→floor(6×2⁻¹²⁶)→pow2 scale(1/6)→e2m1 RN 编码 clamp(x/s,±6)→解码×s→bf16 写回），我们全 f32=精度偏高 3-6%⇒topk 选择偏移。新内核 idx_fp4_rt_kernel（mags 表 RN 编码=quant_fp4_fused 的已验证逻辑）应用于 k（rope 后发布前）和 q（rope 汇聚后）。**首验证失败→根因=launcher 误入 dsv41_kernels.cu 的匿名命名空间（:44-3370）→ extern "C" 也被内部链接→符号不进 .so 动态表**（症状：build 成功但运行时"kernel not in the loaded .so"；nm -D 空；单文件编译的 mangled `_GLOBAL__N__` stub 暴露真身）。修复=launcher 移到 `} // namespace` 之后（bfc6a985），重建带 `nm -D | grep -c` 符号自检。**教训（两条）：①新增 extern "C" launcher 必须在匿名命名空间外；②验证轮前先 nm 自检符号（省一轮白跑）。**
+**indexer 战况**：D2+D3（分数链 bf16+scale 折叠，30978c7c）已验证——**attn_o 无变化**（分数链舍入贡献小）。**D1（fp4 e2m1 往返）已验证通过**：数数 1..51→**1..63（历史最佳）**！op 级持平但序列级大幅改善（topk 选择对齐）。
+
+## 🎯 EOS 提前/状态污染的调查（2026-09-15 凌晨——#6 进行中）
+
+**margin 分析（决定性）**：ref logits 逐记录对拍（格式 [8B pos][vocab×4B]×N）——**0-125 步每步都是 ref 的 rank-0（margin=+0.000 完美）**，第 126 步悬崖翻转（margin +18.96，EOS 从 ref 的 rank-3 拉到我们的 top-1）。**不是渐进侵蚀——是单步越界。**
+
+**假设排除**：
+- **engram**：用户裁决"engram不可能影响正确性"+ 实证（edbea8b9：不带 SKIP_ENGRAM_WEIGHTS 数数退回 1..51 更差）——**SKIP=1 保持，engram 非根因**
+- 层 0：op-diff 在 125-140 全正常（attn_o ~0.9%）
+
+**鉴别实验（"从50数到150"，593888df）**：正确 50..76（27 个）后退化为重复乱码（'87','99 99'），跑到 400 无 EOS——**崩溃点不固定（位置 141 vs ~70、数值 63 vs 76）= 累积状态污染在不同序列的不同点越界**。
+
+**19 logits 偏差的量级推理**：0.9% 的层间均匀误差线性累积只够 ~1-2 logits，远小于 19 ⇒ **要么深层有爆发性累积（hc 残差流的指数放大？），要么 head 放大**。
+
+**当前武器（kind-40/41，4d15ebbc）**：层 0/39 的输入 h dump（层号折进 kind）+ ref 的 REF_HDUMP 逐层对拍——**若层 39 的 h 发散而层 0 的正常 ⇒ 层内累积爆发；若两层都正常但 logits 崩 ⇒ head 放大**。逐层对拍轮（118dd444）在飞。
+
+**dump 141 缺失之谜已解**：EOS break 发生在下一轮 dump 前（正常行为，非异常路径）。
 
 **T1 模式定义**：融合内核内联产激活/量化但跳过官方有的 bf16 边界（官方每个算子输出都是 `.to(dtype)`=bf16）。三例：
 1. **T1 原版**（hc_mixes_tail_kernel 的 xn fp8 发射）——已修 ✓ kv_gemm 0.00%
