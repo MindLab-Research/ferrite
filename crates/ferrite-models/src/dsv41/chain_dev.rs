@@ -3298,6 +3298,26 @@ fn hc_tail_split() -> bool {
         // Tail split join for the FFN front end (same contract as the attention
         // side): the MoE consumed the EARLY half, so wait the LATE half's comb.
         self.dev.hc_tail_join()?;
+        // Probe the exact buffers this hc_post is ABOUT to read (x = s.o, the
+        // residual = s.h), so they can be compared with kind 2 (the merged MoE
+        // output) and kind 720 (the h right after the attention's hc_post): a
+        // mismatch proves something clobbers them in between.
+        //   kind 730+layer = s.h immediately before the FFN-side hc_post
+        //   kind 740+layer = s.o immediately before the FFN-side hc_post
+        if let Ok(xdp) = std::env::var("DSV41_GT_XDUMP") {
+            self.gt_dump_vec(
+                &xdp,
+                730 + layer as u64,
+                self.s.h.ptr as *mut std::ffi::c_void,
+                hc * dim,
+            )?;
+            self.gt_dump_vec(
+                &xdp,
+                740 + layer as u64,
+                self.s.o.ptr as *mut std::ffi::c_void,
+                dim,
+            )?;
+        }
         if Self::fuse_c() {
             // Segment-C P1: same fold as the attention side, on the MoE AR.
             if !moe_hc_folded {
