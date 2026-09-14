@@ -142,6 +142,35 @@ module's return value IS `attn_out` (verified: the hook printed 0.586200, i.e.
 exactly attn_out). Comparing the attn-side hc_post needs a reimplementation of
 that step (as was done for the engram and the MoE), not a module hook.
 
+## The remaining gap is `mixes`, and the sinkhorn is exonerated by the data
+
+Comparing the four `hc_mixes` outputs at pos 0 (reference vs ours, relative):
+
+| quantity | reference | ours | rel | what it tells us |
+|---|---|---|---|---|
+| `pre[0]` | 0.17028567 | 0.17029853 | **7.5e-5** | sigmoid of a slice of `mixes` |
+| `post[0]` | 0.0031584359 | 0.0031585852 | **4.7e-5** | sigmoid of a slice of `mixes` |
+| `comb[0]` | 0.8692773581 | 0.869278 | 7.4e-7 | sinkhorn output |
+| `comb_rowsum[0]` | 0.96963 | 0.9696305 | ~1e-6 | sinkhorn normalisation |
+
+`pre` and `post` (both sigmoids of `mixes`) deviate by ~5e-5 while the sinkhorn's
+own output and its row sums agree to ~1e-6. The sinkhorn's row/column
+normalisations absorb any COMMON scale factor, so this pattern says the deviation
+entered `mixes = GEMV(x, hc_fn) * rsqrt` (model.py:993-994) - a common-factor-type
+~1e-5 relative error - and not the sinkhorn.
+
+Two suspects, both in that one line:
+1. the `rsqrt` statistic: the reference is `torch.rsqrt(x.square().mean(-1) +
+   norm_eps)` over the flattened 20480 stream (a torch pairwise/tree reduction);
+2. `F.linear(x, hc_fn)` itself (bf16 weights times f32 activations; our GEMM's
+   K-split/reduction tree differs from torch's BLAS path).
+
+Next measurement (the first two of the four intermediates): dump `mix_raw` (the
+GEMV output) and `rsqrt` inside `hc_mixes_kernel` (`dsv41_kernels.cu:2417`,
+launcher `dsv41_hc_mixes` :7420, Rust `hc_front_split` `chain_dev.rs:2882`) and
+compare with the same two quantities computed in the harness with the model's own
+methods. Whichever moves first is the line to fix.
+
 ## Ruled out by measurement (do not re-test)
 
 | hypothesis | test | result |
