@@ -1467,6 +1467,20 @@ impl<'a> DevChain<'a> {
         })
     }
 
+    /// WOA_CUBLAS (DSV41_WOA_CUBLAS, default OFF): the wo_a projection via
+    /// cuBLAS gemm_f32 instead of our custom gemv — matching the official's
+    /// einsum accumulation order (the o-proj chain is the 3× amplification
+    /// source per the kind 50/51 bisection). The weights are dequantized to
+    /// f32 with dsv41_dequant_fp8_ue8m0 on every call (test path; cache later).
+    fn woa_cublas() -> bool {
+        static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *F.get_or_init(|| {
+            std::env::var("DSV41_WOA_CUBLAS")
+                .map(|v| v != "0")
+                .unwrap_or(false)
+        })
+    }
+
     /// chain-pair-grid-sync (DSV41_WO_PAIR, default OFF): the wo_a -> wo_b pair as
     /// ONE grid-sync launch (`dsv41_gemm_fp8_wo_pair`) instead of two, with a
     /// sense-reversing device-wide barrier between the phases. Each row is still
@@ -4051,6 +4065,38 @@ fn hc_tail_split() -> bool {
         // domain. The wo_fuse/B1 path (whose epilogue emits wo_q) stays fp8.
         let mut woa_ok = false;
         if !wo_fuse && Self::woa_f32() && self.dev.supports_gemm_fp8_f32() {
+            if Self::woa_cublas() {
+                // cuBLAS path: dequantize fp8 weights to f32, call gemm_f32 per
+                // group — matching the official's einsum accumulation order
+                // (the o-proj chain is the 3× amplification source per the
+                // kind 50/51 bisection).
+                let n_total = nlg * olg;
+                let w_f32 = self.dev.alloc(n_total * k * 4)?;
+                self.dev.dequant_fp8_ue8m0(
+                    ld.wo_a.as_ref().unwrap().as_u8(),
+                    ld.wo_a_scale.as_ref().unwrap().as_u8(),
+                    w_f32.ptr as *mut f32,
+                    n_total as i32,
+                    k as i32,
+                )?;
+                for g in 0..nlg {
+                    let af = (self.s.o.ptr as *const f32).wrapping_add(g * k);
+                    let wf = (w_f32.ptr as *const f32).wrapping_add(g * olg * k);
+                    let out = (self.s.wo.ptr as *mut f32).wrapping_add(g * olg);
+                    self.dev.gemm_f32(
+                        af as *const std::ffi::c_void,
+                        wf as *const std::ffi::c_void,
+                        out,
+                        1,
+                        olg as i32,
+                        k as i32,
+                    )?;
+                }
+                if bf16_o() {
+                    self.dev.bf16_round_inplace(self.s.wo.ptr as *mut f32, (nlg * olg) as i32)?;
+                }
+                woa_ok = true;
+            } else {
             woa_ok = true;
             for g in 0..nlg {
                 let af = (self.s.o.ptr as *const f32).wrapping_add(g * k);
@@ -4078,6 +4124,7 @@ fn hc_tail_split() -> bool {
             if woa_ok && bf16_o() {
                 self.dev
                     .bf16_round_inplace(self.s.wo.ptr as *mut f32, (nlg * olg) as i32)?;
+            }
             }
         }
         if !woa_ok {

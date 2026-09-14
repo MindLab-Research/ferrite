@@ -628,6 +628,41 @@ __global__ void vec_scale_bf16_round_kernel(float* __restrict__ v, int n,
     v[i] = glue_bf16_round(v[i] * w[0]);
 }
 
+// Dequantize fp8 e4m3 weights with ue8m0 block scales to f32 — for the
+// wo_a cuBLAS path (matching the official's einsum accumulation order).
+// The LUT-based decode matches the gemv's exactly.
+__global__ void dequant_fp8_ue8m0_kernel(const uint8_t* __restrict__ w,
+                                          const uint8_t* __restrict__ ws,
+                                          float* __restrict__ out, int n, int k) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n * k) return;
+    const int row = idx / k, col = idx % k;
+    const float sc = exp2f((float)(int)ws[(row / 32) * (k / 32) + col / 32] - 127.0f);
+    const uint8_t b = w[idx];
+    // e4m3 decode (same as the gemv's inline path)
+    const int exp = (b >> 3) & 0xF;
+    const int man = b & 0x7;
+    float v;
+    if (exp == 0 && man == 0) {
+        v = 0.0f;
+    } else if (exp == 0) {
+        v = (b & 0x80 ? -1.0f : 1.0f) * (float)man / 64.0f;
+    } else if (exp == 15 && man == 7) {
+        v = nanf("");
+    } else {
+        v = (b & 0x80 ? -1.0f : 1.0f) * (1.0f + (float)man / 8.0f) * exp2f((float)(exp - 7));
+    }
+    out[idx] = v * sc;
+}
+
+extern "C" int dsv41_dequant_fp8_ue8m0(const uint8_t* w, const uint8_t* ws, float* out,
+                                        int n, int k, cudaStream_t s) {
+    const int total = n * k;
+    if (total <= 0) return (int)cudaErrorInvalidValue;
+    dequant_fp8_ue8m0_kernel<<<(unsigned)((total + 255) / 256), 256, 0, s>>>(w, ws, out, n, k);
+    return (int)cudaGetLastError();
+}
+
 extern "C" int dsv41_vec_scale_bf16_round(float* v, int n, const float* w, cudaStream_t s) {
     if (n <= 0) return (int)cudaSuccess;
     vec_scale_bf16_round_kernel<<<(unsigned)((n + 255) / 256), 256, 0, s>>>(v, n, w);

@@ -367,6 +367,9 @@ struct Kernels {
     vec_scale_bf16_round: Option<
         unsafe extern "C" fn(*mut f32, c_int, *const f32, CuStream) -> c_int,
     >,
+    dequant_fp8_ue8m0: Option<
+        unsafe extern "C" fn(*const u8, *const u8, *mut f32, c_int, c_int, CuStream) -> c_int,
+    >,
     comp_placeholder:
         Option<unsafe extern "C" fn(*mut i32, *const c_int, c_int, c_int, CuStream) -> c_int>,
     ring_append:
@@ -833,6 +836,7 @@ impl Device {
             gate_gemv_f32: ko!(rt, "dsv41_gate_gemv_f32"),
             bf16_round_inplace: ko!(rt, "dsv41_bf16_round_inplace"),
             vec_scale_bf16_round: ko!(rt, "dsv41_vec_scale_bf16_round"),
+            dequant_fp8_ue8m0: ko!(rt, "dsv41_dequant_fp8_ue8m0"),
             comp_placeholder: ko!(rt, "dsv41_comp_placeholder"),
             compress_commit: ko!(rt, "dsv41_compress_commit"),
             ring_append: ko!(rt, "dsv41_ring_append"),
@@ -3122,6 +3126,21 @@ impl Device {
         let f = self.need(self.kernels.vec_scale_bf16_round, "dsv41_vec_scale_bf16_round")?;
         let rc = unsafe { f(v, n, w, self.stream) };
         self.kerr(rc, "dsv41_vec_scale_bf16_round")
+    }
+
+    /// Dequantize fp8 e4m3 weights with ue8m0 block scales to f32 — for the
+    /// wo_a cuBLAS path (the official's einsum accumulation order).
+    pub fn dequant_fp8_ue8m0(
+        &self,
+        w: *const u8,
+        ws: *const u8,
+        out: *mut f32,
+        n: i32,
+        k: i32,
+    ) -> Result<()> {
+        let f = self.need(self.kernels.dequant_fp8_ue8m0, "dsv41_dequant_fp8_ue8m0")?;
+        let rc = unsafe { f(w, ws, out, n, k, self.stream) };
+        self.kerr(rc, "dsv41_dequant_fp8_ue8m0")
     }
 
     /// Publish the roped index key into the owner's group slot, with the slot
