@@ -278,3 +278,17 @@ torch.polar → glibc cosf/sinf）。CUDA 设备端的 cosf/sinf 是完全不同
 
 **下一验证**：数数 1-100（rope 位级修复后 kv_RT 的 4/512 元素差应消除 → attention 0.254%
 应大幅下降 → attn_o 0.79% 应显著改善 → 数数断点应推进）。
+
+## ⚠️ wkvpost 解析 bug 定谳（2026-09-14 04:55）
+
+**发现**：ref_diff.py 的 wkvpost hook 写 kind=6 时用 `oo = output`（shape [1,s,512]），
+`oo.shape[0]=1`（batch 维）→ 每条 forward 写 **一条 [s,512]=7680 f32s 记录**（prefill），
+而我们引擎写 per-position 512 f32s。**SIZES 表按 512 解析 → prefill 后所有记录错位**。
+
+**影响范围**：kind=6 变成 7680 之后的所有轮次，xn/kv_gemm/kv_RT MISS、attn_o/moe_o 的
+"数字"以及 kind 50/51 暴力扫描的 110% 差异——**全部是错位伪影，不可信**。
+
+**修复**：wkvpost 改为 `o[0]` 取 [s,512] 再逐行写 per-position [512] 记录（与 xpost 同构）。
+
+**教训**：hook 写 dump 时必须先 `o[0]` 去掉 batch 维再逐行迭代（oo.shape[0] 是 batch 不是
+seqlen）；解析侧 MISS 或荒谬数字（110%）时先查记录格式，不要直接采信。
