@@ -5093,11 +5093,24 @@ fn hc_tail_split() -> bool {
         // complete, so the shared half reads exactly what the serial code read -
         // it just no longer WAITS for the gate + routed experts in between.
         //
-        // The predicate mirrors `batched` below (the routed path must be the
-        // batched one: the sequential loop reuses `s.ex_act`, which the shared
-        // half writes). `!mix_gate_shared()` is required because the mixed
+        // The predicate must mirror `batched` below EXACTLY (the routed path must
+        // be the batched one: the sequential loop reuses `s.ex_act`, which the
+        // shared half writes). `!mix_gate_shared()` is required because the mixed
         // gate+w1+w3 launch is a main-stream writer of `s.xq`/`s.ex_act` that the
         // shared half would consume. See `moe_dual()` for the full contract.
+        //
+        // ⚠️ The mirror was INCOMPLETE until 2026-09-14: `batched` also requires
+        // `!expert_act_e4m3()` and `!expert_cublas()`, both of which were missing
+        // here. With the default (`DSV41_EXPERT_ACT_E4M3` ON, which forces the
+        // routed SEQUENTIAL path) `dual` was therefore still true, so the routed
+        // loop's `expert_gate_up_fp4_indirect` wrote `s.ex_act[0 .. 2*320]` on the
+        // main stream while the shared half's `gemm_fp8_mx2_on` wrote
+        // `s.ex_act[0 .. 4608]` on the side stream - overlapping ranges, two
+        // streams, no ordering. Measured at layer 0 / pos 0 against the official:
+        // shared term 0.175694 (correct, official 0.175733) when the race loses,
+        // 0.148034 when it wins, and the MoE output 1.4% low - which is exactly
+        // the per-layer drift that flips the counted token. Adding any D2H probe
+        // in between changed the outcome, the classic race signature.
         let dual = moe_dual()
             && !mix_gate_shared()
             && !self.opts.skip_experts
@@ -5110,6 +5123,10 @@ fn hc_tail_split() -> bool {
             && topk > 0
             && ld.experts.len() >= 2
             && self.dev.supports_moe_batch()
+            // the routed path falls back to the SEQUENTIAL loop (which owns
+            // `s.ex_act`) under these two gates, so the fork must not take
+            && !expert_act_e4m3()
+            && !expert_cublas()
             && self.dev.supports_dual_chain();
         if dual {
             self.dev.dual_chain_fork()?;
@@ -5621,6 +5638,14 @@ fn hc_tail_split() -> bool {
                         w2s_stride,
                         ids,
                     )?;
+                    // per-slot expert output magnitudes (only the pair path keeps
+                    // them separately: the fused down-reduce writes s.o directly)
+                    if layer == 0 {
+                        for slot in 0..topk {
+                            let p = (self.s.ex_down_b.ptr as *const f32).wrapping_add(slot * dim);
+                            self.l0_probe(&format!("slot{slot}"), p, dim)?;
+                        }
+                    }
                     // Fixed-order sum, slot 0 first: the SAME order the sequential
                     // `o[row] += x` accumulation used (from the zeroed `o`), so the
                     // result is bit-identical (fp addition is not associative).
@@ -6008,6 +6033,20 @@ fn hc_tail_split() -> bool {
         // official anchor (REF_ABLATE=routed): the routed experts' term at layer 0
         if layer == 0 {
             self.l0_probe("routed", self.s.o.ptr as *const f32, dim)?;
+        }
+        // per-token routing detail (which experts, which weights) at layer 0
+        if layer == 0 && self.rank() == 0 && std::env::var("DSV41_MOE_DBG2").is_ok() && topk > 0 {
+            let mut ids_h = vec![0i32; topk];
+            let mut wts_h = vec![0f32; topk];
+            let b = Device::view(self.s.route_idx.ptr as *mut std::ffi::c_void, topk * 4);
+            self.dev.download_u8(&b, unsafe {
+                std::slice::from_raw_parts_mut(ids_h.as_mut_ptr() as *mut u8, topk * 4)
+            })?;
+            let b = Device::view(self.s.route_w.ptr as *mut std::ffi::c_void, topk * 4);
+            self.dev.download_u8(&b, unsafe {
+                std::slice::from_raw_parts_mut(wts_h.as_mut_ptr() as *mut u8, topk * 4)
+            })?;
+            eprintln!("[moe2] L0 route ids={ids_h:?} w={wts_h:?}");
         }
         // shared expert: fp8, every token. Its weights are replicated, so under
         // a collective exactly one rank may contribute it — otherwise the
